@@ -176,6 +176,9 @@ class _MockTokenizerManager:
         self.create_abort_task = Mock()
         self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
     def config_value(self, name: str):
         """The value in effect for one config field."""
         if name in self._config_overrides:
