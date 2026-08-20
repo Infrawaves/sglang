@@ -59,7 +59,7 @@ fn build_app_context(
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             policy,
             decode_policy: Default::default(),
             bucket_config: Some(bucket_config),

@@ -117,7 +117,7 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
                     bucket_config: None,

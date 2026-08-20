@@ -472,7 +472,7 @@ mod tests {
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
-                tokenizer_path: "/tmp/x".into(),
+                tokenizer_path: Some("/tmp/x".into()),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,
