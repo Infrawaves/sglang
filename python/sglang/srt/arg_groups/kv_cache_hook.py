@@ -363,15 +363,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool does not "
             "support --dcp-size > 1."
         )
-    if (
-        cfg.disaggregation_decode_retraction_backup == "host_pool"
-        and cfg.enable_priority_scheduling
-        and not cfg.disable_priority_preemption
-    ):
-        raise ValueError(
-            "--disaggregation-decode-retraction-backup=host_pool requires "
-            "--disable-priority-preemption when priority scheduling is enabled."
-        )
     if cfg.radix_eviction_policy == "tlru":
         tlru_config = cfg.radix_eviction_policy_config or {}
         threshold = tlru_config.get("threshold", 0)
