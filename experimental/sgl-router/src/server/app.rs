@@ -107,10 +107,11 @@ async fn access_log_and_record(
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
-    let request_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+    // The gateway stamps `venus-request-id`; `x-request-id` is the fallback.
+    // First hit wins; `-` when the client sent neither.
+    let request_id = ["venus-request-id", "x-request-id"]
+        .iter()
+        .find_map(|h| req.headers().get(*h).and_then(|v| v.to_str().ok()))
         .unwrap_or("-")
         .to_owned();
     let start = std::time::Instant::now();
