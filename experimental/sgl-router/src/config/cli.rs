@@ -165,6 +165,12 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
 
+    /// Max accepted request body on the inference routes, in bytes (default 32 MiB).
+    /// Larger bodies get 413 before routing. Raising it raises the worst-case heap one
+    /// request can pin, so size it against concurrency, not just the biggest prompt.
+    #[arg(long, default_value_t = ProxyConfig::default().max_chat_body_bytes)]
+    pub max_chat_body_bytes: usize,
+
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
@@ -635,6 +641,7 @@ impl Cli {
                 max_attempts: self.server.retry_max_attempts,
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
+                max_chat_body_bytes: self.server.max_chat_body_bytes,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -2239,6 +2246,26 @@ mod tests {
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 240);
+    }
+
+    /// Pins the body cap to the flag, and the unflagged default to the constant
+    /// the 413 tests build their oversized bodies from.
+    #[test]
+    fn max_chat_body_bytes_defaults_and_overrides() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(
+            c.proxy.max_chat_body_bytes,
+            crate::server::routes::chat::MAX_CHAT_BODY_BYTES,
+        );
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--max-chat-body-bytes",
+            "536870912",
+        ]))
+        .unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 512 << 20);
     }
 
     #[test]

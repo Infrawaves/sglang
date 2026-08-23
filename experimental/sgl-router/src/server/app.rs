@@ -4,7 +4,6 @@
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -117,6 +116,19 @@ async fn access_log_and_record(
     let start = std::time::Instant::now();
 
     ctx.metrics.record_ingress(&route, method_label);
+    // Arrival half of the access log. The `http_request` line below only runs
+    // once a response head exists, so a request that hangs or whose client
+    // disconnects first would otherwise leave no trace; an arrival with no
+    // matching completion is the signal for a stuck request.
+    if !is_infra_path(&path) {
+        tracing::info!(
+            pod_id = %pod_id(),
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            "http_request_start",
+        );
+    }
     let inflight = ctx.inflight_http.enter();
     let resp = next.run(req).await;
     let status = resp.status();
@@ -183,6 +195,8 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    // Read before the builder chain: `.with_state(ctx)` moves `ctx`.
+    let max_body = ctx.config.proxy.max_chat_body_bytes;
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
@@ -202,39 +216,39 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/completions",
             post(crate::server::routes::chat::completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/classify",
             post(crate::server::routes::chat::classify)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/rerank",
             post(crate::server::routes::chat::rerank)
                 .put(crate::server::routes::chat::rerank)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(

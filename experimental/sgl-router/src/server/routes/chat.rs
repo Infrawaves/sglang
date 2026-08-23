@@ -36,9 +36,10 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+/// Default maximum buffered request body, including base64 multimodal inputs (32 MiB),
+/// overridable with `--max-chat-body-bytes`. The effective cap is
+/// `ProxyConfig::max_chat_body_bytes`, enforced by the `DefaultBodyLimit` layer in app.rs.
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
 
 /// Validate, select workers, and forward a chat-completions request.
 pub async fn chat_completions(
