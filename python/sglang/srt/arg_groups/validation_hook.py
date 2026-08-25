@@ -419,6 +419,43 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_proactive_decode_demotion(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.proactive_decode_demotion_output_len_threthold <= 1:
+        raise ValueError(
+            "--proactive-decode-demotion-output-len-threthold must be greater "
+            "than 1."
+        )
+    if not 0.0 < cfg.proactive_decode_demotion_cache_usage <= 1.0:
+        raise ValueError(
+            "--proactive-decode-demotion-cache-usage must be in (0, 1]."
+        )
+    if cfg.proactive_safe_cpu_demote_cache_usage <= 0.0:
+        raise ValueError(
+            "--proactive-safe-cpu-demote-cache-usage must be positive."
+        )
+    if cfg.candidate_demotion_output_len_threthold <= 0.0:
+        raise ValueError(
+            "--candidate-demotion-output-len-threthold must be positive."
+        )
+    if cfg.proactive_demotion_max_input_len <= 0:
+        raise ValueError("--proactive-demotion-max-input-len must be positive.")
+    if cfg.proactive_demotion_min_output_len <= 0:
+        raise ValueError("--proactive-demotion-min-output-len must be positive.")
+    if cfg.proactive_demotion_recovery_duration < 0.0:
+        raise ValueError(
+            "--proactive-demotion-recovery-duration must be non-negative."
+        )
+    if (
+        cfg.enable_proactive_decode_demotion
+        and cfg.disaggregation_mode != "decode"
+    ):
+        raise ValueError(
+            "--enable-proactive-decode-demotion requires "
+            "--disaggregation-mode decode."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
