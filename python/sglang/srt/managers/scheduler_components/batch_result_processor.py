@@ -329,16 +329,18 @@ class SchedulerBatchResultProcessor:
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
                         store=(
-                            should_commit_output and sampling_mask_finish_reason is None
+                            should_commit_output
+                            and not req.is_demoted
+                            and sampling_mask_finish_reason is None
                         ),
                     )
 
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
-                ) or req.is_retracted:
-                    # Decode req in a mixed batch, or a retracted req. Keep an
-                    # aborted middle chunk in the chunked branch long enough to
-                    # drain its accounting without streaming it.
+                ) or req.is_retracted or req.is_demoted:
+                    # Decode req in a mixed batch, or a retracted/demoted req.
+                    # Keep an aborted middle chunk in the chunked branch long
+                    # enough to drain its accounting without streaming it.
                     continue
 
                 if req.inflight_middle_chunks <= 0:
@@ -455,7 +457,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
+                if req.is_retracted or req.is_demoted:
                     continue
 
                 req.embedding = embeddings[i]
@@ -595,7 +597,9 @@ class SchedulerBatchResultProcessor:
                 has_consumed_output = any(
                     req.inflight_middle_chunks <= 0
                     for req in batch.reqs
-                    if not req.finished() and not req.is_retracted
+                    if not req.finished()
+                    and not req.is_retracted
+                    and not req.is_demoted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
                     chunks = list([r.inflight_middle_chunks for r in batch.reqs])
@@ -607,7 +611,11 @@ class SchedulerBatchResultProcessor:
             return
 
         for req in batch.reqs:
-            if not req.finished() and not req.is_retracted:
+            if (
+                not req.finished()
+                and not req.is_retracted
+                and not req.is_demoted
+            ):
                 assert req.inflight_middle_chunks > 0, (
                     f"PP skip output comm invariant violated: req {req.rid} "
                     f"has inflight_middle_chunks={req.inflight_middle_chunks} "
@@ -788,7 +796,11 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
-            if req.is_retracted or req.finished():
+            if (
+                req.is_retracted
+                or req.is_demoted
+                or req.finished()
+            ):
                 # Nothing to settle: no worker pre-claims the bonus, so
                 # kv_committed_len already holds the committed prefix.
                 pass
@@ -878,6 +890,7 @@ class SchedulerBatchResultProcessor:
                 if (
                     req.grammar is None
                     or req.is_retracted
+                    or req.is_demoted
                     or req.finished()
                     or req.inflight_middle_chunks > 0
                 ):
@@ -896,7 +909,12 @@ class SchedulerBatchResultProcessor:
         stride = _get_speculative_output_stride(result)
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
-            if req.grammar is None or req.is_retracted or req.finished():
+            if (
+                req.grammar is None
+                or req.is_retracted
+                or req.is_demoted
+                or req.finished()
+            ):
                 continue
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
             # Stop accepting once the grammar terminates so the over-drafted suffix
@@ -988,9 +1006,12 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
+                req.finished()
+                or req.is_retracted
+                or req.is_demoted
             ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+                # A finished, retracted, or demoted request can remain in a
+                # delayed overlap result after leaving the running batch.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
