@@ -322,6 +322,7 @@ class DecodeRequest:
 class DemotedRequest:
     req: Req
     demoted_start_time: float
+    demoted_tokens: int
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -812,6 +813,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
         self.demotion_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -882,6 +884,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, req: Req, demoted_start_time: Optional[float] = None
     ) -> None:
         req.is_demoted = True
+        demoted_tokens = req.seqlen
+        self.scheduler.remain_cpu_demote_tokens -= demoted_tokens
         self.demotion_queue.append(
             DemotedRequest(
                 req=req,
@@ -890,6 +894,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if demoted_start_time is None
                     else demoted_start_time
                 ),
+                demoted_tokens=demoted_tokens,
             )
         )
 
@@ -934,6 +939,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             req.is_demoted = False
             req.is_demoted_recovered = True
+            self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             full_allocatable_tokens -= full_required
@@ -2868,8 +2874,7 @@ class SchedulerDisaggregationDecodeMixin:
                 p95_output_len,
             )
 
-        # Note: Demote too much may case OOM.
-        if self.disagg_decode_prealloc_queue.demotion_queue:
+        if self.remain_cpu_demote_tokens <= 0:
             return False
 
         if not self.if_output_len_imbalance:
@@ -2910,10 +2915,7 @@ class SchedulerDisaggregationDecodeMixin:
         ]
         candidates = demoted_recovered_candidates + candidates
         demoted_reqs = []
-        while (
-            self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
-            > self.server_args.proactive_decode_safe_cache_usage
-        ):
+        while self.remain_cpu_demote_tokens > 0:
             if not candidates:
                 break
 
