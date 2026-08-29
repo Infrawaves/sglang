@@ -31,6 +31,7 @@ class RemoteInstanceWeightTransporter:
     # Registration may run after the runner's construction scope has exited.
     tp_rank: int = field(init=False, default_factory=lambda: get_parallel().tp_rank)
     gpu_id: int
+    is_draft_worker: bool = False
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -84,6 +85,9 @@ class RemoteInstanceWeightTransporter:
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
             remote_instance_transfer_engine_enabled()
+            # The draft shares the target's tp_rank, the bootstrap server's
+            # key, so publishing here would replace the target's manifest.
+            and not self.is_draft_worker
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
