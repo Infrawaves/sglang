@@ -3240,6 +3240,36 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = None
+    enable_proactive_decode_promotion: A[
+        bool,
+        "Enable scheduler-local proactive decode demotion based on output-length imbalance.",
+        NS("disagg"),
+    ] = False
+    proactive_decode_demotion_output_len_threthold: A[
+        int,
+        "P95/P50 output-length ratio that enables proactive decode demotion.",
+        NS("disagg"),
+    ] = 8
+    proactive_decode_demotion_cache_usage: A[
+        float,
+        "KV pool usage ratio that enables proactive decode demotion.",
+        NS("disagg"),
+    ] = 0.95
+    proactive_safe_cpu_demote_cache_usage: A[
+        float,
+        "Total KV that proactive demotion may keep offloaded to CPU, as a ratio of the GPU KV pool size.",
+        NS("disagg"),
+    ] = 0.2
+    candidate_demotion_output_len_threthold: A[
+        float,
+        "Output-length multiplier over P50 for proactive demotion candidates.",
+        NS("disagg"),
+    ] = 2.0
+    proactive_demotion_recovery_duration: A[
+        float,
+        "Minimum seconds a proactively demoted request stays offloaded.",
+        NS("disagg"),
+    ] = 180.0
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
@@ -3823,6 +3853,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._handle_proactive_decode_demotion()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -4219,6 +4250,37 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _handle_proactive_decode_demotion(self):
+        if self.proactive_decode_demotion_output_len_threthold <= 1:
+            raise ValueError(
+                "--proactive-decode-demotion-output-len-threthold must be greater "
+                "than 1."
+            )
+        if not 0.0 < self.proactive_decode_demotion_cache_usage <= 1.0:
+            raise ValueError(
+                "--proactive-decode-demotion-cache-usage must be in (0, 1]."
+            )
+        if self.proactive_safe_cpu_demote_cache_usage <= 0.0:
+            raise ValueError(
+                "--proactive-safe-cpu-demote-cache-usage must be positive."
+            )
+        if self.candidate_demotion_output_len_threthold <= 0.0:
+            raise ValueError(
+                "--candidate-demotion-output-len-threthold must be positive."
+            )
+        if self.proactive_demotion_recovery_duration < 0.0:
+            raise ValueError(
+                "--proactive-demotion-recovery-duration must be non-negative."
+            )
+        if (
+            self.enable_proactive_decode_promotion
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "--enable-proactive-decode-promotion requires "
+                '--disaggregation-mode decode.'
+            )
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:
