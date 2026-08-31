@@ -814,6 +814,13 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+                self.stats.num_demotion_queue_reqs = QueueCount.from_reqs(
+                    self.scheduler.disagg_decode_prealloc_queue.demoted_reqs(),
+                    priority_enabled,
+                )
+                self.stats.demotion_queue_cache_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.demotion_queue_cache_usage()
+                )
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -1040,6 +1047,13 @@ class SchedulerMetricsReporter:
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                )
+                self.stats.num_demotion_queue_reqs = QueueCount.from_reqs(
+                    self.scheduler.disagg_decode_prealloc_queue.demoted_reqs(),
+                    priority_enabled,
+                )
+                self.stats.demotion_queue_cache_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.demotion_queue_cache_usage()
                 )
 
             # Streaming session metrics
@@ -1361,5 +1375,12 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+            )
+            self.stats.num_demotion_queue_reqs = QueueCount.from_reqs(
+                self.scheduler.disagg_decode_prealloc_queue.demoted_reqs(),
+                priority_enabled,
+            )
+            self.stats.demotion_queue_cache_usage = (
+                self.scheduler.disagg_decode_prealloc_queue.demotion_queue_cache_usage()
             )
         self.metrics_collector.log_stats(self.stats)
