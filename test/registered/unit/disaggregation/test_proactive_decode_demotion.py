@@ -29,10 +29,11 @@ _CPU_TENSOR_DISAGG = SimpleNamespace(
 class _FakeBatch:
     """Minimal running-batch stand-in recording release_req calls."""
 
-    def __init__(self, reqs):
+    def __init__(self, reqs, *, backup_saved=True):
         self.reqs = list(reqs)
         self.batch_is_full = True
         self.release_calls = []
+        self.backup_saved = backup_saved
 
     def is_empty(self):
         return not self.reqs
@@ -40,14 +41,14 @@ class _FakeBatch:
     def batch_size(self):
         return len(self.reqs)
 
-    def release_req(self, index, _, __, *, is_demoted=False):
+    def release_req(self, index, _, offload_kv=True, *, is_demoted=False):
         victim = self.reqs[index]
         if is_demoted:
             victim.is_demoted = True
         else:
             victim.is_retracted = True
         self.release_calls.append((victim.rid, index, is_demoted))
-        return True
+        return self.backup_saved
 
     def filter_batch(self, keep_indices):
         self.reqs = [self.reqs[i] for i in keep_indices]
@@ -198,19 +199,19 @@ class TestProactiveDecodeDemotion(CustomTestCase):
     def test_demoted_request_waits_then_restores(self):
         req = SimpleNamespace(is_retracted=False, is_demoted=True)
         queue = self._make_demoted_queue(req, recovery_duration=10.0)
-        with patch(
-            "sglang.srt.disaggregation.decode.time.monotonic", return_value=5.0
-        ):
+        with patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=5.0):
             self.assertEqual(queue.resume_demoted_reqs(), [])
         self.assertEqual(len(queue.demotion_queue), 1)
         self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
 
-        with patch(
-            "sglang.srt.disaggregation.decode.time.monotonic", return_value=15.0
-        ), patch(
-            "sglang.srt.disaggregation.decode.get_disagg",
-            return_value=_CPU_TENSOR_DISAGG,
-        ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
+        with (
+            patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=15.0),
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=_CPU_TENSOR_DISAGG,
+            ),
+            patch("sglang.srt.disaggregation.decode.restore_kv_cache") as restore,
+        ):
             self.assertEqual(queue.resume_demoted_reqs(), [req])
         self.assertEqual(queue.demotion_queue, [])
         self.assertFalse(req.is_retracted)
@@ -228,10 +229,15 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         queue.retracted_queue = []
         queue.kv_manager = SimpleNamespace()
         queue._cancel_prefill_dp_rank_queries = lambda: None
-        with patch(
-            "sglang.srt.disaggregation.decode.get_disagg",
-            return_value=_CPU_TENSOR_DISAGG,
-        ), patch("sglang.srt.disaggregation.decode.retraction_discard") as discard:
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=_CPU_TENSOR_DISAGG,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.discard_kv_cache_backup"
+            ) as discard,
+        ):
             queue.release_memory_occupation()
         discard.assert_called_once()
         self.assertEqual(queue.demotion_queue, [])
@@ -242,9 +248,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             decode_metric_collector=SimpleNamespace(maybe_update=lambda: None),
             remain_cpu_demote_tokens=remain_cpu_demote_tokens,
             pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: SimpleNamespace(
-                    get_max_pool_usage=lambda: 0.96
-                )
+                get_pool_stats=lambda: SimpleNamespace(get_max_pool_usage=lambda: 0.96)
             ),
             server_args=SimpleNamespace(
                 proactive_decode_demotion_cache_usage=0.70,
@@ -289,18 +293,14 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         demotion_queue = scheduler.disagg_decode_prealloc_queue.demotion_queue
         self.assertEqual(batch.reqs, [short])
         self.assertEqual([entry.req for entry in demotion_queue], [long, medium])
-        self.assertEqual(
-            [entry.demoted_tokens for entry in demotion_queue], [30, 20]
-        )
+        self.assertEqual([entry.demoted_tokens for entry in demotion_queue], [30, 20])
         # 40 - 30 - 20: the last victim may overshoot the budget by one request.
         self.assertEqual(scheduler.remain_cpu_demote_tokens, -10)
         self.assertFalse(long.is_retracted)
         self.assertTrue(long.is_demoted)
         self.assertFalse(medium.is_retracted)
         self.assertTrue(medium.is_demoted)
-        self.assertEqual(
-            batch.release_calls, [("long", 0, True), ("medium", 1, True)]
-        )
+        self.assertEqual(batch.release_calls, [("long", 0, True), ("medium", 1, True)])
         self.assertEqual(scheduler.metrics_reporter.num_demoted_reqs, 2)
         scheduler.metrics_reporter.metrics_collector.increment_demoted_reqs.assert_called_once_with(
             num_demoted_reqs=2,
@@ -329,6 +329,40 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertEqual(scheduler.remain_cpu_demote_tokens, -5)
         self.assertFalse(medium.is_demoted)
 
+    def test_failed_demotion_aborts_without_spending_budget(self):
+        """A failed KV backup must finish the request instead of queueing it for restore."""
+        victim = Req(
+            "failed", "", array("q", [1] * 10), SamplingParams(max_new_tokens=128)
+        )
+        victim.output_ids.extend([0] * 20)
+        # KV offloading is the external boundary; run the actual abort handling.
+        batch = _FakeBatch([victim], backup_saved=False)
+        scheduler = _make_demotion_scheduler(batch, budget=100, enable_metrics=True)
+        outputs = []
+        scheduler.output_streamer = SimpleNamespace(
+            stream_output=lambda reqs, _: outputs.extend(
+                (req.rid, req.finished_reason.to_json()) for req in reqs
+            )
+        )
+
+        self.assertFalse(
+            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                scheduler
+            )
+        )
+
+        self.assertEqual(len(outputs), 1)
+        rid, finish_reason = outputs[0]
+        self.assertEqual(rid, victim.rid)
+        self.assertEqual(finish_reason["type"], "abort")
+        self.assertEqual(finish_reason["status_code"], 500)
+        self.assertTrue(victim.finished())
+        self.assertFalse(victim.is_demoted)
+        self.assertEqual(batch.reqs, [])
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.demotion_queue, [])
+        self.assertEqual(scheduler.remain_cpu_demote_tokens, 100)
+        self.assertEqual(scheduler.metrics_reporter.num_demoted_reqs, 0)
+
     def test_redemotion_requires_incremental_output(self):
         """Re-demotion must require min_output_len tokens generated since the
         last demotion; comparing total output length alone re-demoted a
@@ -352,6 +386,36 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertFalse(recovered.is_demoted)
         # Demotion records the output length the next wave must build on.
         self.assertEqual(fresh.last_demote_output_len, 30)
+
+    def test_demotion_queue_cache_usage_matches_budget_spend(self):
+        """demotion_queue_cache_usage must equal the budget debited by
+        add_demoted_req divided by the pool size, so the gauge tracks the
+        proactive_safe_cpu_demote_cache_usage cap without separate accounting."""
+        long = _make_demotion_candidate("long", 30, 20)
+        medium = _make_demotion_candidate("medium", 20, 12)
+        batch = _FakeBatch([long, medium])
+        initial_budget = 100
+        scheduler = _make_demotion_scheduler(batch, budget=initial_budget)
+        scheduler.max_total_num_tokens = 500
+        queue = scheduler.disagg_decode_prealloc_queue
+        # Hybrid SWA preallocation may use a smaller capacity than the one
+        # used to size the scheduler's demotion budget.
+        queue.max_total_num_tokens = 100
+
+        self.assertEqual(queue.demotion_queue_cache_usage(), 0.0)
+        self.assertEqual(queue.demoted_reqs(), [])
+
+        self.assertTrue(
+            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                scheduler
+            )
+        )
+
+        spent = initial_budget - scheduler.remain_cpu_demote_tokens
+        self.assertEqual(
+            queue.demotion_queue_cache_usage(), spent / scheduler.max_total_num_tokens
+        )
+        self.assertEqual(queue.demoted_reqs(), [long, medium])
 
 
 if __name__ == "__main__":

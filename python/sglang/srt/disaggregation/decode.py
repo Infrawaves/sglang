@@ -79,6 +79,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -114,9 +117,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_QUEUE,
     scheduler_stage_method,
-)
-from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
-    NewTokenRatioTracker,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -952,7 +952,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         self.retracted_queue.clear()
         for entry in self.demotion_queue:
-            retraction_discard(
+            discard_kv_cache_backup(
                 entry.req,
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
@@ -1057,6 +1057,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         )
 
+    def demoted_reqs(self) -> List[Req]:
+        return [entry.req for entry in self.demotion_queue]
+
+    def demotion_queue_cache_usage(self) -> float:
+        # Use the same capacity as the scheduler's demotion budget, not the
+        # preallocation limit, which may be smaller for hybrid SWA models.
+        # The last demoted request can overshoot the remaining budget.
+        demoted_tokens = sum(entry.demoted_tokens for entry in self.demotion_queue)
+        return demoted_tokens / self.scheduler.max_total_num_tokens
+
     def resume_demoted_reqs(self) -> List[Req]:
         """Restore demoted requests only after their recovery duration expires."""
         recovery_duration = (
@@ -1089,7 +1099,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             self._pre_alloc(req)
-            retraction_restore(
+            restore_kv_cache(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
@@ -3263,7 +3273,6 @@ class SchedulerDisaggregationDecodeMixin:
                     req.set_extend_range(
                         len(req.prefix_indices), req.kv.kv_committed_len
                     )
-                num_remain_used_batch -= 1
             else:
                 waiting_queue.append(req)
 
@@ -3354,8 +3363,7 @@ class SchedulerDisaggregationDecodeMixin:
                 and not req.is_retracted
                 and not req.is_demoted
                 and len(req.origin_input_ids) <= max_input_len
-                and len(req.output_ids) - req.last_demote_output_len
-                >= min_output_len
+                and len(req.output_ids) - req.last_demote_output_len >= min_output_len
             )
 
         demoted_any = False
@@ -3367,13 +3375,10 @@ class SchedulerDisaggregationDecodeMixin:
                 break
 
             victim = candidates.pop(0)
-            victim_index = next(
-                i for i, r in enumerate(batch.reqs) if r is victim
-            )
+            victim_index = next(i for i, r in enumerate(batch.reqs) if r is victim)
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
-                self.server_args,
                 is_demoted=True,
             )
             if backup_saved:
@@ -3382,27 +3387,22 @@ class SchedulerDisaggregationDecodeMixin:
                 demoted_reqs.append(victim)
                 demoted_any = True
             else:
-                victim.to_finish = FINISH_ABORT(
+                victim.is_demoted = False
+                prepare_abort(
+                    victim,
                     "Proactive demotion host KV backup failed; request aborted.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(victim, finished_reason=victim.to_finish.to_json()),
-                    victim,
-                )
+                self.output_streamer.stream_output([victim], victim.return_logprob)
 
             batch.filter_batch(
                 keep_indices=[
-                    index
-                    for index, _ in enumerate(batch.reqs)
-                    if index != victim_index
+                    index for index, _ in enumerate(batch.reqs) if index != victim_index
                 ]
             )
             batch.batch_is_full = False
             self.new_token_ratio_tracker.current = (
-                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
-                    batch.reqs
-                )
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(batch.reqs)
             )
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
