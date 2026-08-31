@@ -1430,6 +1430,13 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
+        self.stats.num_demotion_queue_reqs = QueueCount.from_reqs(
+            self.scheduler.disagg_decode_prealloc_queue.demoted_reqs(),
+            priority_enabled,
+        )
+        self.stats.demotion_queue_cache_usage = (
+            self.scheduler.disagg_decode_prealloc_queue.demotion_queue_cache_usage()
+        )
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
