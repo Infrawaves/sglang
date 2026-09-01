@@ -3468,6 +3468,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     # Map backend-group positions through the rank-local shard to global grid rows.
                     global_indices = [image_indices[index] for index in indices]
                     first_config = group_configs[0]
+                    global_indices = [image_indices[index] for index in indices]
                     if backend == "gpu":
                         from sglang.srt.multimodal.processors.kimi_k25 import (
                             _gpu_preprocess_images,
