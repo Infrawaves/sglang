@@ -24,7 +24,7 @@ class ToolCallTestParams:
     test_strict: bool = True
     test_multiturn: bool = True
     test_thinking: bool = False  # model-specific, e.g. DeepSeek
-    test_reasoning_usage: bool = False  # verify usage.reasoning_tokens > 0
+    test_reasoning_usage: bool = False  # verify usage.completion_tokens_details.reasoning_tokens > 0
     test_parallel: bool = True
     test_streaming_parallel: bool = True
 
@@ -251,7 +251,7 @@ def _test_thinking(client, model):
 
 
 def _test_reasoning_usage(client, model):
-    """With thinking enabled, usage.reasoning_tokens should be reported as > 0."""
+    """With thinking enabled, usage.completion_tokens_details.reasoning_tokens should be > 0."""
     thinking_body = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
     response = client.chat.completions.create(
         model=model,
@@ -264,13 +264,12 @@ def _test_reasoning_usage(client, model):
     usage = response.usage
     assert usage is not None, "usage should not be None"
     assert (
-        usage.reasoning_tokens and usage.reasoning_tokens > 0
-    ), f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
-    if usage.completion_tokens_details:
-        detail_reasoning = usage.completion_tokens_details.get("reasoning_tokens", 0)
-        assert (
-            detail_reasoning > 0
-        ), f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+        usage.completion_tokens_details is not None
+    ), "expected completion_tokens_details to be set"
+    reasoning_tokens = usage.completion_tokens_details.reasoning_tokens
+    assert (
+        reasoning_tokens and reasoning_tokens > 0
+    ), f"expected completion_tokens_details.reasoning_tokens > 0, got {reasoning_tokens}"
 
 
 def _test_parallel(client, model):

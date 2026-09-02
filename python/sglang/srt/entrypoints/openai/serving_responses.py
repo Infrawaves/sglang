@@ -57,6 +57,7 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    CompletionTokensDetails,
     Function,
     MessageProcessingResult,
     PromptTokenUsageInfo,
@@ -716,7 +717,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+            completion_tokens_details=CompletionTokensDetails(
+                reasoning_tokens=num_reasoning_tokens or 0
+            ),
         )
         if self.enable_prompt_tokens_details and num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
@@ -2495,7 +2498,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
-            reasoning_tokens=reasoning_tokens_meta,
+            completion_tokens_details=CompletionTokensDetails(
+                reasoning_tokens=reasoning_tokens_meta or 0
+            ),
         )
         if self.enable_prompt_tokens_details and cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(

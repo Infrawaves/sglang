@@ -478,7 +478,7 @@ class FullResponseUsageTestCase(CustomTestCase):
 
         self.assertEqual(response.usage.prompt_tokens, 11)
         self.assertEqual(response.usage.completion_tokens, 7)
-        self.assertEqual(response.usage.reasoning_tokens, 2)
+        self.assertEqual(response.usage.completion_tokens_details.reasoning_tokens, 2)
         self.assertEqual(metadata.final_usage_info, response.usage)
 
 

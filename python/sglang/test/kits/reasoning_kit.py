@@ -65,32 +65,39 @@ class ReasoningTokenUsageMixin:
                 usage = data["usage"]
         return usage
 
+    @staticmethod
+    def _reasoning_tokens(usage):
+        details = usage.get("completion_tokens_details") or {}
+        return details.get("reasoning_tokens", 0)
+
     def test_reasoning_tokens_thinking(self):
         resp = self._reasoning_chat_request(enable_thinking=True)
         self.assertEqual(resp.status_code, 200, resp.text)
         usage = resp.json()["usage"]
-        self.assertGreater(usage["reasoning_tokens"], 0)
-        self.assertLess(usage["reasoning_tokens"], usage["completion_tokens"])
+        reasoning_tokens = self._reasoning_tokens(usage)
+        self.assertGreater(reasoning_tokens, 0)
+        self.assertLess(reasoning_tokens, usage["completion_tokens"])
 
     def test_reasoning_tokens_non_thinking(self):
         resp = self._reasoning_chat_request(enable_thinking=False)
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["usage"]["reasoning_tokens"], 0)
+        self.assertEqual(self._reasoning_tokens(resp.json()["usage"]), 0)
 
     def test_reasoning_tokens_thinking_stream(self):
         with self._reasoning_chat_request(enable_thinking=True, stream=True) as resp:
             self.assertEqual(resp.status_code, 200, resp.text)
             usage = self._extract_streaming_usage(resp)
             self.assertIsNotNone(usage, "No usage in stream")
-            self.assertGreater(usage["reasoning_tokens"], 0)
-            self.assertLess(usage["reasoning_tokens"], usage["completion_tokens"])
+            reasoning_tokens = self._reasoning_tokens(usage)
+            self.assertGreater(reasoning_tokens, 0)
+            self.assertLess(reasoning_tokens, usage["completion_tokens"])
 
     def test_reasoning_tokens_non_thinking_stream(self):
         with self._reasoning_chat_request(enable_thinking=False, stream=True) as resp:
             self.assertEqual(resp.status_code, 200, resp.text)
             usage = self._extract_streaming_usage(resp)
             self.assertIsNotNone(usage, "No usage in stream")
-            self.assertEqual(usage["reasoning_tokens"], 0)
+            self.assertEqual(self._reasoning_tokens(usage), 0)
 
     def test_reasoning_tokens_generate_exact_count(self):
         api_key = getattr(self, "api_key", None)
