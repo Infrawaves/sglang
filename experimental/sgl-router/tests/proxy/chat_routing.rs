@@ -550,6 +550,94 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
 }
 
 #[tokio::test]
+async fn non_streaming_oversized_upstream_error_body_is_truncated() {
+    // A worker validation error on a `Union` field emits one entry per branch,
+    // each echoing `input`, so one bad value can balloon into tens of KB. The
+    // router caps what reaches the client. Small error bodies still pass
+    // through verbatim -- see the passthrough tests above.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"error": {"message": "x".repeat(64 * 1024)}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "truncation must not change the upstream status",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        bytes.len() < 8 * 1024,
+        "oversized upstream error body must be truncated; got {} bytes",
+        bytes.len(),
+    );
+    let text = String::from_utf8(bytes.to_vec()).expect("truncated body must stay UTF-8");
+    assert!(
+        text.contains("[truncated,"),
+        "client must be told the body was cut: {text:.256}",
+    );
+}
+
+#[tokio::test]
+async fn streaming_oversized_upstream_error_body_is_truncated() {
+    // A `stream: true` request whose body fails worker-side validation gets
+    // the same oversized error payload, so the streaming path needs the same
+    // cap. It is returned buffered, not pumped as SSE.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"message": "x".repeat(64 * 1024)}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        res.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/json",
+        "upstream content-type must survive the truncating path",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        bytes.len() < 8 * 1024,
+        "oversized streaming error body must be truncated; got {} bytes",
+        bytes.len(),
+    );
+    let text = String::from_utf8(bytes.to_vec()).expect("truncated body must stay UTF-8");
+    assert!(text.contains("[truncated,"), "cut must be marked: {text:.256}");
+}
+
+#[tokio::test]
 async fn oversized_request_body_returns_413() {
     // Regression: the router must enforce a body-size cap on
     // `/v1/chat/completions`. A multi-MiB body from a hostile client must be
