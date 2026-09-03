@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -55,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt import pd_profiling
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -751,6 +753,7 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                req.prefill_finish_ns = time.perf_counter_ns()
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
@@ -821,6 +824,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
                 if req.pending_bootstrap and not still_chunking:
+                    req.prefill_finish_ns = None
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -829,6 +833,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
                 if is_aborted(req):
+                    req.prefill_finish_ns = None
                     self.clear_pending_chunk_send(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -927,6 +932,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if pd_profiling.enabled() and req.prefill_finish_ns is not None:
+                    pd_profiling.observe(
+                        req.rid,
+                        "pd_inflight",
+                        (time.perf_counter_ns() - req.prefill_finish_ns) // 1000,
+                    )
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
@@ -934,7 +945,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                req.prefill_finish_ns = None
             elif poll == KVPoll.Failed:
+                req.prefill_finish_ns = None
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -956,6 +969,8 @@ class SchedulerDisaggregationPrefillMixin:
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
                 req.disagg_kv_sender.get_transfer_metric()
             )
+            if metrics and get_parallel().tp_rank == 0:
+                pd_profiling.observe_kv_transfer(req.rid, metrics)
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
@@ -1000,6 +1015,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.prefill_finish_ns = None
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1020,6 +1036,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
+        req.prefill_finish_ns = None
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1356,6 +1373,7 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
+        req.prefill_finish_ns = None
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

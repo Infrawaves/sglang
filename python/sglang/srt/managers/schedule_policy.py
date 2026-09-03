@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 
+from sglang.srt import pd_profiling
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import get_disagg
@@ -1216,6 +1218,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        start_ns = time.perf_counter_ns()
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1377,6 +1380,10 @@ class PrefillAdder:
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
                 self.can_run_list.append(req)
+                if pd_profiling.enabled():
+                    pd_profiling.observe(
+                        req.rid, "hicache", (time.perf_counter_ns() - start_ns) // 1000
+                    )
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1427,6 +1434,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
+                if pd_profiling.enabled():
+                    pd_profiling.observe(
+                        req.rid, "hicache", (time.perf_counter_ns() - start_ns) // 1000
+                    )
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)

@@ -79,6 +79,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt import pd_profiling
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
     append_beam_tail,
@@ -909,6 +910,8 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
         self.retraction_backup: Optional[RetractionBackup] = None
+        # Monotonic timestamp captured when prefill finishes before KV transfer.
+        self.prefill_finish_ns: Optional[int] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -2561,6 +2564,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         storage_hit_len=req.storage_hit_length,
                     )
                     req._cache_breakdown_computed = True
+                    if get_parallel().tp_rank == 0:
+                        pd_profiling.observe_cache(
+                            rid=req.rid,
+                            prompt_tokens=len(req.origin_input_ids),
+                            device_hit_tokens=req.cached_tokens_device,
+                            host_hit_tokens=req.cached_tokens_host,
+                            storage_hit_tokens=req.cached_tokens_storage,
+                        )
 
                 req.already_computed = seq_len
             req.is_retracted = False

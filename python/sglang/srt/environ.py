@@ -440,6 +440,8 @@ class Envs:
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
+    SGLANG_ENABLE_PD_PROFILING = EnvBool(False)
+    SGLANG_PD_PROFILING_OUT = EnvStr("/tmp/pd_profiling.csv")
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).

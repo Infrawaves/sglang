@@ -25,6 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import pd_profiling
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1616,12 +1617,25 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+            is_prefill = (
+                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                or forward_batch.forward_mode.is_split_prefill()
             )
+            start_ns = time.perf_counter_ns() if is_prefill else None
+            try:
+                output = self._forward_raw(
+                    forward_batch,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
+            finally:
+                if is_prefill and pd_profiling.enabled() and forward_batch.rids:
+                    pd_profiling.observe(
+                        forward_batch.rids[0],
+                        "prefill",
+                        (time.perf_counter_ns() - start_ns) // 1000,
+                    )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
