@@ -1675,7 +1675,14 @@ class KimiK3DeltaAttention(nn.Module):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
+        if self.all_reduce_fusion:
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
+        if k3_gemm_ar.maybe_wrap_o_proj(self.o_proj):
+            self.all_reduce_fusion = False
+        elif self.all_reduce_fusion:
+            self.o_proj.reduce_results = False
+            self.o_proj.use_dp_attention_reduce = False
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2053,7 +2060,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
+        if self.all_reduce_fusion:
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
+        if k3_gemm_ar.maybe_wrap_o_proj(self.o_proj):
+            self.all_reduce_fusion = False
+        elif self.all_reduce_fusion:
+            self.o_proj.reduce_results = False
+            self.o_proj.use_dp_attention_reduce = False
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
             # the fused all-reduce does the reduce itself and reduces the o_proj
