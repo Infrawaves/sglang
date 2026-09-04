@@ -2,6 +2,7 @@
 
 import logging
 import os
+from typing import Optional
 
 import numpy as np
 
@@ -109,21 +110,29 @@ class VideoDecoderWrapper:
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
-    def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+    def get_frames_as_tensor(self, indices: list, num_threads: Optional[int] = None):
+        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory).
+
+        num_threads overrides the instance's num_decode_threads for this call
+        only. Pass 1 when the caller is *itself* already running one decode per
+        thread on its own pool: this decoder's inner pool would then multiply
+        against that outer concurrency (outer_workers x inner_threads decoders
+        alive at once, each with its own ffmpeg threads and each entering
+        OpenMP regions during colour conversion), which is how a decode fleet
+        exhausts the process/thread limit. None keeps the instance's setting.
+        """
         import torch
 
-        if (
-            _BACKEND == "torchcodec"
-            and self._num_decode_threads != 1
-            and len(indices) > 1
-        ):
-            num_threads = self._num_decode_threads
-            if num_threads <= 0:
-                num_threads = min(os.cpu_count() or 8, 16)
-            num_threads = min(num_threads, len(indices))
-            if num_threads > 1:
-                return self._parallel_decode(indices, num_threads)
+        effective_threads = (
+            self._num_decode_threads if num_threads is None else num_threads
+        )
+        if _BACKEND == "torchcodec" and effective_threads != 1 and len(indices) > 1:
+            resolved_threads = effective_threads
+            if resolved_threads <= 0:
+                resolved_threads = min(os.cpu_count() or 8, 16)
+            resolved_threads = min(resolved_threads, len(indices))
+            if resolved_threads > 1:
+                return self._parallel_decode(indices, resolved_threads)
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)

@@ -1598,6 +1598,68 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Hard cap on sampled frames for a Kimi-K3 request's video_url content, as
+    # a safety net independent of the checkpoint's own sample_fps /
+    # max_num_frames_each_video preprocessor config: summed across every
+    # video in the request (NOT checked per-video -- two videos each under
+    # the cap can still add up over it, which is exactly the shape of a real
+    # incident this was missed on the first pass), a request that would
+    # sample more than this many frames total is rejected with 503 (Service
+    # Unavailable) before any GPU preprocessing, instead of risking an OOM
+    # deep in the model forward pass on an oversized prefill batch. 503 (not
+    # 400) so a router/gateway sees this as "this backend can't take it
+    # right now" and can retry elsewhere, rather than a client-side error.
+    # Set to 0 (or any value <= 0) to disable the cap.
+    SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES = EnvInt(256)
+    # Global cap on total sampled frames across all Kimi-K3 video requests
+    # currently in GPU preprocessing (bicubic resize -> patchify -> concat)
+    # on this worker, at the same time. SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES
+    # bounds one request's own preprocessing cost, but nothing else bounds
+    # how many of those per-request peaks land on the GPU simultaneously --
+    # two or more requests that are each individually within budget can
+    # still add up past available memory (the same shape of gap that
+    # motivated checking SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES cumulatively
+    # across videos within one request, just one level up: across
+    # concurrent requests on the same worker). This is a byte-count-free
+    # proxy for GPU memory pressure -- weighted by sampled frame count
+    # rather than by request count, so a request queues for exactly as
+    # long as its own frame weight needs the other requests to finish, not
+    # a fixed number of concurrency "slots". Excess requests block until
+    # enough frame budget frees up; this never rejects a request that
+    # already passed SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES on its own. Set to
+    # 0 (or any value <= 0) to disable (unbounded concurrency).
+    SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES = EnvInt(256)
+    # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
+    # events (current in-flight count) at INFO level, on top of the
+    # always-on per-request duration/frame-count/token-count logs. Off by
+    # default because slot events fire far more often than one line per
+    # video; turn on to confirm the concurrency cap above is actually taking
+    # effect under real traffic.
+    SGLANG_K3_VIDEO_DEBUG_LOG = EnvBool(False)
+    # Override individual keys of the checkpoint-provided video media_proc_cfg
+    # (sample_fps / max_num_frames_each_video / in_patch_limit_video) without
+    # locating or editing the checkpoint's own trust_remote_code processor
+    # file -- media_proc_cfg ships entirely from that checkpoint-side code,
+    # not from sglang or any file sglang controls, so there is normally no
+    # way to tune it short of finding and editing that file. Unset (None)
+    # leaves the checkpoint's own value alone; each is applied independently.
+    SGLANG_K3_VIDEO_SAMPLE_FPS = EnvFloat(None)
+    SGLANG_K3_VIDEO_MAX_NUM_FRAMES = EnvInt(None)
+    SGLANG_K3_VIDEO_IN_PATCH_LIMIT = EnvInt(None)
+    # Threads VideoDecoderWrapper may use *within* one Kimi-K3 video's frame
+    # decode. Defaults to 1 because _split_k3_video already runs one video per
+    # thread on the shared multimodal IO pool (mm_io_worker_num, 16 by
+    # default), so the decoder's own inner pool multiplies against that:
+    # io_workers x inner_threads live VideoDecoder instances, each with its own
+    # ffmpeg threads, and each entering an OpenMP region per colour-conversion
+    # copy. libgomp aborts the *process* when pthread_create returns EAGAIN
+    # (gomp_fatal -> exit() off the main thread, while other threads still hold
+    # torch/CUDA state -> SIGSEGV), so the product has to stay bounded. Inner
+    # parallelism only helps when the outer pool is idle -- a single video in
+    # flight -- and that is exactly the case that was never the bottleneck.
+    # Raise it (or 0 for min(cpu_count, 16)) only alongside a lowered
+    # --mm-io-worker-num and a pinned OMP_NUM_THREADS.
+    SGLANG_K3_VIDEO_DECODE_THREADS = EnvInt(1)
 
     # ===================================================================
     # Symmetric memory
