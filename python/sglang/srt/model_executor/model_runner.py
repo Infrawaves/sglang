@@ -1110,6 +1110,7 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
+            remote_instance_weight_transporter_protocol=self.remote_instance_weight_transporter.protocol,
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,

@@ -3231,6 +3231,51 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+def _should_release_reader_registration(protocol: Optional[str]) -> bool:
+    # ibv_reg_mr pins pages the KV pool sizes itself around; an NVLink
+    # registration is a metadata entry that frees nothing.
+    from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+        NVLINK_PROTOCOLS,
+    )
+
+    if envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.is_set():
+        return envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get()
+    return protocol not in NVLINK_PROTOCOLS
+
+
+def _seed_endpoint_for_local_engine(seed_info, protocol: Optional[str]):
+    # ``protocol`` is what the engine was actually initialized with, carried from
+    # the transporter that resolved it against the seed's offer.
+    from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+        NVLINK_PROTOCOLS,
+    )
+    from sglang.srt.utils.network import get_local_ip_auto
+    from sglang.srt.utils.nvlink_fabric_utils import get_nvlink_fabric_identity
+
+    if protocol is None:
+        protocol = (
+            envs.SGLANG_REMOTE_INSTANCE_PROTOCOL.get() or envs.MOONCAKE_PROTOCOL.get()
+        )
+    on_nvlink = protocol in NVLINK_PROTOCOLS
+    endpoint = seed_info.endpoint_for(
+        protocol=protocol,
+        fabric=(
+            get_nvlink_fabric_identity(torch.cuda.current_device())
+            if on_nvlink
+            else None
+        ),
+        local_host=get_local_ip_auto() if on_nvlink else None,
+    )
+    if endpoint is None:
+        logger.error(
+            "The seed serves weights over %s, none of which this rank can reach "
+            "over protocol=%s.",
+            seed_info.offered_protocols(),
+            protocol,
+        )
+    return endpoint
+
+
 class RemoteInstanceModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote sglang instance."""
 
@@ -3356,16 +3401,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             # Runs before the release below: a rank that succeeded alone still
             # needs its registration freed to have room for the checkpoint.
             success = self._all_ranks_succeeded(success is True)
-            # On by default after a successful load (the registration is
-            # dead weight, but it is charged against the KV pool);
-            # unconditional on failure, so the disk fallback has the memory
-            # to load into.
+            # Unconditional on failure, so the disk fallback has room to load
+            # into; otherwise it depends on what the registration cost.
+            engine_protocol = (
+                load_config.remote_instance_weight_loader_transfer_engine_protocol
+            )
             released = True
-            if not success or envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get():
+            if not success or _should_release_reader_registration(engine_protocol):
                 deregister_tic = time.time()
                 released = deregister_memory_region(
                     load_config.remote_instance_weight_loader_transfer_engine,
                     registered_blocks,
+                    protocol=engine_protocol,
                 )
                 logger.info(
                     "TransferEngine memory regions have been deregistered in %.2fs.",
@@ -3524,15 +3571,20 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, transfer_engine, seed_url, tp_rank
     ) -> bool:
         # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
-        )
-        if (
-            seed_transfer_engine_session_id is None
-            or seed_transfer_engine_weight_info is None
-        ):
+        seed_info = get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        if seed_info is None:
             logger.error("Cannot get transfer engine session or weight info.")
             return False
+        # Pointers and session id are per-endpoint, so read the one matching
+        # the engine this rank built.
+        endpoint = _seed_endpoint_for_local_engine(
+            seed_info,
+            self.load_config.remote_instance_weight_loader_transfer_engine_protocol,
+        )
+        if endpoint is None:
+            return False
+        seed_transfer_engine_session_id = endpoint.session_id
+        seed_transfer_engine_weight_info = endpoint.weights_info_dict
 
         # prepare local/remote RDMA keys
         seed_ptr_list = []
