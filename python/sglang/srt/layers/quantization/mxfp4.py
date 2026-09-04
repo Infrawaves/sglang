@@ -784,20 +784,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # A plain halves swap keeps rows blocked and pairs up_i with
                 # up_{i+1}, which scrambles the gated activation.
                 half = w13_weight.shape[-2] // 2
-                pair_idx = torch.empty(2 * half, dtype=torch.long)
-                pair_idx[0::2] = torch.arange(half) + half  # up (w3)
-                pair_idx[1::2] = torch.arange(half)  # gate (w1)
+                # Built on device: these index CUDA tensors three times below,
+                # and a CPU index tensor forces an implicit H2D copy per use.
+                device = w13_weight.device
+                pair_idx = torch.empty(2 * half, dtype=torch.long, device=device)
+                arange_half = torch.arange(half, device=device)
+                pair_idx[0::2] = arange_half + half  # up (w3)
+                pair_idx[1::2] = arange_half  # gate (w1)
                 w13_weight = w13_weight[..., pair_idx, :].contiguous()
                 w13_weight_scale = w13_weight_scale[..., pair_idx, :].contiguous()
                 w13_bias = w13_bias[..., pair_idx].contiguous()
 
-            # Shuffle weights and scaling factors for transposed mma output
-            gemm1_weights_mxfp4_shuffled = []
-            gemm1_scales_mxfp4_shuffled = []
-            gemm2_weights_mxfp4_shuffled = []
-            gemm2_scales_mxfp4_shuffled = []
-            gemm1_bias_shuffled = []
-            gemm2_bias_shuffled = []
+            # Shuffle weights and scaling factors for transposed mma output.
+            # The permute indices depend only on the per-expert shape, so they
+            # are identical for every expert and each row shuffle can be one
+            # batched gather.
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             w13_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight[0].view(torch.uint8),
@@ -827,46 +828,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
 
-            for i in range(E):
-                gemm1_weights_mxfp4_shuffled.append(
-                    w13_weight[i]
-                    .view(torch.uint8)[w13_weight_permute_indices]
-                    .contiguous()
-                )
+            # Dim 0 is the expert axis; the indices only address the row axis.
+            w13_weight = w13_weight.view(torch.uint8)[:, w13_weight_permute_indices]
+            w2_weight = w2_weight.view(torch.uint8)[:, w2_weight_permute_indices]
+            w13_bias = w13_bias[:, w13_bias_permute_indices]
+            w2_bias = w2_bias[:, w2_bias_permute_indices]
 
-                gemm1_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w13_weight_scale[i]
-                        .view(torch.uint8)[w13_scale_permute_indices]
-                        .contiguous()
-                    )
-                )
+            # nvfp4_block_scale_interleave flattens its input to 1-D, so it has
+            # to stay per-expert: one batched call would swizzle across expert
+            # boundaries. Only the gather that feeds it is batched.
+            def shuffle_and_interleave_scales(scale, permute_indices):
+                gathered = scale.view(torch.uint8)[:, permute_indices]
+                out = gathered.new_empty((E, gathered[0].numel()))
+                for i in range(E):
+                    chunk = nvfp4_block_scale_interleave(gathered[i].contiguous())
+                    # Reinterpret, not convert: a dtype-converting copy into the
+                    # uint8 buffer would silently rewrite these swizzled bytes.
+                    out[i] = chunk.view(torch.uint8)
+                return out
 
-                gemm1_bias_shuffled.append(
-                    w13_bias[i].reshape(-1, 1)[w13_bias_permute_indices].contiguous()
-                )
-
-                gemm2_weights_mxfp4_shuffled.append(
-                    w2_weight[i]
-                    .view(torch.uint8)[w2_weight_permute_indices]
-                    .contiguous()
-                )
-
-                gemm2_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w2_weight_scale[i]
-                        .view(torch.uint8)[w2_scale_permute_indices]
-                        .contiguous()
-                    )
-                )
-
-                gemm2_bias_shuffled.append(
-                    w2_bias[i].reshape(-1, 1)[w2_bias_permute_indices].contiguous()
-                )
-
-            w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
             w13_weight_scale = (
-                torch.stack(gemm1_scales_mxfp4_shuffled)
+                shuffle_and_interleave_scales(
+                    w13_weight_scale, w13_scale_permute_indices
+                )
                 .reshape(
                     E,
                     2 * self.intermediate_size_per_partition,
@@ -875,9 +859,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            w2_weight = torch.stack(gemm2_weights_mxfp4_shuffled)
             w2_weight_scale = (
-                torch.stack(gemm2_scales_mxfp4_shuffled)
+                shuffle_and_interleave_scales(w2_weight_scale, w2_scale_permute_indices)
                 .reshape(
                     E,
                     self.hidden_size,
@@ -891,12 +874,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
             layer.w13_weight_bias = Parameter(
-                torch.stack(gemm1_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
+                w13_bias.reshape(E, -1), requires_grad=False
             )
             layer.w2_weight_bias = Parameter(
-                torch.stack(gemm2_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
+                w2_bias.reshape(E, -1), requires_grad=False
             )
             return
         if _use_aiter:
