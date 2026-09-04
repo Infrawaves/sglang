@@ -1158,6 +1158,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             layer=layer,
+            return_lse=return_lse,
         )
 
     def _run_varlen_absorbed_kernel(
@@ -1212,6 +1213,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         max_q_len: Optional[int] = None,
         strict_trtllm_gen: bool = False,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         """Wrapper around flashinfer trtllm_batch_decode_with_kv_cache_mla.
 
@@ -1221,6 +1223,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         strict_trtllm_gen: set by _run_varlen_absorbed_kernel as a shape-gate
         defense-in-depth -- turns a gate bug into a loud error, not a silent
         cute-dsl redirect.
+
+        return_lse: only _run_decode_kernel's DCP cross-rank merge requests
+        this; _run_varlen_absorbed_kernel never does (see
+        varlen_absorbed_mla_shape_ok's docstring).
         """
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
