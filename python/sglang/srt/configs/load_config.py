@@ -83,6 +83,9 @@ class LoadConfig:
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
     remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
+    # Carried rather than re-derived: a client resolves its transport against
+    # what the seed offers, so the environment no longer answers which one.
+    remote_instance_weight_loader_transfer_engine_protocol: Optional[str] = None
     modelexpress_url: Optional[str] = None
     modelexpress_transport: str = "nixl"
 
