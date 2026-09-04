@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import triton
@@ -1143,6 +1143,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             layer=layer,
+            return_lse=return_lse,
         )
 
     def _run_varlen_absorbed_kernel(
@@ -1197,7 +1198,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         max_q_len: Optional[int] = None,
         strict_trtllm_gen: bool = False,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Wrapper around flashinfer trtllm_batch_decode_with_kv_cache_mla.
 
         max_q_len must accompany cum_seq_lens_q, or flashinfer's
