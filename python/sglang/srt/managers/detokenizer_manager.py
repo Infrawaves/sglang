@@ -98,6 +98,16 @@ class DecodeStatus:
             self.decoded_text_chunks.clear()
         return self.decoded_text
 
+    def compact_decode_ids(self):
+        """Drop token ids that can no longer affect incremental decoding."""
+        if self.surr_offset == 0:
+            return
+
+        prefix_len = self.surr_offset
+        del self.decode_ids[:prefix_len]
+        self.read_offset -= prefix_len
+        self.surr_offset = 0
+
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
@@ -393,6 +403,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     s.append_decoded_text(new_text)
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
+                    # The scheduler owns the complete output_ids and sends only
+                    # new decode ids. Detokenizer therefore only needs the
+                    # surrogate window retained by [surr_offset:read_offset].
+                    s.compact_decode_ids()
                     s.sent_offset = s.decoded_text_len
                     output_strs.append(new_text[pending:] if pending else new_text)
                 else:
