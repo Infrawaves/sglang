@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     SeedTransferEngineInfo,
     _parse_seed_transfer_engine_info,
+    deregister_memory_region,
 )
 from sglang.srt.utils import nvlink_fabric_utils
 from sglang.srt.utils.nvlink_fabric_utils import (
@@ -360,6 +361,130 @@ class TestMooncakeTransportEnv(CustomTestCase):
                 with self._transport_env("rdma"):
                     raise RuntimeError("initialize failed")
             self.assertEqual(self._env_snapshot(), before)
+
+
+class TestDeregisterAfterPartialBatch(CustomTestCase):
+    """mooncake's batch unregister returns its first error even after freeing
+    most of the list, and an address it already freed answers a retry with
+    ERR_ADDRESS_NOT_REGISTERED. Reading that as "still pinned" reported ~85% of
+    a Kimi-K3 registration as leaked when it had in fact been released.
+    """
+
+    def _blocks(self, count):
+        return [(0x1000 + i * 0x100, 0x100) for i in range(count)]
+
+    def test_addresses_the_batch_already_freed_count_as_done(self):
+        class PartialBatch:
+            def __init__(self):
+                self.freed = set()
+                self.per_address_calls = 0
+
+            def batch_unregister_memory(self, addresses):
+                self.freed.update(addresses[: int(len(addresses) * 0.85)])
+                return -3  # its first error, despite having freed most
+
+            def unregister_memory(self, address):
+                self.per_address_calls += 1
+                if address in self.freed:
+                    return -3  # ERR_ADDRESS_NOT_REGISTERED
+                self.freed.add(address)
+                return 0
+
+        engine = PartialBatch()
+        blocks = self._blocks(200)
+        self.assertTrue(deregister_memory_region(engine, blocks, protocol="rdma"))
+        self.assertEqual(len(engine.freed), 200)
+        # One sweep for the remainder, not a redo of the whole list.
+        self.assertEqual(engine.per_address_calls, 200)
+
+    def test_a_real_failure_is_still_reported(self):
+        class Stuck:
+            def batch_unregister_memory(self, addresses):
+                return -1
+
+            def unregister_memory(self, address):
+                return -202  # ERR_CONTEXT
+
+        self.assertFalse(
+            deregister_memory_region(Stuck(), self._blocks(20), protocol="rdma")
+        )
+
+
+class TestDeregisterRetry(CustomTestCase):
+    """The retry loop existed for EAGAIN from a driver busy with the other ranks,
+    which clears. An address mooncake refuses as a registration base never does,
+    and on Kimi-K3 that is ~85% of them -- five backoffs over those cost 5s of
+    startup for nothing.
+    """
+
+    def _blocks(self, count):
+        return [(0x1000 + i * 0x100, 0x100) for i in range(count)]
+
+    def test_stops_once_an_attempt_frees_nothing(self):
+        class Stalling:
+            def __init__(self):
+                self.calls = 0
+                self.freed = 0
+
+            def batch_unregister_memory(self, addresses):
+                return -1
+
+            def unregister_memory(self, address):
+                self.calls += 1
+                if self.freed < 10:
+                    self.freed += 1
+                    return 0
+                return -1
+
+        engine = Stalling()
+        released = deregister_memory_region(engine, self._blocks(100), protocol="rdma")
+        self.assertFalse(released)
+        # One pass over all 100, one over the 90 that stalled, then stop.
+        self.assertEqual(engine.calls, 100 + 90)
+
+    def test_keeps_retrying_while_it_makes_progress(self):
+        # A driver that frees 40 per pass needs three passes; stopping at the
+        # first partial failure would leave pages pinned that do come free.
+        class Draining:
+            def __init__(self):
+                self.calls = 0
+                self.freed_this_pass = 0
+                self.pinned = set(range(100))
+
+            def batch_unregister_memory(self, addresses):
+                return -1
+
+            def unregister_memory(self, address):
+                self.calls += 1
+                if self.freed_this_pass >= 40:
+                    return -1
+                self.freed_this_pass += 1
+                self.pinned.discard((address - 0x1000) // 0x100)
+                if not self.pinned:
+                    return 0
+                if self.freed_this_pass == 40:
+                    # Next call starts the following pass.
+                    self.freed_this_pass = -1_000_000
+                return 0
+
+        engine = Draining()
+        released = deregister_memory_region(engine, self._blocks(100), protocol="rdma")
+        self.assertTrue(released)
+        self.assertEqual(engine.pinned, set())
+
+    def test_nvlink_never_reaches_the_retry_loop(self):
+        class Exploding:
+            def batch_unregister_memory(self, addresses):
+                return -1
+
+            def unregister_memory(self, address):
+                raise AssertionError("NVLink should not retry block by block")
+
+        self.assertTrue(
+            deregister_memory_region(
+                Exploding(), self._blocks(10), protocol="nvlink_intra"
+            )
+        )
 
 
 class TestReaderRegistrationRelease(CustomTestCase):
