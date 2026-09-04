@@ -1646,6 +1646,20 @@ class Envs:
     SGLANG_K3_VIDEO_SAMPLE_FPS = EnvFloat(None)
     SGLANG_K3_VIDEO_MAX_NUM_FRAMES = EnvInt(None)
     SGLANG_K3_VIDEO_IN_PATCH_LIMIT = EnvInt(None)
+    # Threads VideoDecoderWrapper may use *within* one Kimi-K3 video's frame
+    # decode. Defaults to 1 because _split_k3_video already runs one video per
+    # thread on the shared multimodal IO pool (mm_io_worker_num, 16 by
+    # default), so the decoder's own inner pool multiplies against that:
+    # io_workers x inner_threads live VideoDecoder instances, each with its own
+    # ffmpeg threads, and each entering an OpenMP region per colour-conversion
+    # copy. libgomp aborts the *process* when pthread_create returns EAGAIN
+    # (gomp_fatal -> exit() off the main thread, while other threads still hold
+    # torch/CUDA state -> SIGSEGV), so the product has to stay bounded. Inner
+    # parallelism only helps when the outer pool is idle -- a single video in
+    # flight -- and that is exactly the case that was never the bottleneck.
+    # Raise it (or 0 for min(cpu_count, 16)) only alongside a lowered
+    # --mm-io-worker-num and a pinned OMP_NUM_THREADS.
+    SGLANG_K3_VIDEO_DECODE_THREADS = EnvInt(1)
 
     # ===================================================================
     # Symmetric memory

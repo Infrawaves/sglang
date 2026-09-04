@@ -171,7 +171,12 @@ def _split_k3_video(
         np.linspace(0, total_frames - 1, sampled_nframes).round().astype(int).tolist()
     )
     if hasattr(video, "get_frames_as_tensor"):
-        decoded_frames = video.get_frames_as_tensor(frame_indices)
+        # This function runs one video per thread on the shared IO pool, so the
+        # decoder's own inner thread pool would multiply against that outer
+        # concurrency -- see SGLANG_K3_VIDEO_DECODE_THREADS (default 1).
+        decoded_frames = video.get_frames_as_tensor(
+            frame_indices, num_threads=envs.SGLANG_K3_VIDEO_DECODE_THREADS.get()
+        )
     elif hasattr(video, "get_frames_at"):
         decoded_frames = video.get_frames_at(frame_indices)
     else:
