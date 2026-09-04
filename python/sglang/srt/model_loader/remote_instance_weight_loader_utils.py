@@ -26,6 +26,10 @@ NVLINK_PROTOCOLS = (INTRA_NVLINK_PROTOCOL, MNNVL_PROTOCOL)
 # Arbitrary; enough for the ranks unregistering concurrently to drain.
 _DEREGISTER_MAX_ATTEMPTS = 5
 _DEREGISTER_BACKOFF_S = 0.5
+# mooncake's ERR_ADDRESS_NOT_REGISTERED. Its batch unregister returns the first
+# error even after freeing most of the list, and the addresses it did free answer
+# a retry with this -- they are done, not stuck.
+_MOONCAKE_ERR_ADDRESS_NOT_REGISTERED = -3
 
 
 def _iter_manifest_parameters(model):
@@ -285,11 +289,14 @@ def deregister_memory_region(
         )
         return True
 
-    logger.warning("Batch deregistration failed; retrying block by block.")
-    # The pinned pages stay resident until this succeeds -- a caller falling
-    # back to disk has no room to load into while they do. EAGAIN here is the
-    # driver being busy, not a permanent refusal: every rank on the host is
-    # unregistering at once, so back off and retry the stragglers.
+    # A non-zero batch return is the normal path, not a failure: mooncake reports
+    # its first error even after freeing most of the list, so this pass sweeps
+    # whatever it left. Retrying past that pays off only while it makes progress
+    # -- a driver busy with the other ranks clears, a permanent refusal does not.
+    logger.debug(
+        "Batch deregistration reported an error; sweeping the %d region(s).",
+        len(addresses),
+    )
     pending = addresses
     for attempt in range(_DEREGISTER_MAX_ATTEMPTS):
         if attempt:
@@ -297,12 +304,15 @@ def deregister_memory_region(
         failed = []
         for address in pending:
             try:
-                if transfer_engine.unregister_memory(address) != 0:
-                    failed.append(address)
+                ret = transfer_engine.unregister_memory(address)
             except Exception:
+                failed.append(address)
+                continue
+            if ret != 0 and ret != _MOONCAKE_ERR_ADDRESS_NOT_REGISTERED:
                 failed.append(address)
         if not failed:
             return True
+        stalled = len(failed) == len(pending)
         logger.warning(
             "%d of %d weight memory regions still pinned after attempt %d.",
             len(failed),
@@ -310,10 +320,18 @@ def deregister_memory_region(
             attempt + 1,
         )
         pending = failed
+        if stalled:
+            logger.warning(
+                "Attempt %d freed none of them, so the remaining addresses are "
+                "being refused rather than deferred; not retrying.",
+                attempt + 1,
+            )
+            break
 
     logger.error(
         "Failed to deregister %d of %d weight memory regions; that memory "
-        "stays pinned for the life of the process.",
+        "stays pinned for the life of the process, and the KV pool sizes "
+        "itself around it.",
         len(pending),
         len(addresses),
     )
