@@ -4,6 +4,7 @@ import unittest
 from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import (
+    CompletionTokensDetails,
     PromptTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
@@ -305,7 +306,7 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
                 prompt_tokens=11,
                 completion_tokens=102,
                 total_tokens=113,
-                reasoning_tokens=7,
+                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=7),
                 prompt_tokens_details=PromptTokensDetails(cached_tokens=3),
             ),
         )
