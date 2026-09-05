@@ -148,17 +148,23 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        # Should skip demotion requests to decrease detokenizer concurrency.
+        streamable_reqs = [
+            req
+            for req in reqs
+            if req is not skip_req and not getattr(req, "is_demoted", False)
+        ]
         return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
+            req.return_hidden_states for req in streamable_reqs
         )
         return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
+            req.return_routed_experts for req in streamable_reqs
         )
         return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
+            req.return_indexer_topk for req in streamable_reqs
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_mask for req in streamable_reqs
         )
 
         acc = _GenerationStreamAccumulator(
@@ -175,9 +181,7 @@ class SchedulerOutputStreamer:
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
         )
-        for req in reqs:
-            if req is skip_req:
-                continue
+        for req in streamable_reqs:
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
