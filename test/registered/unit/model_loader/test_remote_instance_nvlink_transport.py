@@ -530,5 +530,411 @@ class TestReaderRegistrationRelease(CustomTestCase):
                 self.assertIsNone(_parse_seed_transfer_engine_info(payload))
 
 
+class _FakeWeight:
+    def __init__(self, ptr, numel=8, element_size=2):
+        self._ptr, self._numel, self._element_size = ptr, numel, element_size
+
+    def data_ptr(self):
+        return self._ptr
+
+    def numel(self):
+        return self._numel
+
+    def element_size(self):
+        return self._element_size
+
+
+class _FakeModel:
+    """Stands in for nn.Module far enough for the registration walk."""
+
+    def __init__(self, weights):
+        self._weights = list(weights)
+
+    def named_parameters(self, remove_duplicate=True):
+        return iter(self._weights)
+
+
+class _FakeDriver:
+    """cuMemGetAddressRange over a fixed allocation map.
+
+    ``allocations`` is a list of ``(base, size)``; a pointer resolves to the one
+    whose range contains it, and to an error when none does.
+    """
+
+    class CUresult:
+        CUDA_SUCCESS = 0
+        CUDA_ERROR_INVALID_VALUE = 1
+
+    def __init__(self, allocations):
+        self.allocations = allocations
+
+    def cuMemGetAddressRange(self, ptr):
+        for base, size in self.allocations:
+            if base <= ptr < base + size:
+                return (self.CUresult.CUDA_SUCCESS, base, size)
+        return (self.CUresult.CUDA_ERROR_INVALID_VALUE, 0, 0)
+
+
+class _RecordingEngine:
+    def __init__(self, fail_on_call=None):
+        self.registered = []
+        self.deregistered = []
+        self._fail_on_call = fail_on_call
+
+    def register_memory(self, address, size):
+        if (
+            self._fail_on_call is not None
+            and len(self.registered) == self._fail_on_call
+        ):
+            return -1
+        self.registered.append((address, size))
+        return 0
+
+    def batch_unregister_memory(self, addresses):
+        self.deregistered.extend(addresses)
+        return 0
+
+
+class TestVmmRegistration(CustomTestCase):
+    """Pooled weights are invisible to the snapshot walk, which reads the caching
+    allocator's segments, so every transport reaches them through the allocations
+    instead. MNNVL additionally needs the deduplication: it registers the
+    allocation enclosing a weight and appends a descriptor per call, so
+    registering per weight would publish the same allocation many times over and
+    serialize every copy into the segment other ranks read.
+    """
+
+    def _register(self, model, engine, allocations, vmm_bases=None, protocol="nvlink"):
+        """``vmm_bases`` limits which allocation bases came from cuMemCreate;
+        None means all of them did."""
+        from sglang.srt.model_loader import remote_instance_weight_loader_utils as u
+
+        def is_vmm(ptr):
+            return vmm_bases is None or ptr in vmm_bases
+
+        with (
+            mock.patch(
+                "sglang.srt.utils.cuda_vmm_utils.is_vmm_pointer", side_effect=is_vmm
+            ),
+            mock.patch(
+                "sglang.srt.utils.cuda_vmm_utils._get_cuda_driver",
+                return_value=_FakeDriver(allocations),
+            ),
+        ):
+            return u.register_memory_region_vmm(model, engine, protocol=protocol)
+
+    def test_one_registration_per_allocation_not_per_weight(self):
+        # Three weights, two allocations. Per-weight registration would push
+        # three descriptors, two of them duplicates of the same base.
+        allocations = [(0x1000, 0x1000), (0x4000, 0x1000)]
+        model = _FakeModel(
+            [
+                ("a", _FakeWeight(0x1000)),
+                ("b", _FakeWeight(0x1200)),
+                ("c", _FakeWeight(0x4000)),
+            ]
+        )
+        engine = _RecordingEngine()
+        weight_info, blocks = self._register(model, engine, allocations)
+
+        self.assertEqual(engine.registered, [(0x1000, 0x1000), (0x4000, 0x1000)])
+        self.assertEqual(blocks, [(0x1000, 0x1000), (0x4000, 0x1000)])
+        # The manifest stays keyed per weight at the weight's own pointer: that
+        # is what the client looks its own parameters up by.
+        self.assertEqual(weight_info["b"], (0x1200, 8, 2))
+        self.assertEqual(set(weight_info), {"a", "b", "c"})
+
+    def test_a_weight_straddling_two_allocations_registers_both(self):
+        # The pool grew mid-tensor, so covering only the first allocation would
+        # leave the tail unreachable -- and the client reads the whole span.
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        model = _FakeModel([("big", _FakeWeight(0x1FF0, numel=0x20, element_size=1))])
+        engine = _RecordingEngine()
+        _, blocks = self._register(model, engine, allocations)
+        self.assertEqual(blocks, [(0x1000, 0x1000), (0x2000, 0x1000)])
+
+    def test_weights_outside_a_vmm_allocation_register_nothing(self):
+        # Half a model behind a handle nobody can complete is worse than none:
+        # the client would fail mid-transfer instead of picking another endpoint.
+        allocations = [(0x1000, 0x1000)]
+        model = _FakeModel(
+            [("a", _FakeWeight(0x1000)), ("stray", _FakeWeight(0x99000))]
+        )
+        engine = _RecordingEngine()
+        self.assertIsNone(self._register(model, engine, allocations))
+        self.assertEqual(engine.registered, [])
+
+    def test_cudamalloc_weights_fall_through_rather_than_registering(self):
+        engine = _RecordingEngine()
+        self.assertIsNone(
+            self._register(
+                _FakeModel([("a", _FakeWeight(0x1000))]),
+                engine,
+                [(0x1000, 0x1000)],
+                vmm_bases=(),
+            )
+        )
+        self.assertEqual(engine.registered, [])
+
+    def test_one_un_exportable_allocation_withdraws_all_of_them(self):
+        # cuMemGetAddressRange resolves cudaMalloc allocations too, so it cannot
+        # tell the allocators apart. Sampling one base would register the pooled
+        # ones and publish a manifest covering the rest, which no client can read.
+        allocations = [(0x1000, 0x1000), (0x4000, 0x1000)]
+        model = _FakeModel(
+            [("pooled", _FakeWeight(0x1000)), ("heap", _FakeWeight(0x4000))]
+        )
+        engine = _RecordingEngine()
+        self.assertIsNone(
+            self._register(model, engine, allocations, vmm_bases=(0x1000,))
+        )
+        self.assertEqual(engine.registered, [])
+
+    def test_a_failure_partway_releases_what_it_already_took(self):
+        allocations = [(0x1000, 0x1000), (0x4000, 0x1000)]
+        model = _FakeModel([("a", _FakeWeight(0x1000)), ("c", _FakeWeight(0x4000))])
+        engine = _RecordingEngine(fail_on_call=1)
+        with self.assertRaises(RuntimeError):
+            self._register(model, engine, allocations)
+        # The caller never learns about the first one, so leaving it registered
+        # would strand it with nobody holding a handle.
+        self.assertEqual(engine.deregistered, [0x1000])
+
+
+class TestRegistrationDispatch(CustomTestCase):
+    """Which walk to use is a property of where the weights live, not of the
+    transport. Keying it on the transport strands the NIC on pooled weights: the
+    snapshot walk reads the caching allocator's segments, finds none of them, and
+    registers nothing -- so the one transport a peer outside the NVLink domain can
+    use would serve a manifest whose addresses were never registered.
+    """
+
+    def _dispatch_for(self, protocol, weights_are_pooled):
+        from sglang.srt.model_loader import remote_instance_weight_loader_utils as u
+
+        vmm = ("vmm", [(0x1000, 0x1000)]) if weights_are_pooled else None
+        with (
+            mock.patch.object(
+                u, "register_memory_region_vmm", return_value=vmm
+            ) as vmm_walk,
+            mock.patch.object(
+                u, "register_memory_region_v2", return_value=("v2", [])
+            ) as snapshot_walk,
+        ):
+            result, _ = u.register_memory_region(
+                _FakeModel([]), _RecordingEngine(), protocol=protocol
+            )
+        return result, vmm_walk.called, snapshot_walk.called
+
+    def test_pooled_weights_take_the_allocation_walk_on_every_transport(self):
+        # Including rdma: a peer in another NVL72 has only the NIC, and the
+        # snapshot walk cannot see pooled weights to register for it.
+        for protocol in ("nvlink", "nvlink_intra", "rdma", None):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    self._dispatch_for(protocol, weights_are_pooled=True),
+                    ("vmm", True, False),
+                )
+
+    def test_caching_allocator_weights_keep_the_snapshot_walk(self):
+        for protocol in ("nvlink", "nvlink_intra", "rdma", None):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    self._dispatch_for(protocol, weights_are_pooled=False),
+                    ("v2", True, True),
+                )
+
+
+def _transporter(model, endpoints):
+    from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transporter import (
+        RemoteInstanceWeightTransporter,
+        _TransportEndpoint,
+    )
+
+    transporter = RemoteInstanceWeightTransporter(
+        get_model=lambda: model, tp_rank=0, gpu_id=0
+    )
+    transporter.endpoints = {
+        protocol: _TransportEndpoint(
+            protocol=protocol, engine=_RecordingEngine(), session_id="10.1.1.4:16000"
+        )
+        for protocol in endpoints
+    }
+    return transporter
+
+
+class TestServableProtocolsUnderTheFabricPool(CustomTestCase):
+    """CUDA IPC cannot export cuMemCreate memory, so a seed whose weights come
+    from the fabric pool can never serve nvlink_intra. Building it anyway costs a
+    registration walk over every weight on every rank before it is dropped, and
+    the knob is readable now while the weights are not: endpoints are built
+    before load_model.
+    """
+
+    def _servable(self, pool_value):
+        transporter = _transporter(_FakeModel([]), ())
+        transporter.fabric_identity = _identity()
+        with envs.SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL.override(pool_value):
+            return transporter._servable_nvlink_protocols()
+
+    def test_the_pool_withdraws_cuda_ipc_before_it_is_built(self):
+        self.assertEqual(self._servable("NVLINK"), ("nvlink",))
+
+    def test_without_the_pool_cuda_ipc_is_still_offered(self):
+        self.assertEqual(self._servable(None), ("nvlink_intra", "nvlink"))
+
+    def test_a_seed_off_the_fabric_serves_only_cuda_ipc(self):
+        # No clique to publish a fabric handle into, so MNNVL is not servable --
+        # and without the pool CUDA IPC still is.
+        transporter = _transporter(_FakeModel([]), ())
+        transporter.fabric_identity = None
+        with envs.SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL.override(None):
+            self.assertEqual(
+                transporter._servable_nvlink_protocols(), ("nvlink_intra",)
+            )
+
+
+class TestSeedWithdrawsUnservableMnnvl(CustomTestCase):
+    """mooncake answers a fabric-handle refusal with success after registering
+    nothing, so `ret == 0` does not mean the seed can serve. Advertising anyway
+    costs every client a full handshake, registration and transfer before it
+    reads `Requested address ... not found!` and disk-loads -- on every rank.
+    """
+
+    def _drop(self, transporter, is_vmm):
+        with mock.patch(
+            "sglang.srt.utils.cuda_vmm_utils.is_vmm_pointer", side_effect=is_vmm
+        ):
+            transporter._drop_endpoints_that_registered_nothing()
+        return tuple(transporter.endpoints)
+
+    def test_cudamalloc_weights_withdraw_mnnvl_and_keep_the_rest(self):
+        transporter = _transporter(
+            _FakeModel([("a", _FakeWeight(0x1000))]), ("nvlink", "rdma")
+        )
+        self.assertEqual(self._drop(transporter, lambda ptr: False), ("rdma",))
+
+    def test_pooled_weights_keep_mnnvl(self):
+        transporter = _transporter(
+            _FakeModel([("a", _FakeWeight(0x1000))]), ("nvlink", "rdma")
+        )
+        self.assertEqual(self._drop(transporter, lambda ptr: True), ("nvlink", "rdma"))
+
+    def test_an_unprobeable_allocator_keeps_mnnvl(self):
+        # The probe failing says nothing about what mooncake's own registration
+        # managed to do; dropping on it would disable a transport that works.
+        transporter = _transporter(
+            _FakeModel([("a", _FakeWeight(0x1000))]), ("nvlink", "rdma")
+        )
+        self.assertEqual(
+            self._drop(transporter, RuntimeError("no driver")), ("nvlink", "rdma")
+        )
+
+    def test_cuda_ipc_is_not_gated_on_the_allocator(self):
+        # nvlink_intra reaches cudaMalloc weights fine, so the withdrawal must
+        # not widen to it.
+        transporter = _transporter(
+            _FakeModel([("a", _FakeWeight(0x1000))]), ("nvlink_intra", "rdma")
+        )
+        self.assertEqual(
+            self._drop(transporter, lambda ptr: False), ("nvlink_intra", "rdma")
+        )
+
+
+class TestPerEndpointRegistrationIsolation(CustomTestCase):
+    """A seed holds one engine per transport. CUDA IPC cannot export VMM-backed
+    memory, so a seed allocating weights from the fabric pool has nvlink_intra
+    refuse the same buffers MNNVL accepts. Letting that out would leave the
+    instance serving nothing over the transports that do work.
+    """
+
+    def _register_with(self, transporter, register):
+        from sglang.srt.model_executor.model_runner_components import (
+            remote_instance_weight_transporter as t,
+        )
+
+        with mock.patch.object(t, "register_memory_region", side_effect=register):
+            transporter._register_each_endpoint()
+        return tuple(transporter.endpoints)
+
+    def test_one_transports_refusal_does_not_take_the_others(self):
+        transporter = _transporter(_FakeModel([]), ("nvlink_intra", "nvlink", "rdma"))
+
+        def register(model, engine, protocol=None):
+            if protocol == "nvlink_intra":
+                raise RuntimeError("cudaIpcGetMemHandle failed")
+            return ({"a": (0x1000, 8, 2)}, [(0x1000, 0x1000)])
+
+        self.assertEqual(self._register_with(transporter, register), ("nvlink", "rdma"))
+        self.assertIsNotNone(transporter.endpoints["nvlink"].weight_info)
+
+    def test_registering_zero_regions_withdraws_the_endpoint(self):
+        # Registering nothing reports success, so without this check the seed
+        # publishes a manifest whose addresses no client can read.
+        transporter = _transporter(_FakeModel([]), ("nvlink_intra", "rdma"))
+
+        def register(model, engine, protocol=None):
+            if protocol == "nvlink_intra":
+                return ({"a": (0x1000, 8, 2)}, [])
+            return ({"a": (0x1000, 8, 2)}, [(0x1000, 0x1000)])
+
+        self.assertEqual(self._register_with(transporter, register), ("rdma",))
+
+
+class TestWeightMemPool(CustomTestCase):
+    """The pool exists so MNNVL can export a handle for the weights. Asking for
+    it and silently getting the default allocator reproduces exactly the failure
+    it prevents, so an unavailable pool is a startup error.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.model_loader import weight_mem_pool
+
+        weight_mem_pool._pool = None
+
+    def test_unset_returns_no_pool_without_touching_mooncake(self):
+        # The default path must not import mooncake at all: most deployments do
+        # not have it, and importing it here would make weight loading depend on
+        # a package the NIC path never needs.
+        from sglang.srt.model_loader.weight_mem_pool import maybe_init_weight_mem_pool
+
+        with (
+            envs.SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL.override(None),
+            mock.patch.dict(sys.modules, {"mooncake.allocator": None}),
+        ):
+            self.assertIsNone(maybe_init_weight_mem_pool())
+
+    def test_a_misspelled_pool_is_not_silently_ignored(self):
+        # Accepting it would leave the operator believing MNNVL is served from a
+        # fabric pool while the weights came from the caching allocator.
+        from sglang.srt.model_loader.weight_mem_pool import maybe_init_weight_mem_pool
+
+        with envs.SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL.override("NVLNIK"):
+            with self.assertRaises(ValueError):
+                maybe_init_weight_mem_pool()
+
+    def test_a_gpu_in_a_clique_is_told_to_check_the_imex_channel(self):
+        # The two causes need different fixes and the handle type alone cannot
+        # tell them apart: in a clique but not FABRIC is the IMEX channel not
+        # reaching the process, which is what a container misses.
+        from sglang.srt.model_loader.weight_mem_pool import unusable_fabric_reason
+
+        reason = unusable_fabric_reason(
+            device="cuda:0", handle_type_name="POSIX_FD", fabric_ready=True
+        )
+        self.assertIn("imex-channels", reason)
+        self.assertNotIn("x86 HGX", reason)
+
+    def test_a_gpu_outside_any_clique_is_told_there_is_no_domain(self):
+        from sglang.srt.model_loader.weight_mem_pool import unusable_fabric_reason
+
+        reason = unusable_fabric_reason(
+            device="cuda:0", handle_type_name="POSIX_FD", fabric_ready=False
+        )
+        self.assertIn("x86 HGX", reason)
+        self.assertNotIn("imex-channels", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

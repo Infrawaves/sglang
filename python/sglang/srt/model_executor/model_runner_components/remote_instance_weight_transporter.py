@@ -21,6 +21,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.model_loader.weight_mem_pool import weight_mem_pool_requested
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -33,6 +34,10 @@ from sglang.srt.utils.nvlink_fabric_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Weights land in one allocator or the other as a whole, so a handful answers
+# for all of them; a model has tens of thousands of parameters.
+_VMM_PROBE_SAMPLE = 8
 
 
 @dataclass(slots=True, kw_only=True)
@@ -142,7 +147,14 @@ class RemoteInstanceWeightTransporter:
     def _servable_nvlink_protocols(self) -> tuple[str, ...]:
         # nvlink_intra needs no fabric -- it is CUDA IPC, and only the client
         # knows whether it landed on this host. MNNVL needs a clique to publish.
-        protocols = [INTRA_NVLINK_PROTOCOL]
+        protocols = []
+        # Weights from the fabric pool cannot be exported through CUDA IPC at
+        # all, so building this endpoint only to have cudaIpcGetMemHandle refuse
+        # it costs a registration walk over every weight before it is dropped.
+        # Read off the knob rather than the weights: endpoints are built before
+        # load_model, so there is nothing to probe yet.
+        if not weight_mem_pool_requested():
+            protocols.append(INTRA_NVLINK_PROTOCOL)
         if self.fabric_identity is not None:
             protocols.append(MNNVL_PROTOCOL)
         return tuple(protocols)
@@ -309,12 +321,15 @@ class RemoteInstanceWeightTransporter:
             # transports need: they register through cuMemGetAddressRange and
             # would fail with CUDA_ERROR_INVALID_CONTEXT (201).
             torch.cuda.set_device(self.gpu_id)
-            for endpoint in self.endpoints.values():
-                # Never deregistered: the seed serves handles out of this for the
-                # life of the process.
-                endpoint.weight_info, _ = register_memory_region(
-                    self.model, endpoint.engine
+            self._register_each_endpoint()
+            self._drop_endpoints_that_registered_nothing()
+            if not self.endpoints:
+                logger.error(
+                    "No transport could register the weights for tp_rank=%s; "
+                    "this instance will not be usable as a remote-instance seed.",
+                    self.tp_rank,
                 )
+                return
             self._register_to_engine_info_bootstrap()
         except Exception:
             logger.exception(
@@ -322,6 +337,99 @@ class RemoteInstanceWeightTransporter:
                 "will not be usable as a remote-instance seed.",
                 self.tp_rank,
             )
+
+    def _register_each_endpoint(self) -> None:
+        """Register the weights with every endpoint, dropping those that refuse.
+
+        One transport's refusal is not the others': CUDA IPC cannot export
+        VMM-backed memory, so a seed allocating weights from the fabric pool
+        registers them with MNNVL and the NIC while nvlink_intra fails on the
+        same buffers. Letting that failure out would leave this instance serving
+        nothing over a transport that works.
+        """
+        for protocol, endpoint in list(self.endpoints.items()):
+            try:
+                # Never deregistered: the seed serves handles out of this for the
+                # life of the process.
+                endpoint.weight_info, blocks = register_memory_region(
+                    self.model, endpoint.engine, protocol=endpoint.protocol
+                )
+            except Exception:
+                del self.endpoints[protocol]
+                logger.warning(
+                    "Not offering %s for tp_rank=%s: registering the weights "
+                    "with it failed.",
+                    protocol,
+                    self.tp_rank,
+                    exc_info=True,
+                )
+                continue
+            if not blocks:
+                # A model always has parameters, so registering none of them means
+                # the walk could not see where they live.
+                del self.endpoints[protocol]
+                logger.error(
+                    "Not offering %s for tp_rank=%s: the weights registered as "
+                    "zero regions, so nothing was published for a client to "
+                    "read.",
+                    protocol,
+                    self.tp_rank,
+                )
+
+    def _drop_endpoints_that_registered_nothing(self) -> None:
+        """Stop offering MNNVL when its registration cannot have taken.
+
+        mooncake exports a fabric handle through cuMemRetainAllocationHandle,
+        which refuses memory the caching allocator handed out, and answers that
+        refusal with success after registering nothing. Offering the endpoint
+        anyway costs every client a full handshake, registration and transfer
+        before it reads `Requested address ... not found!` and disk-loads.
+        """
+        if MNNVL_PROTOCOL not in self.endpoints:
+            return
+        if self._weights_are_vmm_backed() is not False:
+            return
+        del self.endpoints[MNNVL_PROTOCOL]
+        logger.error(
+            "Not offering %s for tp_rank=%s: the weights are not "
+            "cuMemCreate-backed, so mooncake registered no fabric handle for "
+            "them (its own log says 'not allocated by cuMemCreate'). Serving "
+            "%s instead. Set SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL=NVLINK to "
+            "allocate the weights from a fabric-capable pool.",
+            MNNVL_PROTOCOL,
+            self.tp_rank,
+            tuple(self.endpoints) or "nothing",
+        )
+
+    def _weights_are_vmm_backed(self) -> Optional[bool]:
+        """Whether the weights came from cuMemCreate. None when unprobeable.
+
+        Unprobeable is not a failure: the driver bindings being absent says
+        nothing about what mooncake's own C++ registration managed to do, so the
+        caller keeps the endpoint rather than dropping one that works.
+        """
+        try:
+            from sglang.srt.utils.cuda_vmm_utils import is_vmm_pointer
+        except ImportError:
+            logger.debug("No CUDA VMM bindings; cannot probe the weight allocator.")
+            return None
+
+        probed = 0
+        try:
+            # remove_duplicate=False to match the set register_memory_region
+            # walks, so an aliased parameter cannot be the one sampled.
+            for _, weight in self.model.named_parameters(remove_duplicate=False):
+                if weight.numel() == 0:
+                    continue
+                if not is_vmm_pointer(weight.data_ptr()):
+                    return False
+                probed += 1
+                if probed >= _VMM_PROBE_SAMPLE:
+                    break
+        except Exception:
+            logger.debug("Weight allocator probe raised.", exc_info=True)
+            return None
+        return True if probed else None
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.

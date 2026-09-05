@@ -314,6 +314,12 @@ class Envs:
     # what the cluster handshakes on, while weight transfer is one seed to one
     # client.
     SGLANG_REMOTE_INSTANCE_PROTOCOL = EnvStr(None)
+    # Allocates the weights from mooncake's cuMemCreate-backed pool so MNNVL can
+    # export a fabric handle for them; the caching allocator's cudaMalloc memory
+    # is refused by cuMemRetainAllocationHandle, and mooncake answers that
+    # refusal with success after registering nothing. "NVLINK" unless unset, and
+    # raises at startup when that pool is unavailable.
+    SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL = EnvStr(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)

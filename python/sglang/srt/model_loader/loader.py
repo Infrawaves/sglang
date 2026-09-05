@@ -3382,7 +3382,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 self.remote_instance_transfer_engine_weight_info,
                 registered_blocks,
             ) = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                protocol=load_config.remote_instance_weight_loader_transfer_engine_protocol,
             )
             logger.info(
                 "TransferEngine memory regions have been successfully registered "
@@ -3590,7 +3592,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         seed_transfer_engine_session_id = endpoint.session_id
         seed_transfer_engine_weight_info = endpoint.weights_info_dict
 
-        # prepare local/remote RDMA keys
+        # prepare the local/remote pointer pairs to read
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -3632,7 +3634,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         transfer_elapsed = time.time() - transfer_tic
         logger.info(
-            "RDMA transfer done: %.2f GiB in %.2fs (%.2f GiB/s) over %d tensors.",
+            "Weight transfer over %s done: %.2f GiB in %.2fs (%.2f GiB/s) over "
+            "%d tensors.",
+            endpoint.protocol or "an unreported transport",
             total_bytes / (1 << 30),
             transfer_elapsed,
             total_bytes / (1 << 30) / max(transfer_elapsed, 1e-9),

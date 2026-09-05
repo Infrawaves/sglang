@@ -252,11 +252,128 @@ def _registration_failure_hint() -> str:
     )
 
 
-def register_memory_region(model, transfer_engine):
+def register_memory_region(model, transfer_engine, protocol: Optional[str] = None):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
-    else:
-        return register_memory_region_v2(model, transfer_engine)
+    # Keyed on where the weights live, not on the transport: the snapshot walk
+    # reads the caching allocator's segments, so it would register nothing for a
+    # custom pool -- for the NIC as much as for MNNVL.
+    vmm = register_memory_region_vmm(model, transfer_engine, protocol=protocol)
+    if vmm is not None:
+        return vmm
+    return register_memory_region_v2(model, transfer_engine)
+
+
+def register_memory_region_vmm(model, transfer_engine, protocol: Optional[str] = None):
+    """Register one region per VMM allocation the weights live in.
+
+    Returns None when the weights did not come from ``cuMemCreate``, leaving the
+    caller on the snapshot walk that suits the caching allocator.
+
+    MNNVL also needs the deduplication: it registers the *enclosing* allocation
+    (widening to ``cuMemGetAddressRange``) while ``addLocalMemoryBuffer`` appends
+    without deduplicating, so every block inside one allocation would publish
+    another identical descriptor, and all of them go over the wire.
+    """
+    from sglang.srt.utils.cuda_vmm_utils import is_vmm_pointer
+
+    start_tic = time.time()
+
+    weight_mr_dict = {}
+    spans = []
+    for name, weight in _iter_manifest_parameters(model):
+        weight_mr_dict[name] = (
+            weight.data_ptr(),
+            weight.numel(),
+            weight.element_size(),
+        )
+        nbytes = weight.numel() * weight.element_size()
+        if nbytes:
+            spans.append((weight.data_ptr(), nbytes))
+
+    # One probe decides the walk, so the default allocator pays a single driver
+    # call for this path being on offer.
+    if not spans or not is_vmm_pointer(spans[0][0]):
+        return None
+
+    try:
+        bases = _unique_allocation_bases(spans)
+    except RuntimeError as e:
+        logger.error("Cannot resolve the weights' allocations: %s", e)
+        return None
+
+    # Every base, not just the probe: cuMemGetAddressRange resolves cudaMalloc
+    # allocations too, so it cannot tell the allocators apart, and mooncake
+    # reports registering an un-exportable one as success. Per allocation rather
+    # than per weight -- orders of magnitude fewer, one driver call each.
+    if not all(is_vmm_pointer(base) for base, _ in bases):
+        logger.error(
+            "The weights span both a custom pool and the caching allocator; "
+            "registering only part of them would publish bytes no client can "
+            "read. Falling back to the snapshot walk."
+        )
+        return None
+
+    registered_blocks = []
+    try:
+        for base, size in bases:
+            ret = transfer_engine.register_memory(base, size)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for weight allocation at address "
+                    f"{base} with size {size}, error: {ret}."
+                    f"{_registration_failure_hint()}"
+                )
+            registered_blocks.append((base, size))
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial registration
+        # would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks, protocol=protocol)
+        raise
+
+    logger.debug(
+        "Register memory region vmm time: %.4fs over %d allocation(s) holding "
+        "%d weight(s).",
+        time.time() - start_tic,
+        len(registered_blocks),
+        len(weight_mr_dict),
+    )
+    return weight_mr_dict, registered_blocks
+
+
+def _unique_allocation_bases(spans):
+    """Map ``(ptr, nbytes)`` spans onto the allocations backing them.
+
+    A weight can straddle allocations when the pool grew, so each span is walked
+    until its bytes are covered, the same way the graph-capture path does it.
+    """
+    from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver
+
+    drv = _get_cuda_driver()
+    seen = set()
+    bases = []
+    for ptr, nbytes in spans:
+        cursor, remaining = int(ptr), int(nbytes)
+        while remaining > 0:
+            err, base, size = drv.cuMemGetAddressRange(cursor)
+            if err != drv.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemGetAddressRange({cursor}): {err}")
+            base, size = int(base), int(size)
+            offset = cursor - base
+            if not 0 <= offset < size:
+                raise RuntimeError(
+                    f"weight at {ptr} is outside its allocation "
+                    f"[base={base}, size={size}]"
+                )
+            if base not in seen:
+                seen.add(base)
+                bases.append((base, size))
+            # At least 1: remaining is positive and offset is inside the
+            # allocation, so the cursor always moves and the walk terminates.
+            advance = min(remaining, size - offset)
+            remaining -= advance
+            cursor += advance
+    return bases
 
 
 def deregister_memory_region(
