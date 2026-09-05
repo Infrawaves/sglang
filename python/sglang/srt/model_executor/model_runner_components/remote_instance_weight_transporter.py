@@ -49,6 +49,10 @@ class _TransportEndpoint:
     session_id: str
     fabric_identity: Optional[NvlinkFabricIdentity] = None
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+    # Set once the weights this endpoint serves are known to be on a FABRIC
+    # arena. Published because only the seed can know it: a client's own memory
+    # is ordinary cudaMalloc whether or not the seed built an arena.
+    serves_from_fabric_arena: bool = False
 
     def to_payload(self) -> dict:
         return {
@@ -60,6 +64,7 @@ class _TransportEndpoint:
                 if self.fabric_identity is not None
                 else None
             ),
+            "serves_from_fabric_arena": self.serves_from_fabric_arena,
         }
 
 
@@ -329,23 +334,27 @@ class RemoteInstanceWeightTransporter:
         for protocol in NVLINK_PROTOCOLS:
             if protocol not in offered:
                 continue
-            if protocol == MNNVL_PROTOCOL and not self._mnnvl_offer_is_credible():
+            # Resolved before the credibility check because that check reads a
+            # field off this endpoint -- whether the seed put its weights on a
+            # fabric arena, which nothing else can tell us.
+            endpoint = seed_info.endpoint_for(
+                protocol=protocol,
+                fabric=self.fabric_identity,
+                local_host=local_host,
+            )
+            if endpoint is None:
                 continue
-            if (
-                seed_info.endpoint_for(
-                    protocol=protocol,
-                    fabric=self.fabric_identity,
-                    local_host=local_host,
-                )
-                is not None
+            if protocol == MNNVL_PROTOCOL and not self._mnnvl_offer_is_credible(
+                endpoint
             ):
-                logger.info(
-                    "GPU %s reaches its seed over %s; loading weights over "
-                    "NVLink instead of the NIC.",
-                    self.gpu_id,
-                    protocol,
-                )
-                return protocol
+                continue
+            logger.info(
+                "GPU %s reaches its seed over %s; loading weights over "
+                "NVLink instead of the NIC.",
+                self.gpu_id,
+                protocol,
+            )
+            return protocol
 
         for protocol in offered:
             if protocol not in NVLINK_PROTOCOLS:
@@ -368,25 +377,31 @@ class RemoteInstanceWeightTransporter:
         )
         return None
 
-    def _mnnvl_offer_is_credible(self) -> bool:
+    def _mnnvl_offer_is_credible(self, endpoint) -> bool:
         """Whether an MNNVL offer from the seed is one it can actually serve.
 
         A seed predating the check in _can_serve_mnnvl offers MNNVL on clique
         membership alone, and mooncake's registration lets it: the offer looks
         healthy and the failure surfaces only as a transfer error, by which point
-        the fallback is disk rather than the NIC. Judging it by this rank's own
-        allocator is indirect -- what matters is the seed's memory, not ours --
-        but seed and client run the same allocator configuration in every setup
-        where this path is worth taking, and being wrong costs the NIC's
-        bandwidth rather than the load.
+        the fallback is disk rather than the NIC.
+
+        ``serves_from_fabric_arena`` is the seed stating it placed the weights on
+        memory MNNVL can export. Nothing here can stand in for that -- this rank's
+        buffers are ordinary cudaMalloc whether or not the seed built an arena, so
+        asking our own allocator would decline every arena seed. Without the field
+        that question is still the best proxy available, for a seed old enough to
+        omit it and therefore sharing our allocator configuration.
         """
+        if endpoint.serves_from_fabric_arena:
+            return True
         if caching_allocator_memory_is_fabric_exportable(self.gpu_id):
             return True
         logger.info(
-            "The seed offers MNNVL, but memory from this rank's allocator cannot "
-            "be fabric-exported, so the seed's most likely cannot either. "
-            "Skipping MNNVL rather than failing the transfer and disk-loading; "
-            "set SGLANG_REMOTE_INSTANCE_PROTOCOL=%s to force it.",
+            "The seed offers MNNVL but does not report serving from a fabric "
+            "arena, and memory from this rank's allocator cannot be "
+            "fabric-exported, so the seed's most likely cannot either. Skipping "
+            "MNNVL rather than failing the transfer and disk-loading; set "
+            "SGLANG_REMOTE_INSTANCE_PROTOCOL=%s to force it.",
             MNNVL_PROTOCOL,
         )
         return False
@@ -426,6 +441,9 @@ class RemoteInstanceWeightTransporter:
                 endpoint.weight_info, _ = register_memory_region(
                     self.model, endpoint.engine, arena=self.weight_arena
                 )
+                # Published so a client can trust the offer: its own allocator
+                # cannot tell it whether these weights are exportable.
+                endpoint.serves_from_fabric_arena = self.weight_arena is not None
             self._withdraw_mnnvl_if_weights_escaped_the_arena()
             self._register_to_engine_info_bootstrap()
         except Exception:

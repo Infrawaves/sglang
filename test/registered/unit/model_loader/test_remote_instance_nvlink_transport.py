@@ -662,16 +662,103 @@ class TestClientSkipsAStaleMnnvlOffer(CustomTestCase):
     a failed transfer, and the fallback from there is disk.
     """
 
-    def _credible(self, *, exportable):
+    def _endpoint(self, *, from_arena=False):
+        return SeedTransferEngineInfo(
+            session_id=f"{_SEED_HOST}:16002",
+            weights_info_dict=_WEIGHTS,
+            protocol="nvlink",
+            fabric_identity=_identity(),
+            serves_from_fabric_arena=from_arena,
+        )
+
+    def _credible(self, *, exportable, from_arena=False):
         transporter = _transporter(fabric_identity=_identity())
         with _patch_exportable({"return_value": exportable}):
-            return transporter._mnnvl_offer_is_credible()
+            return transporter._mnnvl_offer_is_credible(
+                self._endpoint(from_arena=from_arena)
+            )
 
     def test_declines_when_this_ranks_memory_cannot_be_exported(self):
         self.assertFalse(self._credible(exportable=False))
 
     def test_accepts_when_it_can(self):
         self.assertTrue(self._credible(exportable=True))
+
+    def test_an_arena_seed_is_accepted_however_this_rank_allocates(self):
+        # The bug this guards: a client's own buffers are ordinary cudaMalloc
+        # whether or not the seed built an arena, so judging the offer by the local
+        # allocator declined every arena seed and the feature was unreachable.
+        self.assertTrue(self._credible(exportable=False, from_arena=True))
+
+    def test_an_arena_seed_is_not_second_guessed(self):
+        # The seed's statement is the only authority on its own memory; consulting
+        # the local allocator after it can only produce a wrong answer.
+        transporter = _transporter(fabric_identity=_identity())
+        with _patch_exportable({"side_effect": AssertionError("should not probe")}):
+            self.assertTrue(
+                transporter._mnnvl_offer_is_credible(self._endpoint(from_arena=True))
+            )
+
+
+class TestFabricArenaFlagOnTheWire(CustomTestCase):
+    """The flag has to reach the client on an *alternate*, because a seed's MNNVL
+    endpoint is never the primary -- the NIC is, so a client too old to read
+    alternates still lands somewhere reachable.
+    """
+
+    def _wire_with_alternate(self, tail):
+        return [
+            f"{_SEED_HOST}:16000",
+            _WEIGHTS,
+            "rdma",
+            None,
+            [
+                [
+                    f"{_SEED_HOST}:16002",
+                    _WEIGHTS,
+                    "nvlink",
+                    msgspec.structs.asdict(_identity()),
+                    *tail,
+                ]
+            ],
+            False,
+        ]
+
+    def _nvlink_endpoint(self, wire):
+        info = _parse_seed_transfer_engine_info(wire)
+        return info.endpoint_for(protocol="nvlink", fabric=_identity())
+
+    def test_it_survives_as_an_alternate(self):
+        endpoint = self._nvlink_endpoint(self._wire_with_alternate([None, True]))
+        self.assertTrue(endpoint.serves_from_fabric_arena)
+
+    def test_a_seed_too_old_to_send_it_reads_as_false(self):
+        # Which is exactly what stops a client trusting a pre-arena offer.
+        endpoint = self._nvlink_endpoint(_dual_transport_wire())
+        self.assertFalse(endpoint.serves_from_fabric_arena)
+
+    def test_the_alternates_slot_is_never_read_as_the_flag(self):
+        # Slot 4 holds the alternates list on a primary and nothing on an
+        # alternate. Truncating there instead of blanking it would shift every
+        # later field by one, and a non-empty list would read as a true flag.
+        endpoint = self._nvlink_endpoint(self._wire_with_alternate([["junk"], False]))
+        self.assertFalse(endpoint.serves_from_fabric_arena)
+        self.assertEqual(endpoint.alternates, ())
+
+    def test_the_primary_carries_it_too(self):
+        # A seed pinned to MNNVL by SGLANG_REMOTE_INSTANCE_PROTOCOL builds one
+        # endpoint, and that one is the primary.
+        info = _parse_seed_transfer_engine_info(
+            [
+                f"{_SEED_HOST}:16002",
+                _WEIGHTS,
+                "nvlink",
+                msgspec.structs.asdict(_identity()),
+                [],
+                True,
+            ]
+        )
+        self.assertTrue(info.serves_from_fabric_arena)
 
 
 def _patch_arena_capable(value):

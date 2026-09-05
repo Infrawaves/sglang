@@ -74,9 +74,16 @@ class EngineInfoBootstrapServer:
                                 alt["weights_info_dict"],
                                 alt.get("protocol"),
                                 alt.get("fabric_identity"),
+                                # Slot 4 is the alternates list on the primary and
+                                # is unused here -- alternates do not nest -- but
+                                # holding the position keeps every later field at
+                                # one index for both, so one parser reads either.
+                                None,
+                                bool(alt.get("serves_from_fabric_arena")),
                             )
                             for alt in alternates
                         ],
+                        bool(info.get("serves_from_fabric_arena")),
                     )
 
                 logger.info(

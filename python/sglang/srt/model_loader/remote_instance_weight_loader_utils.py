@@ -121,6 +121,11 @@ class SeedTransferEngineInfo(msgspec.Struct, frozen=True):
     # Other endpoints for the same weights. The primary above stays the NIC one,
     # which is where a client too old to read this field lands.
     alternates: tuple["SeedTransferEngineInfo", ...] = ()
+    # Whether this endpoint's weights sit on a FABRIC arena. Only the seed knows:
+    # a client cannot infer it from its own allocator, whose memory is ordinary
+    # cudaMalloc either way. False from a seed that predates the arena, which is
+    # what keeps a client from trusting an offer that cannot be served.
+    serves_from_fabric_arena: bool = False
 
     def endpoint_for(
         self,
@@ -204,6 +209,7 @@ def _parse_seed_transfer_engine_info(raw) -> Optional[SeedTransferEngineInfo]:
     protocol = raw[2] if len(raw) > 2 else None
     fabric = raw[3] if len(raw) > 3 else None
     alternates = raw[4] if len(raw) > 4 else None
+    from_arena = bool(raw[5]) if len(raw) > 5 else False
     return SeedTransferEngineInfo(
         session_id=session_id,
         weights_info_dict=weights_info_dict,
@@ -212,6 +218,7 @@ def _parse_seed_transfer_engine_info(raw) -> Optional[SeedTransferEngineInfo]:
             msgspec.convert(fabric, NvlinkFabricIdentity) if fabric else None
         ),
         alternates=_parse_alternates(alternates),
+        serves_from_fabric_arena=from_arena,
     )
 
 
@@ -220,8 +227,12 @@ def _parse_alternates(raw) -> tuple[SeedTransferEngineInfo, ...]:
         return ()
     parsed = []
     for entry in raw:
-        # Leaves only: nesting would let a malformed payload recurse.
-        endpoint = _parse_seed_transfer_engine_info(entry[:4] if entry else entry)
+        # Leaves only: nesting would let a malformed payload recurse. Blanking the
+        # alternates slot rather than truncating there keeps every later field at
+        # the index it holds in the primary, so one parser reads both.
+        if isinstance(entry, (list, tuple)) and len(entry) > 4:
+            entry = [*entry[:4], None, *entry[5:]]
+        endpoint = _parse_seed_transfer_engine_info(entry)
         if endpoint is not None:
             parsed.append(endpoint)
     return tuple(parsed)
