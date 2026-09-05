@@ -669,6 +669,8 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
+        # Rebinds weight storage, so it must precede any graph capture.
+        self.remote_instance_weight_transporter.maybe_place_weights_on_fabric_memory()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,

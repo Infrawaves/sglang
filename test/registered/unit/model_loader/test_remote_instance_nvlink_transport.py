@@ -674,5 +674,131 @@ class TestClientSkipsAStaleMnnvlOffer(CustomTestCase):
         self.assertTrue(self._credible(exportable=True))
 
 
+def _patch_arena_capable(value):
+    return mock.patch.object(
+        _transporter_module(), "device_can_back_fabric_arena", **value
+    )
+
+
+class TestArenaChangesWhatASeedOffers(CustomTestCase):
+    """With the arena the weights are on FABRIC memory, so the pre-load gate has
+    to stop asking about the default allocator -- and nvlink_intra has to go,
+    because cudaIpcGetMemHandle fails on a VMM pointer.
+    """
+
+    def _offered(self, *, requested, arena_capable):
+        transporter = _transporter(fabric_identity=_identity())
+        with mock.patch.object(
+            type(transporter), "_fabric_weights_requested", lambda self: requested
+        ):
+            with _patch_arena_capable({"return_value": arena_capable}):
+                # An arena seed must not consult the default allocator: its answer
+                # is False by construction and would withdraw a working offer.
+                with _patch_exportable(
+                    {"side_effect": AssertionError("should not be probed")}
+                    if requested
+                    else {"return_value": False}
+                ):
+                    return transporter._servable_nvlink_protocols()
+
+    def test_an_arena_seed_offers_mnnvl_alone(self):
+        # nvlink_intra cannot register VMM memory at all, and MNNVL reaches
+        # same-host peers too, so dropping it costs them nothing.
+        self.assertEqual(self._offered(requested=True, arena_capable=True), ("nvlink",))
+
+    def test_a_device_that_cannot_back_an_arena_still_offers_intra_node(self):
+        # No MNNVL endpoint means the migration is skipped, so the weights stay on
+        # the default allocator -- which is exactly the memory nvlink_intra can
+        # serve. Withdrawing it here would cost same-host peers for nothing.
+        self.assertEqual(
+            self._offered(requested=True, arena_capable=False), ("nvlink_intra",)
+        )
+
+    def test_without_the_arena_the_old_behaviour_stands(self):
+        self.assertEqual(
+            self._offered(requested=False, arena_capable=True), ("nvlink_intra",)
+        )
+
+
+class TestFabricWeightsAreOptIn(CustomTestCase):
+    """The migration rebinds every weight's storage, which a module that cached
+    ``.data`` rather than the Parameter would not survive. So it stays off unless
+    asked for, and the env check has to come first -- _is_seed() reads global
+    runtime context that a plain transporter has no business touching.
+    """
+
+    def test_off_by_default_without_consulting_anything_else(self):
+        transporter = _transporter(fabric_identity=_identity())
+        with mock.patch.object(
+            type(transporter), "_is_seed", lambda self: 1 / 0  # would raise
+        ):
+            self.assertFalse(transporter._fabric_weights_requested())
+
+    def test_a_draft_worker_never_requests_it(self):
+        # The draft neither serves weights nor owns the manifest key.
+        transporter = _transporter_module().RemoteInstanceWeightTransporter(
+            get_model=lambda: None, tp_rank=0, gpu_id=0, is_draft_worker=True
+        )
+        with envs.SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS.override(True):
+            with mock.patch.object(type(transporter), "_is_seed", lambda self: True):
+                self.assertFalse(transporter._fabric_weights_requested())
+
+    def test_a_client_never_requests_it(self):
+        # A client reads into ordinary buffers; only a seed has to export.
+        transporter = _transporter(fabric_identity=_identity())
+        with envs.SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS.override(True):
+            with mock.patch.object(type(transporter), "_is_seed", lambda self: False):
+                self.assertFalse(transporter._fabric_weights_requested())
+
+    def test_a_seed_that_asked_for_it_gets_it(self):
+        transporter = _transporter(fabric_identity=_identity())
+        with envs.SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS.override(True):
+            with mock.patch.object(type(transporter), "_is_seed", lambda self: True):
+                self.assertTrue(transporter._fabric_weights_requested())
+
+
+class TestWithdrawMnnvlWhenWeightsEscape(CustomTestCase):
+    """_can_serve_mnnvl answers on intent, before the weights exist. This is where
+    intent meets the real pointers, and it is the only thing standing between an
+    escaped weight and the client-side failure the arena was built to remove.
+    """
+
+    def _transporter_with(self, *, mappings, manifest):
+        transporter = _transporter(fabric_identity=_identity())
+        transporter.weight_arena = SimpleNamespace(mappings=mappings)
+        transporter.endpoints["nvlink"] = _transporter_module()._TransportEndpoint(
+            protocol="nvlink",
+            engine=object(),
+            session_id="10.1.1.4:16002",
+            weight_info=manifest,
+        )
+        return transporter
+
+    def test_an_escaped_weight_withdraws_the_endpoint(self):
+        transporter = self._transporter_with(
+            mappings=[(0x1000, 0x1000)],
+            manifest={"inside": (0x1000, 8, 1), "escaped": (0x99000, 8, 1)},
+        )
+        transporter._withdraw_mnnvl_if_weights_escaped_the_arena()
+        self.assertNotIn("nvlink", transporter.endpoints)
+
+    def test_a_fully_covered_manifest_keeps_it(self):
+        transporter = self._transporter_with(
+            mappings=[(0x1000, 0x1000)], manifest={"a": (0x1000, 8, 1)}
+        )
+        transporter._withdraw_mnnvl_if_weights_escaped_the_arena()
+        self.assertIn("nvlink", transporter.endpoints)
+
+    def test_no_arena_leaves_the_endpoint_alone(self):
+        # The non-arena path publishes per-tensor pointers that were never meant
+        # to fall inside a mapping, so this check must not run against it.
+        transporter = self._transporter_with(
+            mappings=[(0x1000, 0x1000)], manifest={"a": (0x99000, 8, 1)}
+        )
+        transporter.weight_arena = None
+        transporter._withdraw_mnnvl_if_weights_escaped_the_arena()
+        self.assertIn("nvlink", transporter.endpoints)
+
+
 if __name__ == "__main__":
     unittest.main()

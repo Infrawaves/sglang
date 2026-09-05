@@ -252,11 +252,61 @@ def _registration_failure_hint() -> str:
     )
 
 
-def register_memory_region(model, transfer_engine):
+def register_memory_region(model, transfer_engine, arena=None):
+    if arena is not None:
+        return register_memory_region_arena(model, transfer_engine, arena)
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
     else:
         return register_memory_region_v2(model, transfer_engine)
+
+
+def register_memory_region_arena(model, transfer_engine, arena):
+    """Register a fabric arena at the granularity mooncake publishes at.
+
+    One registration per mapping, because ``registerLocalMemory`` publishes the
+    range ``cuMemGetAddressRange`` reports for the address rather than the length
+    it was given -- so a single call spanning several mappings would advertise
+    only the first, and the rest would be unreachable.
+
+    The v2 path cannot be used here for two independent reasons: it merges
+    adjacent blocks, which would break that invariant, and it discovers blocks
+    through ``memory_snapshot()``, which does not report a private ``MemPool``'s
+    segments.
+    """
+    start_tic = time.time()
+
+    weight_mr_dict = {}
+    for name, weight in _iter_manifest_parameters(model):
+        weight_mr_dict[name] = (
+            weight.data_ptr(),
+            weight.numel(),
+            weight.element_size(),
+        )
+
+    registered_blocks = []
+    try:
+        for address, length in arena.mappings:
+            ret = transfer_engine.register_memory(address, length)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for fabric mapping at address "
+                    f"{address} with size {length}, error: {ret}."
+                    f"{_registration_failure_hint()}"
+                )
+            registered_blocks.append((address, length))
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial
+        # registration would stay registered with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks)
+        raise
+
+    logger.debug(
+        "Registered %d fabric mapping(s) in %.4fs",
+        len(registered_blocks),
+        time.time() - start_tic,
+    )
+    return weight_mr_dict, registered_blocks
 
 
 def deregister_memory_region(

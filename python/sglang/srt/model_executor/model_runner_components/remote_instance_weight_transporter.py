@@ -21,6 +21,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.model_loader.weight_fabric_arena import (
+    device_can_back_fabric_arena,
+    migrate_weights_to_fabric_arena,
+    names_outside_arena,
+)
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -66,6 +71,9 @@ class RemoteInstanceWeightTransporter:
     is_draft_worker: bool = False
     endpoints: dict[str, _TransportEndpoint] = field(default_factory=dict)
     fabric_identity: Optional[NvlinkFabricIdentity] = None
+    # Set once the weights have been moved onto FABRIC memory. Held for the life
+    # of the process: closing it would unmap the weights.
+    weight_arena: Optional[Any] = None
     _nixl_manager: Optional[Any] = None
 
     @property
@@ -143,26 +151,87 @@ class RemoteInstanceWeightTransporter:
     def _servable_nvlink_protocols(self) -> tuple[str, ...]:
         # nvlink_intra needs no fabric -- it is CUDA IPC, and only the client
         # knows whether it landed on this host. MNNVL needs a clique to publish.
+        serves_mnnvl = self.fabric_identity is not None and self._can_serve_mnnvl()
+        # nvlink_intra registers through cudaIpcGetMemHandle, which fails on VMM
+        # pointers, so arena weights cannot be served over it at all. MNNVL
+        # reaches same-host peers too, so dropping it costs those peers nothing.
+        if serves_mnnvl and self._fabric_weights_requested():
+            return (MNNVL_PROTOCOL,)
         protocols = [INTRA_NVLINK_PROTOCOL]
-        if self.fabric_identity is not None and self._can_serve_mnnvl():
+        if serves_mnnvl:
             protocols.append(MNNVL_PROTOCOL)
         return tuple(protocols)
 
     def _can_serve_mnnvl(self) -> bool:
+        """Whether MNNVL will have exportable weights to serve, asked pre-load.
+
+        Engines are built before the model exists and the endpoint set is fixed
+        once published, so this has to answer on intent rather than on the
+        weights themselves. Two ways to get there: the arena will place them on
+        FABRIC memory, or the default allocator already hands out such memory.
+        Either way ``_register_and_publish_weight_info`` re-checks against the
+        real pointers and withdraws MNNVL if the intent did not hold.
+        """
         # Being in a clique only says a handle would resolve; serving still needs
         # an allocation to export one from. Mooncake answers a registration it
         # cannot export with success and an empty segment, so an unchecked offer
         # here reads as healthy right up to the client's first transfer.
+        if self._fabric_weights_requested():
+            if device_can_back_fabric_arena(self.gpu_id):
+                return True
+            logger.info(
+                "GPU %s cannot allocate FABRIC-exportable VMM memory, so the "
+                "weight arena would not help; not offering MNNVL.",
+                self.gpu_id,
+            )
+            return False
         if caching_allocator_memory_is_fabric_exportable(self.gpu_id):
             return True
         logger.info(
             "GPU %s is on NVLink fabric %s, but its weights come from memory "
             "MNNVL cannot export a fabric handle for, so only nvlink_intra and "
-            "the NIC are offered. Cross-node peers will load over the NIC.",
+            "the NIC are offered. Cross-node peers will load over the NIC. Set "
+            "SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS=1 to place them on "
+            "memory MNNVL can serve.",
             self.gpu_id,
             self.fabric_identity,
         )
         return False
+
+    def _fabric_weights_requested(self) -> bool:
+        # Only a seed serves weights; a client reads into ordinary buffers, which
+        # need no fabric handle of their own.
+        return (
+            envs.SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS.get()
+            and not self.is_draft_worker
+            and self._is_seed()
+        )
+
+    def maybe_place_weights_on_fabric_memory(self) -> None:
+        """Move the weights onto memory MNNVL can export, if that was asked for.
+
+        Synchronous and on the startup path, unlike registration: it rebinds every
+        weight's storage, so it has to complete before anything captures a weight
+        pointer.
+        """
+        if not self._fabric_weights_requested():
+            return
+        if MNNVL_PROTOCOL not in self.endpoints:
+            # Nothing published MNNVL, so nothing will serve from the arena and
+            # the rebind would buy only its own risk.
+            return
+        try:
+            self.weight_arena = migrate_weights_to_fabric_arena(self.model, self.gpu_id)
+        except Exception:
+            # Past the first rebind there is no way back: the arena cannot be
+            # closed without freeing live weights. Fail startup rather than serve
+            # a model whose storage is half-migrated.
+            logger.exception(
+                "Placing weights on FABRIC memory failed after it had begun "
+                "rebinding parameter storage for tp_rank=%s.",
+                self.tp_rank,
+            )
+            raise
 
     @staticmethod
     @contextmanager
@@ -355,8 +424,9 @@ class RemoteInstanceWeightTransporter:
                 # Never deregistered: the seed serves handles out of this for the
                 # life of the process.
                 endpoint.weight_info, _ = register_memory_region(
-                    self.model, endpoint.engine
+                    self.model, endpoint.engine, arena=self.weight_arena
                 )
+            self._withdraw_mnnvl_if_weights_escaped_the_arena()
             self._register_to_engine_info_bootstrap()
         except Exception:
             logger.exception(
@@ -364,6 +434,36 @@ class RemoteInstanceWeightTransporter:
                 "will not be usable as a remote-instance seed.",
                 self.tp_rank,
             )
+
+    def _withdraw_mnnvl_if_weights_escaped_the_arena(self) -> None:
+        """Drop MNNVL when the manifest names weights no mapping covers.
+
+        _can_serve_mnnvl had to answer on intent, before the weights existed.
+        This is where that intent meets the real pointers: migration deduplicates
+        by storage, so two distinct Parameters over one allocation leave the
+        non-survivor outside the arena. Publishing it anyway would reproduce the
+        client-side "Requested address ... not found!" this arena removes, and
+        withdrawing costs those peers the NIC rather than the load.
+        """
+        endpoint = self.endpoints.get(MNNVL_PROTOCOL)
+        if (
+            self.weight_arena is None
+            or endpoint is None
+            or endpoint.weight_info is None
+        ):
+            return
+        escaped = names_outside_arena(endpoint.weight_info, self.weight_arena)
+        if not escaped:
+            return
+        del self.endpoints[MNNVL_PROTOCOL]
+        logger.warning(
+            "Withdrawing the MNNVL endpoint for tp_rank=%s: %d weight(s) are "
+            "outside the fabric arena (e.g. %s), so it cannot serve the whole "
+            "manifest. Peers will load over the NIC instead.",
+            self.tp_rank,
+            len(escaped),
+            ", ".join(escaped[:3]),
+        )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.

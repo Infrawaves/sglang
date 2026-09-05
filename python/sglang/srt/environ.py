@@ -314,6 +314,11 @@ class Envs:
     # what the cluster handshakes on, while weight transfer is one seed to one
     # client.
     SGLANG_REMOTE_INSTANCE_PROTOCOL = EnvStr(None)
+    # Place a seed's weights on FABRIC-exportable memory so cross-node clients
+    # can read them over MNNVL. Off by default: it rebinds every weight's storage
+    # after loading, which a module that cached ``.data`` rather than the
+    # Parameter would not survive.
+    SGLANG_ENABLE_REMOTE_INSTANCE_FABRIC_WEIGHTS = EnvBool(False)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
