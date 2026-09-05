@@ -30,7 +30,7 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import enter_scope, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -70,6 +70,9 @@ class _FakeReq:
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
         self.time_stats = None
         self.return_hidden_states = False
@@ -77,6 +80,7 @@ class _FakeReq:
         self.return_indexer_topk = False
         self.return_sampling_mask = sampling_mask_rows is not None
         self.sampling_mask_rows = sampling_mask_rows
+        self.is_demoted = False
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -110,21 +114,103 @@ def _accumulator(current_weight_version="default", return_sampling_mask=False):
     )
 
 
-class TestOutputStreamerCustomizedInfo(unittest.TestCase):
+class TestOutputStreamerCustomizedInfo(CustomTestCase):
     def setUp(self):
-        serving_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+        self.server_args = enter_scope(
+            self,
+            published_topology(
+                ranks={"dp_rank": 0},
+                stream_interval=1,
+                weight_version="default",
+                enable_request_time_stats_logging=False,
+            ),
         )
-        observability_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
-            return_value=SimpleNamespace(enable_request_time_stats_logging=False),
+
+    def _make_streamer(self, outputs, *, rust_server_mode=False):
+        return SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            server_args=self.server_args,
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+            rust_server=(
+                SimpleNamespace(push_generation=outputs.append)
+                if rust_server_mode
+                else None
+            ),
         )
-        serving_patch.start()
-        observability_patch.start()
-        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
-        self.addCleanup(serving_patch.stop)
-        self.addCleanup(observability_patch.stop)
+
+    def test_demoted_requests_preserve_unsent_output_until_resume(self):
+        """Pausing output must not consume tokens or enable another request's metadata."""
+        for rust_server_mode in (False, True):
+            with self.subTest(rust_server_mode=rust_server_mode):
+                outputs = []
+                streamer = self._make_streamer(
+                    outputs, rust_server_mode=rust_server_mode
+                )
+                demoted = _FakeReq("demoted", [10])
+                demoted.is_demoted = True
+                demoted.stream = True
+                optional_flags = (
+                    "return_hidden_states",
+                    "return_routed_experts",
+                    "return_indexer_topk",
+                    "return_sampling_mask",
+                )
+                for flag in optional_flags:
+                    setattr(demoted, flag, True)
+                active = _FakeReq("active", [20])
+                active.stream = True
+                skipped = _FakeReq("skipped", [30])
+                skipped.stream = True
+
+                streamer._stream_output_generation(
+                    [demoted, active, skipped], False, skip_req=skipped
+                )
+
+                self.assertEqual(len(outputs), 1)
+                self.assertEqual(outputs[0].rids, ["active"])
+                self.assertEqual(outputs[0].output_ids, [[20]])
+                self.assertIsNone(outputs[0].output_hidden_states)
+                self.assertIsNone(outputs[0].routed_experts)
+                self.assertIsNone(outputs[0].indexer_topk)
+                self.assertIsNone(outputs[0].output_token_sampling_mask)
+                self.assertEqual(demoted.send_token_offset, 0)
+                self.assertEqual(demoted.send_decode_id_offset, 0)
+                self.assertEqual(demoted.send_output_token_logprobs_offset, 0)
+                self.assertEqual(skipped.send_token_offset, 0)
+
+                demoted.is_demoted = False
+                for flag in optional_flags:
+                    setattr(demoted, flag, False)
+                demoted.output_ids.append(11)
+                streamer._stream_output_generation([demoted], False)
+
+                self.assertEqual(len(outputs), 2)
+                self.assertEqual(outputs[1].rids, ["demoted"])
+                self.assertEqual(outputs[1].output_ids, [[10, 11]])
+                self.assertEqual(demoted.send_token_offset, 2)
+                self.assertEqual(
+                    demoted.send_decode_id_offset, 0 if rust_server_mode else 2
+                )
+
+    def test_all_demoted_requests_preserve_idle_heartbeat(self):
+        """Filtering all requests suppresses normal output but keeps the idle signal."""
+        outputs = []
+        streamer = self._make_streamer(outputs)
+        demoted = _FakeReq("demoted", [10])
+        demoted.stream = True
+        demoted.is_demoted = True
+
+        streamer._stream_output_generation([demoted], False)
+        self.assertEqual(outputs, [])
+        streamer._stream_output_generation([demoted], False, is_idle_batch=True)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].rids, [])
+        self.assertEqual(outputs[0].output_ids, [])
+        self.assertEqual(demoted.send_token_offset, 0)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()

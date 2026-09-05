@@ -55,7 +55,7 @@ class _FakeBatch:
             victim.is_demoted = True
         else:
             victim.is_retracted = True
-        self.release_calls.append((victim.rid, index, is_demoted))
+        self.release_calls.append((victim.rid, index, offload_kv, is_demoted))
         return self.backup_saved
 
     def filter_batch(self, keep_indices):
@@ -607,7 +607,10 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertTrue(long.is_demoted)
         self.assertFalse(medium.is_retracted)
         self.assertTrue(medium.is_demoted)
-        self.assertEqual(batch.release_calls, [("long", 0, True), ("medium", 1, True)])
+        self.assertEqual(
+            batch.release_calls,
+            [("long", 0, True, True), ("medium", 1, True, True)],
+        )
         self.assertEqual(scheduler.metrics_reporter.num_demoted_reqs, 2)
         scheduler.metrics_reporter.metrics_collector.increment_demoted_reqs.assert_called_once_with(
             num_demoted_reqs=2,
