@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvlink_fabric_utils import (
     NvlinkFabricIdentity,
+    caching_allocator_memory_is_fabric_exportable,
     get_nvlink_fabric_identity,
 )
 
@@ -143,9 +144,25 @@ class RemoteInstanceWeightTransporter:
         # nvlink_intra needs no fabric -- it is CUDA IPC, and only the client
         # knows whether it landed on this host. MNNVL needs a clique to publish.
         protocols = [INTRA_NVLINK_PROTOCOL]
-        if self.fabric_identity is not None:
+        if self.fabric_identity is not None and self._can_serve_mnnvl():
             protocols.append(MNNVL_PROTOCOL)
         return tuple(protocols)
+
+    def _can_serve_mnnvl(self) -> bool:
+        # Being in a clique only says a handle would resolve; serving still needs
+        # an allocation to export one from. Mooncake answers a registration it
+        # cannot export with success and an empty segment, so an unchecked offer
+        # here reads as healthy right up to the client's first transfer.
+        if caching_allocator_memory_is_fabric_exportable(self.gpu_id):
+            return True
+        logger.info(
+            "GPU %s is on NVLink fabric %s, but its weights come from memory "
+            "MNNVL cannot export a fabric handle for, so only nvlink_intra and "
+            "the NIC are offered. Cross-node peers will load over the NIC.",
+            self.gpu_id,
+            self.fabric_identity,
+        )
+        return False
 
     @staticmethod
     @contextmanager
@@ -243,6 +260,8 @@ class RemoteInstanceWeightTransporter:
         for protocol in NVLINK_PROTOCOLS:
             if protocol not in offered:
                 continue
+            if protocol == MNNVL_PROTOCOL and not self._mnnvl_offer_is_credible():
+                continue
             if (
                 seed_info.endpoint_for(
                     protocol=protocol,
@@ -279,6 +298,29 @@ class RemoteInstanceWeightTransporter:
             self.gpu_id,
         )
         return None
+
+    def _mnnvl_offer_is_credible(self) -> bool:
+        """Whether an MNNVL offer from the seed is one it can actually serve.
+
+        A seed predating the check in _can_serve_mnnvl offers MNNVL on clique
+        membership alone, and mooncake's registration lets it: the offer looks
+        healthy and the failure surfaces only as a transfer error, by which point
+        the fallback is disk rather than the NIC. Judging it by this rank's own
+        allocator is indirect -- what matters is the seed's memory, not ours --
+        but seed and client run the same allocator configuration in every setup
+        where this path is worth taking, and being wrong costs the NIC's
+        bandwidth rather than the load.
+        """
+        if caching_allocator_memory_is_fabric_exportable(self.gpu_id):
+            return True
+        logger.info(
+            "The seed offers MNNVL, but memory from this rank's allocator cannot "
+            "be fabric-exported, so the seed's most likely cannot either. "
+            "Skipping MNNVL rather than failing the transfer and disk-loading; "
+            "set SGLANG_REMOTE_INSTANCE_PROTOCOL=%s to force it.",
+            MNNVL_PROTOCOL,
+        )
+        return False
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (

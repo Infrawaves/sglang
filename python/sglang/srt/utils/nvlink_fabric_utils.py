@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVLink fabric (MNNVL) identity.
+"""NVLink fabric (MNNVL) identity and exportability.
 
 An NVL72 rack shares one NVLink domain across nodes, but partitions it into
 cliques at runtime. A fabric handle only resolves between two GPUs that agree on
 both the cluster UUID and the clique id.
+
+Being in a clique is necessary but not sufficient: MNNVL serves a buffer by
+exporting the allocation behind it as a fabric handle, which only exists for
+memory the caller made with cuMemCreate.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Optional
 
@@ -17,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 # nvmlGpuFabricState_t: NVML_GPU_FABRIC_STATE_COMPLETED.
 _FABRIC_STATE_COMPLETED = 3
+
+# CUmemAllocationHandleType: CU_MEM_HANDLE_TYPE_FABRIC.
+_CU_MEM_HANDLE_TYPE_FABRIC = 0x8
+_CUDA_SUCCESS = 0
+# Above the caching allocator's small-pool cutoff, so the probe buffer comes
+# from the same pool the weights do.
+_PROBE_BYTES = 4 << 20
 
 
 class NvlinkFabricIdentity(msgspec.Struct, frozen=True):
@@ -62,6 +74,69 @@ def get_nvlink_fabric_identity(gpu_id: int) -> Optional[NvlinkFabricIdentity]:
         return None
 
     return NvlinkFabricIdentity(cluster_uuid=cluster_uuid, clique_id=clique_id)
+
+
+@functools.lru_cache(maxsize=None)
+def caching_allocator_memory_is_fabric_exportable(gpu_id: int) -> bool:
+    """Whether MNNVL can serve a buffer the torch caching allocator handed out.
+
+    Mooncake registers a buffer for its NVLink fabric transport by retaining the
+    allocation behind the pointer and exporting it as a fabric handle. Both steps
+    are cuMemCreate-only, and the caching allocator's default path is cudaMalloc,
+    so the retain fails -- at which point mooncake logs "is not allocated by
+    cuMemCreate, but it can be used as local buffer", *returns success*, and
+    publishes a segment with no buffer covering the weights. A reader only finds
+    out at transfer time, as "Requested address ... not found!".
+
+    The answer is a property of the process's allocator configuration, so one
+    probe per device settles it.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        with torch.cuda.device(gpu_id):
+            probe = torch.empty(_PROBE_BYTES, dtype=torch.uint8, device="cuda")
+            return _pointer_is_fabric_exportable(probe.data_ptr())
+    except Exception as e:
+        logger.debug("Cannot probe fabric exportability on GPU %s (%s).", gpu_id, e)
+        return False
+
+
+def _pointer_is_fabric_exportable(pointer: int) -> bool:
+    import ctypes
+
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError as e:
+        logger.debug("Cannot load libcuda to probe fabric exportability (%s).", e)
+        return False
+
+    handle = ctypes.c_ulonglong(0)
+    if (
+        cuda.cuMemRetainAllocationHandle(ctypes.byref(handle), ctypes.c_void_p(pointer))
+        != _CUDA_SUCCESS
+    ):
+        # cudaMalloc memory: there is no allocation handle to export.
+        return False
+    try:
+        # Retaining is not enough. An allocation carries the handle types it was
+        # created with, and exporting as a type it did not request fails -- which
+        # is what torch's expandable_segments does unless it asked for FABRIC.
+        # 64 bytes covers CUmemFabricHandle.
+        export_handle = (ctypes.c_ubyte * 64)()
+        return (
+            cuda.cuMemExportToShareableHandle(
+                ctypes.byref(export_handle),
+                handle,
+                ctypes.c_int(_CU_MEM_HANDLE_TYPE_FABRIC),
+                ctypes.c_ulonglong(0),
+            )
+            == _CUDA_SUCCESS
+        )
+    finally:
+        cuda.cuMemRelease(handle)
 
 
 def _query_fabric_info(pynvml, handle, gpu_id: int):

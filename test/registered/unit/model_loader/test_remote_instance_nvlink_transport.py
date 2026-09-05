@@ -530,5 +530,149 @@ class TestReaderRegistrationRelease(CustomTestCase):
                 self.assertIsNone(_parse_seed_transfer_engine_info(payload))
 
 
+class TestFabricExportability(CustomTestCase):
+    """MNNVL serves a buffer by exporting the allocation behind it as a fabric
+    handle, which exists only for cuMemCreate memory -- and the torch caching
+    allocator's default path is cudaMalloc. Mooncake answers a registration it
+    cannot export with *success* and an empty segment, so the seed looks healthy
+    and the reader fails at transfer time with "Requested address ... not
+    found!". Observed on GB300: all 8 client ranks fell through to disk.
+    """
+
+    def _fake_cuda(self, *, retain, export):
+        calls = []
+
+        class FakeCuda:
+            def cuMemRetainAllocationHandle(self, handle, pointer):
+                calls.append("retain")
+                return retain
+
+            def cuMemExportToShareableHandle(self, out, handle, kind, flags):
+                calls.append(("export", kind.value))
+                return export
+
+            def cuMemRelease(self, handle):
+                calls.append("release")
+                return 0
+
+        return FakeCuda(), calls
+
+    def _probe(self, *, retain, export):
+        cuda, calls = self._fake_cuda(retain=retain, export=export)
+        with mock.patch.object(ctypes, "CDLL", return_value=cuda):
+            result = nvlink_fabric_utils._pointer_is_fabric_exportable(0x7F0000000000)
+        return result, calls
+
+    def test_cuda_malloc_memory_cannot_be_exported(self):
+        # The GB300 case: retain fails, which is the whole bug.
+        result, calls = self._probe(retain=1, export=0)
+        self.assertFalse(result)
+        self.assertEqual(calls, ["retain"])
+
+    def test_retaining_is_not_enough_on_its_own(self):
+        # An allocation carries the handle types it was created with, so
+        # cuMemCreate memory that never asked for FABRIC retains fine and still
+        # cannot export. Dropping the second step would call
+        # expandable_segments:True a fix when it is not.
+        result, calls = self._probe(retain=0, export=1)
+        self.assertFalse(result)
+        self.assertEqual(calls, ["retain", ("export", 0x8), "release"])
+
+    def test_fabric_exportable_memory_passes(self):
+        result, calls = self._probe(retain=0, export=0)
+        self.assertTrue(result)
+        self.assertEqual(calls, ["retain", ("export", 0x8), "release"])
+
+    def test_the_retained_handle_is_released_even_when_export_fails(self):
+        _, calls = self._probe(retain=0, export=1)
+        self.assertIn("release", calls)
+
+    def test_no_libcuda_is_not_exportable(self):
+        with mock.patch.object(ctypes, "CDLL", side_effect=OSError("no libcuda")):
+            self.assertFalse(
+                nvlink_fabric_utils._pointer_is_fabric_exportable(0x7F0000000000)
+            )
+
+
+def _transporter_module():
+    from sglang.srt.model_executor.model_runner_components import (
+        remote_instance_weight_transporter,
+    )
+
+    return remote_instance_weight_transporter
+
+
+def _transporter(*, fabric_identity):
+    return _transporter_module().RemoteInstanceWeightTransporter(
+        get_model=lambda: None,
+        tp_rank=0,
+        gpu_id=0,
+        fabric_identity=fabric_identity,
+    )
+
+
+def _patch_exportable(value):
+    """Patch where the transporter looks the probe up, not where it is defined.
+
+    The transporter imports it by name at module load, so patching
+    nvlink_fabric_utils would leave that binding untouched and the test would
+    exercise the real CUDA probe.
+    """
+    return mock.patch.object(
+        _transporter_module(),
+        "caching_allocator_memory_is_fabric_exportable",
+        **value,
+    )
+
+
+class TestSeedWithdrawsAnUnservableMnnvlOffer(CustomTestCase):
+    """A seed in a clique can still be unable to serve MNNVL. Offering on clique
+    membership alone is what made every GB300 client pick the one transport that
+    could not work, and lose the NIC endpoint that would have.
+    """
+
+    def _offered(self, *, exportable):
+        transporter = _transporter(fabric_identity=_identity())
+        with _patch_exportable({"return_value": exportable}):
+            return transporter._servable_nvlink_protocols()
+
+    def test_an_unexportable_seed_offers_only_intra_node(self):
+        self.assertEqual(self._offered(exportable=False), ("nvlink_intra",))
+
+    def test_an_exportable_seed_offers_both(self):
+        self.assertEqual(self._offered(exportable=True), ("nvlink_intra", "nvlink"))
+
+    def test_intra_node_survives_the_withdrawal(self):
+        # nvlink_intra registers through cudaIpcGetMemHandle, which is fine on
+        # cudaMalloc memory, so the fabric verdict must not gate it. It is the
+        # only NVLink transport that works for a same-host client.
+        self.assertIn("nvlink_intra", self._offered(exportable=False))
+
+    def test_a_seed_off_the_fabric_never_reaches_the_probe(self):
+        transporter = _transporter(fabric_identity=None)
+        with _patch_exportable({"side_effect": AssertionError("should not be probed")}):
+            self.assertEqual(
+                transporter._servable_nvlink_protocols(), ("nvlink_intra",)
+            )
+
+
+class TestClientSkipsAStaleMnnvlOffer(CustomTestCase):
+    """A seed predating the check above still offers MNNVL it cannot serve. The
+    client has to decline, because the cost of accepting is not the NIC -- it is
+    a failed transfer, and the fallback from there is disk.
+    """
+
+    def _credible(self, *, exportable):
+        transporter = _transporter(fabric_identity=_identity())
+        with _patch_exportable({"return_value": exportable}):
+            return transporter._mnnvl_offer_is_credible()
+
+    def test_declines_when_this_ranks_memory_cannot_be_exported(self):
+        self.assertFalse(self._credible(exportable=False))
+
+    def test_accepts_when_it_can(self):
+        self.assertTrue(self._credible(exportable=True))
+
+
 if __name__ == "__main__":
     unittest.main()
