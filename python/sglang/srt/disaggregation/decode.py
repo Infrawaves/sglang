@@ -3533,7 +3533,7 @@ class SchedulerDisaggregationDecodeMixin:
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
-                self.server_args,
+                offload_kv=True,
                 is_demoted=True,
             )
             if backup_saved:

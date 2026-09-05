@@ -74,6 +74,9 @@ class _FakeReq:
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
         self.time_stats = None
         self.return_hidden_states = False
@@ -81,6 +84,7 @@ class _FakeReq:
         self.return_indexer_topk = False
         self.return_sampling_mask = sampling_mask_rows is not None
         self.sampling_mask_rows = sampling_mask_rows
+        self.is_demoted = False
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -129,6 +133,35 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
+
+    def test_demoted_requests_are_not_streamed(self):
+        outputs = []
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            server_args=SimpleNamespace(
+                stream_interval=1,
+                enable_request_time_stats_logging=False,
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+        )
+        demoted = _FakeReq("demoted", [10])
+        demoted.is_demoted = True
+        demoted.stream = True
+        active = _FakeReq("active", [20])
+        active.stream = True
+
+        streamer._stream_output_generation([demoted, active], False)
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].rids, ["active"])
+        self.assertEqual(outputs[0].output_ids, [[20]])
+        self.assertEqual(demoted.send_token_offset, 0)
+        self.assertEqual(demoted.send_decode_id_offset, 0)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
