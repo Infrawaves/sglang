@@ -908,14 +908,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         demoted_tokens = sum(entry.demoted_tokens for entry in self.demotion_queue)
         return demoted_tokens / self.max_total_num_tokens
 
-    def resume_demoted_reqs(self) -> List[Req]:
-        """Restore demoted requests only after their recovery duration expires."""
+    def get_demoted_req_indices_to_resume(self) -> List[int]:
+        """Select recoverable entries on the request-plane TP leader."""
         recovery_duration = (
             self.scheduler.server_args.proactive_demotion_recovery_duration
         )
         now = time.monotonic()
-        resumed_reqs: List[Req] = []
-        indices_to_remove = set()
+        indices_to_resume: List[int] = []
+        pending_swa_tokens = 0
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         if uses_swa_tail_prealloc:
             full_allocatable_tokens, swa_allocatable_tokens = (
@@ -925,12 +925,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False
             )
+        available_req_slots = self.req_to_token_pool.available_size()
 
         for i, entry in enumerate(self.demotion_queue):
             if now - entry.demoted_start_time < recovery_duration:
                 continue
             req = entry.req
-            if self.req_to_token_pool.available_size() <= 0:
+            if available_req_slots <= 0:
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
@@ -939,6 +940,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            indices_to_resume.append(i)
+            available_req_slots -= 1
+            full_allocatable_tokens -= full_required
+            if uses_swa_tail_prealloc:
+                _, swa_len = self._prealloc_kv_lens(req)
+                pending_swa_tokens += ceil_align(
+                    swa_len, self.token_to_kv_pool_allocator.page_size
+                )
+                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                    count_retracted=False,
+                    extra_reserved_reqs=len(indices_to_resume),
+                    pending_swa_tokens=pending_swa_tokens,
+                )
+
+        return indices_to_resume
+
+    def resume_demote_reqs(self, indices_to_resume: List[int]) -> List[Req]:
+        if not indices_to_resume:
+            return []
+
+        resumed_reqs: List[Req] = []
+        indices_to_remove = set(indices_to_resume)
+
+        for i in indices_to_resume:
+            entry = self.demotion_queue[i]
+            req = entry.req
             self._pre_alloc(req)
             retraction_restore(
                 req,
@@ -950,13 +977,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.is_demoted = False
             self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
-            indices_to_remove.add(i)
-            full_allocatable_tokens -= full_required
-            if uses_swa_tail_prealloc:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
-                    count_retracted=False,
-                    extra_reserved_reqs=len(resumed_reqs),
-                )
 
         self.demotion_queue = [
             entry
@@ -1778,6 +1798,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         n_active: Optional[int] = None,
         reserved_tokens: Optional[int] = None,
         extra_reserved_reqs: int = 0,
+        pending_swa_tokens: int = 0,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
@@ -1806,7 +1827,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
-        swa_available = self.token_to_kv_pool_allocator.swa_available_size()
+        # Selection has not allocated KV yet. Project its page-aligned
+        # occupancy into both free capacity and the remaining growth headroom.
+        swa_available = (
+            self.token_to_kv_pool_allocator.swa_available_size() - pending_swa_tokens
+        )
         swa_evictable = self.tree_cache.swa_evictable_size()
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
@@ -2840,7 +2865,7 @@ class SchedulerDisaggregationDecodeMixin:
         # Experimental fixed-rule demotion: trigger on cache pressure alone,
         # with no output-length imbalance gate.
         collector = self.decode_metric_collector
-        if collector is None:
+        if not get_disagg().enable_proactive_decode_demotion or collector is None:
             return False
 
         # The fixed rule no longer consumes quantiles; keep them ticking only
@@ -2939,6 +2964,22 @@ class SchedulerDisaggregationDecodeMixin:
 
         return demoted_any
 
+    def resume_demote_reqs(self: Scheduler) -> List[Req]:
+        indices_to_resume = None
+        if self.dp_tp_group.rank_in_group == 0:
+            indices_to_resume = (
+                self.disagg_decode_prealloc_queue.get_demoted_req_indices_to_resume()
+            )
+
+        # Only broadcast when demotion queue is not empty to decrease latency.
+        if self.disagg_decode_prealloc_queue.demotion_queue:
+            indices_to_resume = self.dp_tp_group.broadcast_object(indices_to_resume, src=0)
+        resumed_reqs = self.disagg_decode_prealloc_queue.resume_demote_reqs(
+            indices_to_resume
+        )
+        self.waiting_queue.extend(resumed_reqs)
+        return resumed_reqs
+
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
@@ -2954,8 +2995,8 @@ class SchedulerDisaggregationDecodeMixin:
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
 
-        resumed_demoted_reqs = self.disagg_decode_prealloc_queue.resume_demoted_reqs()
-        self.waiting_queue.extend(resumed_demoted_reqs)
+        if get_disagg().enable_proactive_decode_demotion:
+            self.resume_demote_reqs()
 
         if self.need_to_proactive_retract_request():
             self.proactively_demote_longest_request()
