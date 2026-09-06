@@ -82,12 +82,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
     # A disabled cache publishes nothing, so no storage backend applies.
-    # Host-pool retraction goes to UnifiedRadixCache, which validates it (and
-    # rejects pure-SWA).
+    # HiCache retraction (host_pool/ssd) goes to UnifiedRadixCache, which
+    # validates it (and rejects pure-SWA).
     if ctx.disable_radix_cache:
-        if (
-            is_pure_swa
-            and get_disagg().disaggregation_decode_retraction_backup != "host_pool"
+        if is_pure_swa and get_disagg().disaggregation_decode_retraction_backup not in (
+            "host_pool",
+            "ssd",
         ):
             from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
@@ -149,11 +149,15 @@ def create_unified_radix_cache(
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
     server_args, params = ctx.server_args, ctx.params
-    if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+    if get_disagg().disaggregation_decode_retraction_backup in ("host_pool", "ssd"):
         if ctx.is_hybrid_ssm:
-            raise ValueError("Host-pool retraction does not support Mamba models.")
+            raise ValueError(
+                "HiCache retraction backup does not support Mamba models."
+            )
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
-            raise ValueError("Host-pool retraction does not support pure-SWA models.")
+            raise ValueError(
+                "HiCache retraction backup does not support pure-SWA models."
+            )
 
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -188,6 +192,7 @@ def create_unified_radix_cache(
     if (
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        or get_disagg().disaggregation_decode_retraction_backup == "ssd"
     ):
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
