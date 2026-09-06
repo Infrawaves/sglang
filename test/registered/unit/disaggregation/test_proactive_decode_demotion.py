@@ -195,13 +195,152 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         queue._pre_alloc = MagicMock()
         return queue
 
+    def _make_demoted_queue_with_entries(self, entries, recovery_duration):
+        queue = self._make_demoted_queue(entries[0][0], recovery_duration)
+        queue.demotion_queue = [
+            DemotedRequest(
+                req=req,
+                demoted_start_time=start_time,
+                demoted_tokens=demoted_tokens,
+            )
+            for req, start_time, demoted_tokens in entries
+        ]
+        return queue
+
+    def test_demoted_recovery_decision_respects_slots_and_full_budget(self):
+        reqs = [SimpleNamespace(is_demoted=True) for _ in range(3)]
+        for slots, budget, expected in [
+            (0, 10, []),
+            (1, 10, [0]),
+            (3, 3, []),
+            (3, 4, [0]),
+            (3, 8, [0, 1]),
+        ]:
+            with self.subTest(slots=slots, budget=budget):
+                queue = self._make_demoted_queue_with_entries(
+                    [(req, 0.0, 7) for req in reqs], recovery_duration=0.0
+                )
+                queue.req_to_token_pool.available_size = lambda: slots
+                queue._allocatable_token_budgets = lambda **_: budget
+                queue._prealloc_required_tokens = lambda _: (4, 4)
+
+                self.assertEqual(queue.get_demoted_req_indices_to_resume(), expected)
+                queue._pre_alloc.assert_not_called()
+
+    def _make_demoted_swa_queue(self, fill_lens, capacity, reserved_tokens):
+        reqs = [
+            SimpleNamespace(
+                origin_input_ids=[0] * fill_len,
+                output_ids=[],
+                is_demoted=True,
+            )
+            for fill_len in fill_lens
+        ]
+        queue = self._make_demoted_queue_with_entries(
+            [(req, 0.0, fill_len) for req, fill_len in zip(reqs, fill_lens)],
+            recovery_duration=0.0,
+        )
+        queue._uses_swa_tail_prealloc = lambda: True
+        del queue._allocatable_token_budgets
+        del queue._prealloc_required_tokens
+        queue.num_reserved_decode_tokens = reserved_tokens
+        queue.req_to_token_pool.available_size = lambda: len(reqs)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=16,
+            size_swa=capacity,
+            full_available_size=lambda: 4096,
+            swa_available_size=lambda: capacity,
+        )
+        queue.tree_cache.swa_evictable_size.return_value = 0
+        queue.scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+        queue.scheduler.running_batch = SimpleNamespace(reqs=[])
+        queue.scheduler.waiting_queue = []
+        queue.scheduler.last_batch = None
+        queue.scheduler.enable_hisparse = False
+        queue.scheduler.sliding_window_size = 64
+        queue.transfer_queue = SimpleNamespace(queue=[])
+        queue.retracted_queue = []
+        return queue
+
+    def test_demoted_recovery_accounts_for_pending_swa_pages_and_growth(self):
+        for fill_lens, capacity, reserved, disable_radix, expected in [
+            ([64, 64], 96, 16, True, [0]),
+            ([64, 64], 128, 16, True, [0, 1]),
+            ([16, 64], 80, 16, True, [0]),
+            ([64, 64], 128, 16, False, [0]),
+            ([17, 17, 17], 80, 0, True, [0, 1]),
+        ]:
+            with self.subTest(
+                fill_lens=fill_lens, capacity=capacity, disable_radix=disable_radix
+            ):
+                queue = self._make_demoted_swa_queue(fill_lens, capacity, reserved)
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_memory",
+                    return_value=SimpleNamespace(disable_radix_cache=disable_radix),
+                ):
+                    self.assertEqual(
+                        queue.get_demoted_req_indices_to_resume(), expected
+                    )
+                queue._pre_alloc.assert_not_called()
+                self.assertEqual(len(queue.demotion_queue), len(fill_lens))
+                self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
+
+    def test_demoted_recovery_uses_tp_consensus(self):
+        for rank, indices in [(0, [1]), (1, [1]), (0, []), (1, [])]:
+            with self.subTest(rank=rank, indices=indices):
+                first, second = [SimpleNamespace(is_demoted=True) for _ in range(2)]
+                queue = self._make_demoted_queue_with_entries(
+                    [(first, 10.0, 7), (second, 0.0, 11)], recovery_duration=10.0
+                )
+                decision = MagicMock(wraps=queue.get_demoted_req_indices_to_resume)
+                queue.get_demoted_req_indices_to_resume = decision
+                group = SimpleNamespace(
+                    rank_in_group=rank,
+                    broadcast_object=MagicMock(return_value=indices),
+                )
+                scheduler = SimpleNamespace(
+                    dp_tp_group=group,
+                    disagg_decode_prealloc_queue=queue,
+                    waiting_queue=[],
+                )
+
+                with patch(
+                    "sglang.srt.disaggregation.decode.time.monotonic",
+                    return_value=15.0 if indices else 5.0,
+                ), patch(
+                    "sglang.srt.disaggregation.decode.get_disagg",
+                    return_value=_CPU_TENSOR_DISAGG,
+                ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
+                    resumed = SchedulerDisaggregationDecodeMixin.resume_demote_reqs(
+                        scheduler
+                    )
+
+                group.broadcast_object.assert_called_once_with(
+                    indices if rank == 0 else None, src=0
+                )
+                self.assertEqual(decision.call_count, int(rank == 0))
+                self.assertEqual(resumed, [second] if indices else [])
+                self.assertEqual(scheduler.waiting_queue, resumed)
+                self.assertEqual(
+                    [entry.req for entry in queue.demotion_queue],
+                    [first] if indices else [first, second],
+                )
+                self.assertTrue(first.is_demoted)
+                self.assertEqual(second.is_demoted, not indices)
+                self.assertEqual(
+                    queue.scheduler.remain_cpu_demote_tokens, 11 if indices else 0
+                )
+                self.assertEqual(restore.call_count, len(indices))
+
     def test_demoted_request_waits_then_restores(self):
         req = SimpleNamespace(is_retracted=False, is_demoted=True)
         queue = self._make_demoted_queue(req, recovery_duration=10.0)
         with patch(
             "sglang.srt.disaggregation.decode.time.monotonic", return_value=5.0
         ):
-            self.assertEqual(queue.resume_demoted_reqs(), [])
+            indices = queue.get_demoted_req_indices_to_resume()
+            self.assertEqual(indices, [])
+            self.assertEqual(queue.resume_demote_reqs(indices), [])
         self.assertEqual(len(queue.demotion_queue), 1)
         self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
 
@@ -211,7 +350,11 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             "sglang.srt.disaggregation.decode.get_disagg",
             return_value=_CPU_TENSOR_DISAGG,
         ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
-            self.assertEqual(queue.resume_demoted_reqs(), [req])
+            indices = queue.get_demoted_req_indices_to_resume()
+            self.assertEqual(indices, [0])
+            queue._pre_alloc.assert_not_called()
+            self.assertTrue(req.is_demoted)
+            self.assertEqual(queue.resume_demote_reqs(indices), [req])
         self.assertEqual(queue.demotion_queue, [])
         self.assertFalse(req.is_retracted)
         self.assertFalse(req.is_demoted)
@@ -256,10 +399,16 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         non-empty, so a mostly-recovered queue still froze demotion; the gate
         must instead track the remaining CPU token budget."""
         check = SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request
-        self.assertFalse(check(self._make_retract_check_scheduler(0)))
-        self.assertFalse(check(self._make_retract_check_scheduler(-5)))
-        # Budget remaining allows a new wave even mid-recovery.
-        self.assertTrue(check(self._make_retract_check_scheduler(100)))
+        with patch(
+            "sglang.srt.disaggregation.decode.get_disagg",
+            return_value=SimpleNamespace(enable_proactive_decode_demotion=True),
+        ) as disagg:
+            self.assertFalse(check(self._make_retract_check_scheduler(0)))
+            self.assertFalse(check(self._make_retract_check_scheduler(-5)))
+            # Budget remaining allows a new wave even mid-recovery.
+            self.assertTrue(check(self._make_retract_check_scheduler(100)))
+            disagg.return_value.enable_proactive_decode_demotion = False
+            self.assertFalse(check(self._make_retract_check_scheduler(100)))
 
     def test_triggers_without_output_len_quantiles(self):
         """The fixed rule must fire on cache pressure alone; an empty quantile
@@ -268,11 +417,15 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         scheduler.decode_metric_collector = SimpleNamespace(
             maybe_update=lambda: (None, None)
         )
-        self.assertTrue(
-            SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
-                scheduler
+        with patch(
+            "sglang.srt.disaggregation.decode.get_disagg",
+            return_value=SimpleNamespace(enable_proactive_decode_demotion=True),
+        ):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
+                    scheduler
+                )
             )
-        )
 
     def test_proactive_demotion_filters_and_spends_budget(self):
         short = _make_demotion_candidate("short", 10, 5)
