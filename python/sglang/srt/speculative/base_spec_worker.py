@@ -254,7 +254,7 @@ class BaseSpecWorker(ABC):
         if not (
             get_memory().enable_hierarchical_cache
             or get_memory().enable_unified_cache_external_linker
-            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+            or get_disagg().disaggregation_decode_retraction_backup in ("host_pool", "ssd")
         ):
             return HiCacheDraftPlan()
 

@@ -84,7 +84,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if (
         ctx.disable_radix_cache
-        and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        and get_disagg().disaggregation_decode_retraction_backup
+        in ("host_pool", "ssd")
     ):
         return _create_unified_radix_cache(ctx, server_args, params)
 
@@ -152,11 +153,15 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
-    if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+    if get_disagg().disaggregation_decode_retraction_backup in ("host_pool", "ssd"):
         if ctx.is_hybrid_ssm:
-            raise ValueError("Host-pool retraction does not support Mamba models.")
+            raise ValueError(
+                "HiCache retraction backup does not support Mamba models."
+            )
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
-            raise ValueError("Host-pool retraction does not support pure-SWA models.")
+            raise ValueError(
+                "HiCache retraction backup does not support pure-SWA models."
+            )
 
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -191,6 +196,7 @@ def _create_unified_radix_cache(
     if (
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        or get_disagg().disaggregation_decode_retraction_backup == "ssd"
     ):
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
