@@ -6,6 +6,7 @@ https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/api_logging.py
 
 from __future__ import annotations
 
+import enum
 import fnmatch
 import functools
 import inspect
@@ -14,10 +15,13 @@ import logging
 import os
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, TypeVar, overload
 
 import torch
+
+from sglang.srt.environ import envs
 
 _logger = logging.getLogger("sglang.kernel_api")
 
@@ -83,7 +87,13 @@ def _setup_logger() -> None:
     elif _KERNEL_API_LOG_DEST == "stderr":
         handler = logging.StreamHandler(sys.stderr)
     else:
-        handler = logging.FileHandler(_KERNEL_API_LOG_DEST, mode="a")
+        max_mb = envs.SGLANG_KERNEL_API_LOG_MAX_MB.get()
+        if max_mb > 0:
+            handler = RotatingFileHandler(
+                _KERNEL_API_LOG_DEST, maxBytes=max_mb * 1024**2, backupCount=4
+            )
+        else:
+            handler = logging.FileHandler(_KERNEL_API_LOG_DEST, mode="a")
 
     handler.setFormatter(logging.Formatter("%(message)s"))
     _logger.addHandler(handler)
@@ -183,6 +193,9 @@ def _serialize_value(value: Any, depth: int = 0) -> list[str]:
     if isinstance(value, torch.Tensor):
         return _serialize_tensor(value)
 
+    if isinstance(value, enum.Enum):
+        return [f"{type(value).__name__}.{value.name}"]
+
     if isinstance(value, (str, int, float, bool, type(None))):
         return [repr(value)]
 
@@ -212,6 +225,11 @@ def _serialize_value(value: Any, depth: int = 0) -> list[str]:
             lines.append(f"  ... ({len(items) - 8} more items)")
         lines.append("}")
         return lines
+
+    if _KERNEL_API_LOG_LEVEL <= 3:
+        # Opaque FFI objects can implement repr/properties by inspecting GPU
+        # storage. Metadata-only logs must never invoke those accessors.
+        return [f"{type(value).__name__}(metadata omitted)"]
 
     summary = [f"{type(value).__name__}("]
     for attr in ("shape", "dtype", "device"):
@@ -411,6 +429,12 @@ def debug_kernel_api(
         return func
 
     def decorator(f: Callable) -> Callable:
+        func_name = op_name or _infer_func_name(f)
+        include = envs.SGLANG_KERNEL_API_LOG_INCLUDE.get()
+        if include and not any(
+            fnmatch.fnmatchcase(func_name, pattern) for pattern in include
+        ):
+            return f
         if hasattr(f, "_debug_kernel_wrapped"):
             return f
 
@@ -419,7 +443,6 @@ def debug_kernel_api(
             if _is_compiling():
                 return f(*args, **kwargs)
 
-            func_name = op_name or _infer_func_name(f)
             dump_dir: Path | None = None
             positional_args = args
             try:

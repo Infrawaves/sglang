@@ -22,6 +22,11 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.observability.decode_hang import (
+    emit as trace_decode_hang,
+    enabled as decode_hang_trace_enabled,
+    group_facts,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -197,9 +202,20 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
+    trace_fields = None
+    if decode_hang_trace_enabled():
+        trace_fields = group_facts(group)
+        trace_decode_hang(
+            "poll_min_enter", count=len(polls), polls=polls, **trace_fields
+        )
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    reduced = tensor_to_reduce.tolist()
+    if trace_fields is not None:
+        trace_decode_hang(
+            "poll_min_return", count=len(reduced), polls=reduced, **trace_fields
+        )
+    return reduced
 
 
 def poll_and_all_reduce(

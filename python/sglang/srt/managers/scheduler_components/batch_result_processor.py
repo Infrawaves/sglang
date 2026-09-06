@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability.decode_hang import emit as trace_decode_hang
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
@@ -889,7 +890,9 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            trace_decode_hang("copy_done_wait_enter", forward_iter=batch.forward_iter)
             result.copy_done.synchronize()
+            trace_decode_hang("copy_done_wait_return", forward_iter=batch.forward_iter)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

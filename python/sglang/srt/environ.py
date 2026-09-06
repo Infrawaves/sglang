@@ -468,6 +468,15 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # CPU-only per-rank Decode flight log. Read at startup; no CUDA sync added.
+    SGLANG_DEBUG_DECODE_HANG = EnvBool(False)
+    SGLANG_DEBUG_DECODE_HANG_DIR = EnvStr("/tmp/sglang-decode-hang")
+    SGLANG_DEBUG_DECODE_HANG_MAX_MB = EnvInt(64)
+    SGLANG_DEBUG_DECODE_HANG_BACKUPS = EnvInt(4)
+    # Filter all kernel API log levels (the existing DUMP_INCLUDE only filters dumps).
+    SGLANG_KERNEL_API_LOG_INCLUDE = EnvTuple(())
+    # 0 preserves the existing unbounded file handler; >0 retains four backups.
+    SGLANG_KERNEL_API_LOG_MAX_MB = EnvInt(0)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)

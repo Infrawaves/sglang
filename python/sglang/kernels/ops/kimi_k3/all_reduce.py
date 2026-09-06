@@ -42,6 +42,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -237,6 +238,7 @@ def _pull_norm_op(
     )
 
 
+@debug_kernel_api(op_name="k3.all_reduce_push_res")
 def all_reduce_push_res(
     world_size: int,
     x: torch.Tensor,
@@ -252,6 +254,7 @@ def all_reduce_push_res(
     return x
 
 
+@debug_kernel_api(op_name="k3.all_reduce_push_norm")
 def all_reduce_push_norm(
     world_size: int,
     x: torch.Tensor,
@@ -266,6 +269,7 @@ def all_reduce_push_norm(
     return x
 
 
+@debug_kernel_api(op_name="k3.finalize_all_reduce_push_norm")
 def finalize_all_reduce_push_norm(
     world_size: int,
     out: torch.Tensor,
@@ -294,6 +298,7 @@ def finalize_all_reduce_push_norm(
     return out
 
 
+@debug_kernel_api(op_name="k3.all_reduce_pull_res")
 def all_reduce_pull_res(
     world_size: int,
     x: torch.Tensor,
@@ -323,6 +328,7 @@ def all_reduce_pull_res(
     return x
 
 
+@debug_kernel_api(op_name="k3.all_reduce_pull_norm")
 def all_reduce_pull_norm(
     world_size: int,
     x: torch.Tensor,

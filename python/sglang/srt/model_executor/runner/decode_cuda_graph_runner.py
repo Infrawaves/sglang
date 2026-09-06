@@ -103,6 +103,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.observability.decode_hang import emit as trace_decode_hang
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -1476,6 +1477,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            trace_decode_hang(
+                "graph_replay_submit",
+                raw_bs=forward_batch.batch_size,
+                graph_size=self._replay_graph_key.size,
+                ragged_verify=bool(self.ragged_verify_mode),
+                draft_worker=self.model_runner.is_draft_worker,
+            )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

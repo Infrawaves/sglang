@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability.decode_hang import trace_requests, trace_schedule
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -859,6 +860,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
+            trace_requests("retract_restore_enter", [req])
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
@@ -875,6 +877,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
 
+        trace_requests("retract_restore_return", resumed_reqs)
         self.retracted_queue = [
             entry
             for i, entry in enumerate(self.retracted_queue)
@@ -943,6 +946,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            trace_requests("demotion_restore_enter", [req])
             self._pre_alloc(req)
             retraction_restore(
                 req,
@@ -952,6 +956,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
             req.is_demoted = False
+            trace_requests("demotion_restore_return", [req])
             self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
             indices_to_remove.add(i)
@@ -2673,6 +2678,7 @@ class SchedulerDisaggregationDecodeMixin:
         return GenerationBatchResult()
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @trace_schedule
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
@@ -2871,11 +2877,15 @@ class SchedulerDisaggregationDecodeMixin:
             victim_index = next(
                 i for i, r in enumerate(batch.reqs) if r is victim
             )
+            trace_requests("demotion_backup_enter", [victim])
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
                 self.server_args,
                 is_demoted=True,
+            )
+            trace_requests(
+                "demotion_backup_return", [victim], backup_saved=backup_saved
             )
             if backup_saved:
                 victim.time_stats.set_retract_time()
@@ -2899,6 +2909,7 @@ class SchedulerDisaggregationDecodeMixin:
                     if index != victim_index
                 ]
             )
+            trace_requests("demotion_removed", [victim])
             batch.batch_is_full = False
             self.new_token_ratio_tracker.current = (
                 NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
@@ -2968,4 +2979,5 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
+            trace_requests("transfer_admit", transferred_reqs)
             self.waiting_queue.extend(transferred_reqs)

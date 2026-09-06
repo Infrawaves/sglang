@@ -16,6 +16,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.observability.decode_hang import token_sync_enter, token_sync_return
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -524,7 +525,15 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        sync_enabled = bool(SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars)
+        trace_ticket = token_sync_enter(
+            batch_next_token_ids,
+            self.tp_sync_group,
+            sync_enabled=sync_enabled,
+            env_enabled=SYNC_TOKEN_IDS_ACROSS_TP,
+            has_grammar=bool(sampling_info.grammars),
+        )
+        if sync_enabled:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
@@ -537,6 +546,7 @@ class Sampler(nn.Module):
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
+            token_sync_return(trace_ticket)
 
     def compute_logprobs_only(
         self,

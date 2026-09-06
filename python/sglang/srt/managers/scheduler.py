@@ -281,6 +281,11 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.decode_hang import (
+    trace_process_result,
+    trace_requests,
+    trace_run_batch,
+)
 from sglang.srt.observability.decode_metric_collector import DecodeMetricCollector
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -3748,7 +3753,14 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
+            trace_requests("retract_enter", batch.reqs, forward_iter=batch.forward_iter)
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            trace_requests(
+                "retract_return", retracted_reqs, forward_iter=batch.forward_iter
+            )
+            trace_requests(
+                "retract_abort", reqs_to_abort, forward_iter=batch.forward_iter
+            )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3869,6 +3881,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    @trace_run_batch
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -4213,6 +4226,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_nvtx_method("scheduler.process_batch_result")
+    @trace_process_result
     def process_batch_result(
         self,
         batch: ScheduleBatch,
