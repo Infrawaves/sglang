@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import threading
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -24,6 +25,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.model_loader.weight_mem_pool import maybe_init_weight_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -194,6 +196,7 @@ def build_load_config(
     load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
+    remote_instance_weight_transporter_protocol: Optional[str] = None,
     draft_model_idx: Optional[int],
     weight_cache_mode: str,
     weight_cache_socket: Optional[str],
@@ -219,6 +222,7 @@ def build_load_config(
         remote_instance_weight_loader_backend=get_model().remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
+        remote_instance_weight_loader_transfer_engine_protocol=remote_instance_weight_transporter_protocol,
         modelexpress_url=server_args.modelexpress_url,
         modelexpress_transport=server_args.modelexpress_transport,
         modelopt_config=modelopt_config,
@@ -291,9 +295,20 @@ def load_model_with_memory_saver(
 
     remote_instance_weight_info = None
     startup_weight_load = None
-    with memory_saver_adapter.region(
-        GPU_MEMORY_TYPE_WEIGHTS,
-        enable_cpu_backup=enable_cpu_backup,
+    # Around load_model, not just the allocation: process_weights_after_loading
+    # replaces Parameters outright (mxfp4 rewrites scales and reshuffles
+    # experts), so the tensors a seed registers are post-processing's.
+    weight_mem_pool = maybe_init_weight_mem_pool()
+    with (
+        memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=enable_cpu_backup,
+        ),
+        (
+            torch.cuda.use_mem_pool(weight_mem_pool)
+            if weight_mem_pool is not None
+            else nullcontext()
+        ),
     ):
         loader = get_model_loader(
             load_config=load_config,

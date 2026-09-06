@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -12,17 +14,52 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    INTRA_NVLINK_PROTOCOL,
+    MNNVL_PROTOCOL,
+    NVLINK_PROTOCOLS,
     RemoteInstanceWeightLoaderBackend,
+    get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.model_loader.weight_mem_pool import weight_mem_pool_requested
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     remote_instance_transfer_engine_enabled,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+from sglang.srt.utils.nvlink_fabric_utils import (
+    NvlinkFabricIdentity,
+    get_nvlink_fabric_identity,
+)
 
 logger = logging.getLogger(__name__)
+
+# Weights land in one allocator as a whole, so a handful answers for all of the
+# tens of thousands a model has.
+_VMM_PROBE_SAMPLE = 8
+
+
+@dataclass(slots=True, kw_only=True)
+class _TransportEndpoint:
+    # One engine per transport: initialize() bakes it in.
+    protocol: str
+    engine: Any
+    session_id: str
+    fabric_identity: Optional[NvlinkFabricIdentity] = None
+    weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+
+    def to_payload(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "weights_info_dict": self.weight_info,
+            "protocol": self.protocol,
+            "fabric_identity": (
+                msgspec.structs.asdict(self.fabric_identity)
+                if self.fabric_identity is not None
+                else None
+            ),
+        }
 
 
 @dataclass(slots=True, kw_only=True)
@@ -31,10 +68,45 @@ class RemoteInstanceWeightTransporter:
     tp_rank: int
     gpu_id: int
     is_draft_worker: bool = False
-    engine: Optional[Any] = None
-    session_id: str = ""
-    weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+    endpoints: dict[str, _TransportEndpoint] = field(default_factory=dict)
+    fabric_identity: Optional[NvlinkFabricIdentity] = None
     _nixl_manager: Optional[Any] = None
+
+    @property
+    def engine(self) -> Optional[Any]:
+        endpoint = self._primary_endpoint()
+        return endpoint.engine if endpoint is not None else None
+
+    @property
+    def session_id(self) -> str:
+        endpoint = self._primary_endpoint()
+        return endpoint.session_id if endpoint is not None else ""
+
+    @property
+    def protocol(self) -> Optional[str]:
+        endpoint = self._primary_endpoint()
+        return endpoint.protocol if endpoint is not None else None
+
+    @property
+    def weight_info(self) -> Optional[dict[str, tuple[int, int, int]]]:
+        endpoint = self._primary_endpoint()
+        return endpoint.weight_info if endpoint is not None else None
+
+    @weight_info.setter
+    def weight_info(self, value) -> None:
+        endpoint = self._primary_endpoint()
+        if endpoint is not None:
+            endpoint.weight_info = value
+
+    def _primary_endpoint(self) -> Optional[_TransportEndpoint]:
+        # A seed with several endpoints reports the NIC one, the endpoint every
+        # peer can reach; a client has built exactly one.
+        if not self.endpoints:
+            return None
+        for protocol, endpoint in self.endpoints.items():
+            if protocol not in NVLINK_PROTOCOLS:
+                return endpoint
+        return next(iter(self.endpoints.values()))
 
     @property
     def model(self) -> torch.nn.Module:
@@ -48,11 +120,74 @@ class RemoteInstanceWeightTransporter:
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
             return
-        self.engine = TransferEngine()
+        # Assigned by the driver at boot, so it is fixed for the process.
+        self.fabric_identity = get_nvlink_fabric_identity(self.gpu_id)
+        for protocol in self._protocols_to_serve():
+            endpoint = self._build_endpoint(TransferEngine, protocol)
+            if endpoint is not None:
+                self.endpoints[endpoint.protocol] = endpoint
+
+    def _protocols_to_serve(self) -> tuple[str, ...]:
+        # A client needs the one transport that reaches its seed; a seed cannot
+        # know which clients will arrive, so it serves every one it can.
+        configured = envs.SGLANG_REMOTE_INSTANCE_PROTOCOL.get()
+        if configured:
+            return (configured,)
+        seed_protocol = self._probe_seed_protocol()
+        if seed_protocol is not None:
+            return (seed_protocol,)
+        if self._is_seed():
+            return (*self._servable_nvlink_protocols(), envs.MOONCAKE_PROTOCOL.get())
+        return (envs.MOONCAKE_PROTOCOL.get(),)
+
+    def _is_seed(self) -> bool:
+        # A seed has no seed of its own to point at.
+        return get_model().remote_instance_weight_loader_seed_instance_ip is None
+
+    def _servable_nvlink_protocols(self) -> tuple[str, ...]:
+        # nvlink_intra is CUDA IPC, so only the client knows whether it landed on
+        # this host. MNNVL needs a clique to publish.
+        protocols = []
+        # CUDA IPC cannot export the fabric pool's memory. Read off the knob, not
+        # the weights: endpoints are built before load_model.
+        if not weight_mem_pool_requested():
+            protocols.append(INTRA_NVLINK_PROTOCOL)
+        if self.fabric_identity is not None:
+            protocols.append(MNNVL_PROTOCOL)
+        return tuple(protocols)
+
+    @staticmethod
+    @contextmanager
+    def _mooncake_transport_env(protocol: str):
+        """Make mooncake install ``protocol`` for the engine built inside.
+
+        initialize() takes a protocol but picks the transport from these two
+        variables, so setting them per call is what lets one process hold
+        engines on different transports.
+        """
+        # Mutually exclusive by mooncake's own rule.
+        wanted = (
+            (envs.MC_INTRANODE_NVLINK, protocol == INTRA_NVLINK_PROTOCOL),
+            (envs.MC_FORCE_MNNVL, protocol == MNNVL_PROTOCOL),
+        )
+        saved = [(env, env.is_set(), env.get()) for env, _ in wanted]
+        try:
+            for env, enable in wanted:
+                # Cleared, not set false: mooncake uses getenv, to which the
+                # string "False" is as true as "1".
+                env.set(True) if enable else env.clear()
+            yield
+        finally:
+            for env, was_set, value in saved:
+                env.set(value) if was_set else env.clear()
+
+    def _build_endpoint(
+        self, transfer_engine_cls, protocol: str
+    ) -> Optional[_TransportEndpoint]:
+        engine = transfer_engine_cls()
         local_ip = get_local_ip_auto()
-        # Resolved per rank, not passed through: these accept a
-        # {gpu_id: devices} mapping, which mooncake cannot parse -- it would
-        # fall back to taking every NIC on every rank.
+        # Resolved per rank: these accept a {gpu_id: devices} mapping mooncake
+        # cannot parse, and it would take every NIC on every rank instead.
         configured_device = (
             envs.SGLANG_REMOTE_INSTANCE_IB_DEVICE.get() or envs.MOONCAKE_DEVICE.get()
         )
@@ -65,21 +200,93 @@ class RemoteInstanceWeightTransporter:
                 self.gpu_id,
             )
             ib_device = None
-        self.engine.initialize(
-            local_ip,
-            "P2PHANDSHAKE",
-            envs.MOONCAKE_PROTOCOL.get(),
-            ib_device or "",
-        )
-        self.session_id = NetworkAddress(
-            local_ip, self.engine.get_rpc_port()
-        ).to_host_port_str()
+        try:
+            with self._mooncake_transport_env(protocol):
+                engine.initialize(local_ip, "P2PHANDSHAKE", protocol, ib_device or "")
+        except Exception:
+            # A build without this transport compiled in refuses it here.
+            logger.warning(
+                "Cannot initialize a mooncake TransferEngine on protocol=%s for "
+                "GPU %s; that transport will not be offered.",
+                protocol,
+                self.gpu_id,
+                exc_info=True,
+            )
+            return None
         logger.info(
-            "Remote-instance TransferEngine on GPU %s using ib_device=%r "
-            "(empty means mooncake selects).",
+            "Remote-instance TransferEngine on GPU %s using protocol=%s, "
+            "ib_device=%r (empty means mooncake selects), fabric=%s.",
             self.gpu_id,
+            protocol,
             ib_device or "",
+            self.fabric_identity or "none",
         )
+        return _TransportEndpoint(
+            protocol=protocol,
+            engine=engine,
+            session_id=NetworkAddress(
+                local_ip, engine.get_rpc_port()
+            ).to_host_port_str(),
+            fabric_identity=(
+                self.fabric_identity if protocol in NVLINK_PROTOCOLS else None
+            ),
+        )
+
+    def _probe_seed_protocol(self) -> Optional[str]:
+        # Runs before any engine exists, so it asks over HTTP, not the fabric.
+        seed_ip = get_model().remote_instance_weight_loader_seed_instance_ip
+        seed_port = get_model().remote_instance_weight_loader_seed_instance_service_port
+        if seed_ip is None or seed_port is None:
+            return None
+
+        seed_info = get_remote_instance_transfer_engine_info_per_rank(
+            f"http://{seed_ip}:{seed_port}", self.tp_rank
+        )
+        if seed_info is None or seed_info.protocol is None:
+            return None
+
+        offered = seed_info.offered_protocols()
+        local_host = get_local_ip_auto()
+        # NVLINK_PROTOCOLS is fastest first, so the first reachable one wins.
+        for protocol in NVLINK_PROTOCOLS:
+            if protocol not in offered:
+                continue
+            if (
+                seed_info.endpoint_for(
+                    protocol=protocol,
+                    fabric=self.fabric_identity,
+                    local_host=local_host,
+                )
+                is not None
+            ):
+                logger.info(
+                    "GPU %s reaches its seed over %s; loading weights over "
+                    "NVLink instead of the NIC.",
+                    self.gpu_id,
+                    protocol,
+                )
+                return protocol
+
+        for protocol in offered:
+            if protocol not in NVLINK_PROTOCOLS:
+                logger.info(
+                    "GPU %s cannot reach its seed over NVLink (seed offers %s, "
+                    "this host is %s on fabric %s); loading weights over %s.",
+                    self.gpu_id,
+                    offered,
+                    local_host,
+                    self.fabric_identity or "none",
+                    protocol,
+                )
+                return protocol
+
+        logger.warning(
+            "The seed serves weights only over %s, which GPU %s cannot reach. "
+            "Expect a disk load.",
+            offered,
+            self.gpu_id,
+        )
+        return None
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
@@ -106,9 +313,19 @@ class RemoteInstanceWeightTransporter:
 
     def _register_and_publish_weight_info(self) -> None:
         try:
-            # The seed serves handles out of this registration for the life of
-            # the process, so the blocks are never deregistered here.
-            self.weight_info, _ = register_memory_region(self.model, self.engine)
+            # A fresh thread carries no CUDA context, which the NVLink transports
+            # need: they register through cuMemGetAddressRange and would fail
+            # with CUDA_ERROR_INVALID_CONTEXT (201).
+            torch.cuda.set_device(self.gpu_id)
+            self._register_each_endpoint()
+            self._drop_endpoints_that_registered_nothing()
+            if not self.endpoints:
+                logger.error(
+                    "No transport could register the weights for tp_rank=%s; "
+                    "this instance will not be usable as a remote-instance seed.",
+                    self.tp_rank,
+                )
+                return
             self._register_to_engine_info_bootstrap()
         except Exception:
             logger.exception(
@@ -116,6 +333,96 @@ class RemoteInstanceWeightTransporter:
                 "will not be usable as a remote-instance seed.",
                 self.tp_rank,
             )
+
+    def _register_each_endpoint(self) -> None:
+        """Register the weights with every endpoint, dropping those that refuse.
+
+        One transport's refusal is not the others': CUDA IPC cannot export
+        VMM-backed memory, so a seed on the fabric pool has nvlink_intra fail on
+        the same buffers MNNVL and the NIC accept. Letting that out would leave
+        the instance serving nothing over the transports that work.
+        """
+        for protocol, endpoint in list(self.endpoints.items()):
+            try:
+                # Never deregistered: the seed serves handles out of this for the
+                # life of the process.
+                endpoint.weight_info, blocks = register_memory_region(
+                    self.model, endpoint.engine, protocol=endpoint.protocol
+                )
+            except Exception:
+                del self.endpoints[protocol]
+                logger.warning(
+                    "Not offering %s for tp_rank=%s: registering the weights "
+                    "with it failed.",
+                    protocol,
+                    self.tp_rank,
+                    exc_info=True,
+                )
+                continue
+            if not blocks:
+                # A model always has parameters, so registering none of them means
+                # the walk could not see where they live.
+                del self.endpoints[protocol]
+                logger.error(
+                    "Not offering %s for tp_rank=%s: the weights registered as "
+                    "zero regions, so nothing was published for a client to "
+                    "read.",
+                    protocol,
+                    self.tp_rank,
+                )
+
+    def _drop_endpoints_that_registered_nothing(self) -> None:
+        """Stop offering MNNVL when its registration cannot have taken.
+
+        See weight_mem_pool.py for why mooncake reports success there without
+        registering anything. Offering the endpoint anyway costs every client a
+        full handshake, registration and transfer before it reads `Requested
+        address ... not found!` and disk-loads.
+        """
+        if MNNVL_PROTOCOL not in self.endpoints:
+            return
+        if self._weights_are_vmm_backed() is not False:
+            return
+        del self.endpoints[MNNVL_PROTOCOL]
+        logger.error(
+            "Not offering %s for tp_rank=%s: the weights are not "
+            "cuMemCreate-backed, so mooncake registered no fabric handle for "
+            "them (its own log says 'not allocated by cuMemCreate'). Serving "
+            "%s instead. Set SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL=NVLINK to "
+            "allocate the weights from a fabric-capable pool.",
+            MNNVL_PROTOCOL,
+            self.tp_rank,
+            tuple(self.endpoints) or "nothing",
+        )
+
+    def _weights_are_vmm_backed(self) -> Optional[bool]:
+        """Whether the weights came from cuMemCreate. None when unprobeable.
+
+        Unprobeable is not a failure: missing driver bindings say nothing about
+        what mooncake's own registration managed, so the caller keeps the
+        endpoint rather than dropping one that works.
+        """
+        try:
+            from sglang.srt.utils.cuda_vmm_utils import is_vmm_pointer
+        except ImportError:
+            logger.debug("No CUDA VMM bindings; cannot probe the weight allocator.")
+            return None
+
+        probed = 0
+        try:
+            # remove_duplicate=False to match the set register_memory_region walks.
+            for _, weight in self.model.named_parameters(remove_duplicate=False):
+                if weight.numel() == 0:
+                    continue
+                if not is_vmm_pointer(weight.data_ptr()):
+                    return False
+                probed += 1
+                if probed >= _VMM_PROBE_SAMPLE:
+                    break
+        except Exception:
+            logger.debug("Weight allocator probe raised.", exc_info=True)
+            return None
+        return True if probed else None
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
@@ -138,13 +445,19 @@ class RemoteInstanceWeightTransporter:
         bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
-        payload = {
-            "tp_rank": self.tp_rank,
-            "transfer_engine_info": {
-                "session_id": self.session_id,
-                "weights_info_dict": self.weight_info,
-            },
-        }
+        # The NIC endpoint is primary, so a client too old to read "alternates"
+        # still lands on one it can reach.
+        primary = self._primary_endpoint()
+        if primary is None:
+            logger.error("No transfer engine to publish for tp_rank=%s.", self.tp_rank)
+            return
+        info = primary.to_payload()
+        info["alternates"] = [
+            endpoint.to_payload()
+            for protocol, endpoint in self.endpoints.items()
+            if protocol != primary.protocol
+        ]
+        payload = {"tp_rank": self.tp_rank, "transfer_engine_info": info}
 
         try:
             resp = http_requests.put(url, json=payload, timeout=5)

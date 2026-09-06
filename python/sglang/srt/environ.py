@@ -296,10 +296,8 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
-    # Release the reader's RDMA registration once a remote-instance load is
-    # done: it is dead weight afterwards and charged against the KV pool, which
-    # sizes itself off the memory left after the weights. Unregistering scales
-    # with the NIC count the same way registering does (~0.7s over 4 NICs).
+    # Overrides whether the reader frees its registration. Unset, the transport
+    # decides (see deregister_memory_region).
     SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE = EnvBool(True)
     # HCAs for remote-instance weight transfers, same formats MOONCAKE_DEVICE
     # takes and falling back to it when unset. Separate because mooncake store
@@ -310,6 +308,13 @@ class Envs:
     # unreachable. "auto" unless set; --load-format is already spoken for by
     # remote_instance, so there is nowhere else to say it.
     SGLANG_REMOTE_INSTANCE_FALLBACK_LOAD_FORMAT = EnvStr(None)
+    # Pins the mooncake transport for remote-instance weight transfers, falling
+    # back to MOONCAKE_PROTOCOL. Unset, each client picks per seed.
+    SGLANG_REMOTE_INSTANCE_PROTOCOL = EnvStr(None)
+    # "NVLINK" allocates the weights from a fabric-capable pool so MNNVL can
+    # serve them, and raises at startup when that pool is unavailable. See
+    # weight_mem_pool.py.
+    SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL = EnvStr(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
@@ -760,6 +765,11 @@ class Envs:
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
     MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
+    # mooncake reads these at each initialize() to pick a TransferEngine's
+    # transport, ignoring the protocol argument. sglang sets them per call so one
+    # seed can serve NVLink and the NIC at once, then restores them.
+    MC_INTRANODE_NVLINK = EnvBool(False)
+    MC_FORCE_MNNVL = EnvBool(False)
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
