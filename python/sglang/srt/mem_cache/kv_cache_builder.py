@@ -336,17 +336,17 @@ def build_kv_cache(
     )
 
     if (
-        enable_hierarchical_cache or retraction_backup == "host_pool"
+        enable_hierarchical_cache or retraction_backup in ("host_pool", "ssd")
     ) and hicache_draft_plan is not None:
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
         )
 
-    if retraction_backup == "host_pool":
+    if retraction_backup in ("host_pool", "ssd"):
         if not isinstance(tree_cache, UnifiedRadixCache):
             raise ValueError(
-                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "--disaggregation-decode-retraction-backup host_pool/ssd requires "
                 "UnifiedRadixCache with HiCache attached."
             )
         tree_cache.validate_retraction_host_capacity()

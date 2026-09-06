@@ -601,7 +601,10 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        if self.enable_hierarchical_cache:
+        if (
+            self.enable_hierarchical_cache
+            or get_disagg().disaggregation_decode_retraction_backup == "ssd"
+        ):
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
@@ -1521,11 +1524,24 @@ class Scheduler(
             )
             if get_disagg().enable_proactive_decode_demotion:
                 self.decode_metric_collector = DecodeMetricCollector()
-                # Fixed demotion CPU offload budget in tokens
-                self.remain_cpu_demote_tokens = int(
-                    self.server_args.proactive_safe_cpu_demote_cache_usage
-                    * self.max_total_num_tokens
-                )
+                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
+                    # SSD backups use the shared HiCache L2 as bounded staging.
+                    # L3 capacity is not part of the admission budget because
+                    # L2 must hold each request until its D2H copy is complete.
+                    host_pool_group = getattr(
+                        self.tree_cache, "host_pool_group", None
+                    )
+                    self.remain_cpu_demote_tokens = (
+                        host_pool_group.logical_size
+                        if host_pool_group is not None
+                        else 0
+                    )
+                else:
+                    # Fixed demotion CPU offload budget in tokens
+                    self.remain_cpu_demote_tokens = int(
+                        self.server_args.proactive_safe_cpu_demote_cache_usage
+                        * self.max_total_num_tokens
+                    )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -4710,6 +4726,10 @@ class Scheduler(
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
+                    idle &= not getattr(
+                        self.tree_cache, "retraction_ssd_backups", {}
+                    )
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -5222,7 +5242,11 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        self.remain_cpu_demote_tokens += entry.demoted_tokens
+                        if (
+                            get_disagg().disaggregation_decode_retraction_backup
+                            != "ssd"
+                        ):
+                            self.remain_cpu_demote_tokens += entry.demoted_tokens
                         self.ipc_channels.send_to_tokenizer.send_output(
                             _make_abort_req(req), req
                         )

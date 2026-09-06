@@ -37,6 +37,11 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # SSD retraction metadata.  The host indices remain owned by the backup
+    # until the storage acknowledgement is drained by the scheduler.
+    storage_operation_id: Optional[int] = None
+    storage_hashes: Optional[list[str]] = None
+    storage_state: str = "L2_READY"
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -201,18 +206,20 @@ def retraction_backup(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Preserve retracted KV, returning False when the selected tier cannot stage it."""
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
-    if backend != "host_pool":
+    if backend not in ("host_pool", "ssd"):
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    if backend == "ssd":
+        req.kv.retraction_backup = unified_cache.retraction_backup_ssd(req)
+    elif backend == "host_pool":
+        req.kv.retraction_backup = unified_cache.retraction_backup(req)
     return req.kv.retraction_backup is not None
 
 
@@ -226,19 +233,29 @@ def retraction_restore(
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return
-    if backend != "host_pool":
+    if backend not in ("host_pool", "ssd"):
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    if backend == "ssd":
+        unified_cache.retraction_restore_ssd(req, req.kv.retraction_backup)
+    elif backend == "host_pool":
+        unified_cache.retraction_restore(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
     if backend == "cpu_tensor":
+        req.kv.retraction_backup = None
+        return
+    if backend == "ssd":
+        if req.kv.retraction_backup is None:
+            return
+        unified_cache = cast("UnifiedRadixCache", tree_cache)
+        unified_cache.retraction_discard_ssd(req.kv.retraction_backup)
         req.kv.retraction_backup = None
         return
     if backend != "host_pool":
