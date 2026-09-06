@@ -1489,6 +1489,24 @@ class TestHiCacheArgs(unittest.TestCase):
 
         handle_cache_compatibility(args)
 
+    def test_ssd_retraction_requires_storage_and_accepts_cache_mode(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+            hicache_storage_backend="file",
+            hicache_host_memory_mode="cache",
+        )
+        handle_cache_compatibility(args)
+        handle_hicache(args)
+
+    def test_ssd_retraction_rejects_missing_storage(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*hicache-storage-backend"):
+            handle_cache_compatibility(args)
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

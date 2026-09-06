@@ -42,7 +42,8 @@ def handle_hicache(server_args: Any):
         or cfg.disaggregation_decode_enable_offload_kvcache
         or (
             cfg.disaggregation_mode == "decode"
-            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+            and cfg.disaggregation_decode_retraction_backup
+            in (None, "host_pool", "ssd")
         )
     ):
         return
@@ -200,6 +201,17 @@ def validate_hicache_host_memory_mode(server_args: Any):
         )
 
     if cfg.hicache_host_memory_mode == "cache":
+        if cfg.disaggregation_decode_retraction_backup == "ssd":
+            if cfg.hicache_storage_backend is None:
+                raise ValueError(
+                    "--disaggregation-decode-retraction-backup=ssd requires "
+                    "--hicache-storage-backend."
+                )
+            if cfg.disaggregation_mode != "decode":
+                raise ValueError(
+                    "--disaggregation-decode-retraction-backup=ssd is only "
+                    "supported on a PD decode server."
+                )
         return
 
     if cfg.hicache_storage_backend is None:

@@ -91,9 +91,11 @@ class Disagg:
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+                "'ssd' uses the shared HiCache L2 pool as asynchronous staging "
+                "and persists the backup through the configured L3 storage backend. "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool"],
+            choices=["cpu_tensor", "host_pool", "ssd"],
         ),
     ] = None
     enable_proactive_decode_demotion: A[
