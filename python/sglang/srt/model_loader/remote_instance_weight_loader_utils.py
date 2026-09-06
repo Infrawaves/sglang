@@ -5,15 +5,31 @@ import importlib
 import importlib.util
 import logging
 import time
-from typing import List
+from typing import List, Optional
 
+import msgspec
 import requests
 
+from sglang.srt.environ import envs
+from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvlink_fabric_utils import NvlinkFabricIdentity
+
 logger = logging.getLogger(__name__)
+
+# Mooncake transport names. "nvlink" is MNNVL, reaching one fabric clique;
+# "nvlink_intra" is CUDA IPC, reaching one host.
+MNNVL_PROTOCOL = "nvlink"
+INTRA_NVLINK_PROTOCOL = "nvlink_intra"
+# Fastest first, which is also fewest peers first.
+NVLINK_PROTOCOLS = (INTRA_NVLINK_PROTOCOL, MNNVL_PROTOCOL)
 
 # Arbitrary; enough for the ranks unregistering concurrently to drain.
 _DEREGISTER_MAX_ATTEMPTS = 5
 _DEREGISTER_BACKOFF_S = 0.5
+# mooncake's ERR_ADDRESS_NOT_REGISTERED. Its batch unregister returns the first
+# error even after freeing most of the list, and the addresses it did free answer
+# a retry with this -- they are done, not stuck.
+_MOONCAKE_ERR_ADDRESS_NOT_REGISTERED = -3
 
 
 def _iter_manifest_parameters(model):
@@ -95,7 +111,64 @@ def trigger_transferring_weights_request(
         raise
 
 
-def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
+class SeedTransferEngineInfo(msgspec.Struct, frozen=True):
+    # protocol and fabric_identity are None when the seed predates them; the
+    # client then assumes the seed matches its own configured transport.
+    session_id: str
+    weights_info_dict: dict
+    protocol: Optional[str] = None
+    fabric_identity: Optional[NvlinkFabricIdentity] = None
+    # Other endpoints for the same weights. The primary above stays the NIC one,
+    # which is where a client too old to read this field lands.
+    alternates: tuple["SeedTransferEngineInfo", ...] = ()
+
+    def endpoint_for(
+        self,
+        *,
+        protocol: str,
+        fabric: Optional[NvlinkFabricIdentity] = None,
+        local_host: Optional[str] = None,
+    ) -> Optional["SeedTransferEngineInfo"]:
+        # Each NVLink transport is gated on a different thing: CUDA IPC on the
+        # peer being on this host, a fabric handle on it being in this clique.
+        # The NIC routes anywhere, so it is gated on neither.
+        for endpoint in (self, *self.alternates):
+            if endpoint.protocol is None:
+                # A seed older than this field never offered NVLink.
+                if protocol in NVLINK_PROTOCOLS:
+                    continue
+            elif endpoint.protocol != protocol:
+                continue
+            if protocol == MNNVL_PROTOCOL and endpoint.fabric_identity != fabric:
+                continue
+            if protocol == INTRA_NVLINK_PROTOCOL and not endpoint.is_on_host(
+                local_host
+            ):
+                continue
+            return endpoint
+        return None
+
+    def is_on_host(self, host: Optional[str]) -> bool:
+        # The session id is the seed's own host:port, so no second round trip.
+        if host is None:
+            return False
+        try:
+            return NetworkAddress.parse(self.session_id).host == host
+        except ValueError:
+            logger.warning(
+                "Cannot read a host out of seed session id %r.", self.session_id
+            )
+            return False
+
+    def offered_protocols(self) -> tuple[str, ...]:
+        return tuple(
+            e.protocol for e in (self, *self.alternates) if e.protocol is not None
+        )
+
+
+def get_remote_instance_transfer_engine_info_per_rank(
+    seed_url: str, rank: int
+) -> Optional[SeedTransferEngineInfo]:
     try:
         response = requests.get(
             f"{seed_url}/get_remote_instance_transfer_engine_info",
@@ -104,36 +177,231 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
             },
         )
 
-        if response.status_code == 200:
-            data = response.json()
-
-            if "remote_instance_transfer_engine_info" in data:
-                return data["remote_instance_transfer_engine_info"]
-            else:
-                logger.error(
-                    "Failed to get `remote_instance_transfer_engine_info` in response."
-                )
-                return None, None
-        else:
+        if response.status_code != 200:
             logger.error(f"request.get failed: {response.status_code}")
-            return None, None
+            return None
+
+        data = response.json()
+        if "remote_instance_transfer_engine_info" not in data:
+            logger.error(
+                "Failed to get `remote_instance_transfer_engine_info` in response."
+            )
+            return None
+
+        return _parse_seed_transfer_engine_info(
+            data["remote_instance_transfer_engine_info"]
+        )
     except Exception as e:
         logger.error(f"Exception: {e}")
-        return None, None
+        return None
 
 
-def register_memory_region(model, transfer_engine):
+def _parse_seed_transfer_engine_info(raw) -> Optional[SeedTransferEngineInfo]:
+    # A positional list, only ever appended to, so a client can be newer than
+    # the seed it reads.
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+        logger.error("Malformed transfer engine info from the seed: %r", raw)
+        return None
+    session_id, weights_info_dict = raw[0], raw[1]
+    if session_id is None or weights_info_dict is None:
+        return None
+    protocol = raw[2] if len(raw) > 2 else None
+    fabric = raw[3] if len(raw) > 3 else None
+    alternates = raw[4] if len(raw) > 4 else None
+    return SeedTransferEngineInfo(
+        session_id=session_id,
+        weights_info_dict=weights_info_dict,
+        protocol=protocol,
+        fabric_identity=(
+            msgspec.convert(fabric, NvlinkFabricIdentity) if fabric else None
+        ),
+        alternates=_parse_alternates(alternates),
+    )
+
+
+def _parse_alternates(raw) -> tuple[SeedTransferEngineInfo, ...]:
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    parsed = []
+    for entry in raw:
+        # Leaves only: nesting would let a malformed payload recurse.
+        endpoint = _parse_seed_transfer_engine_info(entry[:4] if entry else entry)
+        if endpoint is not None:
+            parsed.append(endpoint)
+    return tuple(parsed)
+
+
+def _registration_frees_no_memory(protocol: Optional[str]) -> bool:
+    # ibv_reg_mr pins pages; an NVLink registration is a metadata entry for
+    # memory the model already owns.
+    if protocol is None:
+        protocol = (
+            envs.SGLANG_REMOTE_INSTANCE_PROTOCOL.get() or envs.MOONCAKE_PROTOCOL.get()
+        )
+    return protocol in NVLINK_PROTOCOLS
+
+
+def _registration_failure_hint() -> str:
+    # The mooncake-side cause only reaches its stderr glog.
+    protocol = (
+        envs.SGLANG_REMOTE_INSTANCE_PROTOCOL.get() or envs.MOONCAKE_PROTOCOL.get()
+    )
+    if protocol not in NVLINK_PROTOCOLS:
+        return ""
+    return (
+        f" The transport is mooncake protocol={protocol!r}, whose registration "
+        "goes through the CUDA driver API and needs a current context on the "
+        "calling thread; a mooncake log line reading "
+        "'cuMemGetAddressRange failed ... (error 201)' means it had none."
+    )
+
+
+def register_memory_region(model, transfer_engine, protocol: Optional[str] = None):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
-    else:
-        return register_memory_region_v2(model, transfer_engine)
+    # Keyed on where the weights live, not on the transport: the snapshot walk
+    # would register nothing for a custom pool, for the NIC as much as for MNNVL.
+    vmm = register_memory_region_vmm(model, transfer_engine, protocol=protocol)
+    if vmm is not None:
+        return vmm
+    return register_memory_region_v2(model, transfer_engine)
 
 
-def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
-    """Release the RDMA registration of the given blocks.
+def register_memory_region_vmm(model, transfer_engine, protocol: Optional[str] = None):
+    """Register one region per VMM allocation the weights live in.
+
+    Returns None only when no fabric pool was asked for, leaving the caller on
+    the snapshot walk that suits the caching allocator. Once the pool is
+    requested every weight has to have come from it, so anything else raises:
+    the snapshot walk cannot see pool memory, and falling back to it would
+    register a fraction of the weights while the manifest still covers all of
+    them -- the client would then read addresses nobody registered.
+
+    MNNVL also needs the deduplication: it registers the *enclosing* allocation
+    (widening to ``cuMemGetAddressRange``) while ``addLocalMemoryBuffer`` appends
+    without deduplicating, so every block inside one allocation would publish
+    another identical descriptor, and all of them go over the wire.
+    """
+    from sglang.srt.model_loader.weight_mem_pool import weight_mem_pool_requested
+    from sglang.srt.utils.cuda_vmm_utils import is_vmm_pointer
+
+    # Probing costs a driver call per weight, which the common path never needs.
+    if not weight_mem_pool_requested():
+        return None
+
+    start_tic = time.time()
+
+    weight_mr_dict = {}
+    spans = []
+    for name, weight in _iter_manifest_parameters(model):
+        weight_mr_dict[name] = (
+            weight.data_ptr(),
+            weight.numel(),
+            weight.element_size(),
+        )
+        nbytes = weight.numel() * weight.element_size()
+        if nbytes:
+            spans.append((weight.data_ptr(), nbytes))
+
+    if not spans:
+        return None
+
+    # Every span, not just the first: a model only partly drawn from the pool
+    # means some path allocated around ``use_mem_pool``.
+    off_pool = sum(1 for ptr, _ in spans if not is_vmm_pointer(ptr))
+    if off_pool:
+        raise RuntimeError(
+            f"{off_pool} of {len(spans)} weights are not backed by "
+            f"cuMemCreate even though "
+            f"SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL="
+            f"{envs.SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL.get()!r} asked for "
+            "a fabric pool. Registering only the pooled ones would publish a "
+            "manifest the client reads in full, including addresses nobody "
+            "registered. Unset the variable to load over the NIC instead."
+        )
+
+    # Deliberately uncaught: see the docstring on why falling back is worse.
+    bases = _unique_allocation_bases(spans)
+
+    # cuMemGetAddressRange resolves cudaMalloc allocations too, so it cannot
+    # tell the allocators apart, and mooncake reports registering an
+    # un-exportable one as success.
+    if not all(is_vmm_pointer(base) for base, _ in bases):
+        raise RuntimeError(
+            "The weights' allocations span both a custom pool and the caching "
+            "allocator; registering only part of them would publish bytes no "
+            "client can read."
+        )
+
+    registered_blocks = []
+    try:
+        for base, size in bases:
+            ret = transfer_engine.register_memory(base, size)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for weight allocation at address "
+                    f"{base} with size {size}, error: {ret}."
+                    f"{_registration_failure_hint()}"
+                )
+            registered_blocks.append((base, size))
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial registration
+        # would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks, protocol=protocol)
+        raise
+
+    logger.debug(
+        "Register memory region vmm time: %.4fs over %d allocation(s) holding "
+        "%d weight(s).",
+        time.time() - start_tic,
+        len(registered_blocks),
+        len(weight_mr_dict),
+    )
+    return weight_mr_dict, registered_blocks
+
+
+def _unique_allocation_bases(spans):
+    """Map ``(ptr, nbytes)`` spans onto the allocations backing them.
+
+    A weight can straddle allocations when the pool grew, so each span is walked
+    until its bytes are covered, the same way the graph-capture path does it.
+    """
+    from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver
+
+    drv = _get_cuda_driver()
+    seen = set()
+    bases = []
+    for ptr, nbytes in spans:
+        cursor, remaining = int(ptr), int(nbytes)
+        while remaining > 0:
+            err, base, size = drv.cuMemGetAddressRange(cursor)
+            if err != drv.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemGetAddressRange({cursor}): {err}")
+            base, size = int(base), int(size)
+            offset = cursor - base
+            if not 0 <= offset < size:
+                raise RuntimeError(
+                    f"weight at {ptr} is outside its allocation "
+                    f"[base={base}, size={size}]"
+                )
+            if base not in seen:
+                seen.add(base)
+                bases.append((base, size))
+            # Always at least 1, so the walk terminates.
+            advance = min(remaining, size - offset)
+            remaining -= advance
+            cursor += advance
+    return bases
+
+
+def deregister_memory_region(
+    transfer_engine, registered_blocks, protocol: Optional[str] = None
+) -> bool:
+    """Release the reader's registration of the given blocks.
 
     Reader side only: the seed keeps its registration, that is what it serves
-    handles from.
+    handles from. ``protocol`` is the transport the engine was built with; it
+    decides whether releasing reclaims anything at all.
     """
     if not registered_blocks:
         return True
@@ -141,16 +409,27 @@ def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
     try:
         if transfer_engine.batch_unregister_memory(addresses) == 0:
             return True
-        logger.warning("Batch deregistration failed; retrying block by block.")
     except Exception as e:
         # EAGAIN when the batch call fans out over too many blocks at once, and
         # AttributeError on mooncake builds without the batch entry point.
-        logger.warning("Batch deregistration raised (%s); retrying block by block.", e)
+        logger.debug("Batch deregistration raised (%s).", e)
 
-    # The pinned pages stay resident until this succeeds -- a caller falling
-    # back to disk has no room to load into while they do. EAGAIN here is the
-    # driver being busy, not a permanent refusal: every rank on the host is
-    # unregistering at once, so back off and retry the stragglers.
+    if _registration_frees_no_memory(protocol):
+        # NVLink tracks a registration by cudaMalloc segment base while these
+        # blocks are per-tensor, so the retry below would fail for seconds.
+        logger.debug(
+            "Leaving %d NVLink weight registrations in place; they hold no "
+            "memory to reclaim.",
+            len(addresses),
+        )
+        return True
+
+    # Retrying pays off only while it makes progress: a driver busy with the other
+    # ranks clears, a permanent refusal does not.
+    logger.debug(
+        "Batch deregistration reported an error; sweeping the %d region(s).",
+        len(addresses),
+    )
     pending = addresses
     for attempt in range(_DEREGISTER_MAX_ATTEMPTS):
         if attempt:
@@ -158,12 +437,15 @@ def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
         failed = []
         for address in pending:
             try:
-                if transfer_engine.unregister_memory(address) != 0:
-                    failed.append(address)
+                ret = transfer_engine.unregister_memory(address)
             except Exception:
+                failed.append(address)
+                continue
+            if ret != 0 and ret != _MOONCAKE_ERR_ADDRESS_NOT_REGISTERED:
                 failed.append(address)
         if not failed:
             return True
+        stalled = len(failed) == len(pending)
         logger.warning(
             "%d of %d weight memory regions still pinned after attempt %d.",
             len(failed),
@@ -171,10 +453,18 @@ def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
             attempt + 1,
         )
         pending = failed
+        if stalled:
+            logger.warning(
+                "Attempt %d freed none of them, so the remaining addresses are "
+                "being refused rather than deferred; not retrying.",
+                attempt + 1,
+            )
+            break
 
     logger.error(
         "Failed to deregister %d of %d weight memory regions; that memory "
-        "stays pinned for the life of the process.",
+        "stays pinned for the life of the process, and the KV pool sizes "
+        "itself around it.",
         len(pending),
         len(addresses),
     )
@@ -197,7 +487,8 @@ def register_memory_region_v1(model, transfer_engine):
                 ret = transfer_engine.register_memory(weight.data_ptr(), size)
                 if ret != 0:
                     raise RuntimeError(
-                        f"register memory failed for weight {name}, error: {ret}"
+                        f"register memory failed for weight {name}, error: {ret}."
+                        f"{_registration_failure_hint()}"
                     )
                 seen_blocks.add(block)
                 registered_blocks.append(block)
@@ -269,7 +560,9 @@ def register_memory_region_v2(model, transfer_engine):
             ret = transfer_engine.register_memory(address, size)
             if ret != 0:
                 raise RuntimeError(
-                    f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
+                    f"register memory failed for weight block at address "
+                    f"{address} with size {size}, error: {ret}."
+                    f"{_registration_failure_hint()}"
                 )
             registered_blocks.append(weight_block)
     except BaseException:
