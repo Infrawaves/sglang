@@ -8,6 +8,7 @@ from sglang.srt.managers.cache_controller import HiCacheController, StorageOpera
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     RetractionStorageState,
+    release_kv_cache,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -178,6 +179,77 @@ class TestRetractionRestoreAdmission(CustomTestCase):
                 self._req(backup)
             )
         )
+
+
+class TestRetractionL3Lifetime(CustomTestCase):
+    """L3 objects outlive resume and are deleted once, at the terminal release."""
+
+    def _make_cache(self, *, backup_skip=False):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        # enable_storage is a property forwarding to tree_core.
+        cache.tree_core = SimpleNamespace(enable_storage=True)
+        cache.cache_controller = SimpleNamespace(
+            backup_skip=backup_skip,
+            should_backup=lambda transfer: True,
+            storage_backend=MagicMock(),
+        )
+        return cache
+
+    def test_keys_accumulate_across_demotions_and_release_once(self):
+        """A re-demotion rewrites only its tail plus the earlier partial last
+        page; the union of both cycles must go to the backend in one delete."""
+        cache = self._make_cache()
+        req = SimpleNamespace(kv=SimpleNamespace(retraction_l3_keys=None))
+        first = RetractionBackup(
+            storage_hashes=["p0", "p1_partial"],
+            pool_transfers=[PoolTransfer(name=PoolName.SWA, keys=["p1_partial"])],
+        )
+        second = RetractionBackup(
+            storage_hashes=["p0", "p1", "p2"],
+            pool_transfers=[PoolTransfer(name=PoolName.SWA, keys=["p2"])],
+        )
+        cache._record_retraction_l3(req, first)
+        cache._record_retraction_l3(req, second)
+        cache.release_retraction_l3(req)
+
+        remove = cache.cache_controller.storage_backend.batch_remove_v2
+        (transfers,), _ = remove.call_args
+        by_pool = {transfer.name: transfer.keys for transfer in transfers}
+        self.assertEqual(by_pool[PoolName.KV], ["p0", "p1", "p1_partial", "p2"])
+        self.assertEqual(by_pool[PoolName.SWA], ["p1_partial", "p2"])
+        self.assertIsNone(req.kv.retraction_l3_keys)
+        cache.release_retraction_l3(req)
+        remove.assert_called_once()
+
+    def test_non_writer_rank_records_no_primary_keys(self):
+        """Replicated MLA KV is written by TP0 only; another rank deleting it
+        would race TP0's own restore read."""
+        cache = self._make_cache(backup_skip=True)
+        req = SimpleNamespace(kv=SimpleNamespace(retraction_l3_keys=None))
+        cache._record_retraction_l3(req, RetractionBackup(storage_hashes=["p0"]))
+        self.assertEqual(req.kv.retraction_l3_keys, {})
+
+    def test_release_kv_cache_drops_l3_only_on_terminal_release(self):
+        """A retraction sets retraction_backup before it releases device KV, so
+        a release without one is the request's end and the only delete point."""
+        tree_cache = MagicMock()
+        kv = SimpleNamespace(
+            holds_kv=False,
+            is_kv_released=True,
+            holds_mamba=False,
+            retraction_l3_keys={PoolName.KV: {"p0"}},
+            retraction_backup=RetractionBackup(),
+        )
+        req = SimpleNamespace(kv=kv)
+
+        release_kv_cache(req, tree_cache, is_insert=False)
+        tree_cache.release_retraction_l3.assert_not_called()
+
+        kv.retraction_backup = None
+        release_kv_cache(req, tree_cache)
+        tree_cache.release_retraction_l3.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

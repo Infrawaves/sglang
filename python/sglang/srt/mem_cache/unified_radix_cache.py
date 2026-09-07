@@ -1487,6 +1487,7 @@ class UnifiedRadixCache(BasePrefixCache):
         backup.storage_state = RetractionStorageState.L3_WRITE_PENDING
         self.retraction_ssd_backups[operation_id] = backup
         self.retraction_ssd_requests[operation_id] = req
+        self._record_retraction_l3(req, backup)
         return backup
 
     def get_retraction_ssd_backup(
@@ -1597,38 +1598,35 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             backup.storage_state = RetractionStorageState.RELEASED
 
-    def _delete_retraction_l3(self, backup: RetractionBackup) -> None:
-        """Drop this request's hard-pinned L3 objects."""
-        if (
-            not backup.storage_hashes
-            or self.cache_controller is None
-            or not self.enable_storage
-        ):
-            backup.storage_hashes = None
-            return
+    def _record_retraction_l3(self, req: Req, backup: RetractionBackup) -> None:
         cc = self.cache_controller
-        transfers: list[PoolTransfer] = []
-        if not cc.backup_skip:
-            transfers.append(
-                PoolTransfer(name=PoolName.KV, keys=list(backup.storage_hashes))
-            )
+        record = req.kv.retraction_l3_keys
+        if record is None:
+            record = req.kv.retraction_l3_keys = {}
+        if not cc.backup_skip and backup.storage_hashes:
+            record.setdefault(PoolName.KV, set()).update(backup.storage_hashes)
         for transfer in backup.pool_transfers or []:
             if transfer.keys and cc.should_backup(transfer):
-                transfers.append(
-                    PoolTransfer(
-                        name=transfer.name,
-                        keys=list(transfer.keys),
-                        indices_from_pool=transfer.indices_from_pool,
-                    )
-                )
-        if transfers:
-            try:
-                cc.storage_backend.batch_remove_v2(transfers)
-            except Exception:
-                logger.exception(
-                    "SSD retraction L3 cleanup failed; objects stay hard-pinned"
-                )
-        backup.storage_hashes = None
+                record.setdefault(transfer.name, set()).update(transfer.keys)
+
+    def release_retraction_l3(self, req: Req) -> None:
+        record = req.kv.retraction_l3_keys
+        req.kv.retraction_l3_keys = None
+        if not record or self.cache_controller is None or not self.enable_storage:
+            return
+        transfers = [
+            PoolTransfer(name=name, keys=sorted(keys))
+            for name, keys in record.items()
+            if keys
+        ]
+        if not transfers:
+            return
+        try:
+            self.cache_controller.storage_backend.batch_remove_v2(transfers)
+        except Exception:
+            logger.exception(
+                "SSD retraction L3 cleanup failed; objects stay hard-pinned"
+            )
 
     def _finish_retraction_ssd_backup(self, operation_id: int, success: bool) -> None:
         """Consume an L3 acknowledgement and release L2 only on success."""
@@ -1643,7 +1641,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 return
             self._release_retraction_l2(backup)
-            self._delete_retraction_l3(backup)
+            req = self.retraction_ssd_requests.get(operation_id)
+            if req is not None:
+                self.release_retraction_l3(req)
             self.retraction_ssd_backups.pop(operation_id, None)
             self.retraction_ssd_requests.pop(operation_id, None)
             return
@@ -1731,8 +1731,6 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if backup.host_indices is not None:
             self.retraction_restore(req, backup)
-            # A failed or never-started L3 write may still have landed pages.
-            self._delete_retraction_l3(backup)
             backup.storage_state = RetractionStorageState.RELEASED
             if backup.storage_operation_id is not None:
                 self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
@@ -1830,7 +1828,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_state=RetractionStorageState.L2_READY,
         )
         self.retraction_restore(req, staged)
-        self._delete_retraction_l3(backup)
+        # The L3 objects outlive this resume: see _record_retraction_l3.
         backup.storage_state = RetractionStorageState.RELEASED
         if backup.storage_operation_id is not None:
             self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
@@ -1849,7 +1847,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if backup.storage_state == RetractionStorageState.DISCARD_PENDING:
                 return
         self._release_retraction_l2(backup)
-        self._delete_retraction_l3(backup)
         backup.storage_state = RetractionStorageState.RELEASED
         if backup.storage_operation_id is not None:
             self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
