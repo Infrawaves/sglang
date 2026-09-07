@@ -865,6 +865,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Checked before _pre_alloc so a refusal leaves no device state.
                 continue
 
+            # No mamba budget here: the decode pool sizes mamba slots to at least
+            # the request rows and each request holds exactly one, so this row
+            # check already covers the slot _pre_alloc will take.
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -958,6 +961,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # L3 write still in flight, or no L2 staging even after reclaim.
                 # Checked before _pre_alloc so a refusal leaves no device state.
                 continue
+            # No mamba budget here: the decode pool sizes mamba slots to at least
+            # the request rows and each request holds exactly one, so this row
+            # check already covers the slot _pre_alloc will take.
             if available_req_slots <= 0:
                 break
 
