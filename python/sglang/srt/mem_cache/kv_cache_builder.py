@@ -200,6 +200,10 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
         )
+        # temporarily only support Kimi-K3, not validated on other model
+        supports_host_pool = supports_host_pool or (
+            isinstance(kv_cache, HybridLinearKVPool) and not tp_worker.is_hybrid_swa
+        )
         # TODO(zhangmj): maintain host_pool for priority scheduling, but need
         # to disable when disable hicache.
         backend = (
