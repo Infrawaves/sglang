@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     StorageOperation as HybridStorageOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1160,10 +1160,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_retraction_backup(self) -> bool:
         if self.cache_controller is None or self.host_pool_group is None:
             return False
-        if self.supports_mamba():
-            return False
-
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if self.supports_mamba():
+            return (
+                isinstance(kv_cache, HybridLinearKVPool)
+                and not self.supports_swa()
+                and {
+                    PoolName.KV,
+                    PoolName.MAMBA,
+                }
+                <= self.host_pool_group.entry_map.keys()
+            )
+
         if isinstance(kv_cache, SWAKVPool):
             return (
                 self.supports_swa()
@@ -1260,6 +1268,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     device_indices=self._pad_retraction_indices(
                         swa_indices, self.page_size
                     ),
+                )
+            ]
+
+        if self.supports_mamba():
+            assert req.kv.holds_mamba, f"retraction of {req.rid} without a mamba slot"
+            component_transfers[ComponentType.MAMBA] = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    device_indices=req.kv.mamba_pool_idx.unsqueeze(0).to(torch.int64),
                 )
             ]
 
@@ -1701,6 +1718,8 @@ class UnifiedRadixCache(BasePrefixCache):
             layer_num=self.cache_controller.layer_num,
         )
         completion.finish_event.synchronize()
+        if self.supports_mamba():
+            req.kv.mamba_needs_clear = False
         self.retraction_discard(backup)
 
     def retraction_restore_ssd(self, req: Req, backup: RetractionBackup) -> None:
