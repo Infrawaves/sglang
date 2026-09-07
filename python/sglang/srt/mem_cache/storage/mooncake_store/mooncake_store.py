@@ -291,6 +291,21 @@ class MooncakeBaseStore:
                 supports_group_ids = False
         return ReplicateConfig, supports_group_ids
 
+    @staticmethod
+    def _import_mooncake_hard_pin() -> bool:
+        try:
+            from mooncake.store import ReplicateConfig
+        except ImportError:
+            return False
+        # pybind def_readwrite fields answer hasattr on the class; fall back to
+        # an instance for builds that only expose them per object.
+        probes = [ReplicateConfig]
+        try:
+            probes.append(ReplicateConfig())
+        except Exception:
+            pass
+        return any(hasattr(probe, "with_hard_pin") for probe in probes)
+
     def _load_config(self, storage_config: Any = None):
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
@@ -403,6 +418,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and self._supports_group_ids
                 and self._replicate_config_cls is not None
             )
+            self._supports_hard_pin = self._import_mooncake_hard_pin()
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
@@ -896,7 +912,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        pin: bool = False,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -934,6 +955,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                         self._filter_group_ids(group_ids, missing_idx),
+                        pin=pin,
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
@@ -958,7 +980,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(
+            transfers,
+            is_set=True,
+            pin=extra_info is not None and extra_info.pin,
+        )
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1136,6 +1162,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_buffer_ptrs,
                 set_buffer_sizes,
                 self._filter_group_ids(group_ids, set_indices),
+                pin=extra_info is not None and extra_info.pin,
             )
             end_time = time.perf_counter()
 
@@ -1307,8 +1334,53 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # it is unnecessary to close it manually.
         pass
 
+    def _primary_page_object_keys(self, keys: List[str]) -> List[str]:
+        """Object keys behind logical primary-KV page keys."""
+        if self.mem_pool_host.kv_buffer is None:
+            return []
+        object_keys: List[str] = []
+        for key in keys:
+            if self.is_mla_backend:
+                object_keys.append(f"{key}_{self.mla_suffix}_k")
+            elif self.should_split_heads:
+                for suffix in self.mha_suffix:
+                    object_keys.append(f"{key}_{suffix}_k")
+                    object_keys.append(f"{key}_{suffix}_v")
+            else:
+                object_keys.append(f"{key}_{self.mha_suffix}_k")
+                object_keys.append(f"{key}_{self.mha_suffix}_v")
+        return object_keys
+
+    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> None:
+        object_keys: List[str] = []
+        for transfer in transfers:
+            keys = transfer.keys or []
+            if not keys:
+                continue
+            if transfer.name == PoolName.KV:
+                expanded = self._primary_page_object_keys(keys)
+            else:
+                expanded, _ = self._get_hybrid_page_component_keys(keys, transfer)
+            object_keys.extend(self._tag_keys(expanded))
+        if not object_keys:
+            return
+        # force=True: the restore read that just finished granted these objects
+        # a fresh lease, and the keys are private to one request.
+        results = self.store.batch_remove(object_keys, True)
+        failed = sum(1 for status in results if status != 0)
+        if failed:
+            # Pages a failed write never landed report not-found here.
+            logger.info(
+                "Retraction L3 cleanup: %d/%d objects not removed.",
+                failed,
+                len(object_keys),
+            )
+
     def clear(self) -> None:
         self.store.remove_all()
+
+    def supports_pin(self) -> bool:
+        return self._supports_hard_pin
 
     def _put_batch_zero_copy_impl(
         self,
@@ -1316,6 +1388,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
+        *,
+        pin: bool = False,
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1326,6 +1400,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+
+        if pin:
+            # No support check here on purpose: callers must not ask for a pin
+            # this backend cannot give, so there is deliberately no
+            # write-anyway-unpinned path. Retraction checks supports_pin()
+            # before it stages.
+            #
+            # Hard pin: every eviction pass skips the object, so a full store
+            # fails this put instead of dropping a demoted request's only copy.
+            config = config or self._replicate_config_cls()
+            config.with_hard_pin = True
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()

@@ -392,6 +392,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.demotion_queue: List[DemotedRequest] = []
+        self.demoted_tokens_total = 0
         self.pending_reqs: List[DecodeRequest] = []
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
@@ -826,6 +827,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
         self.demotion_queue.clear()
+        self.demoted_tokens_total = 0
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -855,14 +857,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
-            backup = req.kv.retraction_backup
             if (
                 get_disagg().disaggregation_decode_retraction_backup == "ssd"
-                and backup is not None
-                and backup.storage_state == "L3_PENDING"
+                and not self.tree_cache.retraction_restore_admissible(req)
             ):
-                # The L2 staging pages are still owned by the asynchronous
-                # storage writer; wait for its ack before restoring or freeing.
+                # L3 write still in flight, or no L2 staging even after reclaim.
+                # Checked before _pre_alloc so a refusal leaves no device state.
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -920,20 +920,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 demoted_tokens=demoted_tokens,
             )
         )
+        self.demoted_tokens_total += demoted_tokens
 
     def demoted_reqs(self) -> List[Req]:
         return [entry.req for entry in self.demotion_queue]
 
     def demotion_queue_cache_usage(self) -> float:
-        # SSD staging is bounded by the shared L2 pool; CPU-tensor and legacy
-        # host-pool demotion keep the historical GPU-pool denominator.
-        demoted_tokens = sum(entry.demoted_tokens for entry in self.demotion_queue)
-        if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-            host_pool_group = getattr(self.tree_cache, "host_pool_group", None)
-            capacity = getattr(host_pool_group, "logical_size", 0)
-        else:
-            capacity = self.max_total_num_tokens
-        return demoted_tokens / max(capacity, 1)
+        return self.demoted_tokens_total / self.max_total_num_tokens
 
     def get_demoted_req_indices_to_resume(self) -> List[int]:
         """Select recoverable entries on the request-plane TP leader."""
@@ -958,12 +951,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if now - entry.demoted_start_time < recovery_duration:
                 continue
             req = entry.req
-            backup = req.kv.retraction_backup
             if (
                 get_disagg().disaggregation_decode_retraction_backup == "ssd"
-                and backup is not None
-                and backup.storage_state == "L3_PENDING"
+                and not self.tree_cache.retraction_restore_admissible(req)
             ):
+                # L3 write still in flight, or no L2 staging even after reclaim.
+                # Checked before _pre_alloc so a refusal leaves no device state.
                 continue
             if available_req_slots <= 0:
                 break
@@ -1012,6 +1005,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
+            self.demoted_tokens_total -= entry.demoted_tokens
+            if self.demoted_tokens_total < 0:
+                raise RuntimeError(
+                    f"Demoted token accounting underflowed: {self.demoted_tokens_total}"
+                )
 
         self.demotion_queue = [
             entry
@@ -2911,7 +2909,6 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def need_to_proactive_retract_request(self: Scheduler) -> bool:
-        self._refresh_ssd_demotion_budget()
         # Experimental fixed-rule demotion: trigger on cache pressure alone,
         # with no output-length imbalance gate.
         collector = self.decode_metric_collector
@@ -2928,22 +2925,11 @@ class SchedulerDisaggregationDecodeMixin:
         cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
         return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
 
-    def _refresh_ssd_demotion_budget(self: Scheduler) -> None:
-        """Update currently free host memory budget under ssd backup."""
-        if get_disagg().disaggregation_decode_retraction_backup != "ssd":
-            return
-        host_pool_group = getattr(self.tree_cache, "host_pool_group", None)
-        anchor = getattr(host_pool_group, "anchor_entry", None)
-        host_pool = getattr(anchor, "host_pool", None)
-        if host_pool is not None:
-            self.remain_cpu_demote_tokens = host_pool.available_size()
+    def _decode_pool_above_demotion_threshold(self: Scheduler) -> bool:
+        cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+        return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
 
     def proactively_demote_longest_request(self: Scheduler) -> bool:
-        if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-            # Reap completed storage offloads once before choosing a victim.
-            # SSD demotion must not poll HiCache on every decode-queue pass.
-            self.tree_cache.check_hicache_events()
-
         batch = self.running_batch
         if batch is None or batch.is_empty():
             return False
@@ -2961,6 +2947,7 @@ class SchedulerDisaggregationDecodeMixin:
                 >= min_output_len
             )
 
+        ssd_retraction = get_disagg().disaggregation_decode_retraction_backup == "ssd"
         demoted_any = False
         candidates = [req for req in batch.reqs if is_demotion_candidate(req)]
         candidates.sort(key=lambda req: req.seqlen, reverse=True)
@@ -2970,13 +2957,6 @@ class SchedulerDisaggregationDecodeMixin:
                 break
 
             victim = candidates.pop(0)
-            if (
-                get_disagg().disaggregation_decode_retraction_backup == "ssd"
-                and victim.seqlen > self.remain_cpu_demote_tokens
-            ):
-                # A request must fit in one page-aligned L2 staging span. Keep
-                # it running and give smaller candidates a chance.
-                continue
             victim_index = next(
                 i for i, r in enumerate(batch.reqs) if r is victim
             )
@@ -2992,6 +2972,20 @@ class SchedulerDisaggregationDecodeMixin:
                 demoted_reqs.append(victim)
                 demoted_any = True
             else:
+                if ssd_retraction:
+                    # L2 staging is exhausted even after reclaim; the victim
+                    # keeps its device KV and stays in the batch. A smaller
+                    # candidate would only repeat the eviction pass, so end
+                    # this wave and let the next step retry.
+                    logger.warning(
+                        "Proactive decode demotion backup failed; keeping req=%s "
+                        "in the running batch",
+                        victim.rid,
+                    )
+                    break
+
+                from sglang.srt.managers.scheduler import _make_abort_req
+
                 victim.to_finish = FINISH_ABORT(
                     "Proactive demotion host KV backup failed; request aborted.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -3014,13 +3008,14 @@ class SchedulerDisaggregationDecodeMixin:
                     batch.reqs
                 )
             )
-            self._refresh_ssd_demotion_budget()
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
                 victim.rid,
                 victim.seqlen,
                 len(victim.output_ids),
             )
+            if ssd_retraction and not self._decode_pool_above_demotion_threshold():
+                break
 
         if demoted_reqs:
             self.metrics_reporter.num_demoted_reqs += len(demoted_reqs)
@@ -3055,8 +3050,11 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        self._refresh_ssd_demotion_budget()
-        if self.enable_decode_hicache:
+        pump_retraction_acks = (
+            get_disagg().disaggregation_decode_retraction_backup == "ssd"
+            and bool(self.tree_cache.retraction_ssd_backups)
+        )
+        if self.enable_decode_hicache or pump_retraction_acks:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

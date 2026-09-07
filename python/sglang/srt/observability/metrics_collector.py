@@ -572,8 +572,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.demotion_queue_cache_usage = Gauge(
             name="sglang:demotion_queue_cache_usage",
             documentation=(
-                "KV tokens of demoted requests as a fraction of the GPU KV pool,"
-                " bounded by proactive_safe_cpu_demote_cache_usage."
+                "KV tokens of all demoted requests across storage tiers as a "
+                "fraction of GPU KV capacity; values may exceed 1."
             ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",

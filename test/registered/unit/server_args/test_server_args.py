@@ -1507,6 +1507,18 @@ class TestHiCacheArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires.*hicache-storage-backend"):
             handle_cache_compatibility(args)
 
+    def test_ssd_retraction_rejects_hisparse(self):
+        """release_req tears HiSparse down before the SSD early return, so the
+        combination must be refused at startup rather than corrupt KV later."""
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+            hicache_storage_backend="mooncake",
+            enable_hisparse=True,
+        )
+        with self.assertRaisesRegex(ValueError, "enable-hisparse"):
+            handle_cache_compatibility(args)
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

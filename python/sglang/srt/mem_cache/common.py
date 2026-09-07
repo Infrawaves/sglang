@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Optional, cast
 
+import msgspec
 import numpy as np
 import torch
 
@@ -31,7 +33,16 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-class RetractionBackup(NamedTuple):
+class RetractionStorageState(Enum):
+    L2_READY = "L2_READY"
+    L3_WRITE_PENDING = "L3_WRITE_PENDING"
+    L3_READY = "L3_READY"
+    L3_WRITE_FAILED = "L3_WRITE_FAILED"
+    DISCARD_PENDING = "DISCARD_PENDING"
+    RELEASED = "RELEASED"
+
+
+class RetractionBackup(msgspec.Struct, kw_only=True):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None
     pool_transfers: Optional[list[PoolTransfer]] = None
@@ -41,7 +52,10 @@ class RetractionBackup(NamedTuple):
     # until the storage acknowledgement is drained by the scheduler.
     storage_operation_id: Optional[int] = None
     storage_hashes: Optional[list[str]] = None
-    storage_state: str = "L2_READY"
+    storage_state: RetractionStorageState = RetractionStorageState.L2_READY
+    # Cross-rank identity of the storage payload, hashed once at registration
+    # because the keys it covers are immutable from then on.
+    storage_identity: Optional[int] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
