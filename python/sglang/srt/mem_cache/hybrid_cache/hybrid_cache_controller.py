@@ -130,8 +130,16 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        pin: bool = False,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            pin=pin,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -1178,6 +1186,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        pin: bool = False,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1185,6 +1194,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            pin=pin,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1365,6 +1375,7 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
+                extra_info.pin = operation.pin
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
                 )

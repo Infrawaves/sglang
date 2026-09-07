@@ -404,6 +404,12 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "--disaggregation-decode-retraction-backup=ssd is incompatible "
                 "with --enable-unified-cache-external-linker."
             )
+        if cfg.enable_hisparse:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd is incompatible "
+                "with --enable-hisparse: a failed SSD demotion keeps the request "
+                "running, but HiSparse tears its side buffers down first."
+            )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(

@@ -393,6 +393,7 @@ class TestIdleMetrics(CustomTestCase):
         prealloc_queue.scheduler = self.scheduler
         prealloc_queue.queue = []
         prealloc_queue.demotion_queue = []
+        prealloc_queue.demoted_tokens_total = 0
         # An SWA reservation limit must not change the demotion budget's denominator.
         prealloc_queue.max_total_num_tokens = 50
         self.scheduler.disagg_decode_prealloc_queue = prealloc_queue
@@ -419,6 +420,10 @@ class TestIdleMetrics(CustomTestCase):
                 (True, 1, (1, 0, 1), 0.2),
                 (False, 1, (0, 0, 0), 0.0),
             ):
+                prealloc_queue.demoted_tokens_total -= sum(
+                    entry.demoted_tokens
+                    for entry in prealloc_queue.demotion_queue[:drain_count]
+                )
                 del prealloc_queue.demotion_queue[:drain_count]
                 for req in host_reqs:
                     req.host_staged = waiting

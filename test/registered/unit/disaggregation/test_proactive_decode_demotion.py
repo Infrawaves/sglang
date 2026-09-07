@@ -10,7 +10,7 @@ from sglang.srt.disaggregation.decode import (
     DemotedRequest,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, release_req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -37,10 +37,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _FakeBatch:
     """Minimal running-batch stand-in recording release_req calls."""
 
-    def __init__(self, reqs, *, backup_saved=True):
+    def __init__(self, reqs, backup_results=None, *, backup_saved=True):
         self.reqs = list(reqs)
         self.batch_is_full = True
         self.release_calls = []
+        self.backup_results = list(backup_results or [])
         self.backup_saved = backup_saved
 
     def is_empty(self):
@@ -52,11 +53,16 @@ class _FakeBatch:
     def release_req(self, index, _, offload_kv=True, *, is_demoted=False):
         victim = self.reqs[index]
         if is_demoted:
-            victim.is_demoted = True
+            backup_saved = (
+                self.backup_results.pop(0) if self.backup_results else self.backup_saved
+            )
+            if backup_saved:
+                victim.is_demoted = True
         else:
+            backup_saved = True
             victim.is_retracted = True
         self.release_calls.append((victim.rid, index, offload_kv, is_demoted))
-        return self.backup_saved
+        return backup_saved
 
     def filter_batch(self, keep_indices):
         self.reqs = [self.reqs[i] for i in keep_indices]
@@ -82,6 +88,7 @@ def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
     performs its actual budget deduction."""
     prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
     prealloc_queue.demotion_queue = []
+    prealloc_queue.demoted_tokens_total = 0
     scheduler = SimpleNamespace(
         running_batch=batch,
         enable_overlap=False,
@@ -89,6 +96,10 @@ def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
         server_args=SimpleNamespace(
             proactive_demotion_max_input_len=10,
             proactive_demotion_min_output_len=11,
+            proactive_decode_demotion_cache_usage=0.70,
+        ),
+        pool_stats_observer=SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(get_max_pool_usage=lambda: 0.96)
         ),
         disagg_decode_prealloc_queue=prealloc_queue,
         new_token_ratio_tracker=SimpleNamespace(current=0.0),
@@ -103,6 +114,46 @@ def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
         hisparse_coordinator=None,
     )
     prealloc_queue.scheduler = scheduler
+    # SimpleNamespace stands in for the mixin, so bind the helper the loop calls.
+    scheduler._decode_pool_above_demotion_threshold = SchedulerDisaggregationDecodeMixin._decode_pool_above_demotion_threshold.__get__(
+        scheduler
+    )
+    return scheduler
+
+
+class _PumpTree:
+    def __init__(self, *, pending=False):
+        self.check_calls = 0
+        self.retraction_ssd_backups = {1: object()} if pending else {}
+
+    def check_hicache_events(self):
+        self.check_calls += 1
+
+
+def _make_pump_scheduler(tree, *, enable_decode_hicache):
+    scheduler = SimpleNamespace(
+        enable_decode_hicache=enable_decode_hicache,
+        tree_cache=tree,
+        running_batch=None,
+        decode_offload_manager=SimpleNamespace(check_offload_progress=lambda: None),
+        disagg_decode_transfer_queue=SimpleNamespace(
+            resolve_deferred_releases=lambda: None,
+            extend=lambda _: None,
+            pop_transferred=lambda: [],
+        ),
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            resume_retracted_reqs=lambda: [],
+            retracted_queue=[],
+            pop_preallocated=lambda: ([], None),
+        ),
+        resume_demote_reqs=lambda: [],
+        waiting_queue=[],
+        need_to_proactive_retract_request=lambda: False,
+        enable_hisparse=False,
+        polling_count=0,
+        polling_interval=2,
+        scheduler_stage_metrics=None,
+    )
     return scheduler
 
 
@@ -115,6 +166,58 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 disaggregation_decode_enable_radix_cache=False,
             )
         )
+
+    def test_decode_queue_pumps_hicache_only_while_retraction_write_pending(self):
+        """With decode HiCache off, the SSD path enters the HiCache event
+        phase only while a retraction write awaits its ack; an idle SSD
+        deployment must not pay a collective per step."""
+        ssd = SimpleNamespace(
+            disaggregation_decode_retraction_backup="ssd",
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=2,
+            disaggregation_decode_host_receive_threshold=0,
+            enable_proactive_decode_demotion=False,
+        )
+        for pending, expected in ((False, 0), (True, 1)):
+            tree = _PumpTree(pending=pending)
+            scheduler = _make_pump_scheduler(tree, enable_decode_hicache=False)
+            with get_disagg().override(**vars(ssd)):
+                SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+            self.assertEqual(tree.check_calls, expected, f"pending={pending}")
+
+    def test_decode_queue_pumps_hicache_when_enabled(self):
+        cpu = SimpleNamespace(
+            disaggregation_decode_retraction_backup="cpu_tensor",
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=2,
+            disaggregation_decode_host_receive_threshold=0,
+            enable_proactive_decode_demotion=False,
+        )
+        tree = _PumpTree()
+        scheduler = _make_pump_scheduler(tree, enable_decode_hicache=True)
+
+        with get_disagg().override(**vars(cpu)):
+            SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        self.assertEqual(tree.check_calls, 1)
+
+    def test_decode_queue_skips_hicache_when_neither_source_active(self):
+        """Guards the negative branch: with hicache off and a non-ssd backup
+        there is nothing to drain, so the gate must not degrade to always-true."""
+        cpu = SimpleNamespace(
+            disaggregation_decode_retraction_backup="cpu_tensor",
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=2,
+            disaggregation_decode_host_receive_threshold=0,
+            enable_proactive_decode_demotion=False,
+        )
+        tree = _PumpTree()
+        scheduler = _make_pump_scheduler(tree, enable_decode_hicache=False)
+
+        with get_disagg().override(**vars(cpu)):
+            SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        self.assertEqual(tree.check_calls, 0)
 
     def test_req_tracks_demote_separately_from_retract(self):
         demoted_req = Req(
@@ -132,6 +235,38 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertFalse(retracted_req.is_demoted)
         self.assertTrue(retracted_req.is_retracted)
         self.assertEqual(retracted_req.retraction_count, 1)
+
+    def test_failed_demoted_backup_preserves_kv_and_request_state(self):
+        req = SimpleNamespace(
+            finished=lambda: False,
+            kv=SimpleNamespace(),
+            reset_for_retract=MagicMock(),
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+        )
+        with (
+            get_disagg().override(**vars(disagg)),
+            patch(
+                "sglang.srt.managers.schedule_batch.backup_kv_cache",
+                return_value=None,
+            ),
+            patch("sglang.srt.managers.schedule_batch.release_kv_cache") as release_kv,
+        ):
+            self.assertFalse(
+                release_req(
+                    req=req,
+                    remaing_req_count=1,
+                    req_to_token_pool=MagicMock(),
+                    token_to_kv_pool_allocator=MagicMock(),
+                    tree_cache=MagicMock(),
+                    hisparse_coordinator=None,
+                    is_demoted=True,
+                )
+            )
+        release_kv.assert_not_called()
+        req.reset_for_retract.assert_not_called()
 
     def test_collector_uses_generation_metric_buckets(self):
         self.assertEqual(DEFAULT_OUTPUT_LEN_BUCKETS[-1], 1_100_000)
@@ -203,6 +338,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         queue.demotion_queue = [
             DemotedRequest(req=req, demoted_start_time=0.0, demoted_tokens=7)
         ]
+        queue.demoted_tokens_total = 7
         queue.scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
                 proactive_demotion_recovery_duration=recovery_duration
@@ -238,6 +374,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             )
             for req, start_time, demoted_tokens in entries
         ]
+        queue.demoted_tokens_total = sum(tokens for _, _, tokens in entries)
         return queue
 
     def test_demoted_recovery_decision_respects_slots_and_full_budget(self):
@@ -258,7 +395,12 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 queue._prealloc_required_tokens = lambda _: (4, 4)
                 queue._prealloc_kv_lens = lambda _: (4, 4)
 
-                self.assertEqual(queue.get_demoted_req_indices_to_resume(), expected)
+                with get_disagg().override(
+                    disaggregation_decode_retraction_backup="cpu_tensor"
+                ):
+                    self.assertEqual(
+                        queue.get_demoted_req_indices_to_resume(), expected
+                    )
                 queue._pre_alloc.assert_not_called()
 
     def _make_demoted_swa_queue(self, fill_lens, capacity, reserved_tokens):
@@ -592,11 +734,14 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         batch = _FakeBatch([long, short, medium])
         scheduler = _make_demotion_scheduler(batch, budget=40, enable_metrics=True)
 
-        self.assertTrue(
-            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
-                scheduler
+        with get_disagg().override(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        ):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
             )
-        )
         demotion_queue = scheduler.disagg_decode_prealloc_queue.demotion_queue
         self.assertEqual(batch.reqs, [short])
         self.assertEqual([entry.req for entry in demotion_queue], [long, medium])
@@ -627,11 +772,14 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         batch = _FakeBatch([long, medium])
         scheduler = _make_demotion_scheduler(batch, budget=25)
 
-        self.assertTrue(
-            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
-                scheduler
+        with get_disagg().override(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        ):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
             )
-        )
         # long (seqlen 30) exhausts the budget of 25; medium stays running.
         demotion_queue = scheduler.disagg_decode_prealloc_queue.demotion_queue
         self.assertEqual([entry.req for entry in demotion_queue], [long])
@@ -685,11 +833,14 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         batch = _FakeBatch([recovered, fresh])
         scheduler = _make_demotion_scheduler(batch, budget=100)
 
-        self.assertTrue(
-            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
-                scheduler
+        with get_disagg().override(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        ):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
             )
-        )
         demotion_queue = scheduler.disagg_decode_prealloc_queue.demotion_queue
         self.assertEqual([entry.req for entry in demotion_queue], [fresh])
         self.assertEqual(batch.reqs, [recovered])
@@ -712,20 +863,77 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         # used to size the scheduler's demotion budget.
         queue.max_total_num_tokens = 100
 
-        self.assertEqual(queue.demotion_queue_cache_usage(), 0.0)
+        with get_disagg().override(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        ):
+            self.assertEqual(queue.demotion_queue_cache_usage(), 0.0)
         self.assertEqual(queue.demoted_reqs(), [])
 
-        self.assertTrue(
-            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
-                scheduler
+        with get_disagg().override(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        ):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
             )
-        )
 
         spent = initial_budget - scheduler.remain_cpu_demote_tokens
         self.assertEqual(
             queue.demotion_queue_cache_usage(), spent / scheduler.max_total_num_tokens
         )
         self.assertEqual(queue.demoted_reqs(), [long, medium])
+
+    def test_ssd_failed_backup_keeps_victim_and_ends_wave(self):
+        """L2 is exhausted after reclaim, so a smaller candidate would only
+        repeat the eviction pass: the wave stops with the victim running."""
+        long = _make_demotion_candidate("long", 30, 20)
+        short = _make_demotion_candidate("short", 20, 12)
+        batch = _FakeBatch([long, short], backup_results=[False, True])
+        scheduler = _make_demotion_scheduler(batch, budget=100)
+        ssd = SimpleNamespace(disaggregation_decode_retraction_backup="ssd")
+
+        with get_disagg().override(**vars(ssd)):
+            self.assertFalse(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
+            )
+
+        self.assertEqual(batch.reqs, [long, short])
+        self.assertFalse(long.is_demoted)
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.demoted_reqs(), [])
+        self.assertFalse(hasattr(long, "to_finish"))
+
+    def test_ssd_wave_stops_once_usage_drops_below_threshold(self):
+        """SSD has no token budget; the wave must stop on the live GPU usage
+        reading, or one step would demote every candidate."""
+        long = _make_demotion_candidate("long", 30, 20)
+        short = _make_demotion_candidate("short", 20, 12)
+        batch = _FakeBatch([long, short])
+        scheduler = _make_demotion_scheduler(batch, budget=100)
+        usage = iter([0.60])
+        scheduler.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                get_max_pool_usage=lambda: next(usage)
+            )
+        )
+        ssd = SimpleNamespace(disaggregation_decode_retraction_backup="ssd")
+
+        with get_disagg().override(**vars(ssd)):
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
+            )
+
+        self.assertEqual(batch.reqs, [short])
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.demoted_reqs(), [long])
+
+    def test_host_pool_failed_backup_aborts_victim(self):
+        """Host-pool exhaustion must emit a terminal error without charging budget."""
+        with get_disagg().override(disaggregation_decode_retraction_backup="host_pool"):
+            self.test_failed_demotion_aborts_without_spending_budget()
 
 
 if __name__ == "__main__":
