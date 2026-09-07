@@ -391,11 +391,17 @@ def discard_kv_cache_backup(
         req.kv.retraction_backup = None
         return
     if backend == "ssd":
-        if req.kv.retraction_backup is None:
-            return
         unified_cache = cast("UnifiedRadixCache", tree_cache)
-        unified_cache.retraction_discard_ssd(req.kv.retraction_backup)
-        req.kv.retraction_backup = None
+        backup = req.kv.retraction_backup
+        if backup is not None:
+            unified_cache.retraction_discard_ssd(backup)
+            req.kv.retraction_backup = None
+        if (
+            backup is None
+            or backup.storage_state != RetractionStorageState.DISCARD_PENDING
+        ):
+            # An in-flight write still owns the keys; its ack releases them.
+            unified_cache.release_retraction_l3(req)
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
@@ -410,6 +416,10 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if req.kv.retraction_l3_keys is not None and req.kv.retraction_backup is None:
+        # A retraction sets retraction_backup before releasing, so a bare
+        # release is terminal: the request will never resume from L3.
+        cast("UnifiedRadixCache", tree_cache).release_retraction_l3(req)
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
