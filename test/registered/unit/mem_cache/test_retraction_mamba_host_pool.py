@@ -4,7 +4,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.common import RetractionBackup, RetractionStorageState
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    RetractionStorageState,
+    retraction_discard,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -61,6 +65,7 @@ def _make_req(*, seqlen: int, mamba_slot: int):
             mamba_pool_idx=torch.tensor(mamba_slot),
             holds_mamba=True,
             mamba_needs_clear=True,
+            retraction_l3_keys=None,
         ),
     )
     return req, SimpleNamespace(req_to_token=req_to_token)
@@ -358,6 +363,17 @@ class TestMambaSsdLifecycle(CustomTestCase):
         cache.cache_controller.l2_transfer_engine.submit_host_to_device.assert_called_once()
         self.assertFalse(req.kv.mamba_needs_clear)
 
+        self.assertIs(backup.storage_state, RetractionStorageState.RELEASED)
+        self.assertEqual(cache.retraction_ssd_backups, {})
+        # The hard-pinned objects outlive the resume so a re-demotion only
+        # writes its new tail; the mamba key must be tracked as its own object.
+        cache.cache_controller.storage_backend.batch_remove_v2.assert_not_called()
+        self.assertEqual(
+            req.kv.retraction_l3_keys,
+            {PoolName.KV: {"h0", "h1"}, PoolName.MAMBA: {"h1"}},
+        )
+
+        cache.release_retraction_l3(req)
         (removed,) = (
             cache.cache_controller.storage_backend.batch_remove_v2.call_args.args
         )
@@ -365,8 +381,7 @@ class TestMambaSsdLifecycle(CustomTestCase):
             {t.name: t.keys for t in removed},
             {PoolName.KV: ["h0", "h1"], PoolName.MAMBA: ["h1"]},
         )
-        self.assertIs(backup.storage_state, RetractionStorageState.RELEASED)
-        self.assertEqual(cache.retraction_ssd_backups, {})
+        self.assertIsNone(req.kv.retraction_l3_keys)
 
     def test_replicated_kv_rank_still_owns_its_mamba_shard(self):
         """On an MLA non-zero TP rank the KV pages are somebody else's write, so
@@ -388,12 +403,15 @@ class TestMambaSsdLifecycle(CustomTestCase):
         )
 
         cache._finish_retraction_ssd_backup(7, True)
-        cache.retraction_discard_ssd(backup)
+        self.assertIs(req.kv.retraction_backup, backup)
+        retraction_discard(req, cache, "ssd")
 
         (removed,) = (
             cache.cache_controller.storage_backend.batch_remove_v2.call_args.args
         )
         self.assertEqual({t.name: t.keys for t in removed}, {PoolName.MAMBA: ["h1"]})
+        self.assertIsNone(req.kv.retraction_l3_keys)
+        self.assertIsNone(req.kv.retraction_backup)
 
 
 if __name__ == "__main__":
