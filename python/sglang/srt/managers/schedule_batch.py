@@ -2114,6 +2114,13 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+        # Should not demote request when the KV backup failed.
+        if (
+            is_demoted
+            and not backup_saved
+            and get_disagg().disaggregation_decode_retraction_backup == "ssd"
+        ):
+            return False
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.

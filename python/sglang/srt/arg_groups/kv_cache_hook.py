@@ -157,7 +157,7 @@ def handle_cache_compatibility(server_args: Any) -> None:
             f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
             "does not support --dcp-size > 1."
         )
-        
+
     if cfg.disaggregation_decode_retraction_backup == "ssd":
         if cfg.hicache_storage_backend is None:
             raise ValueError(
@@ -168,6 +168,12 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=ssd is incompatible "
                 "with --enable-unified-cache-external-linker."
+            )
+        if cfg.enable_hisparse:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd is incompatible "
+                "with --enable-hisparse: a failed SSD demotion keeps the request "
+                "running, but HiSparse tears its side buffers down first."
             )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:

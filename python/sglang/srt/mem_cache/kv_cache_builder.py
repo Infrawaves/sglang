@@ -349,7 +349,10 @@ def build_kv_cache(
                 "--disaggregation-decode-retraction-backup host_pool/ssd requires "
                 "UnifiedRadixCache with HiCache attached."
             )
+        tree_cache.retraction_storage_enabled = retraction_backup == "ssd"
         tree_cache.validate_retraction_host_capacity()
+        if retraction_backup == "ssd":
+            tree_cache.validate_retraction_storage_pin()
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

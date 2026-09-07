@@ -1524,24 +1524,12 @@ class Scheduler(
             )
             if get_disagg().enable_proactive_decode_demotion:
                 self.decode_metric_collector = DecodeMetricCollector()
-                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-                    # SSD backups use the shared HiCache L2 as bounded staging.
-                    # L3 capacity is not part of the admission budget because
-                    # L2 must hold each request until its D2H copy is complete.
-                    host_pool_group = getattr(
-                        self.tree_cache, "host_pool_group", None
-                    )
-                    self.remain_cpu_demote_tokens = (
-                        host_pool_group.logical_size
-                        if host_pool_group is not None
-                        else 0
-                    )
-                else:
-                    # Fixed demotion CPU offload budget in tokens
-                    self.remain_cpu_demote_tokens = int(
-                        self.server_args.proactive_safe_cpu_demote_cache_usage
-                        * self.max_total_num_tokens
-                    )
+                # Fixed demotion CPU offload budget in tokens
+                # Never spent under ssd: admission is the L2 allocation itself.
+                self.remain_cpu_demote_tokens = int(
+                    self.server_args.proactive_safe_cpu_demote_cache_usage
+                    * self.max_total_num_tokens
+                )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -4600,14 +4588,30 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
-            self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
-            if_success = True
-        else:
+        if not self.enable_hierarchical_cache:
             logging.warning("Hierarchical cache is not enabled.")
-            if_success = False
-        return ClearHiCacheReqOutput(success=if_success)
+            return ClearHiCacheReqOutput(success=False)
+        if (
+            get_disagg().disaggregation_decode_retraction_backup == "ssd"
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and (
+                self.disagg_decode_prealloc_queue.retracted_queue
+                or self.disagg_decode_prealloc_queue.demotion_queue
+                or self.tree_cache.retraction_ssd_backups
+            )
+        ):
+            # L3 holds the only KV copy of every demoted or retracted request;
+            # clearing it now would make them unrestorable.
+            logger.warning(
+                "Refusing to clear HiCache storage: %d retracted and %d demoted "
+                "requests still hold their KV in L3.",
+                len(self.disagg_decode_prealloc_queue.retracted_queue),
+                len(self.disagg_decode_prealloc_queue.demotion_queue),
+            )
+            return ClearHiCacheReqOutput(success=False)
+        self.tree_cache.clear_storage_backend()
+        logger.info("Hierarchical cache cleared successfully!")
+        return ClearHiCacheReqOutput(success=True)
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -4727,9 +4731,7 @@ class Scheduler(
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
                 if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-                    idle &= not getattr(
-                        self.tree_cache, "retraction_ssd_backups", {}
-                    )
+                    idle &= not self.tree_cache.retraction_ssd_backups
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -5247,6 +5249,9 @@ class Scheduler(
                             != "ssd"
                         ):
                             self.remain_cpu_demote_tokens += entry.demoted_tokens
+                        self.disagg_decode_prealloc_queue.demoted_tokens_total -= (
+                            entry.demoted_tokens
+                        )
                         self.ipc_channels.send_to_tokenizer.send_output(
                             _make_abort_req(req), req
                         )
