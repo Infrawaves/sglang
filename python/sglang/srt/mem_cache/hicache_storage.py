@@ -44,6 +44,8 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    # Hard pin in L3 storage
+    pin: bool = False
 
 
 @dataclass(frozen=True)
@@ -336,6 +338,12 @@ class HiCacheStorage(ABC):
 
     def get_stats(self):
         return None
+
+    def supports_pin(self) -> bool:
+        return False
+
+    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> None:
+        raise NotImplementedError
 
 
 class MetadataCache:
