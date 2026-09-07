@@ -156,8 +156,12 @@ def create_unified_radix_cache(
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
     server_args, params = ctx.server_args, ctx.params
     if get_disagg().disaggregation_decode_retraction_backup in ("host_pool", "ssd"):
-        if ctx.is_hybrid_ssm:
-            raise ValueError("HiCache retraction backup does not support Mamba models.")
+        # temporarily only support Kimi-K3, not validated on other model
+        # TODO(zhangmj): MAMBA+SWA three-pool retraction backup is unverified.
+        if ctx.is_hybrid_ssm and ctx.is_hybrid_swa:
+            raise ValueError(
+                "HiCache retraction backup does not support combined Mamba and SWA models."
+            )
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
             raise ValueError(
                 "HiCache retraction backup does not support pure-SWA models."

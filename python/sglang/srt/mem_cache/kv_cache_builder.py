@@ -181,14 +181,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     unified_decode_radix = (
         memory.enable_unified_memory and disagg.disaggregation_decode_enable_radix_cache
     )
-    if backend == "host_pool" and unified_decode_radix:
+    if backend in ("host_pool", "ssd") and unified_decode_radix:
         raise ValueError(
-            "Unified-memory H2D/D2H does not support host-pool decode "
+            f"Unified-memory H2D/D2H does not support {backend} decode "
             "retraction with decode radix cache yet."
         )
-    if backend == "host_pool" and unified_hybrid_swa:
+    if backend in ("host_pool", "ssd") and unified_hybrid_swa:
         raise ValueError(
-            "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "
+            f"Unified-memory hybrid-SWA H2D/D2H does not support {backend} "
             "decode retraction yet."
         )
     if backend is None:
@@ -214,6 +214,12 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 isinstance(kv_cache, MHATokenToKVPool)
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
+        )
+        # temporarily only support Kimi-K3, not validated on other model
+        supports_host_pool = supports_host_pool or (
+            unified_draft_host_pool_supported
+            and isinstance(kv_cache, HybridLinearKVPool)
+            and not tp_worker.is_hybrid_swa
         )
         # TODO(zhangmj): maintain host_pool for priority scheduling, but need
         # to disable when disable hicache.

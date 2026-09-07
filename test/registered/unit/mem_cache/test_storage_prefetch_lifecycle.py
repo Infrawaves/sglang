@@ -39,6 +39,8 @@ _REQ = CacheRequestHandle("r", 0)
 
 def _staged_fixture(full_match=2):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.retraction_storage_enabled = False
+    cache.retraction_ssd_backups = {}
     cache.tree_core = SimpleNamespace(
         page_size=2,
         is_eagle=False,
@@ -125,6 +127,8 @@ def _staged_fixture(full_match=2):
 def _hit_drain_fixture():
     """A buffer-mode cache whose hit drain and outcome accounting are real."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.retraction_storage_enabled = False
+    cache.retraction_ssd_backups = {}
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False

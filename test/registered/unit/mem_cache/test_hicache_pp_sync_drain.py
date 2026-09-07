@@ -48,6 +48,8 @@ class TestPPSyncDrain(unittest.TestCase):
 class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
+        cache.retraction_storage_enabled = False
+        cache.retraction_ssd_backups = {}
         cache.tree_core = SimpleNamespace(
             enable_storage=False,
             write_back_duplicate_reclaim_digest=0,
@@ -140,6 +142,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             n_release=4,
             extra_release_counts={},
             log_metrics=True,
+            retraction_writes_pending=False,
         )
 
 
