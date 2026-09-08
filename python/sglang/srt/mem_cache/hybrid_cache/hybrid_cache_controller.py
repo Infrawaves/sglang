@@ -759,12 +759,23 @@ class HybridCacheController(BaseHiCacheController):
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
             except Empty:
                 continue
+            if operation is None:
+                continue
+            try:
+                self._page_backup(operation)
+            except Exception:
+                # A lost ACK strands a retraction in L3_WRITE_PENDING for good
+                # and stalls every later write on this rank, so a raise is
+                # reported as a failed write rather than killing the thread.
+                logger.exception(
+                    "Storage backup raised; acknowledging operation %d as failed",
+                    operation.id,
+                )
+                operation.completed_tokens = 0
+                operation.pool_storage_result = PoolTransferResult.empty()
+            self.ack_backup_queue.put(operation)
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

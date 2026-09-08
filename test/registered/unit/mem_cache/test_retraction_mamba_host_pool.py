@@ -254,6 +254,7 @@ def _make_ssd_cache(*, backup_skip: bool = False) -> UnifiedRadixCache:
     cache.disable = True
     cache.retraction_ssd_backups = {}
     cache.retraction_ssd_requests = {}
+    cache.retraction_l3_orphans = {}
 
     def resolve(transfers, *, primary_device_indices=None, primary_host_indices=None):
         for transfer in transfers or []:

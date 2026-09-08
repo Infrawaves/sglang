@@ -1619,6 +1619,26 @@ class TestHiCacheArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires.*hicache-storage-backend"):
             handle_cache_compatibility(args)
 
+    def test_host_retraction_rejects_unified_memory_and_pipeline_parallel(self):
+        """Unified-memory slots are virtual and the host transfer copies them
+        untranslated; the PP decode loop never drains storage acks. Both must
+        fail at startup instead of corrupting KV or stranding a demoted request."""
+        cases = [
+            ("host_pool", {"enable_unified_memory": True}, "enable-unified-memory"),
+            ("ssd", {"enable_unified_memory": True}, "enable-unified-memory"),
+            ("ssd", {"pp_size": 2}, "pp-size"),
+        ]
+        for backend, overrides, message in cases:
+            with self.subTest(backend=backend, **overrides):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_retraction_backup=backend,
+                    hicache_storage_backend="mooncake",
+                    **overrides,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_cache_compatibility(args)
+
     def test_ssd_retraction_rejects_hisparse(self):
         """release_req tears HiSparse down before the SSD early return, so the
         combination must be refused at startup rather than corrupt KV later."""

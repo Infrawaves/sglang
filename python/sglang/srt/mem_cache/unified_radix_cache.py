@@ -265,6 +265,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # without making the request visible to ordinary prefix matching.
         self.retraction_ssd_backups: dict[int, RetractionBackup] = {}
         self.retraction_ssd_requests: dict[int, Req] = {}
+        # Hard-pinned objects whose delete failed; nothing else ever frees
+        # them, so they ride along with the next terminal release.
+        self.retraction_l3_orphans: dict[PoolName, set[str]] = {}
         # Static, rank-identical predicate used for the SSD ACK collective.
         self.retraction_storage_enabled = False
         # Cumulative prefetch-outcome counters, exported through the
@@ -1610,21 +1613,31 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_retraction_l3(self, req: Req) -> None:
         record = req.kv.retraction_l3_keys
         req.kv.retraction_l3_keys = None
-        if not record or self.cache_controller is None or not self.enable_storage:
+        if self.cache_controller is None or not self.enable_storage:
             return
+        pending = self.retraction_l3_orphans
+        self.retraction_l3_orphans = {}
+        for name, keys in (record or {}).items():
+            pending.setdefault(name, set()).update(keys)
         transfers = [
             PoolTransfer(name=name, keys=sorted(keys))
-            for name, keys in record.items()
+            for name, keys in pending.items()
             if keys
         ]
         if not transfers:
             return
         try:
-            self.cache_controller.storage_backend.batch_remove_v2(transfers)
+            failed = self.cache_controller.storage_backend.batch_remove_v2(transfers)
         except Exception:
             logger.exception(
-                "SSD retraction L3 cleanup failed; objects stay hard-pinned"
+                "SSD retraction L3 cleanup raised; retrying at the next release"
             )
+            failed = transfers
+        for transfer in failed:
+            if transfer.keys:
+                self.retraction_l3_orphans.setdefault(transfer.name, set()).update(
+                    transfer.keys
+                )
 
     def _finish_retraction_ssd_backup(self, operation_id: int, success: bool) -> None:
         """Consume an L3 acknowledgement and release L2 only on success."""
