@@ -46,6 +46,7 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+MAX_DISAGGREGATION_TOP_LOGPROBS = 128
 _IS_HIP = is_hip()
 
 
@@ -294,13 +295,17 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class InvalidDisaggregationMetadata(ValueError):
+    """Request metadata cannot fit the negotiated fixed-size buffers."""
+
+
 class MetadataBuffers:
     def __init__(
         self,
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = MAX_DISAGGREGATION_TOP_LOGPROBS,
         max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
@@ -329,8 +334,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
@@ -447,7 +450,35 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
+    def validate_request(self, req: Req) -> None:
+        # Validate before writing any buffer, so a rejected request cannot leave
+        # partially updated metadata to be transferred to decode.
+        if req.return_logprob and req.logprob.output_top_logprobs_val:
+            length = len(req.logprob.output_top_logprobs_val[0])
+            capacity = self.output_top_logprobs_val.shape[1]
+            if length > capacity:
+                raise InvalidDisaggregationMetadata(
+                    f"top_logprobs_num {length} exceeds disaggregation metadata "
+                    f"capacity {capacity}. Lower top_logprobs_num."
+                )
+        if req.return_sampling_mask:
+            if not self.enable_sampling_mask:
+                raise InvalidDisaggregationMetadata(
+                    "return_sampling_mask with disaggregation requires "
+                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+                )
+            masks = req.output_token_sampling_mask
+            if masks and masks[0] is not None:
+                length = len(masks[0])
+                capacity = self.output_token_sampling_mask_idx.shape[1]
+                if length > capacity:
+                    raise InvalidDisaggregationMetadata(
+                        f"Sampling mask length {length} exceeds disaggregation "
+                        f"metadata capacity {capacity}."
+                    )
+
     def set_buf(self, req: Req):
+        self.validate_request(req)
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -479,14 +510,6 @@ class MetadataBuffers:
                 )
 
             if req.logprob.output_top_logprobs_val:  # not none or empty list
-                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
-                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
-                if top_logprobs_len > max_top_logprobs_len:
-                    raise RuntimeError(
-                        f"top_logprobs_num {top_logprobs_len} exceeds "
-                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
-                        "Lower top_logprobs_num or increase the metadata buffer."
-                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
@@ -503,11 +526,6 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            if not self.enable_sampling_mask:
-                raise RuntimeError(
-                    "return_sampling_mask with disaggregation requires "
-                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-                )
             # Sentinel -1: the decode side records None for this handoff token.
             self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
             sampling_masks = req.output_token_sampling_mask
@@ -517,13 +535,6 @@ class MetadataBuffers:
                 sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
                 if sampling_mask is not None and sampling_logprob is not None:
                     mask_len = len(sampling_mask)
-                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
-                    if mask_len > max_mask_len:
-                        raise RuntimeError(
-                            f"Sampling mask length {mask_len} exceeds disaggregation "
-                            f"metadata capacity {max_mask_len}. Increase "
-                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
-                        )
                     self.output_token_sampling_mask_len[req.metadata_buffer_index][
                         0
                     ] = mask_len
