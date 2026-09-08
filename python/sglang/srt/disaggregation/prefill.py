@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
+    InvalidDisaggregationMetadata,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1206,7 +1207,15 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            try:
+                self.disagg_metadata_buffers.set_buf(req)
+            except InvalidDisaggregationMetadata as exc:
+                # Keep the request in the inflight queue. Its normal Failed
+                # polling path releases KV and metadata, preserving this 400.
+                prepare_abort(req, str(exc), status_code=HTTPStatus.BAD_REQUEST)
+                req.disagg_kv_sender.abort()
+                self.clear_pending_chunk_send(req)
+                return
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

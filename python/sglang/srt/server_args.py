@@ -707,6 +707,16 @@ class ServerArgs:
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         NS("schedule"),
     ] = None
+    max_parallel_samples: A[
+        int,
+        "Maximum n (candidate responses) per input. Must be positive. Checked before request expansion.",
+        NS("serving"),
+    ] = 128
+    max_batch_outputs: A[
+        int,
+        "Maximum batch_size * n per generation request. Must be positive. Checked before request expansion, including n=1.",
+        NS("serving"),
+    ] = 1024
     max_total_tokens: A[
         Optional[int],
         Arg(
