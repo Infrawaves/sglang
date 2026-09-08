@@ -58,6 +58,7 @@ class _FakeReq:
         self.return_routed_experts = False
         self.return_indexer_topk = False
         self.return_sampling_mask = False
+        self.is_demoted = False
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -104,6 +105,35 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         observability_patch.start()
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
+
+    def test_demoted_requests_are_not_streamed(self):
+        outputs = []
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            server_args=SimpleNamespace(
+                stream_interval=1,
+                enable_request_time_stats_logging=False,
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+        )
+        demoted = _FakeReq("demoted", [10])
+        demoted.is_demoted = True
+        demoted.stream = True
+        active = _FakeReq("active", [20])
+        active.stream = True
+
+        streamer._stream_output_generation([demoted, active], False)
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].rids, ["active"])
+        self.assertEqual(outputs[0].output_ids, [[20]])
+        self.assertEqual(demoted.send_token_offset, 0)
+        self.assertEqual(demoted.send_decode_id_offset, 0)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
