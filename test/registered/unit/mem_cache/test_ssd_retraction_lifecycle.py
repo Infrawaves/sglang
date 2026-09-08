@@ -1,10 +1,18 @@
+import threading
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, StorageOperation
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    StorageOperation as HybridStorageOperation,
+)
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     RetractionStorageState,
@@ -123,14 +131,20 @@ class TestRetractionHardPin(CustomTestCase):
         config = store.store.batch_put_from.call_args.args[3]
         self.assertTrue(config.with_hard_pin)
 
-    def test_batch_remove_v2_forces_and_expands_primary_keys(self):
-        """A restore read leaves a lease on the objects, so the delete must
-        force; and it must name the same k/v objects batch_set_v1 wrote."""
+    def test_batch_remove_v2_forces_expands_and_reports_refusals(self):
+        """A restore read leaves a lease, so the delete must force and name the
+        k/v objects batch_set_v1 wrote. A refused delete comes back by logical
+        key so the hard pin can be retried; not-found was never pinned."""
         store = self._make_store(supports_hard_pin=True)
-        store.batch_remove_v2([PoolTransfer(name=PoolName.KV, keys=["h0"])])
+        # h0: k removed, v refused; h1: both not found (a write that never landed).
+        store.store.batch_remove.return_value = [0, -703, -704, -704]
+        failed = store.batch_remove_v2(
+            [PoolTransfer(name=PoolName.KV, keys=["h0", "h1"])]
+        )
         keys, force = store.store.batch_remove.call_args.args
-        self.assertEqual(keys, ["h0_0_k", "h0_0_v"])
+        self.assertEqual(keys, ["h0_0_k", "h0_0_v", "h1_0_k", "h1_0_v"])
         self.assertTrue(force)
+        self.assertEqual([(t.name, t.keys) for t in failed], [(PoolName.KV, ["h0"])])
 
 
 class TestRetractionRestoreAdmission(CustomTestCase):
@@ -181,6 +195,33 @@ class TestRetractionRestoreAdmission(CustomTestCase):
         )
 
 
+class TestBackupThreadAcksRaisedWrite(CustomTestCase):
+    def test_raised_write_is_acked_as_failure(self):
+        """A backend exception used to kill the backup thread with no ACK,
+        stranding the demoted request in L3_WRITE_PENDING; it must be acked
+        as a failed write instead."""
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.backup_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        controller.storage_stop_event = threading.Event()
+
+        def raise_and_stop(_operation):
+            controller.storage_stop_event.set()
+            raise RuntimeError("rpc down")
+
+        controller._page_backup = raise_and_stop
+        operation = HybridStorageOperation(None, [], hash_value=["h0"])
+        operation.completed_tokens = 2
+        operation.pool_storage_result.update_extra_pool_hit_pages({"mamba": 1})
+        controller.backup_queue.put(operation)
+
+        controller.backup_thread_func()
+
+        self.assertIs(controller.ack_backup_queue.get_nowait(), operation)
+        self.assertEqual(operation.completed_tokens, 0)
+        self.assertEqual(operation.pool_storage_result.extra_pool_hit_pages, {})
+
+
 class TestRetractionL3Lifetime(CustomTestCase):
     """L3 objects outlive resume and are deleted once, at the terminal release."""
 
@@ -190,6 +231,7 @@ class TestRetractionL3Lifetime(CustomTestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         # enable_storage is a property forwarding to tree_core.
         cache.tree_core = SimpleNamespace(enable_storage=True)
+        cache.retraction_l3_orphans = {}
         cache.cache_controller = SimpleNamespace(
             backup_skip=backup_skip,
             should_backup=lambda transfer: True,
@@ -222,6 +264,24 @@ class TestRetractionL3Lifetime(CustomTestCase):
         self.assertIsNone(req.kv.retraction_l3_keys)
         cache.release_retraction_l3(req)
         remove.assert_called_once()
+
+    def test_undeletable_keys_ride_along_with_the_next_release(self):
+        """A refused delete used to drop the only record of a hard-pinned
+        object, leaking it forever; the keys must be kept and retried."""
+        cache = self._make_cache()
+        remove = cache.cache_controller.storage_backend.batch_remove_v2
+        remove.return_value = [PoolTransfer(name=PoolName.KV, keys=["p0"])]
+        for hashes in (["p0"], ["p1"]):
+            req = SimpleNamespace(kv=SimpleNamespace(retraction_l3_keys=None))
+            cache._record_retraction_l3(req, RetractionBackup(storage_hashes=hashes))
+            cache.release_retraction_l3(req)
+            remove.return_value = []
+        # The refused p0 rides along with p1's release and is then forgotten.
+        (transfers,), _ = remove.call_args
+        self.assertEqual(
+            {t.name: t.keys for t in transfers}, {PoolName.KV: ["p0", "p1"]}
+        )
+        self.assertEqual(cache.retraction_l3_orphans, {})
 
     def test_non_writer_rank_records_no_primary_keys(self):
         """Replicated MLA KV is written by TP0 only; another rank deleting it

@@ -347,7 +347,7 @@ class HiCacheStorage(ABC):
     def supports_pin(self) -> bool:
         return False
 
-    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> None:
+    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> List[PoolTransfer]:
         raise NotImplementedError
 
 
