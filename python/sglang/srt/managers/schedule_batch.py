@@ -118,6 +118,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_backup,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
@@ -885,6 +886,10 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # L3 objects this rank wrote for the request across demotions (ssd backup).
+    # They stay hard-pinned until the request finishes so a re-demotion only
+    # writes new pages; release_kv_cache drops them on the terminal release.
+    retraction_l3_keys: Optional[dict[PoolName, set[str]]] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -2114,6 +2119,13 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+        # Should not demote request when the KV backup failed.
+        if (
+            is_demoted
+            and not backup_saved
+            and get_disagg().disaggregation_decode_retraction_backup == "ssd"
+        ):
+            return False
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.

@@ -253,7 +253,8 @@ class BaseSpecWorker(ABC):
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
-            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+            or get_disagg().disaggregation_decode_retraction_backup
+            in ("host_pool", "ssd")
         ):
             return HiCacheDraftPlan()
 

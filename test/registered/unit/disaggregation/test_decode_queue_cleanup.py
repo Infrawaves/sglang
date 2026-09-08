@@ -399,6 +399,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
+        # is_fully_idle reads the retraction backend off the disagg bag.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
@@ -414,7 +421,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[object()]
+            queue=[], retracted_queue=[object()], demotion_queue=[]
         )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         scheduler.decode_offload_manager = None

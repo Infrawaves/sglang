@@ -3,13 +3,20 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -212,6 +219,165 @@ class TestDecodeRetractionBackup(unittest.TestCase):
 
         allocator.free(blocker_indices)
         allocator.free(destination_indices)
+        req_to_token_pool.free(req)
+
+    # temporarily only support Kimi-K3, not validated on other model
+    def _build_mamba_cache(self, hicache_ratio: float):
+        """Bring up a FULL+MAMBA UnifiedRadixCache over a HybridLinearKVPool."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=1,
+            hicache_ratio=hicache_ratio,
+            hicache_io_backend="kernel",
+            hicache_mem_layout="page_first",
+        )
+        set_global_server_args_for_scheduler(server_args)
+
+        full_layer_ids = [1]
+        mamba_layer_ids = [0]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=64,
+                n_groups=1,
+                num_heads=2,
+                head_dim=16,
+                state_size=16,
+                conv_kernel=4,
+            )
+            cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layer_ids)
+        req_to_token_pool = HybridReqToTokenPool(
+            size=2,
+            mamba_size=4,
+            mamba_spec_state_size=2,
+            max_context_len=self.pool_size,
+            device=self.device,
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            enable_mamba_extra_buffer=False,
+        )
+        kv_pool = HybridLinearKVPool(
+            size=self.pool_size,
+            dtype=self.dtype,
+            page_size=1,
+            head_num=2,
+            head_dim=64,
+            full_attention_layer_ids=full_layer_ids,
+            device=self.device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=False,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=self.pool_size,
+            dtype=self.dtype,
+            device=self.device,
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            disable=True,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        cache = UnifiedRadixCache(params)
+        cache.init_hicache(server_args, params)
+        self.addCleanup(cache.release_host_resources)
+        self.assertIn(PoolName.MAMBA, cache.host_pool_group.entry_map)
+        cache.validate_retraction_host_capacity()
+        return SimpleNamespace(
+            req_to_token_pool=req_to_token_pool,
+            allocator=allocator,
+            kv_pool=kv_pool,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            cache=cache,
+        )
+
+    @staticmethod
+    def _mamba_tensors(mamba_pool):
+        return [*mamba_pool.mamba_cache.conv, mamba_pool.mamba_cache.temporal]
+
+    def test_restores_mamba_state(self):
+        """The recurrent state lives in a per-request slot, not in the token
+        range, so a backup that only walks req_to_token would resume the request
+        on whatever the freshly allocated slot happened to hold. Pending GPU
+        verification: this case has not been run on hardware yet."""
+        env = self._build_mamba_cache(hicache_ratio=1.0)
+        req_to_token_pool = env.req_to_token_pool
+        allocator = env.allocator
+        full_pool = env.kv_pool.full_kv_pool
+        mamba_pool = env.mamba_pool
+        cache = env.cache
+
+        req, source_indices = self._admit_req(env, self.num_tokens)
+        source_slot = req.kv.mamba_pool_idx.unsqueeze(0)
+        self._seed_pool(full_pool, source_indices, base=1000)
+        for layer_tensor in self._mamba_tensors(mamba_pool):
+            layer_tensor[:, source_slot] = (
+                torch.arange(
+                    layer_tensor[:, source_slot].numel(),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                .reshape_as(layer_tensor[:, source_slot])
+                .to(layer_tensor.dtype)
+            )
+        full_expected = self._snapshot_pool(full_pool, source_indices)
+        mamba_expected = [
+            layer_tensor[:, source_slot].clone()
+            for layer_tensor in self._mamba_tensors(mamba_pool)
+        ]
+
+        kv_host_before = cache.host_pool_group.available_size()
+        mamba_host_before = cache.host_pool_group.available_size(PoolName.MAMBA)
+        backup = cache.retraction_backup(req)
+        self.assertEqual(
+            {transfer.name for transfer in backup.pool_transfers or []},
+            {PoolName.MAMBA},
+        )
+        self.assertEqual(
+            cache.host_pool_group.available_size(PoolName.MAMBA),
+            mamba_host_before - 1,
+        )
+
+        for buffer in (*full_pool.k_buffer, *full_pool.v_buffer):
+            buffer.fill_(-1)
+        for layer_tensor in self._mamba_tensors(mamba_pool):
+            layer_tensor.fill_(-2)
+
+        # Restore into a different token range and a different mamba slot,
+        # the way _pre_alloc hands a resumed request fresh resources.
+        allocator.free(source_indices)
+        blocker_indices = allocator.alloc(self.num_tokens)
+        destination_indices = allocator.alloc(self.num_tokens)
+        self.assertFalse(torch.equal(source_indices, destination_indices))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
+        )
+        destination_slot = req_to_token_pool.mamba_allocator.alloc(1)
+        self.assertNotEqual(int(destination_slot[0]), int(source_slot[0]))
+        req.kv.mamba_pool_idx = destination_slot[0]
+        req.kv.mamba_needs_clear = True
+
+        cache.retraction_restore(req, backup)
+
+        self._assert_pool_equal(full_pool, destination_indices, full_expected)
+        for layer_tensor, expected in zip(
+            self._mamba_tensors(mamba_pool), mamba_expected, strict=True
+        ):
+            self.assertTrue(torch.equal(layer_tensor[:, destination_slot], expected))
+        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertEqual(cache.host_pool_group.available_size(), kv_host_before)
+        self.assertEqual(
+            cache.host_pool_group.available_size(PoolName.MAMBA), mamba_host_before
+        )
+
+        allocator.free(blocker_indices)
+        allocator.free(destination_indices)
+        req_to_token_pool.mamba_allocator.free(source_slot)
+        req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
 
 
