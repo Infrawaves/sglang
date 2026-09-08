@@ -94,6 +94,11 @@ pub enum ApiError {
     #[error("worker circuit breaker open: {worker}")]
     BreakerOpen { worker: String },
 
+    /// The prefill worker rejected a PD request. Client errors retain the
+    /// worker's status; server errors are mapped to 502.
+    #[error("prefill worker returned status {status}")]
+    PrefillFailed { status: StatusCode },
+
     /// The worker URL emitted by discovery failed to parse.  Always a
     /// config / discovery-backend bug, not a transient infra issue — but
     /// from the client's perspective the worker is unreachable, so 503.
@@ -138,6 +143,10 @@ impl ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
             }
             ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
+            ApiError::PrefillFailed { status } if status.is_client_error() => {
+                (*status, "prefill_request_rejected")
+            }
+            ApiError::PrefillFailed { .. } => (StatusCode::BAD_GATEWAY, "prefill_worker_error"),
             ApiError::WorkerMisconfigured { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "worker_misconfigured")
             }
@@ -229,13 +238,18 @@ impl IntoResponse for ApiError {
                 );
                 "request expired before completion".to_string()
             }
-            ApiError::PolicySelectionFailed { model } => {
-                tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
-                "service unavailable".to_string()
-            }
+            ApiError::PolicySelectionFailed { .. } => "service unavailable".to_string(),
             ApiError::BreakerOpen { worker } => {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
+            }
+            ApiError::PrefillFailed { status } if status.is_client_error() => {
+                tracing::warn!(prefill_status = %status, "prefill worker rejected request");
+                "prefill worker rejected the request".to_string()
+            }
+            ApiError::PrefillFailed { status } => {
+                tracing::warn!(prefill_status = %status, "prefill worker failed the request");
+                "prefill worker returned an error".to_string()
             }
             ApiError::WorkerMisconfigured { worker, source } => {
                 tracing::error!(
@@ -368,6 +382,21 @@ mod tests {
             !body.contains(worker_str),
             "client body must NOT leak worker URL; got: {body}",
         );
+    }
+
+    #[test]
+    fn policy_selection_failed_envelope_is_unchanged() {
+        let resp = ApiError::PolicySelectionFailed {
+            model: "tiny".into(),
+        }
+        .into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code_header.as_deref(), Some("policy_selection_failed"));
+        assert_eq!(env.error.typ, "server_error");
+        assert_eq!(env.error.code, "policy_selection_failed");
+        assert_eq!(env.error.message, "service unavailable");
     }
 
     #[test]

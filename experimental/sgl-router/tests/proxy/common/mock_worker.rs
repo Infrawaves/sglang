@@ -24,6 +24,7 @@ pub struct CapturedHeaders {
     pub seen: HashSet<String>,            // names (kept for backwards compat)
     pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
+    pub abort_rids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -59,6 +60,7 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/abort_request", post(abort_request))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -392,6 +394,15 @@ impl MockWorker {
 #[allow(dead_code)] // shared across all axum variants
 async fn serve_tiny_server_info() -> Json<Value> {
     Json(serde_json::json!({"served_model_name": "tiny"}))
+}
+
+async fn abort_request(State(s): State<MockWorkerState>, body: Bytes) -> StatusCode {
+    if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+        if let Some(rid) = value.get("rid").and_then(Value::as_str) {
+            s.captured.lock().unwrap().abort_rids.push(rid.to_string());
+        }
+    }
+    StatusCode::OK
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
