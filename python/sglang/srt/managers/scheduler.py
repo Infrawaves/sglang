@@ -200,6 +200,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.request_validation import sampling_mask_error
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -310,7 +311,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -2897,54 +2897,26 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+        if req.return_sampling_mask:
+            is_disaggregated = self.disaggregation_mode != DisaggregationMode.NULL
+            capacity = 0
+            if is_disaggregated and self.disagg_metadata_buffers.enable_sampling_mask:
+                capacity = (
+                    self.disagg_metadata_buffers.output_token_sampling_mask_idx.shape[1]
+                )
+            error_msg = sampling_mask_error(
+                top_k=req.sampling_params.top_k,
+                vocab_size=self.model_config.vocab_size,
+                is_disaggregated=is_disaggregated,
+                capacity=capacity,
+                speculative=not self.spec_algorithm.is_none(),
+                sampling_backend=get_exec().kernel.sampling_backend,
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
-            error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
-            # The ascend backend samples from logits directly and never builds the
-            # top-k/top-p support, so it cannot produce a sampling mask.
-            error_msg = (
-                "return_sampling_mask is not supported with the ascend "
-                "sampling backend."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
