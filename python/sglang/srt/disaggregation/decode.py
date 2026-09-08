@@ -1022,10 +1022,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ):
                     break
 
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
-            req.is_retracted = False
             self._pre_alloc(req)
+            restored = restore_kv_cache(
+                req,
+                self.tree_cache,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+            if not restored:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            else:
+                req.is_retracted = False
+                resumed_reqs.append(req)
+                indices_to_remove.add(i)
+
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1035,14 +1046,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=False,
                     extra_reserved_reqs=len(resumed_reqs),
                 )
-
-            restore_kv_cache(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
 
         self.retracted_queue = [
             entry
@@ -1139,13 +1142,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     raise RuntimeError(f"Cannot resume demoted request: {error}")
 
             self._pre_alloc(req)
-            restore_kv_cache(
+            restored = restore_kv_cache(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
                 allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            # Need to free allocated L1 cache when restore fails.
+            if not restored:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                continue
             req.is_demoted = False
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens

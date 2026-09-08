@@ -255,6 +255,7 @@ def _make_ssd_cache(*, backup_skip: bool = False) -> UnifiedRadixCache:
     cache.retraction_ssd_backups = {}
     cache.retraction_ssd_requests = {}
     cache.retraction_l3_orphans = {}
+    cache._all_reduce = lambda *_args: None
 
     def resolve(transfers, *, primary_device_indices=None, primary_host_indices=None):
         for transfer in transfers or []:
@@ -323,6 +324,56 @@ class TestMambaSsdLifecycle(CustomTestCase):
     """Bookkeeping across the whole SSD path: the one MAMBA slot must be written,
     counted, read and deleted as its own object, or a rank silently loses its
     recurrent-state shard while the KV pages look complete."""
+
+    def test_failed_read_releases_staging_and_retains_backup_for_retry(self):
+        """KV, recurrent-state, and peer read failures must all preserve the
+        only pinned copy and leave local H2D unstarted until a common retry.
+        """
+        for failure in ("kv", "mamba", "exception", "peer"):
+            with self.subTest(failure=failure):
+                cache = _make_ssd_cache()
+                req, cache.req_to_token_pool = _make_ssd_req(mamba_slot=3)
+                backup = cache.retraction_backup_ssd(req)
+                cache._finish_retraction_ssd_backup(7, True)
+                controller = cache.cache_controller
+                group = cache.host_pool_group
+                group.free.reset_mock()
+                group.release_transfers.reset_mock()
+                if failure == "kv":
+                    controller.page_get_func.side_effect = lambda *_args: 0
+                elif failure == "mamba":
+                    controller.storage_backend.batch_get_v2.return_value = {
+                        PoolName.MAMBA: [False]
+                    }
+                elif failure == "exception":
+                    controller.page_get_func.side_effect = OSError("read unavailable")
+                else:
+                    cache._all_reduce = lambda result, _op: result.fill_(0)
+
+                self.assertFalse(cache.retraction_restore_ssd(req, backup))
+                self.assertIs(req.kv.retraction_backup, backup)
+                self.assertIs(backup.storage_state, RetractionStorageState.L3_READY)
+                self.assertIsNone(backup.host_indices)
+                self.assertTrue(req.kv.mamba_needs_clear)
+                self.assertEqual(backup.storage_hashes, ["h0", "h1"])
+                group.free.assert_called_once()
+                group.release_transfers.assert_called_once()
+                controller.l2_transfer_engine.submit_host_to_device.assert_not_called()
+                controller.storage_backend.batch_remove_v2.assert_not_called()
+
+                controller.page_get_func.side_effect = lambda _op, hashes, _idx, _info: (
+                    len(hashes)
+                )
+                controller.storage_backend.batch_get_v2.return_value = {
+                    PoolName.MAMBA: [True]
+                }
+                cache._all_reduce = lambda *_args: None
+                self.assertTrue(cache.retraction_restore_ssd(req, backup))
+                self.assertIs(backup.storage_state, RetractionStorageState.RELEASED)
+                self.assertFalse(req.kv.mamba_needs_clear)
+                self.assertEqual(group.free.call_count, 2)
+                self.assertEqual(group.release_transfers.call_count, 2)
+                controller.l2_transfer_engine.submit_host_to_device.assert_called_once()
 
     def test_mamba_slot_rides_every_storage_call(self):
         cache = _make_ssd_cache()

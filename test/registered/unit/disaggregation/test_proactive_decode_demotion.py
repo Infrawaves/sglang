@@ -736,6 +736,60 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
         queue._pre_alloc.assert_not_called()
 
+    def test_failed_ssd_restore_keeps_request_for_retry(self):
+        """A short L3 read must not put uninitialized KV into the waiting queue."""
+        for demoted in (False, True):
+            with self.subTest(demoted=demoted):
+                backup = object()
+                req = SimpleNamespace(
+                    rid="retry",
+                    is_demoted=demoted,
+                    is_retracted=not demoted,
+                    kv=SimpleNamespace(retraction_backup=backup),
+                )
+                queue = self._make_demoted_queue(req, recovery_duration=0.0)
+                queue.retracted_queue = [] if demoted else [req]
+                if not demoted:
+                    queue.demotion_queue = []
+                    queue.demoted_tokens_total = 0
+                queue.tree_cache.retraction_restore_admissible.return_value = True
+                resume = lambda: (
+                    queue.resume_demote_reqs([0])
+                    if demoted
+                    else queue.resume_retracted_reqs()
+                )
+                with (
+                    get_disagg().override(
+                        disaggregation_decode_retraction_backup="ssd"
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.restore_kv_cache",
+                        side_effect=[False, True],
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.release_kv_cache"
+                    ) as release,
+                ):
+                    self.assertEqual(resume(), [])
+                    self.assertEqual(req.is_demoted, demoted)
+                    self.assertEqual(req.is_retracted, not demoted)
+                    self.assertIs(req.kv.retraction_backup, backup)
+                    self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
+                    self.assertEqual(queue.demoted_tokens_total, 7 if demoted else 0)
+                    self.assertEqual(
+                        queue.demoted_reqs() if demoted else queue.retracted_queue,
+                        [req],
+                    )
+                    release.assert_called_once_with(
+                        req, queue.tree_cache, is_insert=False
+                    )
+                    self.assertEqual(resume(), [req])
+                self.assertFalse(req.is_demoted)
+                self.assertFalse(req.is_retracted)
+                self.assertEqual(queue.demotion_queue, [])
+                self.assertEqual(queue.retracted_queue, [])
+                self.assertEqual(queue.demoted_tokens_total, 0)
+
     def test_release_memory_occupation_returns_budget(self):
         """Dropping a demoted CPU backup must return its tokens to the budget,
         or the budget leaks and demotion locks up permanently."""
