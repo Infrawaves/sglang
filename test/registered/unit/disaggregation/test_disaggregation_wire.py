@@ -34,7 +34,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
+    InvalidDisaggregationMetadata,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -827,6 +829,103 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             self.assertEqual(length[0].item(), 3)
             self.assertEqual(mask.tolist(), [7, 8, 9])
             self.assertEqual(logprobs[0].item(), -0.5)
+
+    def test_invalid_metadata_leaves_the_entire_row_unchanged(self):
+        """Reject malformed variable rows before overwriting a reused RDMA slot."""
+        for failure in (
+            "top_logprobs_capacity",
+            "top_logprobs_length",
+            "mask_capacity",
+            "mask_rows",
+            "support_logprobs_length",
+            "selected_logprobs_length",
+            "mask_disabled",
+        ):
+            with (
+                self.subTest(failure=failure),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(
+                    failure != "mask_disabled"
+                ),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=2,
+                    max_top_logprobs_num=2,
+                )
+                for name, value in vars(buffers).items():
+                    if isinstance(value, torch.Tensor):
+                        value.fill_(13)
+                before = {
+                    name: value.clone()
+                    for name, value in vars(buffers).items()
+                    if isinstance(value, torch.Tensor)
+                }
+                req = self._make_req(
+                    None, sampling_mask=[7, 8], sampling_logprobs=[-1.0, -2.0]
+                )
+                if failure.startswith("top_logprobs"):
+                    req.return_sampling_mask = False
+                    req.return_logprob = True
+                    req.logprob = SimpleNamespace(
+                        output_top_logprobs_val=[[-1.0, -2.0, -3.0]],
+                        output_top_logprobs_idx=[
+                            [1, 2, 3] if failure.endswith("capacity") else [1, 2]
+                        ],
+                    )
+                elif failure == "mask_capacity":
+                    req = self._make_req(
+                        None,
+                        sampling_mask=[7, 8, 9],
+                        sampling_logprobs=[-1.0, -2.0, -3.0],
+                    )
+                elif failure == "mask_rows":
+                    req.sampling_mask_rows.append(
+                        np.array([9], np.int32), np.array([-3.0], np.float32)
+                    )
+                elif failure == "support_logprobs_length":
+                    req = self._make_req(
+                        None, sampling_mask=[7, 8], sampling_logprobs=[-1.0]
+                    )
+                elif failure == "selected_logprobs_length":
+                    req.sampling_logprobs_mode = "selected"
+
+                with self.assertRaises(InvalidDisaggregationMetadata):
+                    buffers.set_buf(req)
+                for name, value in before.items():
+                    self.assertTrue(torch.equal(value, getattr(buffers, name)), name)
+
+    def test_invalid_metadata_is_rejected_before_checksum_publication(self):
+        """Checksum-enabled sends must not write their auxiliary slot first."""
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=2,
+                kv_checksum_enabled=True,
+            )
+        buffers.kv_checksum.fill_(13)
+        before = buffers.kv_checksum.clone()
+        req = self._make_req(
+            None, sampling_mask=[7, 8, 9], sampling_logprobs=[-1.0, -2.0, -3.0]
+        )
+        req.rid = "invalid-metadata"
+        req.disagg_kv_sender = Mock()
+        scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.kv_checksum_computer = Mock()
+        scheduler.disagg_metadata_buffers = buffers
+        scheduler.disagg_prefill_pending_chunk_rids = {req.rid}
+
+        scheduler.send_kv_chunk(req, last_chunk=True)
+
+        self.assertEqual(req.finished_reason.status_code, 400)
+        req.disagg_kv_sender.abort.assert_called_once()
+        req.disagg_kv_sender.send.assert_not_called()
+        scheduler.kv_checksum_computer.compute.assert_not_called()
+        self.assertEqual(scheduler.disagg_prefill_pending_chunk_rids, set())
+        self.assertTrue(torch.equal(before, buffers.kv_checksum))
 
     def test_sampling_mask_row_reaches_decode_unchanged(self):
         """The prefill worker's first-token row is the row the decode worker streams."""
