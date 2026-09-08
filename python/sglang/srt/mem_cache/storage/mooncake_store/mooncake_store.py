@@ -31,6 +31,10 @@ DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
 
+# mooncake-store/include/types.h ErrorCode::OBJECT_NOT_FOUND, as the Python
+# binding's batch_remove returns it.
+_MOONCAKE_OBJECT_NOT_FOUND = -704
+
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
@@ -1351,8 +1355,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 object_keys.append(f"{key}_{self.mha_suffix}_v")
         return object_keys
 
-    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> None:
+    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> List[PoolTransfer]:
         object_keys: List[str] = []
+        # Logical (pool, key) owner of each object key, for the failure report.
+        owners: List[Tuple[PoolName, str]] = []
         for transfer in transfers:
             keys = transfer.keys or []
             if not keys:
@@ -1361,20 +1367,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 expanded = self._primary_page_object_keys(keys)
             else:
                 expanded, _ = self._get_hybrid_page_component_keys(keys, transfer)
+            # Both expansions are page-major with a fixed fan-out per key.
+            fan_out = len(expanded) // len(keys)
             object_keys.extend(self._tag_keys(expanded))
+            owners.extend((transfer.name, key) for key in keys for _ in range(fan_out))
         if not object_keys:
-            return
+            return []
         # force=True: the restore read that just finished granted these objects
         # a fresh lease, and the keys are private to one request.
         results = self.store.batch_remove(object_keys, True)
-        failed = sum(1 for status in results if status != 0)
+        failed: dict[PoolName, set[str]] = {}
+        for (name, key), status in zip(owners, results):
+            # Pages a failed write never landed report not-found; nothing is
+            # pinned there, so only a present-but-undeletable object fails.
+            if status in (0, _MOONCAKE_OBJECT_NOT_FOUND):
+                continue
+            failed.setdefault(name, set()).add(key)
         if failed:
-            # Pages a failed write never landed report not-found here.
             logger.info(
-                "Retraction L3 cleanup: %d/%d objects not removed.",
-                failed,
-                len(object_keys),
+                "Retraction L3 cleanup: %d hard-pinned keys not removed; "
+                "retrying at the next release.",
+                sum(len(keys) for keys in failed.values()),
             )
+        return [
+            PoolTransfer(name=name, keys=sorted(keys)) for name, keys in failed.items()
+        ]
 
     def clear(self) -> None:
         self.store.remove_all()

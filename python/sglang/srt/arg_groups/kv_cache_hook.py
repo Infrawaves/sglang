@@ -158,8 +158,25 @@ def handle_cache_compatibility(server_args: Any) -> None:
             f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
             "does not support --dcp-size > 1."
         )
+    if (
+        cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
+        and cfg.enable_unified_memory
+    ):
+        raise ValueError(
+            f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
+            "is incompatible with --enable-unified-memory: the unified pool's "
+            "device slots are virtual and the host retraction transfer does not "
+            "translate them."
+        )
 
     if cfg.disaggregation_decode_retraction_backup == "ssd":
+        if cfg.pp_size > 1:
+            # TODO(zhangmj): need to support PP with SSD retraction backup
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd does not support "
+                "--pp-size > 1: the PP decode loop never drains storage "
+                "acknowledgements, so a demoted request could not resume."
+            )
         if cfg.hicache_storage_backend is None:
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=ssd requires "
