@@ -15,6 +15,7 @@ from sglang.srt.observability.decode_metric_collector import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import ceil_align
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -339,7 +340,9 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         queue.demoted_tokens_total = sum(tokens for _, _, tokens in entries)
         return queue
 
-    def test_demoted_recovery_decision_respects_slots_and_full_budget(self):
+    def test_demoted_recovery_resume_respects_slots_and_full_budget(self):
+        """Every rank applies slot and token budgets itself over the leader's
+        clock verdict; a leader-side pre-check would evict L2 asymmetrically."""
         reqs = [SimpleNamespace(is_demoted=True) for _ in range(3)]
         for slots, budget, expected in [
             (0, 10, []),
@@ -352,27 +355,35 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 queue = self._make_demoted_queue_with_entries(
                     [(req, 0.0, 7) for req in reqs], recovery_duration=0.0
                 )
-                queue.req_to_token_pool.available_size = lambda: slots
+                queue.req_to_token_pool.available_size = lambda: (
+                    slots - queue._pre_alloc.call_count
+                )
                 queue._allocatable_token_budgets = lambda **_: budget
                 queue._prealloc_required_tokens = lambda _: (4, 4)
 
-                with patch(
-                    "sglang.srt.disaggregation.decode.get_disagg",
-                    return_value=_CPU_TENSOR_DISAGG,
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.decode.get_disagg",
+                        return_value=_CPU_TENSOR_DISAGG,
+                    ),
+                    patch("sglang.srt.disaggregation.decode.retraction_restore"),
                 ):
-                    self.assertEqual(
-                        queue.get_demoted_req_indices_to_resume(), expected
-                    )
-                queue._pre_alloc.assert_not_called()
+                    expired = queue.get_demoted_req_indices_to_resume()
+                    self.assertEqual(expired, [0, 1, 2])
+                    resumed = queue.resume_demote_reqs(expired)
+                self.assertEqual(resumed, [reqs[i] for i in expected])
+                self.assertEqual(queue._pre_alloc.call_count, len(expected))
 
     def _make_demoted_swa_queue(self, fill_lens, capacity, reserved_tokens):
+        # rid keeps equal-length namespaces distinct for reqs.index below.
         reqs = [
             SimpleNamespace(
+                rid=i,
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_demoted=True,
             )
-            for fill_len in fill_lens
+            for i, fill_len in enumerate(fill_lens)
         ]
         queue = self._make_demoted_queue_with_entries(
             [(req, 0.0, fill_len) for req, fill_len in zip(reqs, fill_lens)],
@@ -383,11 +394,20 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         del queue._prealloc_required_tokens
         queue.num_reserved_decode_tokens = reserved_tokens
         queue.req_to_token_pool.available_size = lambda: len(reqs)
+        # The budget is re-read after each _pre_alloc, so the stub allocator
+        # must charge the page-aligned SWA tail like the real one.
+        free = {"swa": capacity}
+
+        def pre_alloc(req):
+            _, swa_len = queue._prealloc_kv_lens(req)
+            free["swa"] -= ceil_align(swa_len, 16)
+
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=16,
             size_swa=capacity,
             full_available_size=lambda: 4096,
-            swa_available_size=lambda: capacity,
+            swa_available_size=lambda: free["swa"],
         )
         queue.tree_cache.swa_evictable_size.return_value = 0
         queue.scheduler.server_args.disaggregation_decode_enable_radix_cache = False
@@ -412,6 +432,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 fill_lens=fill_lens, capacity=capacity, disable_radix=disable_radix
             ):
                 queue = self._make_demoted_swa_queue(fill_lens, capacity, reserved)
+                reqs = [entry.req for entry in queue.demotion_queue]
                 with (
                     patch(
                         "sglang.srt.disaggregation.decode.get_memory",
@@ -421,21 +442,27 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                         "sglang.srt.disaggregation.decode.get_disagg",
                         return_value=_CPU_TENSOR_DISAGG,
                     ),
+                    patch("sglang.srt.disaggregation.decode.retraction_restore"),
                 ):
-                    self.assertEqual(
-                        queue.get_demoted_req_indices_to_resume(), expected
+                    resumed = queue.resume_demote_reqs(
+                        queue.get_demoted_req_indices_to_resume()
                     )
-                queue._pre_alloc.assert_not_called()
-                self.assertEqual(len(queue.demotion_queue), len(fill_lens))
-                self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 0)
+                self.assertEqual([reqs.index(req) for req in resumed], expected)
+                self.assertEqual(
+                    len(queue.demotion_queue), len(fill_lens) - len(expected)
+                )
 
     def test_demoted_recovery_uses_tp_consensus(self):
+        """Only the clock verdict is broadcast; the SSD admission check
+        evicts L2, so it must run on every rank or the host trees diverge."""
+        ssd = SimpleNamespace(disaggregation_decode_retraction_backup="ssd")
         for rank, indices in [(0, [1]), (1, [1]), (0, []), (1, [])]:
             with self.subTest(rank=rank, indices=indices):
                 first, second = [SimpleNamespace(is_demoted=True) for _ in range(2)]
                 queue = self._make_demoted_queue_with_entries(
                     [(first, 10.0, 7), (second, 0.0, 11)], recovery_duration=10.0
                 )
+                queue.tree_cache.retraction_restore_admissible.return_value = True
                 decision = MagicMock(wraps=queue.get_demoted_req_indices_to_resume)
                 queue.get_demoted_req_indices_to_resume = decision
                 group = SimpleNamespace(
@@ -453,7 +480,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                     return_value=15.0 if indices else 5.0,
                 ), patch(
                     "sglang.srt.disaggregation.decode.get_disagg",
-                    return_value=_CPU_TENSOR_DISAGG,
+                    return_value=ssd,
                 ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
                     resumed = SchedulerDisaggregationDecodeMixin.resume_demote_reqs(
                         scheduler
@@ -463,6 +490,10 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                     indices if rank == 0 else None, src=0
                 )
                 self.assertEqual(decision.call_count, int(rank == 0))
+                self.assertEqual(
+                    queue.tree_cache.retraction_restore_admissible.call_count,
+                    len(indices),
+                )
                 self.assertEqual(resumed, [second] if indices else [])
                 self.assertEqual(scheduler.waiting_queue, resumed)
                 self.assertEqual(
@@ -471,9 +502,6 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 )
                 self.assertTrue(first.is_demoted)
                 self.assertEqual(second.is_demoted, not indices)
-                self.assertEqual(
-                    queue.scheduler.remain_cpu_demote_tokens, 11 if indices else 0
-                )
                 self.assertEqual(restore.call_count, len(indices))
 
     def test_demoted_request_waits_then_restores(self):
@@ -496,7 +524,6 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
             indices = queue.get_demoted_req_indices_to_resume()
             self.assertEqual(indices, [0])
-            queue._pre_alloc.assert_not_called()
             self.assertTrue(req.is_demoted)
             self.assertEqual(queue.resume_demote_reqs(indices), [req])
         self.assertEqual(queue.demotion_queue, [])
@@ -702,26 +729,29 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             )
         self.assertEqual(queue.demoted_reqs(), [long, medium])
 
-    def test_ssd_failed_backup_keeps_victim_and_ends_wave(self):
-        """L2 is exhausted after reclaim, so a smaller candidate would only
-        repeat the eviction pass: the wave stops with the victim running."""
+    def test_ssd_failed_backup_keeps_victim_and_tries_shorter_candidate(self):
+        """A victim longer than L2 can hold fails every wave; ending the wave
+        there starved every shorter candidate forever. Same-length peers are
+        skipped, shorter ones still get their turn, and the victim stays."""
         long = _make_demotion_candidate("long", 30, 20)
+        peer = _make_demotion_candidate("peer", 30, 20)
         short = _make_demotion_candidate("short", 20, 12)
-        batch = _FakeBatch([long, short], backup_results=[False, True])
+        batch = _FakeBatch([long, peer, short], backup_results=[False, True])
         scheduler = _make_demotion_scheduler(batch, budget=100)
         ssd = SimpleNamespace(disaggregation_decode_retraction_backup="ssd")
 
         with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=ssd):
-            self.assertFalse(
+            self.assertTrue(
                 SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
                     scheduler
                 )
             )
 
-        self.assertEqual(batch.reqs, [long, short])
+        self.assertEqual(batch.reqs, [long, peer])
         self.assertFalse(long.is_demoted)
-        self.assertEqual(scheduler.disagg_decode_prealloc_queue.demoted_reqs(), [])
         self.assertFalse(hasattr(long, "to_finish"))
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.demoted_reqs(), [short])
+        self.assertEqual([rid for rid, *_ in batch.release_calls], ["long", "short"])
 
     def test_ssd_wave_stops_once_usage_drops_below_threshold(self):
         """SSD has no token budget; the wave must stop on the live GPU usage
