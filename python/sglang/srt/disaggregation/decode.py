@@ -877,13 +877,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
-            retraction_restore(
+            restored = retraction_restore(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            # Need to free allocated L1 cache when restore fails.
+            if not restored:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                indices_to_remove.discard(i)
+                continue
 
         self.retracted_queue = [
             entry
@@ -970,13 +975,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             self._pre_alloc(req)
-            retraction_restore(
+            restored = retraction_restore(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            # Need to free allocated L1 cache when restore fails.
+            if not restored:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                continue
             req.is_demoted = False
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens

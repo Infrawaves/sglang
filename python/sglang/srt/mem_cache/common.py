@@ -243,22 +243,25 @@ def retraction_restore(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
-) -> None:
+) -> bool:
+    """Returns False when an SSD L3 read failed and the device KV must be rolled back."""
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-        return
+        return True
     if backend not in ("host_pool", "ssd"):
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
-        return
+        return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
     if backend == "ssd":
-        unified_cache.retraction_restore_ssd(req, req.kv.retraction_backup)
+        if not unified_cache.retraction_restore_ssd(req, req.kv.retraction_backup):
+            return False
     elif backend == "host_pool":
         unified_cache.retraction_restore(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
+    return True
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:

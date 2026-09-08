@@ -1470,20 +1470,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._release_retraction_ssd_staging(backup)
             raise
 
-        try:
-            operation_id = self.cache_controller.write_storage(
-                host_indices=backup.host_indices,
-                token_ids=[],
-                hash_value=hashes,
-                extra_pools=storage_transfers or None,
-                pin=True,
-            )
-        except Exception:
-            logger.exception(
-                "SSD retraction storage enqueue failed for req=%s", req.rid
-            )
-            self._release_retraction_ssd_staging(backup)
-            return None
+        operation_id = self.cache_controller.write_storage(
+            host_indices=backup.host_indices,
+            token_ids=[],
+            hash_value=hashes,
+            extra_pools=storage_transfers or None,
+            pin=True,
+        )
         backup.storage_operation_id = operation_id
         backup.storage_state = RetractionStorageState.L3_WRITE_PENDING
         self.retraction_ssd_backups[operation_id] = backup
@@ -1735,7 +1728,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.mamba_needs_clear = False
         self.retraction_discard(backup)
 
-    def retraction_restore_ssd(self, req: Req, backup: RetractionBackup) -> None:
+    def retraction_restore_ssd(self, req: Req, backup: RetractionBackup) -> bool:
         assert backup.storage_state != RetractionStorageState.L3_WRITE_PENDING, (
             "SSD retraction restore requested before the L3 write completed; "
             "retraction_restore_admissible must gate this call"
@@ -1746,7 +1739,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if backup.storage_operation_id is not None:
                 self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
                 self.retraction_ssd_requests.pop(backup.storage_operation_id, None)
-            return
+            return True
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -1804,9 +1797,9 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = type("_RetractionPrefetch", (), {})()
         operation.request_id = req.rid
         operation.is_terminated = lambda: False
-        # Every key was hard-pinned at write time and is deleted only by this
-        # request's own terminal path, so a short read is an invariant
-        # violation, not a request outcome.
+        # Still need to guard here through write is hard-pin, since the
+        # read can fail due to network issues.
+        read_ok = True
         for start in range(0, len(storage_hashes), STORAGE_BATCH_SIZE):
             page_hashes = list(storage_hashes[start : start + STORAGE_BATCH_SIZE])
             page_host_indices = host_indices[
@@ -1815,22 +1808,39 @@ class UnifiedRadixCache(BasePrefixCache):
             hit_pages = self.cache_controller.page_get_func(
                 operation, page_hashes, page_host_indices, HiCacheStorageExtraInfo()
             )
-            assert hit_pages == len(page_hashes), (
-                f"SSD retraction KV read for req={req.rid} returned "
-                f"{hit_pages}/{len(page_hashes)} hard-pinned pages"
-            )
+            if hit_pages != len(page_hashes):
+                logger.warning(
+                    "SSD retraction KV read for req=%s returned %d/%d pages; "
+                    "skipping this restore attempt",
+                    req.rid,
+                    hit_pages,
+                    len(page_hashes),
+                )
+                read_ok = False
+                break
 
         sidecars = [x for x in resolved or [] if x.name != PoolName.KV]
-        if sidecars:
+        if read_ok and sidecars:
             results = self.cache_controller.storage_backend.batch_get_v2(sidecars)
             hit_counts = count_pool_hits(results)
             for transfer in sidecars:
                 expected = len(transfer.keys or [])
-                assert hit_counts.get(transfer.name, 0) == expected, (
-                    f"SSD retraction sidecar {transfer.name} read for "
-                    f"req={req.rid} returned "
-                    f"{hit_counts.get(transfer.name, 0)}/{expected} pages"
-                )
+                if hit_counts.get(transfer.name, 0) != expected:
+                    logger.warning(
+                        "SSD retraction sidecar %s read for req=%s returned "
+                        "%d/%d pages; skipping this restore attempt",
+                        transfer.name,
+                        req.rid,
+                        hit_counts.get(transfer.name, 0),
+                        expected,
+                    )
+                    read_ok = False
+                    break
+
+        if not read_ok:
+            self.host_pool_group.free(host_indices)
+            self.host_pool_group.release_transfers(resolved)
+            return False
 
         staged = RetractionBackup(
             host_indices=host_indices,
@@ -1844,6 +1854,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if backup.storage_operation_id is not None:
             self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
             self.retraction_ssd_requests.pop(backup.storage_operation_id, None)
+        return True
 
     def retraction_discard_ssd(self, backup: RetractionBackup) -> None:
         """Release retained L2 staging for an SSD retraction backup."""
