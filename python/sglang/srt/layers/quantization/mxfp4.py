@@ -1049,6 +1049,92 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def process_weights_after_loading_for_remote_instance(self, layer) -> None:
+        """Build the seed's final parameter layout without shuffling empty data.
+
+        A remote-instance client receives the already-processed bytes from its
+        seed, so running the trtllm-gen row permutation and scale interleave on
+        the client's uninitialized skeleton is pure startup overhead. Only the
+        final names, shapes and dtypes have to exist before the transfer starts.
+
+        Only the flashinfer trtllm path is fast-pathed. Marlin, DeepGEMM and
+        MegaMoE repack into layouts whose metadata is not derivable this cheaply
+        (MegaMoE additionally repoints params at freshly built tensors), so they
+        fall through to the regular transform for correctness.
+        """
+        # Mirror the regular path's branch precedence, not just its trtllm
+        # condition: DeepGEMM / MegaMoE are checked *before* use_flashinfer
+        # there, and use_mega_moe comes from the a2a backend, so it can be set
+        # while the runner is still flashinfer_mxfp4. Fast-pathing on
+        # use_flashinfer alone would then build a trtllm layout for weights the
+        # seed packed for DeepGEMM.
+        takes_trtllm_branch = self._fi_kernel == "trtllm_sm100" and not (
+            self.use_deep_gemm or self.use_mega_moe
+        )
+        if not takes_trtllm_branch:
+            self.process_weights_after_loading(layer)
+            return
+
+        E = layer.num_local_experts
+        device = layer.w13_weight.device
+
+        # Registered before the six weights are re-wrapped below, matching the
+        # regular path's statement order. The transfer engine matches by name,
+        # but the NCCL backend broadcasts parameters positionally, so
+        # named_parameters() order has to agree with the seed's.
+        #
+        # These three are value-derived from moe_runner_config rather than read
+        # from the checkpoint, so compute them instead of allocating empty:
+        # correct whether or not the seed's manifest carries them.
+        _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
+        _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
+        layer.gemm1_alpha = Parameter(
+            torch.full((E,), _alpha, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        layer.gemm1_beta = Parameter(
+            torch.full((E,), 1.0, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        layer.gemm1_clamp_limit = Parameter(
+            torch.full((E,), _limit, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+
+        # The row permutation and scale interleave reorder bytes without
+        # changing shape, so the existing allocations can receive the seed's
+        # final byte order directly. Scales are only reinterpreted (uint8 and
+        # float8_e4m3fn are both 1 byte); re-wrap to drop loader attributes.
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.data.view(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+
+        # Bias widens bf16 -> fp32, so its storage cannot be reinterpreted in
+        # place; allocate the final shape and let the transfer populate it.
+        # numel // E mirrors the regular path's `.reshape(E, -1)` rather than
+        # assuming the incoming bias is already 2-D.
+        for name in ("w13_weight_bias", "w2_weight_bias"):
+            bias = getattr(layer, name, None)
+            if bias is None:
+                continue
+            setattr(
+                layer,
+                name,
+                Parameter(
+                    torch.empty(
+                        (E, bias.numel() // E), dtype=torch.float32, device=device
+                    ),
+                    requires_grad=False,
+                ),
+            )
+
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
         for FlashInfer's SM90 ``cutlass_fused_moe(use_w4_group_scaling=True)``

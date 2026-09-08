@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
 
-from sglang.srt.model_loader.loader import device_loading_context
+from sglang.srt.model_loader.loader import (
+    _process_weights_after_loading,
+    device_loading_context,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -19,6 +23,39 @@ def _process_device() -> torch.device | None:
 
 
 PROCESS_DEVICE = _process_device()
+
+
+class TestRemoteInstancePostLoadDispatch(unittest.TestCase):
+    def test_remote_preparation_hook_is_used_when_available(self):
+        model = nn.Module()
+        model.layer = nn.Module()
+        quant_method = mock.Mock()
+        model.layer.quant_method = quant_method
+
+        _process_weights_after_loading(
+            model, torch.device("cpu"), prepare_for_remote_instance=True
+        )
+
+        quant_method.process_weights_after_loading_for_remote_instance.assert_called_once_with(
+            model.layer
+        )
+        quant_method.process_weights_after_loading.assert_not_called()
+
+    def test_remote_preparation_falls_back_to_regular_processing(self):
+        class RegularOnlyQuantMethod:
+            def __init__(self):
+                self.process_weights_after_loading = mock.Mock()
+
+        model = nn.Module()
+        model.layer = nn.Module()
+        quant_method = RegularOnlyQuantMethod()
+        model.layer.quant_method = quant_method
+
+        _process_weights_after_loading(
+            model, torch.device("cpu"), prepare_for_remote_instance=True
+        )
+
+        quant_method.process_weights_after_loading.assert_called_once_with(model.layer)
 
 
 @unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")

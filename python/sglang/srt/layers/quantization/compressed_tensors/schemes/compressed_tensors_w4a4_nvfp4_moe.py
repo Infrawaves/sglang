@@ -205,6 +205,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 layer.w13_input_global_scale.min()
                 .to(torch.float32)
                 .expand(layer.num_local_experts)
+                .contiguous()
             )
         else:
             w13_input_global_scale = layer.w13_input_global_scale.min(dim=1).values.to(
@@ -225,6 +226,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 layer.w2_input_global_scale.min()
                 .to(torch.float32)
                 .expand(layer.num_local_experts)
+                .contiguous()
             )
         else:
             w2_input_global_scale = layer.w2_input_global_scale

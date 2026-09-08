@@ -309,13 +309,28 @@ def _post_load_weights(model: nn.Module) -> None:
 
 
 def _process_weights_after_loading(
-    model: nn.Module, target_device: torch.device
+    model: nn.Module,
+    target_device: torch.device,
+    *,
+    prepare_for_remote_instance: bool = False,
 ) -> None:
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None:
             with device_loading_context(module, target_device):
-                quant_method.process_weights_after_loading(module)
+                prepare = (
+                    getattr(
+                        quant_method,
+                        "process_weights_after_loading_for_remote_instance",
+                        None,
+                    )
+                    if prepare_for_remote_instance
+                    else None
+                )
+                if prepare is not None:
+                    prepare(module)
+                else:
+                    quant_method.process_weights_after_loading(module)
 
 
 class BaseModelLoader(ABC):
@@ -3313,15 +3328,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
         # The seed's bytes land straight in these parameters, so the layout has
-        # to match its post-load one: mxfp4 rewrites bias bf16 -> fp32, scales
-        # uint8 -> float8_e4m3fn, and shuffles experts. The transforms are
-        # structural, so zeroed weights still yield the right layout.
+        # to match its post-load one. Quantization methods may provide a cheap
+        # metadata-only preparation hook; methods without one still run their
+        # regular post-load transform for correctness.
         if (
             load_config.remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
         ):
             post_tic = time.time()
-            _process_weights_after_loading(model, torch.device(device_config.device))
+            _process_weights_after_loading(
+                model,
+                torch.device(device_config.device),
+                prepare_for_remote_instance=True,
+            )
             logger.info(
                 "Matched the seed's post-load weight layout in %.2fs.",
                 time.time() - post_tic,
