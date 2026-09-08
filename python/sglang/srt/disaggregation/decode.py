@@ -1080,104 +1080,77 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self.demoted_tokens_total / self.scheduler.max_total_num_tokens
 
     def get_demoted_req_indices_to_resume(self) -> List[int]:
-        """Select recoverable entries without allocating on the request-plane leader."""
+        """Read the recovery deadline only on the request-plane leader."""
         recovery_duration = get_disagg().proactive_demotion_recovery_duration
         now = time.monotonic()
+        return [
+            i
+            for i, entry in enumerate(self.demotion_queue)
+            if now - entry.demoted_start_time >= recovery_duration
+        ]
+
+    def resume_demote_reqs(self, expired_indices: List[int]) -> List[Req]:
+        if not expired_indices:
+            return []
+
+        resumed_reqs: List[Req] = []
+        indices_to_remove = set()
         allocator = self.token_to_kv_pool_allocator
         uses_swa_reservation = self._uses_swa_reservation()
         swa_req_ring = is_swa_req_ring(allocator)
-        available_req_slots = self.req_to_token_pool.available_size()
-        indices_to_resume: List[int] = []
-        pending_full_tokens = pending_swa_tokens = 0
 
-        for i, entry in enumerate(self.demotion_queue):
-            if now - entry.demoted_start_time < recovery_duration:
-                continue
+        for i in expired_indices:
+            entry = self.demotion_queue[i]
             req = entry.req
             if (
                 get_disagg().disaggregation_decode_retraction_backup == "ssd"
                 and not self.tree_cache.retraction_restore_admissible(req)
             ):
-                # L3 write still in flight, or no L2 staging even after reclaim.
-                # Checked before _pre_alloc so a refusal leaves no device state.
+                # This may reclaim L2: every rank must take the same admission
+                # path, before any device allocation or request state change.
                 continue
-            # No mamba budget here: the decode pool sizes mamba slots to at least
-            # the request rows and each request holds exactly one, so this row
-            # check already covers the slot _pre_alloc will take.
-            if available_req_slots <= 0:
+            if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            req = entry.req
             full_required, swa_required = self._prealloc_required_tokens(req)
             if swa_req_ring:
                 swa_required = allocator.swa_ring_cost_tokens
             full_allocatable_tokens = self._allocatable_token_budgets(
-                count_retracted=False, extra_reserved_reqs=len(indices_to_resume)
+                count_retracted=False, extra_reserved_reqs=len(resumed_reqs)
             )
             swa_allocatable_tokens = None
             if uses_swa_reservation:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
-                    count_retracted=False,
-                    extra_reserved_reqs=len(indices_to_resume),
-                    pending_swa_tokens=pending_swa_tokens,
+                    count_retracted=False, extra_reserved_reqs=len(resumed_reqs)
                 )
-                # The joint allocator sees pending occupancy in the demand below;
-                # keep only the projected growth reservation in this budget.
-                swa_allocatable_tokens += pending_swa_tokens
-
-            # No KV has been allocated yet. Price the entire selected prefix so
-            # shared FULL/SWA allocators check its combined physical footprint.
             if not self._prealloc_reservation_fits(
-                pending_full_tokens + full_required,
-                pending_swa_tokens + swa_required,
+                full_required,
+                swa_required,
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 break
-
-            indices_to_resume.append(i)
-            available_req_slots -= 1
-            full_len, swa_len = self._prealloc_kv_lens(req)
-            pending_full_tokens += ceil_align(full_len, allocator.page_size)
-            if uses_swa_reservation:
-                pending_swa_tokens += (
-                    allocator.swa_ring_cost_tokens
-                    if swa_req_ring
-                    else ceil_align(swa_len, allocator.page_size)
-                )
-
-        return indices_to_resume
-
-    def resume_demote_reqs(self, indices_to_resume: List[int]) -> List[Req]:
-        if not indices_to_resume:
-            return []
-
-        resumed_reqs: List[Req] = []
-        indices_to_remove = set(indices_to_resume)
-
-        for i in indices_to_resume:
-            entry = self.demotion_queue[i]
-            req = entry.req
-            if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
+            if allocator.prealloc_fits_assumes_reclaim():
                 full_len, swa_len = self._prealloc_kv_lens(req)
                 error = self._reclaim_swa_tail_capacity(
                     swa_len, req.rid, full_len=full_len
                 )
                 if error is not None:
-                    # A rank must not silently skip the leader's decision.
                     raise RuntimeError(f"Cannot resume demoted request: {error}")
+
             self._pre_alloc(req)
             restore_kv_cache(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
+                allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
             req.is_demoted = False
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
+            indices_to_remove.add(i)
             self.demoted_tokens_total -= entry.demoted_tokens
             if self.demoted_tokens_total < 0:
                 raise RuntimeError(
@@ -2139,7 +2112,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         n_active: Optional[int] = None,
         reserved_tokens: Optional[int] = None,
         extra_reserved_reqs: int = 0,
-        pending_swa_tokens: int = 0,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
@@ -2171,9 +2143,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
             full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
         )
-        # Selection has not allocated KV yet. Account for its physical pages
-        # in both free capacity and the remaining per-request growth headroom.
-        swa_available -= pending_swa_tokens
         # Per-request SWA ring: cached prefixes still report swa_evictable, but
         # evicting them frees no ring space.
         swa_evictable = (
@@ -3466,15 +3435,16 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 if ssd_retraction:
                     # L2 staging is exhausted even after reclaim; the victim
-                    # keeps its device KV and stays in the batch. A smaller
-                    # candidate would only repeat the eviction pass, so end
-                    # this wave and let the next step retry.
+                    # keeps its device KV and stays in the batch. A shorter
+                    # candidate may still fit, so only same-or-longer ones
+                    # leave this wave.
                     logger.warning(
                         "Proactive decode demotion backup failed; keeping req=%s "
                         "in the running batch",
                         victim.rid,
                     )
-                    break
+                    candidates = [c for c in candidates if c.seqlen < victim.seqlen]
+                    continue
 
                 victim.is_demoted = False
                 prepare_abort(
@@ -3522,12 +3492,14 @@ class SchedulerDisaggregationDecodeMixin:
         if not queue.demotion_queue:
             return []
 
-        indices_to_resume = None
+        expired_indices = None
         if self.dp_tp_group.rank_in_group == 0:
-            indices_to_resume = queue.get_demoted_req_indices_to_resume()
+            expired_indices = queue.get_demoted_req_indices_to_resume()
 
-        indices_to_resume = self.dp_tp_group.broadcast_object(indices_to_resume, src=0)
-        resumed_reqs = queue.resume_demote_reqs(indices_to_resume)
+        expired_indices = self.dp_tp_group.broadcast_object(expired_indices, src=0)
+        # SSD admission can evict L2, so every rank applies it after the
+        # leader broadcasts only the time-based eligibility decision.
+        resumed_reqs = queue.resume_demote_reqs(expired_indices)
         self.waiting_queue.extend(resumed_reqs)
         return resumed_reqs
 
