@@ -1,7 +1,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -533,11 +533,217 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         # Resume returns the demoted tokens to the CPU offload budget.
         self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 7)
 
+    def test_empty_resume_call_does_not_use_transient_failure_metric_state(self):
+        req = _make_demotion_candidate("stale", 20, 12)
+        queue = self._make_demoted_queue(req, recovery_duration=10.0)
+        queue.scheduler.metrics_reporter = SimpleNamespace(
+            enable_metrics=True,
+            is_stats_logging_rank=True,
+            metrics_collector=MagicMock(),
+        )
+
+        self.assertEqual(queue.resume_demote_reqs([]), [])
+        metric = (
+            queue.scheduler.metrics_reporter.metrics_collector
+            .increment_demotion_resume_failures
+        )
+        metric.assert_not_called()
+        self.assertFalse(hasattr(queue, "last_resume_failure_count"))
+
+    def test_demotion_retry_add_initializes_resume_failure_count(self):
+        req = _make_demotion_candidate("fresh", 20, 12)
+        queue = self._make_demoted_queue(req, recovery_duration=10.0)
+        queue.demotion_queue = []
+        queue.demoted_tokens_total = 0
+        queue.resume_failure_cnt = {req.rid: 2}
+
+        with patch(
+            "sglang.srt.disaggregation.decode.get_disagg",
+            return_value=_CPU_TENSOR_DISAGG,
+        ):
+            queue.add_demoted_req(req, demoted_start_time=0.0)
+
+        self.assertEqual(queue.resume_failure_cnt[req.rid], 0)
+
+    def test_demoted_restore_failure_requeues_at_tail_and_refreshes_timestamp(self):
+        first = _make_demotion_candidate("first", 20, 12)
+        second = _make_demotion_candidate("second", 21, 12)
+        queue = self._make_demoted_queue_with_entries(
+            [(first, 0.0, 7), (second, 0.0, 8)], recovery_duration=0.0
+        )
+        queue.resume_failure_cnt = {first.rid: 0, second.rid: 0}
+        release = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=_CPU_TENSOR_DISAGG,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.retraction_restore",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.release_kv_cache",
+                release,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.time.monotonic",
+                return_value=10.0,
+            ),
+        ):
+            resumed = queue.resume_demote_reqs([0])
+
+        self.assertEqual(resumed, [])
+        self.assertEqual([entry.req for entry in queue.demotion_queue], [second, first])
+        self.assertEqual(queue.demotion_queue[-1].demoted_start_time, 10.0)
+        self.assertEqual(queue.resume_failure_cnt[first.rid], 1)
+        release.assert_called_once_with(first, queue.tree_cache, is_insert=False)
+        self.assertEqual(queue.demoted_tokens_total, 15)
+
+    def test_demotion_abort_after_third_restore_failure_cleans_up(self):
+        req = _make_demotion_candidate("retry", 20, 12)
+        queue = self._make_demoted_queue(req, recovery_duration=0.0)
+        queue.resume_failure_cnt = {req.rid: 0}
+        queue.scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=MagicMock())
+        )
+        abort_req = object()
+        discard = MagicMock()
+        restore = MagicMock(return_value=False)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_retraction_backup="ssd"
+                ),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.retraction_restore",
+                restore,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.release_kv_cache",
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.retraction_discard",
+                discard,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler._make_abort_req",
+                return_value=abort_req,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.time.monotonic",
+                side_effect=[10.0, 20.0, 30.0],
+            ),
+        ):
+            self.assertEqual(queue.resume_demote_reqs([0]), [])
+            self.assertEqual(queue.resume_failure_cnt[req.rid], 1)
+            self.assertEqual(queue.resume_demote_reqs([0]), [])
+            self.assertEqual(queue.resume_failure_cnt[req.rid], 2)
+            self.assertEqual(queue.resume_demote_reqs([0]), [])
+
+        self.assertEqual(queue.demotion_queue, [])
+        self.assertNotIn(req.rid, queue.resume_failure_cnt)
+        self.assertEqual(queue.demoted_tokens_total, 0)
+        discard.assert_called_once_with(req, queue.tree_cache, "ssd")
+        send_output = queue.scheduler.ipc_channels.send_to_tokenizer.send_output
+        send_output.assert_called_once_with(abort_req, req)
+        self.assertEqual(restore.call_count, 3)
+
+    def test_demotion_resume_failure_metric_has_one_logical_increment_per_attempt(self):
+        """A failed collective restore is counted by the metrics owner only."""
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                req = _make_demotion_candidate("metric", 20, 12)
+                queue = self._make_demoted_queue(req, recovery_duration=0.0)
+                queue.scheduler.ipc_channels = SimpleNamespace(
+                    send_to_tokenizer=SimpleNamespace(send_output=MagicMock())
+                )
+                scheduler = SimpleNamespace(
+                    dp_tp_group=SimpleNamespace(
+                        rank_in_group=rank,
+                        broadcast_object=MagicMock(return_value=[0]),
+                    ),
+                    disagg_decode_prealloc_queue=queue,
+                    waiting_queue=[],
+                    metrics_reporter=SimpleNamespace(
+                        enable_metrics=True,
+                        is_stats_logging_rank=rank == 0,
+                        metrics_collector=MagicMock(),
+                    ),
+                )
+                queue.scheduler.metrics_reporter = scheduler.metrics_reporter
+                restore = MagicMock(return_value=False)
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.decode.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_retraction_backup="ssd"
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.retraction_restore", restore
+                    ),
+                    patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+                    patch("sglang.srt.disaggregation.decode.retraction_discard"),
+                    patch(
+                        "sglang.srt.managers.scheduler._make_abort_req",
+                        return_value=object(),
+                    ),
+                ):
+                    for _ in range(3):
+                        SchedulerDisaggregationDecodeMixin.resume_demote_reqs(scheduler)
+
+                metric = scheduler.metrics_reporter.metrics_collector
+                if rank == 0:
+                    self.assertEqual(
+                        metric.increment_demotion_resume_failures.call_count, 3
+                    )
+                    metric.increment_demotion_resume_failures.assert_has_calls(
+                        [call(1)] * 3
+                    )
+                else:
+                    metric.increment_demotion_resume_failures.assert_not_called()
+
+    def test_demotion_retry_success_clears_failure_count_for_new_demotion(self):
+        req = _make_demotion_candidate("retry", 20, 12)
+        queue = self._make_demoted_queue(req, recovery_duration=0.0)
+        queue.resume_failure_cnt = {req.rid: 0}
+        restore = MagicMock(side_effect=[False, True])
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=_CPU_TENSOR_DISAGG,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.retraction_restore",
+                restore,
+            ),
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch(
+                "sglang.srt.disaggregation.decode.time.monotonic",
+                return_value=10.0,
+            ),
+        ):
+            self.assertEqual(queue.resume_demote_reqs([0]), [])
+            self.assertEqual(queue.resume_demote_reqs([0]), [req])
+
+            self.assertEqual(queue.demotion_queue, [])
+            self.assertNotIn(req.rid, queue.resume_failure_cnt)
+            queue.add_demoted_req(req, demoted_start_time=20.0)
+
+        self.assertEqual(queue.resume_failure_cnt[req.rid], 0)
+
     def test_release_memory_occupation_returns_budget(self):
         """Dropping a demoted CPU backup must return its tokens to the budget,
         or the budget leaks and demotion locks up permanently."""
         req = SimpleNamespace(is_retracted=False, is_demoted=True)
         queue = self._make_demoted_queue(req, recovery_duration=10.0)
+        queue.resume_failure_cnt = {"stale": 2}
         queue.queue = []
         queue.retracted_queue = []
         queue.kv_manager = SimpleNamespace()
@@ -549,6 +755,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             queue.release_memory_occupation()
         discard.assert_called_once()
         self.assertEqual(queue.demotion_queue, [])
+        self.assertEqual(queue.resume_failure_cnt, {})
         self.assertEqual(queue.scheduler.remain_cpu_demote_tokens, 7)
 
     def _make_retract_check_scheduler(self, remain_cpu_demote_tokens):

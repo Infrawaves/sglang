@@ -512,6 +512,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=labels.keys(),
         )
+        self.num_demotion_resume_failures_total = Counter(
+            name="sglang:num_demotion_resume_failures_total",
+            documentation="Total number of failed proactive demotion resume attempts.",
+            labelnames=labels.keys(),
+        )
         self.num_paused_reqs = Gauge(
             name="sglang:num_paused_reqs",
             documentation="The number of paused requests by async weight sync.",
@@ -1314,6 +1319,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_demoted_output_tokens_total.labels(**self.labels).inc(
             num_demoted_output_tokens
         )
+
+    def increment_demotion_resume_failures(self, value: int = 1) -> None:
+        self.num_demotion_resume_failures_total.labels(**self.labels).inc(value)
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
