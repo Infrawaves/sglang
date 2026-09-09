@@ -16,6 +16,34 @@ use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Cap on a non-2xx upstream body forwarded to the client. A worker validation
+/// error on a `Union` field emits one entry per branch, each echoing `input`,
+/// so one bad value can balloon into tens of KB that just repeats the request
+/// back. Arbitrary value; it holds the useful prefix of every observed case.
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
+
+/// Truncate an upstream error body to [`MAX_UPSTREAM_ERROR_BODY_BYTES`].
+///
+/// The result is deliberately not valid JSON when it truncates: the marker
+/// tells the client the body was cut here, rather than leaving it to conclude
+/// the worker emitted malformed JSON. Cuts on a UTF-8 boundary so the prefix
+/// stays decodable.
+fn truncate_error_body(bytes: Bytes) -> Bytes {
+    if bytes.len() <= MAX_UPSTREAM_ERROR_BODY_BYTES {
+        return bytes;
+    }
+    let total = bytes.len();
+    let mut end = MAX_UPSTREAM_ERROR_BODY_BYTES;
+    // Back off off a continuation byte (0b10xxxxxx) to the codepoint start.
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    let mut out = Vec::with_capacity(end + 48);
+    out.extend_from_slice(&bytes[..end]);
+    out.extend_from_slice(format!("... [truncated, {total} bytes total]").as_bytes());
+    Bytes::from(out)
+}
+
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
 /// `healthy_workers_for(...)` selection, then surface the error as
@@ -143,6 +171,12 @@ impl Proxy {
         } else {
             breaker.record_success();
         }
+        // Success bodies pass through untouched; only error payloads are capped.
+        let bytes = if status.is_success() {
+            bytes
+        } else {
+            truncate_error_body(bytes)
+        };
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -212,38 +246,53 @@ impl Proxy {
         } else {
             upstream_ct
         };
-        // Breaker recording is deferred to the pump's completion hook so
-        // an upstream that returns 2xx headers and then drops mid-stream
-        // is recorded as a failure. For 5xx headers we record_failure
-        // up front and skip the pump hook (the body we surface is the
-        // error response — its stream completing is not a worker win).
-        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+        // A non-2xx body is an error payload, not a generation: collect and
+        // truncate it rather than pumping it as SSE. Nothing here needs the
+        // pump's hooks — there is no TTFT to record, and the guards have no
+        // stream lifetime to stay alive for, so they drop on return.
+        if !status.is_success() {
             if status.is_server_error() {
                 breaker.record_failure();
-                None
             } else {
-                let breaker_for_hook = Arc::clone(breaker);
-                Some(Box::new(move |ok| {
-                    if ok {
-                        breaker_for_hook.record_success();
-                    } else {
-                        breaker_for_hook.record_failure();
-                    }
-                }))
-            };
-        // Only record TTFT for successful streams — a 4xx/5xx error body
-        // streaming back is not a generated token, so drop the hook for
-        // non-2xx responses.
-        let first_byte_hook = if status.is_success() {
-            on_first_byte
-        } else {
-            None
+                breaker.record_success();
+            }
+            drop(stream_guards);
+            let bytes = resp.bytes().await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    upstream = %url,
+                    status = %status,
+                    error = ?e,
+                    "failed reading upstream error body",
+                );
+                Bytes::new()
+            });
+            let mut out = Response::new(Body::from(truncate_error_body(bytes)));
+            *out.status_mut() = status;
+            out.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+            );
+            return Ok(out);
+        }
+        // Breaker recording is deferred to the pump's completion hook so
+        // an upstream that returns 2xx headers and then drops mid-stream
+        // is recorded as a failure.
+        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> = {
+            let breaker_for_hook = Arc::clone(breaker);
+            Some(Box::new(move |ok| {
+                if ok {
+                    breaker_for_hook.record_success();
+                } else {
+                    breaker_for_hook.record_failure();
+                }
+            }))
         };
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
-            first_byte_hook,
+            on_first_byte,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -265,5 +314,42 @@ mod tests {
     async fn new_returns_result_not_panic() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
         assert_eq!(p.request_timeout, Duration::from_secs(5));
+    }
+
+    /// Bodies up to the cap must round-trip byte-exact; the passthrough tests
+    /// in `tests/proxy/chat_routing.rs` depend on it.
+    #[test]
+    fn error_body_up_to_cap_is_untouched() {
+        for body in [
+            Bytes::from(r#"{"error":{"message":"bad request"}}"#),
+            Bytes::from(vec![b'x'; MAX_UPSTREAM_ERROR_BODY_BYTES]),
+        ] {
+            assert_eq!(truncate_error_body(body.clone()), body);
+        }
+    }
+
+    #[test]
+    fn oversized_error_body_is_truncated_with_marker() {
+        let total = MAX_UPSTREAM_ERROR_BODY_BYTES * 4;
+        let out = truncate_error_body(Bytes::from(vec![b'x'; total]));
+        let text = String::from_utf8(out.to_vec()).expect("truncated body must stay UTF-8");
+        assert!(text.starts_with("xxxx"), "prefix preserved: {text:.32}");
+        assert!(
+            text.ends_with(&format!("... [truncated, {total} bytes total]")),
+            "marker must report the original size; got tail: {}",
+            &text[text.len().saturating_sub(48)..],
+        );
+        assert!(out.len() < total, "must shrink: {} vs {total}", out.len());
+    }
+
+    /// A cut landing mid-codepoint must back off, or the client gets an
+    /// undecodable tail.
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        // 3-byte chars do not divide evenly into the cap, so some cut lands
+        // inside a codepoint regardless of alignment.
+        let body: String = "错".repeat(MAX_UPSTREAM_ERROR_BODY_BYTES);
+        let out = truncate_error_body(Bytes::from(body.into_bytes()));
+        String::from_utf8(out.to_vec()).expect("truncated body must stay valid UTF-8");
     }
 }
