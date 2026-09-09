@@ -1,0 +1,26 @@
+ARG BASE_IMAGE=harbor.local.clusters/sglang/sglang:sgl-router-venus-trunc-err-body
+ARG BUILD_IMAGE=${BASE_IMAGE}
+FROM ${BUILD_IMAGE} AS builder
+
+# Override BUILD_IMAGE only for an existing build environment with cached dependencies.
+ARG RUSTUP_TOOLCHAIN=1.97.1
+ENV RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN}
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+WORKDIR /build/router
+COPY experimental/sgl-router/ ./
+RUN cargo build --release --bin sgl-router
+
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/Infrawaves/sglang" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.infrawaves.router.base="5930959b923fc7ed9a6f63b4b2dc1e5bad5e6358"
+COPY --from=builder /build/router/target/release/sgl-router /usr/local/bin/sgl-router
+# Check the same executable operators run in an interactive container.
+RUN test -n "${SOURCE_REVISION}" \
+    && /usr/local/bin/sgl-router --help > /tmp/router-help.txt \
+    && grep -q -- '--no-tokenizer' /tmp/router-help.txt \
+    && grep -q -- '--worker-urls' /tmp/router-help.txt \
+    && grep -q -- '--max-chat-body-bytes' /tmp/router-help.txt
+ENTRYPOINT ["/usr/local/bin/sgl-router"]

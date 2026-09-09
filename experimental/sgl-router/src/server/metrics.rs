@@ -29,6 +29,7 @@
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
+//! | `sgl_router_pd_decode_abort_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
@@ -92,6 +93,21 @@ pub enum RequestOutcome {
     Success,
     Error,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PdDecodeAbortOutcome {
+    Success,
+    Failed,
+}
+
+impl PdDecodeAbortOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 impl RequestOutcome {
@@ -235,6 +251,7 @@ pub struct MetricsRegistry {
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    pd_decode_abort_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
@@ -466,6 +483,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_stale_requests_total{outcome}`.
     pub fn record_stale_request(&self, outcome: StaleRequestOutcome) {
         let mut guard = self.stale_requests_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record whether the paired decode worker accepted the abort RPC.
+    pub fn record_pd_decode_abort(&self, outcome: PdDecodeAbortOutcome) {
+        let mut guard = self.pd_decode_abort_requests_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -812,6 +840,24 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str(
+            "# HELP sgl_router_pd_decode_abort_requests_total Abort RPCs sent to paired decode workers after PD request failures. Success means the worker accepted the RPC, not that GPU memory release was confirmed.\n",
+        );
+        out.push_str("# TYPE sgl_router_pd_decode_abort_requests_total counter\n");
+        let guard = self.pd_decode_abort_requests_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_pd_decode_abort_requests_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         // decode_affinity_total
         out.push_str(
             "# HELP sgl_router_decode_affinity_total Decode-affinity outcomes from select_decode_with_affinity.\n",
@@ -1026,6 +1072,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_worker_cb_state gauge"));
         assert!(out.contains("# TYPE sgl_router_worker_inflight_requests gauge"));
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
+        assert!(out.contains("# TYPE sgl_router_pd_decode_abort_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_policy_decisions_total counter"));
@@ -1278,6 +1325,16 @@ mod tests {
         reg.record_stale_request(StaleRequestOutcome::Expired);
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_stale_requests_total{outcome="expired"} 3"#));
+    }
+
+    #[test]
+    fn pd_decode_abort_counter_records_outcomes() {
+        let reg = MetricsRegistry::new();
+        reg.record_pd_decode_abort(PdDecodeAbortOutcome::Success);
+        reg.record_pd_decode_abort(PdDecodeAbortOutcome::Failed);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#));
+        assert!(out.contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="failed"} 1"#));
     }
 
     #[test]
