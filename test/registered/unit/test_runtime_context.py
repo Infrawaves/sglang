@@ -23,7 +23,10 @@ import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import prefill_buffer_ceiling
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
-from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    mamba_extra_buffer_of,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
 )
@@ -1685,6 +1688,23 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         disable_radix_cache is False
                         and strategy == "extra_buffer_lazy",
                     )
+
+    def test_pd_decode_backup_uses_extra_buffer_without_radix(self):
+        cfg = SimpleNamespace(
+            disable_radix_cache=True,
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup=None,
+            mamba_radix_cache_strategy="extra_buffer",
+        )
+        for backup in ("host_pool", "ssd"):
+            with self.subTest(backup=backup):
+                cfg.disaggregation_decode_retraction_backup = backup
+                self.assertTrue(mamba_extra_buffer_of(cfg))
+                cfg.mamba_radix_cache_strategy = "extra_buffer_lazy"
+                self.assertFalse(mamba_extra_buffer_of(cfg))
+                cfg.mamba_radix_cache_strategy = "extra_buffer"
+        cfg.disaggregation_mode = "prefill"
+        self.assertFalse(mamba_extra_buffer_of(cfg))
 
     def test_prefill_buffer_ceiling_matches_the_member(self):
         from sglang.srt.runtime_context import max_prefill_buffer_tokens

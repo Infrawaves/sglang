@@ -215,12 +215,6 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
         )
-        # temporarily only support Kimi-K3, not validated on other model
-        supports_host_pool = supports_host_pool or (
-            unified_draft_host_pool_supported
-            and isinstance(kv_cache, HybridLinearKVPool)
-            and not tp_worker.is_hybrid_swa
-        )
         # TODO(zhangmj): maintain host_pool for priority scheduling, but need
         # to disable when disable hicache.
         backend = (
@@ -229,8 +223,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
-            # Unified{MHA,HybridLinear}KVPool pass the isinstance checks below
-            # but hand out virtual slots the host transfer never translates.
+            # Unified MHA pools pass the isinstance checks below but hand out
+            # virtual slots the host transfer never translates.
             and not memory.enable_unified_memory
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
