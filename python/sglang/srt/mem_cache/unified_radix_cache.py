@@ -1839,7 +1839,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     read_ok = False
                     break
 
-        if not read_ok:
+        result = torch.tensor([int(read_ok)], dtype=torch.int64, device="cpu")
+        self._all_reduce(result, torch.distributed.ReduceOp.MIN)
+        if not result[0]:
             self.host_pool_group.free(host_indices)
             self.host_pool_group.release_transfers(resolved)
             return False

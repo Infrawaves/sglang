@@ -195,6 +195,109 @@ class TestRetractionRestoreAdmission(CustomTestCase):
         )
 
 
+class TestRetractionRestoreCollective(CustomTestCase):
+    def _make_cache(self, *, page_hits=1, sidecar_hits=None):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(enable_storage=True, page_size=2)
+        cache.cache_controller = SimpleNamespace(
+            page_get_func=MagicMock(return_value=page_hits),
+            storage_backend=MagicMock(),
+        )
+        if sidecar_hits is not None:
+            cache.cache_controller.storage_backend.batch_get_v2.return_value = {
+                PoolName.SWA: sidecar_hits
+            }
+        cache.host_pool_group = MagicMock()
+        cache.host_pool_group.alloc.return_value = torch.arange(2, dtype=torch.int64)
+        cache.host_pool_group.resolve_host_transfers.return_value = [
+            PoolTransfer(name=PoolName.SWA, keys=["s0"])
+        ]
+        cache._reclaim_retraction_host = MagicMock()
+        cache._retraction_device_transfers = MagicMock(
+            return_value=(
+                torch.arange(2, dtype=torch.int64),
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        device_indices=torch.arange(2, dtype=torch.int64),
+                    ),
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        device_indices=torch.arange(2, dtype=torch.int64),
+                    ),
+                ],
+            )
+        )
+        cache.retraction_restore = MagicMock()
+        cache.retraction_ssd_backups = {}
+        cache.retraction_ssd_requests = {}
+        return cache
+
+    def _req_backup(self, cache):
+        backup = RetractionBackup(
+            storage_operation_id=17,
+            storage_hashes=["h0"],
+            pool_transfers=[
+                PoolTransfer(name=PoolName.KV, keys=["h0"]),
+                PoolTransfer(name=PoolName.SWA, keys=["s0"]),
+            ],
+            storage_state=RetractionStorageState.L3_READY,
+        )
+        req = SimpleNamespace(
+            rid=3, seqlen=3, kv=SimpleNamespace(retraction_backup=None)
+        )
+        cache.retraction_ssd_backups[17] = backup
+        cache.retraction_ssd_requests[17] = req
+        return req, backup
+
+    def _install_all_reduce(self, cache, backup, *, reduced_success):
+        calls = []
+
+        def fake_all_reduce(tensor, _op):
+            self.assertIs(backup.storage_state, RetractionStorageState.L3_READY)
+            calls.append(tensor.clone())
+            tensor[0] = int(reduced_success)
+
+        cache._all_reduce = fake_all_reduce
+        return calls
+
+    def test_restore_consensus_all_success_commits(self):
+        cache = self._make_cache(sidecar_hits=[True])
+        req, backup = self._req_backup(cache)
+        calls = self._install_all_reduce(cache, backup, reduced_success=True)
+
+        self.assertTrue(cache.retraction_restore_ssd(req, backup))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].tolist(), [1])
+        cache.retraction_restore.assert_called_once()
+        self.assertIs(backup.storage_state, RetractionStorageState.RELEASED)
+        self.assertNotIn(17, cache.retraction_ssd_backups)
+        self.assertNotIn(17, cache.retraction_ssd_requests)
+
+    def test_restore_consensus_asymmetric_read_rolls_back_staging(self):
+        cache = self._make_cache(page_hits=0, sidecar_hits=[True])
+        req, backup = self._req_backup(cache)
+        calls = self._install_all_reduce(cache, backup, reduced_success=False)
+
+        self.assertFalse(cache.retraction_restore_ssd(req, backup))
+        self.assertEqual(len(calls), 1)
+        cache.host_pool_group.free.assert_called_once()
+        cache.host_pool_group.release_transfers.assert_called_once()
+        cache.retraction_restore.assert_not_called()
+        self.assertIs(backup.storage_state, RetractionStorageState.L3_READY)
+        cache.cache_controller.storage_backend.batch_remove_v2.assert_not_called()
+
+    def test_restore_collective_participates_after_early_page_failure(self):
+        cache = self._make_cache(page_hits=0, sidecar_hits=[True])
+        req, backup = self._req_backup(cache)
+        calls = self._install_all_reduce(cache, backup, reduced_success=False)
+
+        self.assertFalse(cache.retraction_restore_ssd(req, backup))
+        self.assertEqual(len(calls), 1)
+
+
 class TestBackupThreadAcksRaisedWrite(CustomTestCase):
     def test_raised_write_is_acked_as_failure(self):
         """A backend exception used to kill the backup thread with no ACK,
