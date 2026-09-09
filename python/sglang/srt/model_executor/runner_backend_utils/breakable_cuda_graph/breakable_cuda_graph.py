@@ -278,6 +278,11 @@ class BreakableCUDAGraph:
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
 
+    @property
+    def segment_count(self) -> int:
+        """Number of captured segments, for capture bookkeeping."""
+        return len(self._segments)
+
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)

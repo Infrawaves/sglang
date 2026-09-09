@@ -67,6 +67,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -76,6 +77,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
+        self.last_warmup_iterations = 2
         self._shared_output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -113,13 +115,57 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            warmup_out = forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        warmup_iterations = self._warmup_iterations()
+        self.last_warmup_iterations = warmup_iterations
+        try:
+            self._capture_one_impl(
+                shape_key,
+                forward_fn,
+                capture_inputs=capture_inputs,
+                post_warmup_hook=post_warmup_hook,
+                warmup_iterations=warmup_iterations,
+            )
+        except Exception as exc:
+            # Do not retry inside the outer graph-capture session.  In a
+            # multi-rank run another rank may already have entered the next
+            # collective (or a CUDA graph capture) when this rank observes the
+            # failure; retrying here would then issue a different collective
+            # sequence and can deadlock the job. The marker makes the next
+            # process use the historical two-warmup policy, including when
+            # the failure happens while opening the per-shape graph.
+            if warmup_iterations == 1:
+                cache = self._cuda_graph_runner.prefill_graph_cache
+                if cache is not None:
+                    cache.mark_runtime_fallback(
+                        f"one-warmup capture failed ({type(exc).__name__})"
+                    )
+            raise
+
+    def _warmup_iterations(self) -> int:
+        """Return the runner-provided hint, preserving the legacy default."""
+
+        # Breakable capture has always required at least one warmup, and
+        # debug_eager must keep the historical policy. BaseCudaGraphRunner
+        # clamps the hint to the values the cache validates, so only 1
+        # diverges.
+        if self._debug_eager:
+            return 2
+        return 1 if self._cuda_graph_runner.capture_warmup_iterations == 1 else 2
+
+    def _capture_one_impl(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        *,
+        capture_inputs: Optional[Any],
+        post_warmup_hook: Optional[Callable[[], None]],
+        warmup_iterations: int,
+    ) -> None:
+        warmup_out = self._run_warmups(
+            forward_fn,
+            post_warmup_hook=post_warmup_hook,
+            warmup_iterations=warmup_iterations,
+        )
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
@@ -128,11 +174,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            barrier_fn=self._tp_group.barrier,
+        with (
+            graph_pool_capture_scope(),
+            BreakableCUDAGraphCapture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                barrier_fn=self._tp_group.barrier,
+            ),
         ):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
@@ -143,6 +192,38 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+
+    def captured_segment_count(self, shape_key: ShapeKey) -> Optional[int]:
+        """Segments captured for ``shape_key``, or None if nothing was captured.
+
+        Breakable capture splits a shape into one graph per eager break, so the
+        count varies per shape. Exposed so capture bookkeeping does not read
+        backend-private state.
+        """
+        graph = self._graphs.get(shape_key)
+        return None if graph is None else graph.segment_count
+
+    def _run_warmups(
+        self,
+        forward_fn: Callable[[], Any],
+        *,
+        post_warmup_hook: Optional[Callable[[], None]],
+        warmup_iterations: int,
+    ) -> Any:
+        """Run warmups before opening a graph segment.
+
+        Exceptions intentionally propagate unchanged; ``capture_one`` records
+        a failed one-warmup probe without replacing the original traceback.
+        """
+
+        warmup_out = None
+        for _ in range(warmup_iterations):
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            warmup_out = forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
+        return warmup_out
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.

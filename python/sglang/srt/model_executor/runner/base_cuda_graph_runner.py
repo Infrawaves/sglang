@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
@@ -131,6 +131,20 @@ class BaseCudaGraphRunner(BaseRunner):
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
+
+    # Warmup policy, read by the shared Breakable / Full backends. Declared
+    # here (not only on PrefillCudaGraphRunner) because those backends serve
+    # both phases: the decode runner leaves these at the class defaults, so the
+    # backends can read them directly instead of probing for the attribute.
+    # A None cache means "no persistent warmup hint for this phase".
+    prefill_graph_cache: Optional[Any] = None
+    capture_warmup_iterations: int = 2
+
+    # Capture profiling, also read by the shared backends. Only the decode
+    # runner and CPUGraphRunner assign these today; the class defaults let the
+    # prefill path read them without an attribute probe.
+    enable_profile_cuda_graph: bool = False
+    _profiler: Optional[Any] = None
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import inspect
 import logging
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -91,6 +92,10 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
+)
+from sglang.srt.model_executor.runner.prefill_cuda_graph_cache import (
+    DEFAULT_PREFILL_CUDA_GRAPH_WARMUP_ITERATIONS,
+    PrefillCudaGraphCache,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -160,6 +165,69 @@ def _chunked_prefix_variant(num_chunks: int) -> str:
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def _captures_native_graph(backend: Any) -> bool:
+    """Whether a backend captures the transformer body into a native graph.
+
+    Both native backends need the static prefill buffers and the resolved
+    layer_model; tc_piecewise drives its own compiled pieces instead.
+    """
+
+    return isinstance(backend, (BreakableCudaGraphBackend, FullCudaGraphBackend))
+
+
+def _uses_persistent_prefill_graph_cache(backend: Any) -> bool:
+    """Whether a backend consumes the persistent warmup hint.
+
+    Narrower than _captures_native_graph: only Breakable exposes the capture
+    bookkeeping the manifest records (captured_segment_count /
+    last_warmup_iterations). FullCudaGraphBackend is shared with the decode
+    runner, which never sets a hint, so wiring it there would be dead code.
+    """
+
+    return isinstance(backend, BreakableCudaGraphBackend)
+
+
+def _prefill_graph_participant_groups() -> list[Any]:
+    """Return process groups entered by the outer graph-capture context.
+
+    The tensor-parallel group is always present, but PP/DCP/attention-TP/MoE
+    groups can also execute collectives during capture.  Exchanging the cache
+    verdict on those groups prevents different stages from selecting different
+    warmup policies.  The list mirrors ``parallel_state.graph_capture``;
+    attention-CP is intentionally omitted because that group is not entered by
+    the outer capture context. Missing groups are expected for TP-only runs.
+    """
+
+    # ``model_runner.ps`` is a rank/size snapshot and intentionally does not
+    # carry process-group handles, so read the live ParallelContext. Its group
+    # names are properties that always exist, but their bodies assert when the
+    # group was never initialized (get_dcp_group / get_moe_*_group), which is
+    # the normal TP-only case -- hence the per-name AssertionError catch rather
+    # than a defensive getattr.
+    parallel = get_parallel()
+    groups = []
+    seen_ids: set[int] = set()
+    for name in (
+        "tp_group",
+        "pp_group",
+        "dcp_group",
+        "attn_tp_group",
+        "moe_ep_group",
+        "moe_tp_group",
+    ):
+        try:
+            group = getattr(parallel, name)
+        except AssertionError:
+            continue
+        # Several names can resolve to one GroupCoordinator (e.g. attn_tp_group
+        # is tp_group without attention-TP). Exchanging the verdict twice on
+        # one group would desync the all_gather, so dedupe by identity.
+        if group is not None and id(group) not in seen_ids:
+            seen_ids.add(id(group))
+            groups.append(group)
+    return groups
 
 
 def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -476,7 +544,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _captures_native_graph(self.backend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -492,6 +560,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+
+        # CUDA executable handles cannot currently be restored across process
+        # restarts. Keep a strict, rank-scoped manifest for the native graph
+        # backends; tc_piecewise owns its compile cache and does not consume
+        # this warmup hint. A completed manifest only changes the number of
+        # fresh-process warmups; all graph addresses remain process-local.
+        self.prefill_graph_cache = None
+        self.capture_warmup_iterations = DEFAULT_PREFILL_CUDA_GRAPH_WARMUP_ITERATIONS
+        if _uses_persistent_prefill_graph_cache(self.backend):
+            cache = PrefillCudaGraphCache.from_runner(self)
+            self.prefill_graph_cache = cache
+            # synchronize() can downgrade the hint when the ranks disagree, so
+            # read warmup_iterations only after it returns.
+            cache.synchronize(
+                model_runner.tp_group,
+                participant_groups=_prefill_graph_participant_groups(),
+            )
+            self.capture_warmup_iterations = cache.warmup_iterations
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -528,7 +614,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _captures_native_graph(self.backend):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
@@ -1371,13 +1457,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture(
-                stream=get_or_create_global_graph_capture_stream()
-            ) as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+        cache = self.prefill_graph_cache
+        if cache is not None:
+            cache.begin_capture()
+        try:
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                with graph_capture(
+                    stream=get_or_create_global_graph_capture_stream()
+                ) as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
+        except BaseException as exc:
+            if cache is not None:
+                cache.abort(f"capture failed ({type(exc).__name__})")
+            raise
+        else:
+            if cache is not None:
+                cache.commit()
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1470,6 +1567,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+        shape_capture_start = time.perf_counter()
         self.backend.capture_one(
             shape_key,
             run_once,
@@ -1482,6 +1580,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_warmup_hook=post_warmup_hook,
         )
+        cache = self.prefill_graph_cache
+        if cache is not None:
+            # The cache is only built for backends that expose the capture
+            # bookkeeping accessors (see _uses_persistent_prefill_graph_cache).
+            assert _uses_persistent_prefill_graph_cache(self.backend)
+            segment_count = self.backend.captured_segment_count(shape_key)
+            if segment_count is None:
+                cache.mark_runtime_fallback(
+                    f"backend produced no artifact for shape {shape_key}"
+                )
+            else:
+                cache.record_shape(
+                    shape_key,
+                    segment_count=segment_count,
+                    elapsed_s=time.perf_counter() - shape_capture_start,
+                    warmup_iterations=self.backend.last_warmup_iterations,
+                )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
