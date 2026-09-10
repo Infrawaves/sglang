@@ -44,6 +44,8 @@ fn truncate_error_body(bytes: Bytes) -> Bytes {
     Bytes::from(out)
 }
 
+const ABORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
 /// `healthy_workers_for(...)` selection, then surface the error as
@@ -184,6 +186,48 @@ impl Proxy {
             HeaderValue::from_static("application/json"),
         );
         Ok(out)
+    }
+
+    /// Send an idempotent SGLang cancellation to the exact worker that owns
+    /// a decode request. Cancellation is deliberately independent from the
+    /// worker circuit breaker: an open breaker must not prevent cleanup, and
+    /// transport/status cleanup failures do not change breaker state.
+    pub async fn abort_request_to(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        headers: &HeaderMap,
+        rid: &str,
+    ) -> Result<(), ApiError> {
+        let worker_url = parse_worker_url(worker_url, breaker)?;
+        let url = worker_url.join("/abort_request").map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("join worker abort path"))
+        })?;
+        let body = serde_json::to_vec(&serde_json::json!({"rid": rid})).map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("serialize worker abort request"))
+        })?;
+        let mut req = self
+            .client
+            .post(url)
+            .header("content-type", "application/json")
+            .timeout(ABORT_REQUEST_TIMEOUT)
+            .body(body);
+        for (k, v) in headers {
+            if should_forward_request_header(k) {
+                req = req.header(k, v);
+            }
+        }
+        let response = req.send().await.map_err(|e| {
+            Self::classify_reqwest_error_for(worker_url.clone(), e, "/abort_request")
+        })?;
+        let status = response.status();
+        let _ = response.bytes().await.map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("read worker abort response"))
+        })?;
+        if !status.is_success() {
+            return Err(ApiError::UpstreamStatus { status });
+        }
+        Ok(())
     }
 
     /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
