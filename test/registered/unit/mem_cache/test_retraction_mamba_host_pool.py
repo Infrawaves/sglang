@@ -255,6 +255,7 @@ def _make_ssd_cache(*, backup_skip: bool = False) -> UnifiedRadixCache:
     cache.retraction_ssd_backups = {}
     cache.retraction_ssd_requests = {}
     cache.retraction_l3_orphans = {}
+    cache._all_reduce = MagicMock()
 
     def resolve(transfers, *, primary_device_indices=None, primary_host_indices=None):
         for transfer in transfers or []:
@@ -356,6 +357,7 @@ class TestMambaSsdLifecycle(CustomTestCase):
         req.kv.mamba_pool_idx = torch.tensor(6)
         req.kv.mamba_needs_clear = True
         cache.retraction_restore_ssd(req, backup)
+        cache._all_reduce.assert_called_once()
 
         (sidecars,) = cache.cache_controller.storage_backend.batch_get_v2.call_args.args
         self.assertEqual([t.name for t in sidecars], [PoolName.MAMBA])
