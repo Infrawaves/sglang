@@ -28,6 +28,11 @@ class Schedule:
 
     _NS_PATH = "schedule"
 
+    enable_chunked_prefill_round_robin: A[
+        bool,
+        "Round-robin chunked prefill for non-overlap PD prefill (TP8, page size 64).",
+    ] = False
+
     # -------------------------------------------------------------------------
     # Memory and scheduling
     # -------------------------------------------------------------------------

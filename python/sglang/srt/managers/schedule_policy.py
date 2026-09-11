@@ -504,7 +504,9 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        rr_requests: Optional[tuple[Req, ...]] = None,
     ):
+        self.rr_requests = rr_requests
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
@@ -1083,6 +1085,40 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
+    def _rr_can_admit(self, req: Req) -> bool:
+        """Keep completion space for other unfinished prefills at fresh admission."""
+        if self.rr_requests is None:
+            return True
+        planned = {id(r) for r in self.can_run_list}
+        seen = {id(req)}
+        reserved = 0
+        for other in (*self.rr_requests, *self.can_run_list):
+            if id(other) in seen:
+                continue
+            seen.add(id(other))
+            end = (
+                other.extend_range.end
+                if id(other) in planned
+                else other.kv.kv_allocated_len
+            )
+            remaining = len(other.full_untruncated_fill_ids) - end
+            if remaining > 0:
+                reserved += (
+                    self.ceil_paged_tokens(remaining)
+                    + self.page_size
+                    + min(other.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
+        if reserved == 0:
+            return True
+        needed = (
+            self.ceil_paged_tokens(
+                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            )
+            + self.page_size
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+        return needed <= self.rem_total_tokens - reserved
+
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -1101,6 +1137,9 @@ class PrefillAdder:
                 > self.rem_swa_tokens
             ):
                 return AddReqResult.NO_TOKEN
+
+        if not self._rr_can_admit(req):
+            return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1297,6 +1336,8 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+            if not self._rr_can_admit(req):
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:

@@ -1299,9 +1299,86 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self.enable_chunked_prefill_round_robin = (
+            get_schedule().enable_chunked_prefill_round_robin
+        )
+        self.suspended_prefill_queue: List[Req] = []
+        self._pending_rr_aborts: dict[Req, None] = {}
+        self._prefill_ready_seq = 0
+        if self.enable_chunked_prefill_round_robin:
+            self._validate_prefill_round_robin()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+
+    def _validate_prefill_round_robin(self) -> None:
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        supported = (
+            get_disagg().disaggregation_mode == "prefill"
+            and not self.enable_overlap
+            and not self.enable_overlap_mlx
+            and self.schedule_policy == "fcfs"
+            and not self.enable_priority_scheduling
+            and not self.enable_lora
+            and not self.enable_pdmux
+            and self.spec_algorithm.is_none()
+            and get_exec().dllm.dllm_algorithm is None
+            and not get_schedule().enable_dynamic_chunking
+            and not get_schedule().enable_mixed_chunk
+            and self.chunked_prefill_size is not None
+            and self.page_size == 64
+            and self.ps.pp_size == 1
+            and self.ps.tp_size == self.ps.attn_tp_size == 8
+            and self.ps.attn_cp_size
+            == self.ps.attn_dcp_size
+            == self.ps.attn_dp_size
+            == 1
+            and not self.enable_unified_memory
+            and not self.is_hybrid_swa
+            and type(self.token_to_kv_pool_allocator) is PagedTokenToKVPoolAllocator
+        )
+        if not supported:
+            raise ValueError(
+                "enable_chunked_prefill_round_robin requires non-overlap PD prefill, "
+                "FCFS without priority, fixed chunks, page size 64, PP1/TP8 with "
+                "one attention group and an independent paged full-KV allocator; "
+                "LoRA, speculation, DLLM, PDMux and mixed chunks are unsupported."
+            )
+
+    def enqueue_prefill_ready(self, reqs) -> None:
+        for req in reqs:
+            if self.enable_chunked_prefill_round_robin:
+                req.prefill_ready_seq = self._prefill_ready_seq
+                self._prefill_ready_seq += 1
+            self.waiting_queue.append(req)
+
+    def reset_prefill_ready_seq_if_idle(self) -> None:
+        if (
+            not self.waiting_queue
+            and not self.suspended_prefill_queue
+            and self.chunked_req is None
+        ):
+            self._prefill_ready_seq = 0
+
+    def iter_rr_requests(self):
+        seen = set()
+        for req in (
+            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.suspended_prefill_queue,
+            *self._pending_rr_aborts,
+        ):
+            if id(req) not in seen:
+                seen.add(id(req))
+                yield req
+
+    def detach_rr_request(self, req: Req) -> None:
+        if self.chunked_req is req:
+            self.chunked_req = None
+        self.suspended_prefill_queue = [
+            r for r in self.suspended_prefill_queue if r is not req
+        ]
+        self._pending_rr_aborts.pop(req, None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -2364,6 +2441,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_rr_requests=self.iter_rr_requests,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2430,6 +2508,7 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
+            get_rr_requests=self.iter_rr_requests,
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),
@@ -3404,6 +3483,11 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        if self.enable_chunked_prefill_round_robin:
+            for req in tuple(self._pending_rr_aborts):
+                self.detach_rr_request(req)
+                self._release_chunked_abort(req)
+            return
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -3419,6 +3503,11 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
+        self._release_chunked_abort(req)
+        self.chunked_req = None
+        self._pending_chunked_abort_req = None
+
+    def _release_chunked_abort(self, req: Req) -> None:
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
@@ -3432,8 +3521,6 @@ class Scheduler(
         self._release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -3699,16 +3786,17 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        has_resume = self.chunked_req is not None or bool(self.suspended_prefill_queue)
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not has_resume:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
-            and self.chunked_req is None
+            and not has_resume
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
@@ -3725,7 +3813,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
-            and self.chunked_req is None
+            and not has_resume
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -3773,9 +3861,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            rr_requests=tuple(self.iter_rr_requests())
+            if self.enable_chunked_prefill_round_robin
+            else None,
         )
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and not self.enable_chunked_prefill_round_robin:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -3795,8 +3886,45 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        rr_enabled = self.enable_chunked_prefill_round_robin
+        rr_middle = None
+        resume_ids = {id(r) for r in self.iter_rr_requests()} if rr_enabled else set()
+        fresh_blocked = False
+        candidates = self.waiting_queue
+        if rr_enabled:
+            candidates = sorted(
+                [*self.waiting_queue, *self.suspended_prefill_queue],
+                key=lambda r: r.prefill_ready_seq,
+            )
+            if self.chunked_req is not None:
+                candidates.insert(0, self.chunked_req)
+        # Ordinary candidates keep the existing matching and allocation path.
+        for req in candidates:
+            if rr_enabled:
+                if (
+                    adder.rem_input_tokens <= 0
+                    or adder.rem_chunk_tokens <= 0
+                    or len(adder.can_run_list)
+                    >= get_parallel().pp_max_micro_batch_size - running_bs
+                    or (
+                        get_schedule().prefill_max_requests is not None
+                        and len(adder.can_run_list)
+                        >= get_schedule().prefill_max_requests
+                    )
+                ):
+                    break
+                if id(req) in resume_ids:
+                    req.init_next_round_input()
+                    rr_middle = adder.add_chunked_req(req)
+                    if (
+                        rr_middle is not None
+                        or adder.budget_state() != AddReqResult.CONTINUE
+                    ):
+                        break
+                    continue
+                if fresh_blocked:
+                    continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3804,23 +3932,33 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
-                running_bs,
-                candidate_beam_width,
-                running_batch=running_batch,
-            ):
-                running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
-
-            if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+            if rr_enabled:
+                new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                if new_rows >= self.req_to_token_pool.available_size():
+                    fresh_blocked = True
+                    continue
+            else:
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                    running_bs,
+                    candidate_beam_width,
+                    running_batch=running_batch,
                 ):
-                    break
+                    running_batch.batch_is_full = True
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # In prefill mode, prealloc queue and transfer queue can also take memory,
+                    # so we need to check if the available size for the actual available size.
+                    if (
+                        len(adder.can_run_list)
+                        >= self.req_to_token_pool.available_size()
+                    ):
+                        running_batch.batch_is_full = True
+
+                if running_batch.batch_is_full:
+                    if (
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req)
+                    ):
+                        break
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3902,6 +4040,12 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if rr_enabled and not added:
+                    fresh_blocked |= res == AddReqResult.NO_TOKEN
+                    continue
+                break
+
+            if rr_enabled and adder.new_chunked_req is not None:
                 break
 
         if mamba_allocator is not None:
@@ -3918,7 +4062,13 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
+        if rr_enabled:
+            self.suspended_prefill_queue = [
+                r for r in self.suspended_prefill_queue if r not in can_run_set
+            ]
+            assert rr_middle is None or adder.new_chunked_req is None
+            self.chunked_req = rr_middle or adder.new_chunked_req
+        elif adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
@@ -4764,6 +4914,8 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
+            and not self.suspended_prefill_queue
+            and not self._pending_rr_aborts
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -5147,7 +5299,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.iter_rr_requests(),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5168,7 +5320,11 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
+        if self.enable_chunked_prefill_round_robin:
+            for req in self.iter_rr_requests():
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    self._pending_rr_aborts[req] = None
+        elif (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
