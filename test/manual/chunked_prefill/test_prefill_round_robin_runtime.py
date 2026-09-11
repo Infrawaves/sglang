@@ -74,7 +74,7 @@ class Batch:
 def make_adder(page, cache, allocator, running, ratio, budget, chunk, *args, **kwargs):
     adder = Adder(allocator.free, chunk)
     adder.rem_input_tokens = budget
-    adder.rr_requests = kwargs["rr_requests"]
+    adder.round_robin_requests = kwargs["round_robin_requests"]
     adder.preempt_list = []
     return adder
 
@@ -116,8 +116,8 @@ Scheduler = extract(
     [
         "enqueue_prefill_ready",
         "reset_prefill_ready_seq_if_idle",
-        "iter_rr_requests",
-        "detach_rr_request",
+        "iter_round_robin_requests",
+        "detach_round_robin_request",
         "_get_new_batch_prefill_raw",
         "process_pending_chunked_abort",
         "_release_chunked_abort",
@@ -183,7 +183,7 @@ class Harness(Scheduler, Prefill):
         self.waiting_queue = []
         self.suspended_prefill_queue = []
         self.chunked_req = None
-        self._pending_rr_aborts = {}
+        self._pending_round_robin_aborts = {}
         self._pending_chunked_abort_req = None
         self._prefill_ready_seq = 0
         self.running_batch = Batch()
@@ -243,7 +243,7 @@ class Harness(Scheduler, Prefill):
         req.pending_bootstrap = False
 
     def retry(self, req):
-        self.detach_rr_request(req)
+        self.detach_round_robin_request(req)
         req.kv.holds_kv = False
         self.enqueue_prefill_ready([req])
 
@@ -354,7 +354,7 @@ class RoundRobinTests(unittest.TestCase):
         s.suspend(a)
         s.reset_prefill_ready_seq_if_idle()
         self.assertEqual(s._prefill_ready_seq, 1)
-        s.detach_rr_request(a)
+        s.detach_round_robin_request(a)
         s.reset_prefill_ready_seq_if_idle()
         s.enqueue_prefill_ready([a])
         self.assertEqual(a.prefill_ready_seq, 0)
@@ -367,7 +367,7 @@ class RoundRobinTests(unittest.TestCase):
         abort = NS(rid="a", abort_all=False, abort_message=None)
         s.abort_request(abort)
         s.abort_request(abort)
-        self.assertEqual(list(s._pending_rr_aborts), [a])
+        self.assertEqual(list(s._pending_round_robin_aborts), [a])
         s.process_pending_chunked_abort()
         s.process_pending_chunked_abort()
         self.assertIs(s.chunked_req, b)
@@ -381,7 +381,7 @@ class RoundRobinTests(unittest.TestCase):
         s.chunked_req = a
         s.suspend(b)
         s.abort_request(NS(rid="", abort_all=True, abort_message=None))
-        self.assertEqual(list(s.iter_rr_requests()), [a, b])
+        self.assertEqual(list(s.iter_round_robin_requests()), [a, b])
         s.process_pending_chunked_abort()
         self.assertEqual(s.outputs, [a, b])
         self.assertIsNone(s.chunked_req)
@@ -483,7 +483,7 @@ class StartupAndAccountingTests(unittest.TestCase):
         a, b = Req("a", 256, prefix=64), Req("b", 256, prefix=128)
         s.suspend(a)
         s.chunked_req = b
-        s._pending_rr_aborts[a] = None
+        s._pending_round_robin_aborts[a] = None
         namespace = dict(
             DisaggregationMode=MODE, ceil_align=lambda n, p: (n + p - 1) // p * p
         )
@@ -494,7 +494,7 @@ class StartupAndAccountingTests(unittest.TestCase):
             namespace,
         )
         load = load_class()
-        load.get_rr_requests = s.iter_rr_requests
+        load.get_round_robin_requests = s.iter_round_robin_requests
         load.get_chunked_req = lambda: b
         load.get_waiting_queue = lambda: []
         load.waiting_queue_prefix_matched = lambda: False
@@ -513,7 +513,7 @@ class StartupAndAccountingTests(unittest.TestCase):
         checker.get_last_batch = lambda: Batch([a, b])
         checker.get_running_batch = lambda: Batch([b])
         checker.get_chunked_req = lambda: b
-        checker.get_rr_requests = s.iter_rr_requests
+        checker.get_round_robin_requests = s.iter_round_robin_requests
         checker.page_size = 64
         checker.is_hybrid_swa = False
         self.assertEqual(checker._get_total_uncached_sizes(), (192, 0))

@@ -561,7 +561,7 @@ class SchedulerDisaggregationPrefillMixin:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
-                self.detach_rr_request(req)
+                self.detach_round_robin_request(req)
                 self.handle_bootstrap_failure(req)
                 failed.add(req)
             elif (
@@ -1454,7 +1454,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         if self.enable_chunked_prefill_round_robin:
-            self.detach_rr_request(req)
+            self.detach_round_robin_request(req)
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

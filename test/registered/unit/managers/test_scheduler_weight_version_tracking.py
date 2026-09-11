@@ -44,7 +44,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             collect_inflight_reqs=lambda: set(inflight),
             waiting_queue=list(waiting),
             chunked_req=chunked,
-            iter_rr_requests=lambda: iter(
+            iter_round_robin_requests=lambda: iter(
                 [*([chunked] if chunked is not None else []), *suspended]
             ),
             hisparse_coordinator=(

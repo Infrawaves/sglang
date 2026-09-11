@@ -504,9 +504,9 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        rr_requests: Optional[tuple[Req, ...]] = None,
+        round_robin_requests: Optional[tuple[Req, ...]] = None,
     ):
-        self.rr_requests = rr_requests
+        self.round_robin_requests = round_robin_requests
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
@@ -1085,14 +1085,14 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def _rr_can_admit(self, req: Req) -> bool:
+    def _round_robin_can_admit(self, req: Req) -> bool:
         """Keep completion space for other unfinished prefills at fresh admission."""
-        if self.rr_requests is None:
+        if self.round_robin_requests is None:
             return True
         planned = {id(r) for r in self.can_run_list}
         seen = {id(req)}
         reserved = 0
-        for other in (*self.rr_requests, *self.can_run_list):
+        for other in (*self.round_robin_requests, *self.can_run_list):
             if id(other) in seen:
                 continue
             seen.add(id(other))
@@ -1138,7 +1138,7 @@ class PrefillAdder:
             ):
                 return AddReqResult.NO_TOKEN
 
-        if not self._rr_can_admit(req):
+        if not self._round_robin_can_admit(req):
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -1337,7 +1337,7 @@ class PrefillAdder:
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
-            if not self._rr_can_admit(req):
+            if not self._round_robin_can_admit(req):
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:

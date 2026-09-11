@@ -1303,7 +1303,7 @@ class Scheduler(
             get_schedule().enable_chunked_prefill_round_robin
         )
         self.suspended_prefill_queue: List[Req] = []
-        self._pending_rr_aborts: dict[Req, None] = {}
+        self._pending_round_robin_aborts: dict[Req, None] = {}
         self._prefill_ready_seq = 0
         if self.enable_chunked_prefill_round_robin:
             self._validate_prefill_round_robin()
@@ -1360,24 +1360,24 @@ class Scheduler(
         ):
             self._prefill_ready_seq = 0
 
-    def iter_rr_requests(self):
+    def iter_round_robin_requests(self):
         seen = set()
         for req in (
             *([self.chunked_req] if self.chunked_req is not None else []),
             *self.suspended_prefill_queue,
-            *self._pending_rr_aborts,
+            *self._pending_round_robin_aborts,
         ):
             if id(req) not in seen:
                 seen.add(id(req))
                 yield req
 
-    def detach_rr_request(self, req: Req) -> None:
+    def detach_round_robin_request(self, req: Req) -> None:
         if self.chunked_req is req:
             self.chunked_req = None
         self.suspended_prefill_queue = [
             r for r in self.suspended_prefill_queue if r is not req
         ]
-        self._pending_rr_aborts.pop(req, None)
+        self._pending_round_robin_aborts.pop(req, None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -2440,7 +2440,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
-            get_rr_requests=self.iter_rr_requests,
+            get_round_robin_requests=self.iter_round_robin_requests,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2507,7 +2507,7 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_rr_requests=self.iter_rr_requests,
+            get_round_robin_requests=self.iter_round_robin_requests,
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),
@@ -3483,8 +3483,8 @@ class Scheduler(
         Mirrors ``handle_bootstrap_failure``.
         """
         if self.enable_chunked_prefill_round_robin:
-            for req in tuple(self._pending_rr_aborts):
-                self.detach_rr_request(req)
+            for req in tuple(self._pending_round_robin_aborts):
+                self.detach_round_robin_request(req)
                 self._release_chunked_abort(req)
             return
         req = self._pending_chunked_abort_req
@@ -3860,7 +3860,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            rr_requests=tuple(self.iter_rr_requests())
+            round_robin_requests=tuple(self.iter_round_robin_requests())
             if self.enable_chunked_prefill_round_robin
             else None,
         )
@@ -3885,12 +3885,16 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
-        rr_enabled = self.enable_chunked_prefill_round_robin
-        rr_middle = None
-        resume_ids = {id(r) for r in self.iter_rr_requests()} if rr_enabled else set()
+        round_robin_enabled = self.enable_chunked_prefill_round_robin
+        round_robin_middle = None
+        resume_ids = (
+            {id(r) for r in self.iter_round_robin_requests()}
+            if round_robin_enabled
+            else set()
+        )
         fresh_blocked = False
         candidates = self.waiting_queue
-        if rr_enabled:
+        if round_robin_enabled:
             candidates = sorted(
                 [*self.waiting_queue, *self.suspended_prefill_queue],
                 key=lambda r: r.prefill_ready_seq,
@@ -3899,7 +3903,7 @@ class Scheduler(
                 candidates.insert(0, self.chunked_req)
         # Ordinary candidates keep the existing matching and allocation path.
         for req in candidates:
-            if rr_enabled:
+            if round_robin_enabled:
                 if (
                     adder.rem_input_tokens <= 0
                     or adder.rem_chunk_tokens <= 0
@@ -3914,9 +3918,9 @@ class Scheduler(
                     break
                 if id(req) in resume_ids:
                     req.init_next_round_input()
-                    rr_middle = adder.add_chunked_req(req)
+                    round_robin_middle = adder.add_chunked_req(req)
                     if (
-                        rr_middle is not None
+                        round_robin_middle is not None
                         or adder.budget_state() != AddReqResult.CONTINUE
                     ):
                         break
@@ -3931,7 +3935,7 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if rr_enabled:
+            if round_robin_enabled:
                 new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
                 if new_rows >= self.req_to_token_pool.available_size():
                     fresh_blocked = True
@@ -4039,12 +4043,12 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
-                if rr_enabled and not added:
+                if round_robin_enabled and not added:
                     fresh_blocked |= res == AddReqResult.NO_TOKEN
                     continue
                 break
 
-            if rr_enabled and adder.new_chunked_req is not None:
+            if round_robin_enabled and adder.new_chunked_req is not None:
                 break
 
         if mamba_allocator is not None:
@@ -4061,12 +4065,12 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if rr_enabled:
+        if round_robin_enabled:
             self.suspended_prefill_queue = [
                 r for r in self.suspended_prefill_queue if r not in can_run_set
             ]
-            assert rr_middle is None or adder.new_chunked_req is None
-            self.chunked_req = rr_middle or adder.new_chunked_req
+            assert round_robin_middle is None or adder.new_chunked_req is None
+            self.chunked_req = round_robin_middle or adder.new_chunked_req
         elif adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
@@ -4914,7 +4918,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.suspended_prefill_queue
-            and not self._pending_rr_aborts
+            and not self._pending_round_robin_aborts
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -5298,7 +5302,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *self.iter_rr_requests(),
+            *self.iter_round_robin_requests(),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5320,9 +5324,9 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         if self.enable_chunked_prefill_round_robin:
-            for req in self.iter_rr_requests():
+            for req in self.iter_round_robin_requests():
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    self._pending_rr_aborts[req] = None
+                    self._pending_round_robin_aborts[req] = None
         elif (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

@@ -28,11 +28,6 @@ class Schedule:
 
     _NS_PATH = "schedule"
 
-    enable_chunked_prefill_round_robin: A[
-        bool,
-        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
-    ] = False
-
     # -------------------------------------------------------------------------
     # Memory and scheduling
     # -------------------------------------------------------------------------
@@ -65,6 +60,10 @@ class Schedule:
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
+    enable_chunked_prefill_round_robin: A[
+        bool,
+        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
+    ] = False
     prefill_decode_interval: A[
         int,
         "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
