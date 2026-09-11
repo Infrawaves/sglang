@@ -1010,6 +1010,7 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
+        self.prefill_ready_seq: Optional[int] = None
         self.kv = ReqKvInfo()
 
         # Full-KV-derived boundary whose SWA window should be inserted after
