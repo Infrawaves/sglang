@@ -193,6 +193,63 @@ def update_kv_lens_and_indices(
     tl.store(local_kv_indices + local_kv_indices_offsets, kv_values, mask=mask)
 
 
+@triton.jit
+def _prepare_dcp_local_lens_kernel(
+    kv_lens,
+    local_kv_lens,
+    local_kv_indptr,
+    bs: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build DCP lengths and their exclusive scan in one launch.
+
+    Decode batches are small (normally <=256), so every program computes one
+    prefix from the same coalesced length vector.  The deliberately redundant
+    scan is cheaper than launching the pointwise div/remainder/clamp chain and
+    a separate device scan, and, importantly, is CUDA-graph friendly.
+    """
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < bs
+    lens = tl.load(kv_lens + offsets, mask=mask, other=0).to(tl.int32)
+    local = lens // dcp_world_size + (dcp_rank < lens % dcp_world_size)
+    local = tl.maximum(local, 0)
+
+    tl.store(
+        local_kv_lens + row,
+        tl.sum(tl.where(offsets == row, local, 0)),
+        mask=row < bs,
+    )
+    # row == bs writes the terminal element; all other rows write the exclusive
+    # prefix.  Having bs+1 programs also handles an empty batch naturally.
+    prefix = tl.sum(tl.where(offsets < row, local, 0))
+    tl.store(local_kv_indptr + row, prefix)
+
+
+def prepare_dcp_local_lens(
+    kv_lens: torch.Tensor,
+    local_kv_lens: torch.Tensor,
+    local_kv_indptr: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> None:
+    """Fused local-length and exclusive-indptr builder for MLA DCP decode."""
+    bs = kv_lens.numel()
+    block_size = max(16, triton.next_power_of_2(bs))
+    _prepare_dcp_local_lens_kernel[(bs + 1,)](
+        kv_lens,
+        local_kv_lens,
+        local_kv_indptr,
+        bs=bs,
+        dcp_rank=dcp_rank,
+        dcp_world_size=dcp_world_size,
+        BLOCK_SIZE=block_size,
+        num_warps=1 if block_size <= 64 else 4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Partial-attention LSE correction (PR #14194, MLA path).
 # ---------------------------------------------------------------------------
