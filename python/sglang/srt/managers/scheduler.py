@@ -1327,9 +1327,8 @@ class Scheduler(
             and not get_schedule().enable_dynamic_chunking
             and not get_schedule().enable_mixed_chunk
             and self.chunked_prefill_size is not None
-            and self.page_size == 64
             and self.ps.pp_size == 1
-            and self.ps.tp_size == self.ps.attn_tp_size == 8
+            and self.ps.tp_size == self.ps.attn_tp_size
             and self.ps.attn_cp_size
             == self.ps.attn_dcp_size
             == self.ps.attn_dp_size
@@ -1341,7 +1340,7 @@ class Scheduler(
         if not supported:
             raise ValueError(
                 "enable_chunked_prefill_round_robin requires non-overlap PD prefill, "
-                "FCFS without priority, fixed chunks, page size 64, PP1/TP8 with "
+                "FCFS without priority, fixed chunks, PP1 with "
                 "one attention group and an independent paged full-KV allocator; "
                 "LoRA, speculation, DLLM, PDMux and mixed chunks are unsupported."
             )

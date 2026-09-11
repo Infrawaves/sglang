@@ -30,7 +30,7 @@ class Schedule:
 
     enable_chunked_prefill_round_robin: A[
         bool,
-        "Round-robin chunked prefill for non-overlap PD prefill (TP8, page size 64).",
+        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
     ] = False
 
     # -------------------------------------------------------------------------

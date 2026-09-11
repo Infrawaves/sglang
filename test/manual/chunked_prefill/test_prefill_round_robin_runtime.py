@@ -443,9 +443,16 @@ class StartupAndAccountingTests(unittest.TestCase):
             "sys.modules", {"sglang.srt.mem_cache.allocator.paged": module}
         ):
             s._validate_prefill_round_robin()
+            for tp_size in (1, 2, 4, 8, 16):
+                for page_size in (1, 16, 32, 64, 128):
+                    with self.subTest(tp_size=tp_size, page_size=page_size):
+                        s.ps.tp_size = s.ps.attn_tp_size = tp_size
+                        s.page_size = page_size
+                        s._validate_prefill_round_robin()
+            s.ps.tp_size = s.ps.attn_tp_size = 8
+            s.page_size = 64
             for target, name, value in (
                 (s, "enable_overlap", True),
-                (s, "page_size", 1),
                 (s, "enable_unified_memory", True),
                 (s, "enable_lora", True),
                 (s, "schedule_policy", "lpm"),
