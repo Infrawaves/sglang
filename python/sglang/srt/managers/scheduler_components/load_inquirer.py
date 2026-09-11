@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.context_bucket import (
+    CONTEXT_BUCKET_BOUNDS,
+    context_bucket_index,
+)
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -14,7 +18,7 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_lora
+from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -97,7 +101,8 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        running_reqs = self.get_running_batch().reqs
+        num_running_reqs = len(running_reqs)
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
@@ -143,6 +148,19 @@ class SchedulerLoadInquirer:
             req.seqlen for queue in pending_token_queues for req in queue
         )
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
+
+        context_length_histogram = None
+        num_context_tokens = 0
+        if get_parallel().load_balance_method == "context_bucket":
+            context_length_histogram = [0] * (len(CONTEXT_BUCKET_BOUNDS) + 1)
+            # The queues represent disjoint request lifecycle states. Count
+            # transferred requests once, even though their KV is already in
+            # num_used_tokens. Req.seqlen is CPU metadata (input + output).
+            for queue in (running_reqs, *waiting_queues):
+                for req in queue:
+                    length = req.seqlen
+                    context_length_histogram[context_bucket_index(length)] += 1
+                    num_context_tokens += length
 
         memory = None
         try:
@@ -229,6 +247,8 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
+            context_length_histogram=context_length_histogram,
+            num_context_tokens=num_context_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

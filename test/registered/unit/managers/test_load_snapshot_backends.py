@@ -75,6 +75,8 @@ class TestShmRoundTrip(CustomTestCase):
                     total_prefill_uncached_tokens=1000,
                     total_prefill_busy_us=250_000,
                     decode_moments=[2, 30, 3000, 500, 50_000, 60],
+                    context_length_histogram=[0, 1, 0, 2, 0, 0, 0, 0, 1],
+                    num_context_tokens=1_200_000,
                 )
             )
             load = reader.read(0)
@@ -88,6 +90,13 @@ class TestShmRoundTrip(CustomTestCase):
             self.assertEqual(load.total_prefill_busy_us, 250_000)
             self.assertEqual(load.decode_moments[0], 2)
             self.assertEqual(load.decode_moments[5], 60)
+            self.assertEqual(load.context_length_histogram, [0, 1, 0, 2, 0, 0, 0, 0, 1])
+            self.assertEqual(load.num_context_tokens, 1_200_000)
+            core = load.to_dict(include={"core"})
+            self.assertEqual(
+                core["context_length_histogram"], load.context_length_histogram
+            )
+            self.assertEqual(core["num_context_tokens"], 1_200_000)
         finally:
             reader.close()
             writer.close()
@@ -139,13 +148,31 @@ class TestZmqRoundTrip(CustomTestCase):
         try:
             _warmup_zmq([writer], reader)
 
-            writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=7, timestamp=2.0))
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    num_running_reqs=7,
+                    timestamp=2.0,
+                    context_length_histogram=[1, 0, 0, 0, 0, 0, 0, 0, 6],
+                    num_context_tokens=7_000_000,
+                )
+            )
             time.sleep(0.05)
 
             load = reader.read(0)
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 7)
             self.assertEqual(load.timestamp, 2.0)
+            self.assertEqual(load.context_length_histogram, [1, 0, 0, 0, 0, 0, 0, 0, 6])
+            self.assertEqual(load.num_context_tokens, 7_000_000)
+
+            # Turning the policy off must clear previously published bucket data.
+            writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=7, timestamp=3.0))
+            time.sleep(0.05)
+            load = reader.read(0)
+            self.assertEqual(load.timestamp, 3.0)
+            self.assertIsNone(load.context_length_histogram)
+            self.assertEqual(load.num_context_tokens, 0)
         finally:
             writer.close()
             reader.close()
@@ -314,7 +341,7 @@ class TestZmqReaderOwner(CustomTestCase):
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
-        for method in ("total_tokens", "total_requests"):
+        for method in ("total_tokens", "total_requests", "context_bucket"):
             self.assertEqual(
                 self._owners(
                     dp_size=4, tokenizer_worker_num=8, load_balance_method=method
@@ -356,7 +383,12 @@ class TestZmqReaderOwner(CustomTestCase):
     def test_at_most_one_owner_across_configs(self):
         for dp_size in (1, 4):
             for tw in (1, 8):
-                for method in ("round_robin", "total_tokens", "total_requests"):
+                for method in (
+                    "round_robin",
+                    "total_tokens",
+                    "total_requests",
+                    "context_bucket",
+                ):
                     for node_rank in (0, 1):
                         owners = self._owners(
                             dp_size=dp_size,

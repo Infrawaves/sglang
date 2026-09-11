@@ -201,6 +201,20 @@ def handle_load_balance_method(server_args: Any):
     if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
 
+    if cfg.load_balance_method == "context_bucket":
+        if cfg.disaggregation_mode != "decode" or cfg.pp_size != 1:
+            raise ValueError(
+                "context_bucket requires --disaggregation-mode decode and "
+                "--pp-size 1; other modes have incomplete context load snapshots."
+            )
+        if cfg.elastic_ep_backend is not None or (
+            cfg.max_ep_size is not None and cfg.max_ep_size > cfg.dp_size
+        ):
+            raise ValueError(
+                "context_bucket requires a fixed DP topology; elastic EP and "
+                "DP expansion are not supported by its load snapshot budget."
+            )
+
     if cfg.load_balance_method == "auto":
         # Default behavior:
         # - non-PD: round_robin
