@@ -133,15 +133,17 @@ class TestPrefillAdder(CustomTestCase):
         candidate.full_untruncated_fill_ids = range(128)
         self.mock_token_allocator.available_size.return_value = 512
         adder = self.create_adder(
-            self.create_running_batch(), page_size=64, rr_requests=(other, other)
+            self.create_running_batch(),
+            page_size=64,
+            round_robin_requests=(other, other),
         )
         # 321 reserved + 193 new: just over capacity. A planned final releases
         # only the reservation; the existing batch debit remains in the offset.
-        self.assertFalse(adder._rr_can_admit(candidate))
+        self.assertFalse(adder._round_robin_can_admit(candidate))
         other.extend_range = Range(start=64, end=257)
         adder.can_run_list.append(other)
         adder.rem_total_token_offset = 321
-        self.assertTrue(adder._rr_can_admit(candidate))
+        self.assertTrue(adder._round_robin_can_admit(candidate))
         self.assertEqual(adder.rem_total_token_offset, 321)
 
     def test_rr_disabled_and_single_request_keep_native_admission_gate(self):
@@ -150,9 +152,9 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = 256
         for owned in (None, (), (candidate,)):
             adder = self.create_adder(
-                self.create_running_batch(), page_size=64, rr_requests=owned
+                self.create_running_batch(), page_size=64, round_robin_requests=owned
             )
-            self.assertTrue(adder._rr_can_admit(candidate))
+            self.assertTrue(adder._round_robin_can_admit(candidate))
 
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())

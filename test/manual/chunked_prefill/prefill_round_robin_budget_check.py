@@ -29,7 +29,7 @@ def load_adder_methods():
         "add_chunked_req",
         "add_one_req",
         "add_one_req_ignore_eos",
-        "_rr_can_admit",
+        "_round_robin_can_admit",
     }
     selected = [
         ast.ImportFrom(
@@ -90,7 +90,7 @@ class Request:
 
 class Adder(ACTUAL["PrefillAdder"]):
     def __init__(self, free, quantum):
-        self.rr_requests = None
+        self.round_robin_requests = None
         self.free = free
         self.page_size = PAGE
         self.rem_total_token_offset = self.cur_rem_token_offset = 0
@@ -156,7 +156,7 @@ def simulate(
             assert free == capacity
             return
         adder = Adder(free, quantum)
-        adder.rr_requests = tuple(active) if reserve_enabled else None
+        adder.round_robin_requests = tuple(active) if reserve_enabled else None
         planned = {}
         pressure = False
         for req in list(ready):
@@ -281,7 +281,7 @@ def main():
                     adder = Adder(free, 128)
                     adder.tree_cache.disable = False
                     cost, future = reserve(adder, req), reserve(adder, other)
-                    adder.rr_requests = (other,)
+                    adder.round_robin_requests = (other,)
                     adder.add_one_req(req, False, None)
                     if cost <= adder.free - future:
                         if req in adder.can_run_list:
@@ -307,7 +307,7 @@ def main():
     req, other = Request(257, prefix=128), Request(257, prefix=64)
     demand = reserve(adder, req) + reserve(adder, other)
     assert demand <= adder.rem_total_tokens
-    adder.rr_requests = (other,)
+    adder.round_robin_requests = (other,)
 
     @contextmanager
     def pin_prefix(node):
