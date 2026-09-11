@@ -1303,7 +1303,7 @@ class Scheduler(
             get_schedule().enable_chunked_prefill_round_robin
         )
         self.suspended_prefill_queue: List[Req] = []
-        self._pending_round_robin_aborts: dict[Req, None] = {}
+        self._pending_round_robin_actions: dict[Req, Optional[str]] = {}
         self._prefill_ready_seq = 0
         if self.enable_chunked_prefill_round_robin:
             self._validate_prefill_round_robin()
@@ -1316,13 +1316,16 @@ class Scheduler(
 
         supported = (
             get_disagg().disaggregation_mode == "prefill"
-            and not self.enable_overlap
             and not self.enable_overlap_mlx
+            and (
+                not self.enable_overlap
+                or get_disagg().disaggregation_transfer_backend in ("mooncake", "fake")
+            )
             and self.schedule_policy == "fcfs"
             and not self.enable_priority_scheduling
             and not self.enable_lora
             and not self.enable_pdmux
-            and self.spec_algorithm.is_none()
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
             and get_exec().dllm.dllm_algorithm is None
             and not get_schedule().enable_dynamic_chunking
             and not get_schedule().enable_mixed_chunk
@@ -1339,10 +1342,11 @@ class Scheduler(
         )
         if not supported:
             raise ValueError(
-                "enable_chunked_prefill_round_robin requires non-overlap PD prefill, "
+                "enable_chunked_prefill_round_robin requires PD prefill, "
                 "FCFS without priority, fixed chunks, PP1 with "
                 "one attention group and an independent paged full-KV allocator; "
-                "LoRA, speculation, DLLM, PDMux and mixed chunks are unsupported."
+                "overlap requires Mooncake (or fake transfer); only DSPARK speculation is "
+                "supported. LoRA, DLLM, PDMux and mixed chunks are unsupported."
             )
 
     def enqueue_prefill_ready(self, reqs) -> None:
@@ -1357,6 +1361,7 @@ class Scheduler(
             not self.waiting_queue
             and not self.suspended_prefill_queue
             and self.chunked_req is None
+            and not self._pending_round_robin_actions
         ):
             self._prefill_ready_seq = 0
 
@@ -1365,7 +1370,7 @@ class Scheduler(
         for req in (
             *([self.chunked_req] if self.chunked_req is not None else []),
             *self.suspended_prefill_queue,
-            *self._pending_round_robin_aborts,
+            *self._pending_round_robin_actions,
         ):
             if id(req) not in seen:
                 seen.add(id(req))
@@ -1377,7 +1382,7 @@ class Scheduler(
         self.suspended_prefill_queue = [
             r for r in self.suspended_prefill_queue if r is not req
         ]
-        self._pending_round_robin_aborts.pop(req, None)
+        self._pending_round_robin_actions.pop(req, None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -3483,7 +3488,10 @@ class Scheduler(
         Mirrors ``handle_bootstrap_failure``.
         """
         if self.enable_chunked_prefill_round_robin:
-            for req in tuple(self._pending_round_robin_aborts):
+            if self.enable_overlap:
+                self.process_pending_round_robin_actions()
+                return
+            for req in tuple(self._pending_round_robin_actions):
                 self.detach_round_robin_request(req)
                 self._release_chunked_abort(req)
             return
@@ -4918,7 +4926,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.suspended_prefill_queue
-            and not self._pending_round_robin_aborts
+            and not self._pending_round_robin_actions
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -5318,15 +5326,22 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
+        if self.enable_chunked_prefill_round_robin and self.enable_overlap:
+            inflight_batches.extend(batch for batch, _ in self.result_queue)
         return {
             req for batch in inflight_batches if batch is not None for req in batch.reqs
         }
 
     def abort_request(self, recv_req: AbortReq):
         if self.enable_chunked_prefill_round_robin:
-            for req in self.iter_round_robin_requests():
+            candidates = list(self.iter_round_robin_requests())
+            if self.enable_overlap:
+                candidates.extend(
+                    req for batch, _ in self.result_queue for req in batch.reqs
+                )
+            for req in candidates:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    self._pending_round_robin_aborts[req] = None
+                    self._pending_round_robin_actions[req] = "abort"
         elif (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

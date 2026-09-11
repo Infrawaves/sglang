@@ -87,7 +87,9 @@ GLOBALS = dict(
     get_schedule=lambda: SCHEDULE,
     get_parallel=lambda: PARALLEL,
     get_memory=lambda: NS(enable_flexkv=False),
-    get_disagg=lambda: NS(disaggregation_mode="prefill"),
+    get_disagg=lambda: NS(
+        disaggregation_mode="prefill", disaggregation_transfer_backend="mooncake"
+    ),
     get_exec=lambda: NS(dllm=NS(dllm_algorithm=None)),
     TEST_RETRACT=False,
     PrefillAdder=make_adder,
@@ -144,6 +146,14 @@ Prefill = extract(
         "process_prefill_chunk",
         "resolve_waiting_queue_bootstrap",
         "has_bootstrapped_waiting_req",
+        "has_pending_prefill_result",
+        "defer_round_robin_action",
+        "process_pending_round_robin_actions",
+        "round_robin_release_ready",
+        "process_batch_result_disagg_prefill",
+        "handle_bootstrap_failure",
+        "optimistic_release_and_requeue",
+        "_retire_aborted_prefill_result",
     ],
     GLOBALS,
 )
@@ -183,11 +193,12 @@ class Harness(Scheduler, Prefill):
         self.waiting_queue = []
         self.suspended_prefill_queue = []
         self.chunked_req = None
-        self._pending_round_robin_aborts = {}
+        self._pending_round_robin_actions = {}
         self._pending_chunked_abort_req = None
         self._prefill_ready_seq = 0
         self.running_batch = Batch()
         self.last_batch = None
+        self.result_queue = []
         self.enable_hierarchical_cache = self.enable_unified_cache_external_linker = (
             False
         )
@@ -367,7 +378,7 @@ class RoundRobinTests(unittest.TestCase):
         abort = NS(rid="a", abort_all=False, abort_message=None)
         s.abort_request(abort)
         s.abort_request(abort)
-        self.assertEqual(list(s._pending_round_robin_aborts), [a])
+        self.assertEqual(list(s._pending_round_robin_actions), [a])
         s.process_pending_chunked_abort()
         s.process_pending_chunked_abort()
         self.assertIs(s.chunked_req, b)
@@ -443,6 +454,14 @@ class StartupAndAccountingTests(unittest.TestCase):
             "sys.modules", {"sglang.srt.mem_cache.allocator.paged": module}
         ):
             s._validate_prefill_round_robin()
+            s.enable_overlap = True
+            s.spec_algorithm = NS(is_none=lambda: False, is_dspark=lambda: True)
+            s._validate_prefill_round_robin()
+            s.spec_algorithm = NS(is_none=lambda: False, is_dspark=lambda: False)
+            with self.assertRaises(ValueError):
+                s._validate_prefill_round_robin()
+            s.spec_algorithm = NS(is_none=lambda: True)
+            s.enable_overlap = False
             for tp_size in (1, 2, 4, 8, 16):
                 for page_size in (1, 16, 32, 64, 128):
                     with self.subTest(tp_size=tp_size, page_size=page_size):
@@ -452,7 +471,7 @@ class StartupAndAccountingTests(unittest.TestCase):
             s.ps.tp_size = s.ps.attn_tp_size = 8
             s.page_size = 64
             for target, name, value in (
-                (s, "enable_overlap", True),
+                (s, "enable_overlap_mlx", True),
                 (s, "enable_unified_memory", True),
                 (s, "enable_lora", True),
                 (s, "schedule_policy", "lpm"),
@@ -483,7 +502,7 @@ class StartupAndAccountingTests(unittest.TestCase):
         a, b = Req("a", 256, prefix=64), Req("b", 256, prefix=128)
         s.suspend(a)
         s.chunked_req = b
-        s._pending_round_robin_aborts[a] = None
+        s._pending_round_robin_actions[a] = None
         namespace = dict(
             DisaggregationMode=MODE, ceil_align=lambda n, p: (n + p - 1) // p * p
         )

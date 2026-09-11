@@ -62,7 +62,7 @@ class Schedule:
     ] = None
     enable_chunked_prefill_round_robin: A[
         bool,
-        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
+        "Round-robin chunked PD prefill, including overlap and DSPARK (PP1, one attention TP group).",
     ] = False
     prefill_decode_interval: A[
         int,
