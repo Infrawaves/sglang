@@ -28,11 +28,6 @@ class Schedule(msgspec.Struct):
 
     _NS_PATH = "schedule"
 
-    enable_chunked_prefill_round_robin: A[
-        bool,
-        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
-    ] = False
-
     # -------------------------------------------------------------------------
     # Memory and scheduling
     # -------------------------------------------------------------------------
@@ -65,6 +60,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
+    enable_chunked_prefill_round_robin: A[
+        bool,
+        "Round-robin chunked prefill for non-overlap PD prefill (PP1, one attention TP group).",
+    ] = False
     prefill_decode_interval: A[
         Optional[int],
         Arg(
