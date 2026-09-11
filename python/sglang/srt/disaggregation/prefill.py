@@ -552,7 +552,11 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        candidates = [
+            req
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
+            if not is_aborted(req)
+        ]
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -563,6 +567,7 @@ class SchedulerDisaggregationPrefillMixin:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
+                self.detach_rr_request(req)
                 self.handle_bootstrap_failure(req)
                 failed.add(req)
             elif (
@@ -582,7 +587,7 @@ class SchedulerDisaggregationPrefillMixin:
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
-            for req in self.waiting_queue
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -620,7 +625,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.reset_prefill_ready_seq_if_idle()
+            self.enqueue_prefill_ready(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -1220,6 +1226,17 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+        if (
+            self.enable_chunked_prefill_round_robin
+            and req is not None
+            and self.chunked_req is req
+            and (self.waiting_queue or self.suspended_prefill_queue)
+        ):
+            req.prefill_ready_seq = self._prefill_ready_seq
+            self._prefill_ready_seq += 1
+            self.suspended_prefill_queue.append(req)
+            self.chunked_req = None
+
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
@@ -1474,6 +1491,8 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
+        if self.enable_chunked_prefill_round_robin:
+            self.detach_rr_request(req)
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1505,4 +1524,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
-            self.waiting_queue.insert(0, req)
+            if self.enable_chunked_prefill_round_robin:
+                self.enqueue_prefill_ready([req])
+            else:
+                self.waiting_queue.insert(0, req)
