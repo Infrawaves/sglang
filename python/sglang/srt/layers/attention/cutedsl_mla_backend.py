@@ -9,9 +9,11 @@ monolithic MLA decode kernel natively accepts cyclic DCP metadata
 returns the rank-local ``(out, lse)`` needed by the cross-rank merge in
 ``deepseek_common/attention_forward_methods/forward_mla.py``.
 
-Non-DCP (``dcp_size == 1``) decode falls through to the base cute-dsl path
-unchanged. The DCP metadata helpers live on :class:`TRTLLMMLABackend`; this
-module only supplies the cute-dsl kernel call and its decode forward.
+Non-DCP decode uses the base cute-dsl path unless the experimental fixed
+split-KV override is enabled. The DCP metadata helpers are duplicated from
+:mod:`tokenspeed_mla_backend` (they are kernel-agnostic) so that TokenSpeed
+stays untouched; both should collapse into the base once the cute-dsl decode
+path is stable (see the TODO in tokenspeed_mla_backend.py).
 """
 
 from __future__ import annotations
@@ -29,12 +31,17 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
+    _ENABLE_PDL,
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+    is_flashinfer_available,
+)
 
 if is_flashinfer_available():
     import flashinfer
@@ -60,6 +67,23 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        # Resolve once: graph replay captures this split scalar and workspace.
+        self._decode_with_splits = None
+        num_splits = envs.SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS.get()
+        if num_splits != 0:
+            from sglang.srt.layers.attention.cutedsl_mla_splitkv import (
+                create_cutedsl_mla_decode_with_splits,
+            )
+
+            if get_parallel().dcp_enabled or not model_runner.spec_algorithm.is_none():
+                raise ValueError(
+                    "SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS currently requires "
+                    "DCP size 1 and speculative decoding disabled"
+                )
+            if envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is not None:
+                raise ValueError("Fixed CuTeDSL MLA splits do not support skip-softmax")
+            self._decode_with_splits = create_cutedsl_mla_decode_with_splits(num_splits)
+
         super().__init__(
             model_runner,
             skip_prefill,
@@ -67,6 +91,225 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
             backend="cute-dsl",
         )
+
+        if self._decode_with_splits is not None:
+            from sglang.srt.layers.attention.cutedsl_mla_splitkv import (
+                plan_cutedsl_mla_splits,
+            )
+
+            # Same upper bound as the decode graph runner, including alignment
+            # padding. Also covers eager batches up to the request-pool capacity.
+            capacity = model_runner.req_to_token_pool.size
+            max_bs = max(
+                get_cuda_graph_max_batch_size(capacity),
+                get_eager_max_batch_size(capacity),
+            )
+            _, required = plan_cutedsl_mla_splits(
+                max_bs, 1, self.num_local_heads, self.kv_lora_rank, num_splits
+            )
+            if required > self.workspace_buffer.numel():
+                # Keep the shared upstream buffer intact for other instances.
+                # Allocate once before warmup/capture, never in the layer loop.
+                self.workspace_buffer = torch.empty(
+                    required, dtype=torch.int8, device=model_runner.device
+                )
+                self.workspace_size = required
+            logger.info(
+                "CuTeDSL MLA fixed KV splits=%d, max_batch=%d, workspace=%.2f MiB "
+                "(short contexts may use fewer nonempty splits)",
+                num_splits,
+                max_bs,
+                self.workspace_buffer.numel() / 1024**2,
+            )
+
+    # ------------------------------------------------------------------
+    # DCP metadata (rank-local KV lengths + page table).
+    # Duplicated from TokenspeedMLABackend — kernel-agnostic, keyed only on
+    # dcp_size / dcp_rank / page_size / req_to_token.
+    # ------------------------------------------------------------------
+    def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return seq_lens
+        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
+            torch.int32
+        )
+
+    def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return max_seq_len
+        local_max = max_seq_len // parallel.dcp_size + int(
+            parallel.dcp_rank < max_seq_len % parallel.dcp_size
+        )
+        # A positive scheduling bound is required even when every sequence in a
+        # padded graph row is empty on this rank.
+        return max(local_max, 1)
+
+    def _fill_dcp_block_kv_indices(
+        self,
+        block_kv_indices: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        local_seq_lens: torch.Tensor,
+    ) -> None:
+        parallel = get_parallel()
+        pages_per_block = get_num_page_per_block_flashmla(self.page_size)
+        create_mla_kv_page_table_for_dcp[
+            (
+                block_kv_indices.shape[0],
+                get_num_kv_index_blocks_flashmla(
+                    block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            local_seq_lens,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            block_kv_indices.stride(0),
+            PHYSICAL_PAGE_SIZE=self.page_size,
+            DCP_SIZE=parallel.dcp_size,
+            DCP_RANK=parallel.dcp_rank,
+            PAGES_PER_BLOCK=pages_per_block,
+        )
+
+    def _create_block_kv_indices(
+        self,
+        batch_size: int,
+        max_blocks: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not get_parallel().dcp_enabled:
+            return super()._create_block_kv_indices(
+                batch_size,
+                max_blocks,
+                req_pool_indices,
+                seq_lens,
+                device,
+            )
+        block_kv_indices = torch.full(
+            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+        )
+        self._fill_dcp_block_kv_indices(
+            block_kv_indices,
+            req_pool_indices,
+            self._get_dcp_local_seq_lens(seq_lens),
+        )
+        return block_kv_indices
+
+    def _init_cuda_graph_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ):
+        super()._init_cuda_graph_metadata(
+            bs, num_tokens, forward_mode, seq_lens, device
+        )
+        if get_parallel().dcp_enabled:
+            metadata = self.forward_decode_metadata
+            if metadata.global_seq_lens_k is None:
+                # Plain decode under DCP also keeps the int32 GLOBAL lens in a
+                # capture-stable buffer (super allocates it only for verify):
+                # the DCP kernel consumes both the rank-local and the global
+                # lens every MLA layer, so both are maintained once per step.
+                metadata.global_seq_lens_k = torch.zeros(
+                    (bs,), dtype=torch.int32, device=device
+                )
+            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                self.max_context_len
+                + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
+            )
+
+    def _apply_cuda_graph_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode,
+    ):
+        if not get_parallel().dcp_enabled:
+            return super()._apply_cuda_graph_metadata(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode,
+            )
+
+        metadata = self.decode_cuda_graph_metadata[bs]
+        if forward_mode.is_target_verify():
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(
+                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
+            )
+            local_seq_lens = metadata.seq_lens_k
+        elif forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
+            seq_lens = seq_lens[:bs]
+            metadata.seq_lens_k.copy_(seq_lens)
+            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+        else:
+            seq_lens = seq_lens[:bs]
+            # Hoist: refresh the int32 global + rank-local lens once per step
+            # into the capture-stable buffers; forward_decode reads them
+            # instead of recomputing get_dcp_lens + two int32 casts per MLA
+            # layer.
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
+            local_seq_lens = metadata.seq_lens_k
+
+        self._fill_dcp_block_kv_indices(
+            metadata.block_kv_indices,
+            req_pool_indices[:bs],
+            local_seq_lens,
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if (
+            get_parallel().dcp_enabled
+            and self.forward_decode_metadata is not None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            if forward_batch.forward_mode.is_target_verify():
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.forward_decode_metadata.seq_lens_k is not None
+            ):
+                # Same hoist as verify: the parent stored the int32 GLOBAL
+                # lens in seq_lens_k; keep it as global_seq_lens_k and derive
+                # the rank-local view once per step (forward_decode consumes
+                # both every MLA layer).
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
+            self.forward_decode_metadata.max_seq_len_k = (
+                self._get_dcp_local_max_seq_len(
+                    self.forward_decode_metadata.max_seq_len_k
+                )
+            )
 
     # ------------------------------------------------------------------
     # Kernel + decode forward.
@@ -93,6 +336,27 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         rank-local ``(out, lse)``, the LSE in natural log.
         """
         if cp_world <= 1:
+            if self._decode_with_splits is not None:
+                if query.ndim != 4 or query.shape[1] != 1 or return_lse:
+                    raise ValueError(
+                        "Fixed CuTeDSL MLA splits currently support ordinary "
+                        "decode only (Q length 1, no DCP/LSE merge)"
+                    )
+                return self._decode_with_splits(
+                    query=query,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    max_seq_len=max_seq_len,
+                    softmax_scale=self._compute_decode_bmm1_scale(layer),
+                    output_scale=1.0,
+                    out_dtype=torch.bfloat16,
+                    is_var_seq=True,
+                    enable_pdl=_ENABLE_PDL,
+                )
             return super()._run_decode_kernel(
                 query,
                 kv_cache,
