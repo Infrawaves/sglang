@@ -1113,6 +1113,9 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Experimental CuTeDSL MLA override: 0 keeps FlashInfer's heuristic;
+    # 1..32 requests fixed KV splits. Read once before graph capture.
+    SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS = EnvInt(0)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
