@@ -1914,6 +1914,7 @@ class TestHiCacheArgs(unittest.TestCase):
             tp_size=4,
             dcp_size=2,
         )
+        args._model_config = SimpleNamespace(is_hybrid_swa=True)
         handle_cache_compatibility(args)
 
     @patch("sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=True)
@@ -1929,6 +1930,7 @@ class TestHiCacheArgs(unittest.TestCase):
             dcp_size=2,
             enable_dp_attention=True,
         )
+        args._model_config = SimpleNamespace(is_hybrid_swa=True)
         handle_cache_compatibility(args)
 
     @patch("sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=False)
@@ -1952,6 +1954,7 @@ class TestHiCacheArgs(unittest.TestCase):
             tp_size=4,
             dcp_size=2,
         )
+        args._model_config = SimpleNamespace(is_hybrid_swa=True)
         with self.assertRaisesRegex(ValueError, "requires.*mooncake"):
             handle_cache_compatibility(args)
 
@@ -1968,7 +1971,35 @@ class TestHiCacheArgs(unittest.TestCase):
             dcp_size=4,
             enable_dp_attention=True,
         )
+        args._model_config = SimpleNamespace(is_hybrid_swa=True)
         with self.assertRaisesRegex(ValueError, "attn_tp_size.*divisible"):
+            handle_cache_compatibility(args)
+
+    @patch("sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=True)
+    def test_ssd_retraction_dcp_rejects_attention_cp(self, _mock_use_mla):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+            hicache_storage_backend="mooncake",
+            tp_size=8,
+            dcp_size=2,
+            attn_cp_size=2,
+        )
+        args._model_config = SimpleNamespace(is_hybrid_swa=True)
+        with self.assertRaisesRegex(ValueError, "does not support attention context"):
+            handle_cache_compatibility(args)
+
+    @patch("sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=True)
+    def test_ssd_retraction_dcp_rejects_pure_mla(self, _mock_use_mla):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="ssd",
+            hicache_storage_backend="mooncake",
+            tp_size=4,
+            dcp_size=2,
+        )
+        args._model_config = SimpleNamespace(is_hybrid_swa=False)
+        with self.assertRaisesRegex(ValueError, "pure MLA is not supported"):
             handle_cache_compatibility(args)
 
     def test_host_pool_retraction_dcp_remains_rejected(self):

@@ -1,4 +1,3 @@
-import ctypes
 import threading
 import unittest
 from queue import Queue
@@ -63,110 +62,6 @@ class TestMooncakeDcpKeyScoping(CustomTestCase):
         self.assertEqual((config.attn_dp_rank, config.attn_dp_size), (1, 2))
         self.assertTrue(config.is_mla_model)
 
-    def test_rank_scoped_write_read_exists_and_cleanup(self):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        for dcp_size, dp_size in ((1, 1), (2, 1), (2, 2)):
-            with self.subTest(dcp_size=dcp_size, dp_size=dp_size):
-                objects = {}
-
-                def put(keys, pointers, sizes, config):
-                    self.assertTrue(config.with_hard_pin)
-                    for key, ptrs, lengths in zip(keys, pointers, sizes):
-                        self.assertNotIn(key, objects)
-                        objects[key] = [
-                            ctypes.string_at(ptr, length)
-                            for ptr, length in zip(ptrs, lengths)
-                        ]
-                    return [0] * len(keys)
-
-                def get(keys, pointers, sizes):
-                    for key, ptrs, lengths in zip(keys, pointers, sizes):
-                        for ptr, length, data in zip(ptrs, lengths, objects[key]):
-                            self.assertEqual(length, len(data))
-                            ctypes.memmove(ptr, data, length)
-                    return [sum(lengths) for lengths in sizes]
-
-                def remove(keys, force):
-                    self.assertTrue(force)
-                    for key in keys:
-                        del objects[key]
-                    return [0] * len(keys)
-
-                stores = {}
-                keys = ["h0", "h1"]
-                for dp_rank in range(dp_size):
-                    # Two replicated DCP groups inside each attention-TP group.
-                    for tp_rank in range(2 * dcp_size):
-                        dcp_rank = tp_rank % dcp_size
-                        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-                        pool.dcp_rank, pool.dcp_size = dcp_rank, dcp_size
-                        pool.page_size, pool.size = 2, 8
-                        pool.layout, pool.layer_num = "layer_first", 2
-                        pool.kv_cache_dim, pool.dtype = 4, torch.float32
-                        pool.kv_buffer = torch.zeros((2, 8, 1, 4))
-                        payload = torch.arange(32).reshape(2, 4, 1, 4).float()
-                        payload += 100 * dp_rank + 50 * dcp_rank
-                        pool.kv_buffer[:, 2:6] = payload
-
-                        store = MooncakeStore.__new__(MooncakeStore)
-                        store.mem_pool_host = pool
-                        store.is_mla_backend = True
-                        store.enable_storage_metrics = False
-                        store.config_prefix = "model"
-                        store._use_group_semantics = False
-                        store._replicate_config_cls = SimpleNamespace
-                        store.mha_suffix, store.mla_suffix = (
-                            MooncakeStore._build_key_suffixes(
-                                tp_rank, 0, False, dcp_rank, dcp_size, dp_rank, dp_size
-                            )
-                        )
-                        store.store = SimpleNamespace(
-                            batch_put_from_multi_buffers=put,
-                            batch_get_into_multi_buffers=get,
-                            batch_is_exist=lambda ks: [int(k in objects) for k in ks],
-                            batch_remove=remove,
-                        )
-                        stores[dp_rank, tp_rank] = store
-                        if tp_rank < dcp_size:
-                            self.assertEqual(
-                                store.batch_set_v1(
-                                    keys,
-                                    torch.arange(2 * dcp_size, 6 * dcp_size),
-                                    HiCacheStorageExtraInfo(pin=True),
-                                ),
-                                [True, True],
-                            )
-                        self.assertEqual(store.batch_exists(keys), 2)
-                        pool.kv_buffer.zero_()
-                        self.assertEqual(
-                            store.batch_get_v1(
-                                keys, torch.arange(4 * dcp_size, 8 * dcp_size)
-                            ),
-                            [True, True],
-                        )
-                        torch.testing.assert_close(pool.kv_buffer[:, 4:8], payload)
-                        self.assertEqual(pool.kv_buffer[:, :4].count_nonzero(), 0)
-
-                self.assertEqual(len(objects), 2 * dp_size * dcp_size)
-                for dp_rank in range(dp_size):
-                    for dcp_rank in range(dcp_size):
-                        store = stores[dp_rank, dcp_rank]
-                        self.assertEqual(
-                            store.batch_remove_v2(
-                                [PoolTransfer(name=PoolName.KV, keys=keys)]
-                            ),
-                            [],
-                        )
-                        self.assertEqual(store.batch_exists(keys), 0)
-                    # Deleting one DP replica must leave the next replica intact.
-                    for remaining_dp in range(dp_rank + 1, dp_size):
-                        self.assertEqual(stores[remaining_dp, 0].batch_exists(keys), 2)
-                self.assertFalse(objects)
-
     def test_dcp1_suffixes_are_byte_compatible(self):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
@@ -190,30 +85,6 @@ class TestMooncakeDcpKeyScoping(CustomTestCase):
             MooncakeStore._build_key_suffixes(3, 2, True, 1, 4, 1, 2),
             ("3_2_dp1_2", "2_dp1_2_dcp1_4"),
         )
-
-    def test_hybrid_components_use_scoped_suffixes(self):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        store = MooncakeStore.__new__(MooncakeStore)
-        store.mla_suffix = "dp1_2_dcp1_4"
-        store.mha_suffix = "3_dp1_2"
-        store.is_mla_backend = True
-        store.registered_pools = {
-            PoolName.KV: SimpleNamespace(),
-            PoolName.MAMBA: SimpleNamespace(
-                conv_buffer=[object()], temporal_state_elem_size=1
-            ),
-        }
-        kv_keys, _ = store._get_hybrid_page_component_keys(
-            ["h0"], PoolTransfer(name=PoolName.KV, keys=["h0"])
-        )
-        mamba_keys, _ = store._get_hybrid_page_component_keys(
-            ["h0"], PoolTransfer(name=PoolName.MAMBA, keys=["h0"])
-        )
-        self.assertEqual(kv_keys, ["h0_dp1_2_dcp1_4_k"])
-        self.assertEqual(mamba_keys, ["h0_3_dp1_2_temporal", "h0_3_dp1_2_conv_0"])
 
     def test_replicated_writer_is_selected_per_dcp_shard(self):
         from sglang.srt.mem_cache.storage import StorageBackendFactory

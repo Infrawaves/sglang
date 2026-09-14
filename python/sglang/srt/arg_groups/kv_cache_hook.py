@@ -160,10 +160,22 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "--disaggregation-decode-retraction-backup=ssd with DCP "
                 "requires an MLA-family model."
             )
+        if not model_config_of(server_args).is_hybrid_swa:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "requires the supported MLA hybrid retraction stack; pure "
+                "MLA is not supported."
+            )
         if cfg.hicache_storage_backend != "mooncake":
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=ssd with DCP "
                 "requires --hicache-storage-backend mooncake."
+            )
+        if cfg.attn_cp_size > 1:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "does not support attention context parallelism; "
+                "attn_cp_size must be 1."
             )
         attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
         attn_tp_size = cfg.tp_size // attn_dp_size // cfg.attn_cp_size
