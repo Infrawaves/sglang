@@ -1317,8 +1317,8 @@ class Scheduler(
             get_schedule().enable_chunked_prefill_round_robin
         )
         self.suspended_prefill_queue: List[Req] = []
-        # Cleanup/retry actions waiting for outstanding results and KV sends.
-        self._pending_round_robin_actions: dict[Req, Optional[str]] = {}
+        # Terminal cleanup actions waiting for outstanding results and KV sends.
+        self._pending_round_robin_actions: dict[Req, str] = {}
         self._prefill_ready_seq = 0
         if self.enable_chunked_prefill_round_robin:
             self._validate_prefill_round_robin()

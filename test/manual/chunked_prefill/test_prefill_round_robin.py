@@ -606,23 +606,79 @@ class OverlapTests(unittest.TestCase):
         self.assertEqual(s.outputs, [a])
         s.send_kv_chunk.assert_not_called()
 
-    def test_retry_is_deferred_and_abort_wins(self):
+    def test_bootstrap_yield_retries_after_result_or_immediately_if_drained(self):
+        for pending_result in (True, False):
+            with self.subTest(pending_result=pending_result):
+                s = Harness()
+                s.enable_overlap = True
+                a = self.request("a")
+                a.pending_bootstrap = True
+                s.chunked_req = a
+                b = Req("b", 64)
+                s.enqueue_prefill_ready([b])
+                batch = Batch([a], a)
+                result = self.result(batch)
+                s.result_queue = [(batch, result)] if pending_result else []
+                retry = Mock(wraps=s.retry)
+                s.optimistic_release_and_requeue = retry
+                s.process_prefill_chunk(None, s.running_batch)
+                self.assertIsNone(s.chunked_req)
+                self.assertEqual(s.suspended_prefill_queue, [])
+                self.assertEqual(s._pending_round_robin_actions, {})
+                if pending_result:
+                    retry.assert_not_called()
+                    self.assertEqual(s.waiting_queue, [b])
+                    s.spec_algorithm = self.s.spec_algorithm
+                    s.batch_result_processor = self.s.batch_result_processor
+                    s.metrics_reporter = self.s.metrics_reporter
+                    s.maybe_send_health_check_signal = Mock()
+                    s.result_queue.pop(0)
+                    s.process_batch_result_disagg_prefill(batch, result)
+                    result.copy_done.synchronize.assert_called_once()
+                retry.assert_called_once_with(a)
+                self.assertEqual(s.waiting_queue, [b, a])
+                s.send_kv_chunk.assert_not_called()
+
+    def test_pending_bootstrap_without_ready_competitor_keeps_slot(self):
+        s = self.s
+        a, b = self.request("a"), self.request("b")
+        a.pending_bootstrap = b.pending_bootstrap = True
+        s.chunked_req = a
+        s.enqueue_prefill_ready([b])
+        s.process_prefill_chunk(None, s.running_batch)
+        self.assertIs(s.chunked_req, a)
+        self.assertEqual(s.suspended_prefill_queue, [])
+        self.assertEqual(a.cleanup, [])
+        s.send_kv_chunk.assert_not_called()
+
+    def test_bootstrap_failure_waits_for_result(self):
         s = self.s
         a = self.request("a")
+        a.pending_bootstrap = True
         s.chunked_req = a
         batch = Batch([a], a)
-        s.result_queue = [(batch, self.result(batch))]
-        retry = Mock()
-        s.optimistic_release_and_requeue = retry
-        s.defer_round_robin_action(a, "retry")
+        result = self.result(batch)
+        s.result_queue = [(batch, result)]
+
+        def fail_bootstrap(req):
+            Prefill.handle_bootstrap_failure(s, req)
+            return False
+
+        s.check_bootstrap = fail_bootstrap
+        retry = s.optimistic_release_and_requeue = Mock()
+        s.process_prefill_chunk(None, s.running_batch)
+        self.assertIsNone(s.chunked_req)
+        self.assertEqual(s._pending_round_robin_actions[a], "bootstrap_failure")
+        finish = s.handle_bootstrap_failure = Mock()
         s.process_pending_round_robin_actions()
-        retry.assert_not_called()
-        s.abort_request(NS(rid=a.rid, abort_all=False))
-        s.defer_round_robin_action(a, "retry")
-        s.result_queue.clear()
+        finish.assert_not_called()
+        self.assertEqual(a.cleanup, [])
+        s.result_queue.pop(0)
+        s.process_batch_result_disagg_prefill(batch, result)
         s.process_pending_round_robin_actions()
+        s.process_pending_round_robin_actions()
+        finish.assert_called_once_with(a, defer=False)
         retry.assert_not_called()
-        self.assertEqual(s.outputs, [a])
 
     def test_other_rank_can_hold_release(self):
         a = self.request("a")
