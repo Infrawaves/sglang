@@ -307,6 +307,7 @@ class SchedulerBatchResultProcessor:
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
+                    and not req.is_demoted
                     and req.inflight_middle_chunks <= 0
                 )
                 sampling_mask_finish_reason = None
@@ -330,7 +331,6 @@ class SchedulerBatchResultProcessor:
                         extend_input_len=extend_input_len_per_req[i],
                         store=(
                             should_commit_output
-                            and not req.is_demoted
                             and sampling_mask_finish_reason is None
                         ),
                     )
