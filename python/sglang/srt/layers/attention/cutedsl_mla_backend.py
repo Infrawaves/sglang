@@ -9,8 +9,8 @@ monolithic MLA decode kernel natively accepts cyclic DCP metadata
 returns the rank-local ``(out, lse)`` needed by the cross-rank merge in
 ``deepseek_common/attention_forward_methods/forward_mla.py``.
 
-Non-DCP decode uses the base cute-dsl path unless the experimental fixed
-split-KV override is enabled. The DCP metadata helpers are duplicated from
+Non-DCP (``dcp_size == 1``) decode falls through to the base cute-dsl path
+unchanged. The DCP metadata helpers below are intentionally duplicated from
 :mod:`tokenspeed_mla_backend` (they are kernel-agnostic) so that TokenSpeed
 stays untouched; both should collapse into the base once the cute-dsl decode
 path is stable (see the TODO in tokenspeed_mla_backend.py).
@@ -62,7 +62,11 @@ logger = logging.getLogger(__name__)
 
 
 class CuteDslMLABackend(TRTLLMMLABackend):
-    """flashinfer cute-dsl MLA decode backend with decode context parallelism."""
+    """flashinfer cute-dsl MLA decode backend with decode context parallelism.
+
+    SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS optionally overrides the split planner
+    for ordinary non-DCP decode; the default keeps the base cute-dsl path.
+    """
 
     # This kernel does not support varlen queries.
     supports_varlen_absorbed_mla = False

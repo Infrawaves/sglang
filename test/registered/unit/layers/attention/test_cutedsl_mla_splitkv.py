@@ -146,7 +146,7 @@ def cute_dsl_mla_decode(
         )
 
     def test_other_flashinfer_versions_are_rejected(self):
-        for version in ("0.6.16", "0.6.18", "0.6.17+custom"):
+        for version in ("0.6.16", "0.6.19", "0.6.17+custom", "0.6.18+custom"):
             with self.subTest(version=version):
                 self.version.return_value = version
                 with self.assertRaises(RuntimeError):
@@ -154,6 +154,14 @@ def cute_dsl_mla_decode(
         self.assertIs(
             self.module._get_split_kv_and_workspace_size, self.original_helper
         )
+
+    def test_supported_flashinfer_versions(self):
+        for version in ("0.6.17", "0.6.18"):
+            with self.subTest(version=version):
+                self.version.return_value = version
+                decode = create_cutedsl_mla_decode_with_splits(4)
+                self.assertEqual(decode(), ((4, 134479872), "preserved"))
+                self.assertEqual(self.original(), ((1, 0), "preserved"))
 
     def test_missing_flashinfer_distribution_is_rejected(self):
         self.version.side_effect = importlib.metadata.PackageNotFoundError(
