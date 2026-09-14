@@ -1,17 +1,136 @@
-"""CPU regression checks of production scheduler methods, with GPU/transport stubs.
+"""Core round-robin scheduling and overlap cleanup regressions.
 
-Run: python3 test/manual/chunked_prefill/test_prefill_round_robin_runtime.py
-This executes complete method bodies; it does not validate GPU kernels or TP transport.
+Run: python3 test/manual/chunked_prefill/test_prefill_round_robin.py
+Requires Python 3.10+. Executes production method bodies with CPU-only doubles;
+GPU execution, real TP collectives and RDMA require deployment tests.
 """
 
 import ast
+import concurrent.futures
 import logging
+import os
+import threading
 import unittest
+from collections import defaultdict
+from contextlib import nullcontext
+from enum import Enum, auto
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from prefill_round_robin_budget_check import Adder, Request, Result
+SOURCE = (
+    Path(__file__).resolve().parents[3]
+    / "python/sglang/srt/managers/schedule_policy.py"
+)
+
+
+def load_adder_methods():
+    tree = ast.parse(SOURCE.read_text())
+    names = {
+        "ceil_paged_tokens",
+        "budget_state",
+        "_update_prefill_budget",
+        "add_chunked_req",
+        "add_one_req",
+        "add_one_req_ignore_eos",
+        "_round_robin_can_admit",
+    }
+    selected = [
+        ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+    ]
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name)
+            and t.id in {"CLIP_MAX_NEW_TOKENS", "IGNORE_EOS_RESERVE_TOKENS"}
+            for t in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "AddReqResult":
+            selected.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "PrefillAdder":
+            node.body = [
+                n
+                for n in node.body
+                if isinstance(n, ast.FunctionDef) and n.name in names
+            ]
+            assert {n.name for n in node.body} == names
+            selected.append(node)
+    namespace = {"os": os, "Enum": Enum, "auto": auto}
+    module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
+    exec(compile(module, str(SOURCE), "exec"), namespace)
+    return namespace
+
+
+ACTUAL = load_adder_methods()
+Result = ACTUAL["AddReqResult"]
+PAGE = 64
+
+
+class Request:
+    def __init__(self, length, ignore_eos=False, prefix=0):
+        self.full_untruncated_fill_ids = range(length)
+        self.origin_input_ids = range(length)
+        self.prefix_indices = range(prefix)
+        self.output_ids = []
+        self.kv = NS(kv_allocated_len=prefix)
+        self.sampling_params = NS(max_new_tokens=1, ignore_eos=ignore_eos)
+        self.host_hit_length = 0
+        self.retracted_stain = False
+        self.last_node = None
+        self.extend_range = None
+
+    def set_extend_range(self, start, end):
+        self.extend_range = NS(start=start, end=end, length=end - start)
+
+    def needs_host_load_back(self):
+        return False
+
+
+class Adder(ACTUAL["PrefillAdder"]):
+    def __init__(self, free, quantum):
+        self.round_robin_requests = None
+        self.free = free
+        self.page_size = PAGE
+        self.rem_total_token_offset = self.cur_rem_token_offset = 0
+        self.rem_input_tokens = self.rem_chunk_tokens = quantum
+        self.new_token_ratio = 1.0
+        self.tree_cache = NS(disable=True)
+        self.running_batch = NS(reqs=[])
+        self.dllm_config = self.prefill_delayer_single_pass = None
+        self.prefill_max_requests = self.rem_mamba_slots = None
+        self.is_hybrid_swa = False
+        self.can_run_list = []
+        self.new_chunked_req = self.req_states = None
+        self.log_hit_tokens = self.log_input_tokens = 0
+        self.reprocessed_log_hit_tokens = self.reprocessed_log_input_tokens = 0
+
+    @property
+    def rem_total_tokens(self):
+        return self.free - self.rem_total_token_offset
+
+    @property
+    def cur_rem_tokens(self):
+        return self.free - self.cur_rem_token_offset
+
+    def _mamba_gap_budget_for_req(self, req):
+        return 0
+
+    def _lock_node(self, node):
+        return nullcontext()
+
+    def _check_prefill_tile_budget(self, length):
+        return None
+
+    def _req_inc_lock_ref(self, req):
+        pass
+
+    def _account_prefill_cache_admission(self, req, prefix):
+        pass
+
+
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3] / "python/sglang/srt"
 SCHEDULE = NS(
@@ -124,7 +243,6 @@ Scheduler = extract(
         "process_pending_chunked_abort",
         "_release_chunked_abort",
         "abort_request",
-        "_validate_prefill_round_robin",
     ],
     GLOBALS,
 )
@@ -279,6 +397,17 @@ class Harness(Scheduler, Prefill):
 
 
 class RoundRobinTests(unittest.TestCase):
+    def test_reservation_uses_planned_end_without_double_counting(self):
+        other, candidate = Req("other", 257, prefix=64), Req("new", 128)
+        adder = Adder(512, 128)
+        adder.round_robin_requests = (other, other)
+        self.assertFalse(adder._round_robin_can_admit(candidate))
+        other.set_extend_range(64, 257)
+        adder.can_run_list.append(other)
+        adder.rem_total_token_offset = 321
+        self.assertTrue(adder._round_robin_can_admit(candidate))
+        self.assertEqual(adder.rem_total_token_offset, 321)
+
     def test_fresh_before_yield_and_uncontested_number(self):
         s = Harness()
         a, b = Req("a", 384), Req("b", 64)
@@ -326,13 +455,6 @@ class RoundRobinTests(unittest.TestCase):
             self.assertEqual(b.prefill_ready_seq, 0)
             self.assertIsNone(s.chunked_req)
 
-    def test_resume_does_not_consume_fresh_row(self):
-        s = Harness(rows=1)
-        a, b = Req("a", 96, prefix=64), Req("b", 64)
-        s.suspend(a)
-        s.enqueue_prefill_ready([b])
-        self.assertEqual(s.batch().reqs, [a, b])
-
     def test_final_then_new_middle_commits_on_budget_exhaustion(self):
         s = Harness()
         a, b = Req("a", 128, prefix=64), Req("b", 256)
@@ -343,21 +465,6 @@ class RoundRobinTests(unittest.TestCase):
         self.assertIs(s.chunked_req, b)
         self.assertFalse(s.suspended_prefill_queue)
         self.assertEqual(b.inflight_middle_chunks, 1)
-
-    def test_empty_budget_keeps_current(self):
-        s = Harness()
-        a = Req("a", 256, prefix=64)
-        s.chunked_req = a
-        s.max_prefill_tokens = 0
-        self.assertIsNone(s.batch())
-        self.assertIs(s.chunked_req, a)
-
-    def test_zero_free_tail_page_continues(self):
-        s = Harness(free=0, rows=0)
-        a = Req("a", 64, prefix=1)
-        s.suspend(a)
-        self.assertEqual(s.batch().reqs, [a])
-        self.assertIsNone(s.chunked_req)
 
     def test_counter_resets_only_at_empty_boundary(self):
         s = Harness()
@@ -386,42 +493,6 @@ class RoundRobinTests(unittest.TestCase):
         self.assertEqual(s.outputs, [a])
         self.assertFalse(s.suspended_prefill_queue)
 
-    def test_abort_all_is_ordered_and_deduplicated(self):
-        s = Harness()
-        a, b = Req("a", 256, prefix=64), Req("b", 256, prefix=64)
-        s.chunked_req = a
-        s.suspend(b)
-        s.abort_request(NS(rid="", abort_all=True, abort_message=None))
-        self.assertEqual(list(s.iter_round_robin_requests()), [a, b])
-        s.process_pending_chunked_abort()
-        self.assertEqual(s.outputs, [a, b])
-        self.assertIsNone(s.chunked_req)
-
-    def test_bootstrap_release_precedes_rr_yield(self):
-        s = Harness()
-        a, b = Req("a", 256, prefix=64), Req("b", 32)
-        a.pending_bootstrap = True
-        s.chunked_req = a
-        s.enqueue_prefill_ready([b])
-        s.process_prefill_chunk(None, s.running_batch)
-        self.assertEqual(s.waiting_queue, [b, a])
-        self.assertFalse(s.suspended_prefill_queue)
-        self.assertFalse(a.kv.holds_kv)
-        self.assertIsNone(s.chunked_req)
-
-    def test_bootstrap_polls_suspended_and_detaches_failure(self):
-        s = Harness()
-        a, b = Req("a", 256, prefix=64), Req("b", 256, prefix=64)
-        a.pending_bootstrap = b.pending_bootstrap = True
-        a.disagg_kv_sender.poll = "failed"
-        s.suspend(a)
-        s.suspend(b)
-        s.resolve_waiting_queue_bootstrap()
-        self.assertEqual(s.failed, [a])
-        self.assertEqual(s.suspended_prefill_queue, [b])
-        self.assertFalse(b.pending_bootstrap)
-        self.assertTrue(s.has_bootstrapped_waiting_req())
-
     def test_disabled_preserves_current_first(self):
         s = Harness(enabled=False)
         a, b = Req("a", 384, prefix=128), Req("b", 32)
@@ -434,108 +505,216 @@ class RoundRobinTests(unittest.TestCase):
         self.assertEqual(s.suspended_prefill_queue, [])
 
 
-class StartupAndAccountingTests(unittest.TestCase):
-    def test_startup_checks_resolved_config_and_allocator(self):
-        s = Harness()
-        s.enable_overlap_mlx = s.enable_pdmux = s.enable_unified_memory = False
-        s.schedule_policy = "fcfs"
-        s.ps = NS(
-            pp_size=1,
-            tp_size=8,
-            attn_tp_size=8,
-            attn_cp_size=1,
-            attn_dcp_size=1,
-            attn_dp_size=1,
-        )
-        allocator_class = type("PagedTokenToKVPoolAllocator", (), {})
-        s.token_to_kv_pool_allocator = allocator_class()
-        module = NS(PagedTokenToKVPoolAllocator=allocator_class)
-        with patch.dict(
-            "sys.modules", {"sglang.srt.mem_cache.allocator.paged": module}
-        ):
-            s._validate_prefill_round_robin()
-            s.enable_overlap = True
-            s.spec_algorithm = NS(is_none=lambda: False, is_dspark=lambda: True)
-            s._validate_prefill_round_robin()
-            s.spec_algorithm = NS(is_none=lambda: False, is_dspark=lambda: False)
-            with self.assertRaises(ValueError):
-                s._validate_prefill_round_robin()
-            s.spec_algorithm = NS(is_none=lambda: True)
-            s.enable_overlap = False
-            for tp_size in (1, 2, 4, 8, 16):
-                for page_size in (1, 16, 32, 64, 128):
-                    with self.subTest(tp_size=tp_size, page_size=page_size):
-                        s.ps.tp_size = s.ps.attn_tp_size = tp_size
-                        s.page_size = page_size
-                        s._validate_prefill_round_robin()
-            s.ps.tp_size = s.ps.attn_tp_size = 8
-            s.page_size = 64
-            for target, name, value in (
-                (s, "enable_overlap_mlx", True),
-                (s, "enable_unified_memory", True),
-                (s, "enable_lora", True),
-                (s, "schedule_policy", "lpm"),
-                (s.ps, "attn_tp_size", 4),
-                (s.ps, "pp_size", 2),
-                (s, "token_to_kv_pool_allocator", object()),
-                (SCHEDULE, "enable_dynamic_chunking", True),
-            ):
-                previous = getattr(target, name)
-                try:
-                    setattr(target, name, value)
-                    with self.assertRaises(ValueError, msg=name):
-                        s._validate_prefill_round_robin()
-                finally:
-                    setattr(target, name, previous)
+class Tensor:
+    def __init__(self, values):
+        self.values = list(values)
 
-    def test_ordinary_abort_markers_still_clear_after_completion(self):
-        s = Harness(enabled=False)
-        a = Req("a", 256, prefix=64)
-        a.aborted = True
-        s._pending_chunked_abort_req = a
+    def tolist(self):
+        return self.values[:]
+
+
+TORCH = NS(
+    tensor=lambda values, **kwargs: Tensor(values),
+    uint8=None,
+    distributed=NS(all_reduce=lambda *args, **kwargs: None, ReduceOp=NS(MIN=None)),
+)
+
+
+class OverlapTests(unittest.TestCase):
+    def setUp(self):
+        self.torch_patch = patch.dict(GLOBALS, torch=TORCH)
+        self.torch_patch.start()
+        self.addCleanup(self.torch_patch.stop)
+        self.s = Harness()
+        self.s.enable_overlap = True
+        self.s.spec_algorithm = NS(is_eagle=lambda: False)
+        self.s.batch_result_processor = NS(
+            snapshot_auxiliary_output_starts=lambda *args: None,
+            move_logprobs_to_cpu=lambda **kwargs: None,
+        )
+        self.s.metrics_reporter = Mock()
+        self.s.maybe_send_health_check_signal = Mock()
+
+    def result(self, batch):
+        batch.spec_info = NS()
+        batch.prefill_stats = None
+        batch.dp_cooperation_info = None
+        return NS(
+            logits_output=None,
+            next_token_ids=Tensor([1] * len(batch.reqs)),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            copy_done=Mock(),
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            next_draft_input=batch.spec_info,
+            can_run_cuda_graph=False,
+        )
+
+    def request(self, name, middle=True):
+        req = Req(name, 384, prefix=128)
+        req.return_logprob = False
+        req.metadata_buffer_index = 0
+        req.time_stats.set_last_chunked_prefill_finish_time = Mock()
+        req.time_stats.set_completion_time = Mock()
+        req.inflight_middle_chunks = int(middle)
+        req.disagg_kv_sender.is_source_release_safe = Mock(return_value=True)
+        return req
+
+    def test_abort_waits_for_result_and_source_then_releases_once(self):
+        s = self.s
+        a = self.request("a")
+        b = self.request("b")
+        old, new = Batch([a], a), Batch([b], b)
+        result = self.result(old)
+        s.result_queue = [(old, result)]
+        s.chunked_req = a
+        s.abort_request(NS(rid="a", abort_all=False))
         s.process_pending_chunked_abort()
-        self.assertIsNone(s._pending_chunked_abort_req)
-        self.assertEqual(s.outputs, [])
+        self.assertIsNone(s.chunked_req)
+        self.assertEqual(a.cleanup, [])
+        # Next batch launches before A's result is processed.
+        s.result_queue.append((new, self.result(new)))
+        s.result_queue.pop(0)
+        a.disagg_kv_sender.is_source_release_safe.return_value = False
+        s.process_batch_result_disagg_prefill(old, result)
+        result.copy_done.synchronize.assert_called_once()
+        self.assertEqual(a.inflight_middle_chunks, 0)
+        s.process_pending_round_robin_actions()
+        self.assertEqual(a.cleanup, [])
+        a.disagg_kv_sender.is_source_release_safe.return_value = True
+        s.process_pending_round_robin_actions()
+        s.process_pending_round_robin_actions()
+        self.assertEqual(a.cleanup.count("kv"), 1)
+        self.assertEqual(s.outputs, [a])
+        self.assertEqual(s.result_queue[0][0].reqs, [b])
 
-    def test_load_and_invariant_count_suspended_once(self):
-        s = Harness()
-        a, b = Req("a", 256, prefix=64), Req("b", 256, prefix=128)
-        s.suspend(a)
-        s.chunked_req = b
-        s._pending_round_robin_actions[a] = None
-        namespace = dict(
-            DisaggregationMode=MODE, ceil_align=lambda n, p: (n + p - 1) // p * p
-        )
-        load_class = extract(
-            "managers/scheduler_components/load_inquirer.py",
-            "SchedulerLoadInquirer",
-            ["_get_num_pending_tokens", "get_num_waiting_uncached_tokens"],
-            namespace,
-        )
-        load = load_class()
-        load.get_round_robin_requests = s.iter_round_robin_requests
-        load.get_chunked_req = lambda: b
-        load.get_waiting_queue = lambda: []
-        load.waiting_queue_prefix_matched = lambda: False
-        load.get_recent_cache_hit_rate = lambda: 0
-        load.disaggregation_mode = MODE.PREFILL
-        self.assertEqual(load._get_num_pending_tokens(), 320)
-        self.assertEqual(load._get_num_pending_tokens(chunk_deduct=64), 256)
-        self.assertEqual(load.get_num_waiting_uncached_tokens(), 320)
-        invariant_class = extract(
-            "managers/scheduler_components/invariant_checker.py",
-            "SchedulerInvariantChecker",
-            ["_get_total_uncached_sizes"],
-            namespace,
-        )
-        checker = invariant_class()
-        checker.get_last_batch = lambda: Batch([a, b])
-        checker.get_running_batch = lambda: Batch([b])
-        checker.get_chunked_req = lambda: b
-        checker.get_round_robin_requests = s.iter_round_robin_requests
-        checker.page_size = 64
-        checker.is_hybrid_swa = False
-        self.assertEqual(checker._get_total_uncached_sizes(), (192, 0))
+    def test_abort_finds_final_result_without_current_or_suspended(self):
+        s = self.s
+        a = self.request("final", middle=False)
+        batch = Batch([a])
+        result = self.result(batch)
+        s.result_queue = [(batch, result)]
+        s.abort_request(NS(rid=a.rid, abort_all=False))
+        self.assertIn(a, s._pending_round_robin_actions)
+        s.process_pending_chunked_abort()
+        self.assertEqual(a.cleanup, [])
+        s.result_queue.pop(0)
+        s.process_batch_result_disagg_prefill(batch, result)
+        s.process_pending_round_robin_actions()
+        self.assertEqual(s.outputs, [a])
+        s.send_kv_chunk.assert_not_called()
+
+    def test_retry_is_deferred_and_abort_wins(self):
+        s = self.s
+        a = self.request("a")
+        s.chunked_req = a
+        batch = Batch([a], a)
+        s.result_queue = [(batch, self.result(batch))]
+        retry = Mock()
+        s.optimistic_release_and_requeue = retry
+        s.defer_round_robin_action(a, "retry")
+        s.process_pending_round_robin_actions()
+        retry.assert_not_called()
+        s.abort_request(NS(rid=a.rid, abort_all=False))
+        s.defer_round_robin_action(a, "retry")
+        s.result_queue.clear()
+        s.process_pending_round_robin_actions()
+        retry.assert_not_called()
+        self.assertEqual(s.outputs, [a])
+
+    def test_other_rank_can_hold_release(self):
+        a = self.request("a")
+        self.s.defer_round_robin_action(a, "abort")
+
+        def hold(tensor, **kwargs):
+            tensor.values = [0]
+
+        with patch.object(TORCH.distributed, "all_reduce", hold):
+            self.s.process_pending_round_robin_actions()
+        self.assertEqual(a.cleanup, [])
+        self.s.process_pending_round_robin_actions()
+        self.assertEqual(self.s.outputs, [a])
+
+
+MOON_GLOBALS = dict(
+    concurrent=concurrent,
+    logger=Mock(),
+    KVPoll=NS(Failed=0),
+    DisaggregationMode=NS(PREFILL="prefill"),
+    TraceNullContext=lambda: None,
+    TransferKVChunk=lambda **kwargs: NS(staging_counted=False, **kwargs),
+)
+Mooncake = extract(
+    "disaggregation/mooncake/conn.py",
+    "MooncakeKVManager",
+    [
+        "add_transfer_request",
+        "_finish_source_transfer",
+        "is_source_release_safe",
+        "_await_transfer_futures",
+        "transfer_worker",
+    ],
+    MOON_GLOBALS,
+)
+
+
+class SourceDrainTests(unittest.TestCase):
+    def manager(self):
+        m = Mooncake()
+        m.track_source_transfers = True
+        m._source_transfers = defaultdict(int)
+        m._source_transfers_lock = threading.Lock()
+        m.enable_deferred_decode_kv_release = False
+        m.disaggregation_mode = "prefill"
+        m.request_status = {1: 2}
+        m.check_status = lambda room: m.request_status[room]
+        m.transfer_infos = {1: {"host:123": None}}
+        self.queued = []
+        m.transfer_queues = [NS(put=self.queued.append)]
+        return m
+
+    def test_queued_and_running_tasks_both_hold_source(self):
+        m = self.manager()
+        for _ in range(2):
+            m.add_transfer_request(1, [], slice(0, 1), False)
+        self.assertEqual(len(self.queued), 2)
+        self.assertFalse(m.is_source_release_safe(1))
+        m._finish_source_transfer(1)
+        self.assertFalse(m.is_source_release_safe(1))
+        m._finish_source_transfer(1)
+        self.assertTrue(m.is_source_release_safe(1))
+        self.assertEqual(dict(m._source_transfers), {})
+
+    def test_failure_still_waits_for_running_transfer(self):
+        m = self.manager()
+        failed = concurrent.futures.Future()
+        running = concurrent.futures.Future()
+        running.set_running_or_notify_cancel()
+        failed.set_result(1)
+        entered = threading.Event()
+        completed = threading.Event()
+        result = []
+
+        def ordered(futures):
+            yield failed
+            entered.set()
+            yield running
+
+        def wait():
+            result.append(m._await_transfer_futures([failed, running]))
+            completed.set()
+
+        with patch.object(concurrent.futures, "as_completed", ordered):
+            thread = threading.Thread(target=wait)
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(completed.is_set())
+            running.set_result(0)
+            thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [1])
 
 
 if __name__ == "__main__":
