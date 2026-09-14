@@ -1232,9 +1232,8 @@ class SchedulerDisaggregationPrefillMixin:
     def defer_round_robin_action(self: Scheduler, req: Req, action: str) -> bool:
         if not (self.enable_chunked_prefill_round_robin and self.enable_overlap):
             return False
-        # Abort/failure must never be downgraded to a release-and-retry.
-        previous = self._pending_round_robin_actions.get(req)
-        if req not in self._pending_round_robin_actions or previous == "retry":
+        # Preserve the first terminal cleanup action.
+        if req not in self._pending_round_robin_actions:
             self._pending_round_robin_actions[req] = action
         if self.chunked_req is req:
             self.chunked_req = None
@@ -1266,17 +1265,13 @@ class SchedulerDisaggregationPrefillMixin:
         if not pending:
             return
         for req in pending:
-            self.defer_round_robin_action(
-                req, self._pending_round_robin_actions[req] or "abort"
-            )
+            self.defer_round_robin_action(req, self._pending_round_robin_actions[req])
         ready = self.round_robin_release_ready(pending)
         for req, can_release in zip(pending, ready, strict=True):
             if not can_release:
                 continue
             action = self._pending_round_robin_actions.pop(req)
-            if action == "retry":
-                self.optimistic_release_and_requeue(req, defer=False)
-            elif action == "bootstrap_failure":
+            if action == "bootstrap_failure":
                 self.handle_bootstrap_failure(req, defer=False)
             elif action == "retire":
                 if self._retire_aborted_prefill_result(req, defer=False):
@@ -1302,10 +1297,11 @@ class SchedulerDisaggregationPrefillMixin:
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
-                    if (
-                        not self.enable_overlap
-                        or self.enable_chunked_prefill_round_robin
+                    if not self.enable_overlap or (
+                        self.enable_chunked_prefill_round_robin
+                        and not self.has_pending_prefill_result(req)
                     ):
+                        # Without a pending result, no result callback can retry it.
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
@@ -1335,6 +1331,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.enable_chunked_prefill_round_robin
             and req is not None
             and self.chunked_req is req
+            and not req.pending_bootstrap
             and (self.waiting_queue or self.suspended_prefill_queue)
         ):
             req.prefill_ready_seq = self._prefill_ready_seq
@@ -1593,12 +1590,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
-    def optimistic_release_and_requeue(
-        self: Scheduler, req: Req, *, defer: bool = True
-    ) -> None:
+    def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        if defer and self.defer_round_robin_action(req, "retry"):
-            return
         max_attempts = get_disagg().optimistic_prefill_attempts
         if self.enable_chunked_prefill_round_robin:
             self.detach_round_robin_request(req)
