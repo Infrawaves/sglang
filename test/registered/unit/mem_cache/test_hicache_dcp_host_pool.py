@@ -135,7 +135,11 @@ class TestDcpKernelIndices(CustomTestCase):
 
 class TestHostPoolSizingUnderDcp(CustomTestCase):
     def test_logical_and_physical_sizing(self):
-        pool = _make_host_pool(dcp_rank=3)
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+            return_value=10**12,
+        ):
+            pool = _make_host_pool(dcp_rank=3)
         # kernel-facing page is physical
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_page_size, WIDENED_PAGE)
@@ -156,18 +160,62 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
-        pool = MLATokenToKVPoolHost(
-            _fake_mla_device_pool(),
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=PHYSICAL_PAGE,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-        )
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+            return_value=10**12,
+        ):
+            pool = MLATokenToKVPoolHost(
+                _fake_mla_device_pool(),
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=PHYSICAL_PAGE,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+            )
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_size, pool.size)
         self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)
+
+    def test_zero_copy_metadata_folds_widened_indices(self):
+        for dcp_size in (1, DCP_SIZE):
+            for dcp_rank in range(dcp_size):
+                with self.subTest(dcp_size=dcp_size, dcp_rank=dcp_rank):
+                    pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+                    pool.dcp_size = dcp_size
+                    pool.dcp_rank = dcp_rank
+                    pool.page_size = PHYSICAL_PAGE
+                    pool.layout = "layer_first"
+                    pool.layer_num = 2
+                    pool.size = 1024
+                    pool.kv_cache_dim = 8
+                    pool.dtype = torch.float16
+                    pool.kv_buffer = torch.zeros(
+                        (pool.layer_num, pool.size, 1, pool.kv_cache_dim),
+                        dtype=pool.dtype,
+                    )
+                    logical_page = PHYSICAL_PAGE * dcp_size
+                    # Nonzero, noncontiguous logical pages must map to the
+                    # corresponding physical pages on every DCP rank.
+                    logical_indices = torch.cat(
+                        [
+                            torch.arange(p * logical_page, (p + 1) * logical_page)
+                            for p in (2, 4)
+                        ]
+                    )
+                    ptrs, sizes = pool.get_page_buffer_meta(logical_indices)
+                    stride = pool.kv_cache_dim * pool.dtype.itemsize
+                    layer_stride = pool.size * stride
+                    expected = []
+                    for page_start in (2 * PHYSICAL_PAGE, 4 * PHYSICAL_PAGE):
+                        for layer_id in range(pool.layer_num):
+                            expected.append(
+                                pool.kv_buffer.data_ptr()
+                                + page_start * stride
+                                + layer_id * layer_stride
+                            )
+                    self.assertEqual(ptrs, expected)
+                    self.assertEqual(sizes, [PHYSICAL_PAGE * stride] * 4)
 
 
 class TestTransferEntryPointsTranslate(CustomTestCase):

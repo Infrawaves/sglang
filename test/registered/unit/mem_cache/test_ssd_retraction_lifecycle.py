@@ -1,8 +1,9 @@
+import ctypes
 import threading
 import unittest
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -18,11 +19,235 @@ from sglang.srt.mem_cache.common import (
     RetractionStorageState,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestMooncakeDcpKeyScoping(CustomTestCase):
+    def test_storage_config_uses_attention_local_identity(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        controller.mem_pool_host = SimpleNamespace(layout="layer_first")
+        controller.enable_storage_metrics = False
+        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+        parallel = SimpleNamespace(
+            tp_rank=7,
+            tp_size=8,
+            attn_tp_rank=3,
+            attn_tp_size=4,
+            pp_rank=0,
+            pp_size=1,
+            attn_dcp_rank=1,
+            attn_dcp_size=2,
+            attn_dp_rank=1,
+            attn_dp_size=2,
+        )
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.is_dp_attention_enabled", return_value=True),
+            patch(f"{module}.get_attention_dp_rank", return_value=1),
+        ):
+            config = controller._generate_storage_config()
+        self.assertEqual((config.tp_rank, config.tp_size), (3, 4))
+        self.assertEqual((config.dcp_rank, config.dcp_size), (1, 2))
+        self.assertEqual((config.attn_dp_rank, config.attn_dp_size), (1, 2))
+        self.assertTrue(config.is_mla_model)
+
+    def test_rank_scoped_write_read_exists_and_cleanup(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        for dcp_size, dp_size in ((1, 1), (2, 1), (2, 2)):
+            with self.subTest(dcp_size=dcp_size, dp_size=dp_size):
+                objects = {}
+
+                def put(keys, pointers, sizes, config):
+                    self.assertTrue(config.with_hard_pin)
+                    for key, ptrs, lengths in zip(keys, pointers, sizes):
+                        self.assertNotIn(key, objects)
+                        objects[key] = [
+                            ctypes.string_at(ptr, length)
+                            for ptr, length in zip(ptrs, lengths)
+                        ]
+                    return [0] * len(keys)
+
+                def get(keys, pointers, sizes):
+                    for key, ptrs, lengths in zip(keys, pointers, sizes):
+                        for ptr, length, data in zip(ptrs, lengths, objects[key]):
+                            self.assertEqual(length, len(data))
+                            ctypes.memmove(ptr, data, length)
+                    return [sum(lengths) for lengths in sizes]
+
+                def remove(keys, force):
+                    self.assertTrue(force)
+                    for key in keys:
+                        del objects[key]
+                    return [0] * len(keys)
+
+                stores = {}
+                keys = ["h0", "h1"]
+                for dp_rank in range(dp_size):
+                    # Two replicated DCP groups inside each attention-TP group.
+                    for tp_rank in range(2 * dcp_size):
+                        dcp_rank = tp_rank % dcp_size
+                        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+                        pool.dcp_rank, pool.dcp_size = dcp_rank, dcp_size
+                        pool.page_size, pool.size = 2, 8
+                        pool.layout, pool.layer_num = "layer_first", 2
+                        pool.kv_cache_dim, pool.dtype = 4, torch.float32
+                        pool.kv_buffer = torch.zeros((2, 8, 1, 4))
+                        payload = torch.arange(32).reshape(2, 4, 1, 4).float()
+                        payload += 100 * dp_rank + 50 * dcp_rank
+                        pool.kv_buffer[:, 2:6] = payload
+
+                        store = MooncakeStore.__new__(MooncakeStore)
+                        store.mem_pool_host = pool
+                        store.is_mla_backend = True
+                        store.enable_storage_metrics = False
+                        store.config_prefix = "model"
+                        store._use_group_semantics = False
+                        store._replicate_config_cls = SimpleNamespace
+                        store.mha_suffix, store.mla_suffix = (
+                            MooncakeStore._build_key_suffixes(
+                                tp_rank, 0, False, dcp_rank, dcp_size, dp_rank, dp_size
+                            )
+                        )
+                        store.store = SimpleNamespace(
+                            batch_put_from_multi_buffers=put,
+                            batch_get_into_multi_buffers=get,
+                            batch_is_exist=lambda ks: [int(k in objects) for k in ks],
+                            batch_remove=remove,
+                        )
+                        stores[dp_rank, tp_rank] = store
+                        if tp_rank < dcp_size:
+                            self.assertEqual(
+                                store.batch_set_v1(
+                                    keys,
+                                    torch.arange(2 * dcp_size, 6 * dcp_size),
+                                    HiCacheStorageExtraInfo(pin=True),
+                                ),
+                                [True, True],
+                            )
+                        self.assertEqual(store.batch_exists(keys), 2)
+                        pool.kv_buffer.zero_()
+                        self.assertEqual(
+                            store.batch_get_v1(
+                                keys, torch.arange(4 * dcp_size, 8 * dcp_size)
+                            ),
+                            [True, True],
+                        )
+                        torch.testing.assert_close(pool.kv_buffer[:, 4:8], payload)
+                        self.assertEqual(pool.kv_buffer[:, :4].count_nonzero(), 0)
+
+                self.assertEqual(len(objects), 2 * dp_size * dcp_size)
+                for dp_rank in range(dp_size):
+                    for dcp_rank in range(dcp_size):
+                        store = stores[dp_rank, dcp_rank]
+                        self.assertEqual(
+                            store.batch_remove_v2(
+                                [PoolTransfer(name=PoolName.KV, keys=keys)]
+                            ),
+                            [],
+                        )
+                        self.assertEqual(store.batch_exists(keys), 0)
+                    # Deleting one DP replica must leave the next replica intact.
+                    for remaining_dp in range(dp_rank + 1, dp_size):
+                        self.assertEqual(stores[remaining_dp, 0].batch_exists(keys), 2)
+                self.assertFalse(objects)
+
+    def test_dcp1_suffixes_are_byte_compatible(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(2, 1, True, 0, 1, 0, 4),
+            ("2_1", "1"),
+        )
+
+    def test_dcp_and_dp_suffixes_scope_mla_and_mamba(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(3, 0, False, 1, 4, 0, 1),
+            ("3", "dcp1_4"),
+        )
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(3, 2, True, 1, 4, 1, 2),
+            ("3_2_dp1_2", "2_dp1_2_dcp1_4"),
+        )
+
+    def test_hybrid_components_use_scoped_suffixes(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.mla_suffix = "dp1_2_dcp1_4"
+        store.mha_suffix = "3_dp1_2"
+        store.is_mla_backend = True
+        store.registered_pools = {
+            PoolName.KV: SimpleNamespace(),
+            PoolName.MAMBA: SimpleNamespace(
+                conv_buffer=[object()], temporal_state_elem_size=1
+            ),
+        }
+        kv_keys, _ = store._get_hybrid_page_component_keys(
+            ["h0"], PoolTransfer(name=PoolName.KV, keys=["h0"])
+        )
+        mamba_keys, _ = store._get_hybrid_page_component_keys(
+            ["h0"], PoolTransfer(name=PoolName.MAMBA, keys=["h0"])
+        )
+        self.assertEqual(kv_keys, ["h0_dp1_2_dcp1_4_k"])
+        self.assertEqual(mamba_keys, ["h0_3_dp1_2_temporal", "h0_3_dp1_2_conv_0"])
+
+    def test_replicated_writer_is_selected_per_dcp_shard(self):
+        from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+        cases = [
+            (True, 0, 1, False),
+            (True, 1, 1, True),
+            (True, 3, 4, False),
+            (True, 4, 4, True),
+            (False, 5, 4, False),
+        ]
+        for is_mla, local_tp_rank, dcp_size, expected_skip in cases:
+            controller = HiCacheController.__new__(HiCacheController)
+            controller.enable_storage = False
+            controller._stop_storage_threads = lambda: None
+            controller.prefetch_hits_sync_groups = []
+            controller.prefetch_completion_sync_groups = []
+            controller._destroy_sync_groups = lambda _groups: None
+            controller._generate_storage_config = lambda *_args, **_kwargs: (
+                SimpleNamespace(
+                    is_mla_model=is_mla,
+                    tp_rank=local_tp_rank,
+                    dcp_size=dcp_size,
+                )
+            )
+            controller.storage_host_pool = object()
+            with patch.object(
+                StorageBackendFactory,
+                "create_backend",
+                side_effect=RuntimeError("stop after writer selection"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after writer"):
+                    controller.attach_storage_backend("mooncake")
+            self.assertEqual(controller.backup_skip, expected_skip)
 
 
 class TestRetractionStorageState(CustomTestCase):
@@ -193,6 +418,88 @@ class TestRetractionRestoreAdmission(CustomTestCase):
                 self._req(backup)
             )
         )
+
+    def test_side_pool_admission_uses_logical_page_size(self):
+        cache = self._make_cache(available=512, reclaimed=512)
+        cache.host_pool_group.entry_map[PoolName.SWA] = SimpleNamespace(
+            host_pool=SimpleNamespace(page_size=64, logical_page_size=512),
+            host_evict_fn=lambda _need: None,
+        )
+        backup = RetractionBackup(
+            storage_state=RetractionStorageState.L3_READY,
+            storage_hashes=["h0"],
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["s0", "s1"],
+                    host_indices=torch.arange(1024),
+                )
+            ],
+        )
+        self.assertFalse(cache.retraction_restore_admissible(self._req(backup)))
+
+    def test_side_pool_storage_transfer_uses_logical_page_size(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.host_pool_group = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    host_pool=SimpleNamespace(page_size=64, logical_page_size=512)
+                )
+            }
+        )
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(1024),
+        )
+        backup = RetractionBackup(pool_transfers=[transfer])
+
+        transfers = cache._retraction_storage_transfers(backup, ["k0", "k1", "k2"])
+        self.assertEqual(transfers[0].keys, ["k1", "k2"])
+
+
+class TestMooncakeLogicalPageAccounting(CustomTestCase):
+    def _make_store(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.mem_pool_host = SimpleNamespace(
+            page_size=64,
+            logical_page_size=512,
+            get_page_buffer_meta=lambda indices: ([1], [2]),
+        )
+        store.registered_pools = {
+            PoolName.KV: store.mem_pool_host,
+        }
+        store.is_mla_backend = False
+        store.should_split_heads = False
+        store._tag_keys = lambda keys: keys
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (keys, 1)
+        store._can_use_group_semantics = lambda: False
+        store._batch_exist = lambda keys: [1 for _ in keys]
+        store._get_batch_zero_copy_impl = lambda keys, ptrs, sizes: [0 for _ in keys]
+        store._batch_postprocess = lambda results, **kwargs: results
+        return store
+
+    def test_batch_preprocess_uses_logical_page_size(self):
+        store = self._make_store()
+        store._get_mha_buffer_meta = MagicMock(return_value=(["h"], [1], [2]))
+        result = store._batch_preprocess(["h"], torch.arange(512))
+        self.assertEqual(result, (["h"], [1], [2]))
+        store._get_mha_buffer_meta.assert_called_once()
+
+    def test_batch_io_uses_logical_page_size(self):
+        store = self._make_store()
+        transfer = PoolTransfer(
+            name=PoolName.KV,
+            keys=["h"],
+            host_indices=torch.arange(512),
+        )
+        result = store._batch_io_v2([transfer], is_set=False)
+        self.assertEqual(result, {PoolName.KV: [0]})
 
 
 class TestRetractionRestoreCollective(CustomTestCase):

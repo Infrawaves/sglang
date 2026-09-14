@@ -1501,7 +1501,11 @@ class UnifiedRadixCache(BasePrefixCache):
             if transfer.indices_from_pool is not None or not transfer.keys:
                 continue
             entry = self.host_pool_group.entry_map[transfer.name]
-            side_need = len(transfer.keys) * entry.host_pool.page_size
+            host_pool = entry.host_pool
+            logical_page_size = (
+                getattr(host_pool, "logical_page_size", None) or host_pool.page_size
+            )
+            side_need = len(transfer.keys) * logical_page_size
             if not self._host_pool_can_stage(transfer.name, side_need):
                 return False
         return True
@@ -1526,7 +1530,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         f"Retraction pool {transfer.name} has no host indices"
                     )
                 entry = self.host_pool_group.entry_map[transfer.name]
-                pool_page_size = entry.host_pool.page_size
+                host_pool = entry.host_pool
+                pool_page_size = (
+                    getattr(host_pool, "logical_page_size", None) or host_pool.page_size
+                )
                 page_count = len(transfer.host_indices) // pool_page_size
                 if page_count <= 0 or page_count > len(kv_keys):
                     raise ValueError(

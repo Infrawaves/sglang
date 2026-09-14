@@ -555,11 +555,12 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # Replicated MLA pages are written by one rank per DCP shard within
+        # each attention-TP replica. Rank-sharded pools (for example Mamba)
+        # continue to write on every owning rank.
         self.backup_skip = (
             self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
+            and self.storage_config.tp_rank >= self.storage_config.dcp_size
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -734,6 +735,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        parallel = get_parallel()
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -750,6 +752,10 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            dcp_rank=parallel.attn_dcp_rank,
+            dcp_size=parallel.attn_dcp_size,
+            attn_dp_rank=parallel.attn_dp_rank,
+            attn_dp_size=parallel.attn_dp_size,
         )
 
     def reset(self):
