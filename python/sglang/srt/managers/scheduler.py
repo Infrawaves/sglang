@@ -1317,6 +1317,7 @@ class Scheduler(
             get_schedule().enable_chunked_prefill_round_robin
         )
         self.suspended_prefill_queue: List[Req] = []
+        # Cleanup/retry actions waiting for outstanding results and KV sends.
         self._pending_round_robin_actions: dict[Req, Optional[str]] = {}
         self._prefill_ready_seq = 0
         if self.enable_chunked_prefill_round_robin:
@@ -3941,7 +3942,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         round_robin_enabled = self.enable_chunked_prefill_round_robin
-        round_robin_middle = None
+        round_robin_chunked_req = None
         resume_ids = (
             {id(r) for r in self.iter_round_robin_requests()}
             if round_robin_enabled
@@ -3973,9 +3974,9 @@ class Scheduler(
                     break
                 if id(req) in resume_ids:
                     req.init_next_round_input()
-                    round_robin_middle = adder.add_chunked_req(req)
+                    round_robin_chunked_req = adder.add_chunked_req(req)
                     if (
-                        round_robin_middle is not None
+                        round_robin_chunked_req is not None
                         or adder.budget_state() != AddReqResult.CONTINUE
                     ):
                         break
@@ -4124,8 +4125,8 @@ class Scheduler(
             self.suspended_prefill_queue = [
                 r for r in self.suspended_prefill_queue if r not in can_run_set
             ]
-            assert round_robin_middle is None or adder.new_chunked_req is None
-            self.chunked_req = round_robin_middle or adder.new_chunked_req
+            assert round_robin_chunked_req is None or adder.new_chunked_req is None
+            self.chunked_req = round_robin_chunked_req or adder.new_chunked_req
         elif adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
