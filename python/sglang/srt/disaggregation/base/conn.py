@@ -191,9 +191,10 @@ class BaseKVSender(ABC):
         pass
 
     def is_source_release_safe(self) -> bool:
-        """Whether all queued sends have stopped using this request's source buffers.
+        """Whether transfers have stopped using this request's source buffers.
 
-        The caller must stop submitting sends before querying this boundary.
+        Query only after abort has stopped future reads, or transfer success.
+        The caller must also stop submitting sends.
         """
         raise NotImplementedError("This transfer backend has no source drain query")
 

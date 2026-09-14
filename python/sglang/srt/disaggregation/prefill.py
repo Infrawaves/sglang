@@ -990,6 +990,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         release_ready = None
         if self.enable_chunked_prefill_round_robin and self.enable_overlap:
+            # A peer rank's failure must also stop this rank's queued transfers.
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+                if (
+                    poll == KVPoll.Failed
+                    and req.disagg_kv_sender.poll() != KVPoll.Failed
+                ):
+                    req.disagg_kv_sender.abort()
             release_ready = self.round_robin_release_ready(
                 self.disagg_prefill_inflight_queue
             )
@@ -1266,6 +1273,9 @@ class SchedulerDisaggregationPrefillMixin:
             return
         for req in pending:
             self.defer_round_robin_action(req, self._pending_round_robin_actions[req])
+            # Seal the room before checking active transfers; queued chunks will skip.
+            if req.disagg_kv_sender.poll() != KVPoll.Failed:
+                req.disagg_kv_sender.abort()
         ready = self.round_robin_release_ready(pending)
         for req, can_release in zip(pending, ready, strict=True):
             if not can_release:

@@ -225,7 +225,7 @@ GLOBALS = dict(
     _make_abort_req=lambda req, **kwargs: req.rid,
     logger=logging.getLogger(__name__),
     FINISH_ABORT=lambda: "abort",
-    KVPoll=NS(Failed="failed", WaitingForInput="ready"),
+    KVPoll=NS(Failed="failed", WaitingForInput="ready", Success="success"),
     should_force_retry=lambda r: False,
     poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: [
         s.poll for s in senders
@@ -267,6 +267,7 @@ Prefill = extract(
         "has_pending_prefill_result",
         "defer_round_robin_action",
         "process_pending_round_robin_actions",
+        "process_disagg_prefill_inflight_queue",
         "round_robin_release_ready",
         "process_batch_result_disagg_prefill",
         "handle_bootstrap_failure",
@@ -559,6 +560,12 @@ class OverlapTests(unittest.TestCase):
         req.time_stats.set_last_chunked_prefill_finish_time = Mock()
         req.time_stats.set_completion_time = Mock()
         req.inflight_middle_chunks = int(middle)
+        req.disagg_kv_sender.poll = Mock(return_value="ready")
+
+        def abort():
+            req.disagg_kv_sender.poll.return_value = "failed"
+
+        req.disagg_kv_sender.abort = Mock(side_effect=abort)
         req.disagg_kv_sender.is_source_release_safe = Mock(return_value=True)
         return req
 
@@ -680,11 +687,45 @@ class OverlapTests(unittest.TestCase):
         finish.assert_called_once_with(a, defer=False)
         retry.assert_not_called()
 
+    def test_inflight_failure_seals_local_sender_but_success_does_not(self):
+        for status, local_status in (
+            ("failed", "ready"),
+            ("failed", "failed"),
+            ("success", "success"),
+        ):
+            with self.subTest(status=status, local_status=local_status):
+                s = self.s
+                a = self.request(status, middle=False)
+                a.disagg_kv_sender.poll.return_value = local_status
+                s.disagg_prefill_inflight_queue = [a]
+                s.output_streamer = Mock()
+
+                def source_ready():
+                    self.assertEqual(
+                        a.disagg_kv_sender.poll(),
+                        "failed" if status == "failed" else "success",
+                    )
+                    return False
+
+                a.disagg_kv_sender.is_source_release_safe.side_effect = source_ready
+                with patch.dict(
+                    GLOBALS, poll_and_all_reduce_attn_cp_tp_group=lambda *args: [status]
+                ):
+                    self.assertEqual(s.process_disagg_prefill_inflight_queue(), [])
+                self.assertEqual(
+                    a.disagg_kv_sender.abort.call_count,
+                    int(status == "failed" and local_status != "failed"),
+                )
+                self.assertEqual(s.disagg_prefill_inflight_queue, [a])
+                self.assertEqual(a.cleanup, [])
+
     def test_other_rank_can_hold_release(self):
         a = self.request("a")
         self.s.defer_round_robin_action(a, "abort")
 
         def hold(tensor, **kwargs):
+            a.disagg_kv_sender.abort.assert_called_once()
+            self.assertEqual(a.disagg_kv_sender.poll(), "failed")
             tensor.values = [0]
 
         with patch.object(TORCH.distributed, "all_reduce", hold):
@@ -701,13 +742,13 @@ MOON_GLOBALS = dict(
     DisaggregationMode=NS(PREFILL="prefill"),
     TraceNullContext=lambda: None,
     TransferKVChunk=lambda **kwargs: NS(staging_counted=False, **kwargs),
+    get_schedule=lambda: NS(enable_chunked_prefill_round_robin=True),
 )
 Mooncake = extract(
     "disaggregation/mooncake/conn.py",
     "MooncakeKVManager",
     [
         "add_transfer_request",
-        "_finish_source_transfer",
         "is_source_release_safe",
         "_await_transfer_futures",
         "transfer_worker",
@@ -719,9 +760,7 @@ Mooncake = extract(
 class SourceDrainTests(unittest.TestCase):
     def manager(self):
         m = Mooncake()
-        m.track_source_transfers = True
-        m._source_transfers = defaultdict(int)
-        m._source_transfers_lock = threading.Lock()
+        m._staging_outstanding = defaultdict(int)
         m.enable_deferred_decode_kv_release = False
         m.disaggregation_mode = "prefill"
         m.request_status = {1: 2}
@@ -731,17 +770,37 @@ class SourceDrainTests(unittest.TestCase):
         m.transfer_queues = [NS(put=self.queued.append)]
         return m
 
-    def test_queued_and_running_tasks_both_hold_source(self):
+    def test_aborted_queued_tasks_skip_without_reading_source(self):
         m = self.manager()
         for _ in range(2):
             m.add_transfer_request(1, [], slice(0, 1), False)
-        self.assertEqual(len(self.queued), 2)
-        self.assertFalse(m.is_source_release_safe(1))
-        m._finish_source_transfer(1)
-        self.assertFalse(m.is_source_release_safe(1))
-        m._finish_source_transfer(1)
+        m.request_status[1] = 0
         self.assertTrue(m.is_source_release_safe(1))
-        self.assertEqual(dict(m._source_transfers), {})
+        m.enable_trace = False
+        m.bootstrap_port = 1
+        m._transfer_data = Mock(side_effect=AssertionError("read after abort"))
+        queued = iter(self.queued)
+        with self.assertRaisesRegex(RuntimeError, "end worker"):
+
+            def get():
+                try:
+                    return next(queued)
+                except StopIteration:
+                    raise RuntimeError("end worker")
+
+            m.transfer_worker(NS(get=get), None)
+        m._transfer_data.assert_not_called()
+        self.assertTrue(m.is_source_release_safe(1))
+        m.add_transfer_request(1, [], slice(0, 1), False)
+        self.assertEqual(len(self.queued), 2)
+
+    def test_active_transfer_must_drain_even_after_abort(self):
+        m = self.manager()
+        m._staging_outstanding[1] = 1
+        m.request_status[1] = 0
+        self.assertFalse(m.is_source_release_safe(1))
+        m._staging_outstanding[1] -= 1
+        self.assertTrue(m.is_source_release_safe(1))
 
     def test_failure_still_waits_for_running_transfer(self):
         m = self.manager()
@@ -765,10 +824,12 @@ class SourceDrainTests(unittest.TestCase):
         with patch.object(concurrent.futures, "as_completed", ordered):
             thread = threading.Thread(target=wait)
             thread.start()
-            self.assertTrue(entered.wait(1))
-            self.assertFalse(completed.is_set())
-            running.set_result(0)
-            thread.join(1)
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(completed.is_set())
+            finally:
+                running.set_result(0)
+                thread.join(1)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [1])
 
