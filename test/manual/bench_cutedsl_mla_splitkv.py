@@ -1,6 +1,6 @@
 """Manual Blackwell MLA split-KV experiment; not a CI or model-accuracy test.
 
-Run from an environment with this SGLang checkout and FlashInfer 0.6.17:
+Run from an environment with this SGLang checkout and FlashInfer 0.6.17/0.6.18:
   python test/manual/bench_cutedsl_mla_splitkv.py --batch-size 128
   python test/manual/bench_cutedsl_mla_splitkv.py --max-seq-len 1048576
 
@@ -111,7 +111,7 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits):
         type(n) is not int or n < q_len for n in lengths
     ):
         raise ValueError("lengths must contain active-batch-size integers >= q-len")
-    # Non-DCP FlashInfer 0.6.17's reducer does not support K=0. SGLang ordinary
+    # The supported non-DCP reducers do not support K=0. SGLang ordinary
     # decode pads seq_lens with 1, so keep these rows as real minimal KV work.
     lengths = lengths + [q_len] * (batch - len(lengths))
     bound = args.max_seq_len or max(lengths)
@@ -290,6 +290,7 @@ def main():
     from flashinfer.cute_dsl.attention.monolithic import mla_decode as stock
 
     from sglang.srt.layers.attention.cutedsl_mla_splitkv import (
+        SUPPORTED_FLASHINFER_VERSIONS,
         create_cutedsl_mla_decode_with_splits,
         plan_cutedsl_mla_splits,
     )
@@ -299,8 +300,11 @@ def main():
             "This experiment requires Blackwell SM100/SM103 CUDA hardware"
         )
     version = importlib.metadata.version("flashinfer-python")
-    if version != "0.6.17":
-        raise RuntimeError(f"This experiment pins FlashInfer 0.6.17; found {version}")
+    if version not in SUPPORTED_FLASHINFER_VERSIONS:
+        raise RuntimeError(
+            f"This experiment requires FlashInfer in {SUPPORTED_FLASHINFER_VERSIONS}; "
+            f"found {version}"
+        )
     print(
         json.dumps(
             dict(

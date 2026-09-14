@@ -1,4 +1,4 @@
-"""Opt-in fixed split-KV planning for FlashInfer 0.6.17 CuTeDSL MLA.
+"""Opt-in fixed split-KV planning for FlashInfer 0.6.17/0.6.18 CuTeDSL MLA.
 
 FlashInfer's public MLA API does not expose a split override. Give this backend
 its own copy of the Python launch wrapper, replacing only its planner. The
@@ -10,6 +10,10 @@ import functools
 from importlib import import_module
 from importlib.metadata import version
 from types import FunctionType
+
+# Both releases have the same monolithic wrapper, planner ABI and workspace
+# layout. Keep an explicit allowlist because this adapter uses a private API.
+SUPPORTED_FLASHINFER_VERSIONS = ("0.6.17", "0.6.18")
 
 
 @functools.lru_cache(maxsize=1024, typed=True)
@@ -51,9 +55,10 @@ def create_cutedsl_mla_decode_with_splits(num_splits: int):
     """Build an isolated wrapper once, before warmup/CUDA graph capture."""
     plan_cutedsl_mla_splits(1, 1, 1, 512, num_splits)
     installed = version("flashinfer-python")
-    if installed != "0.6.17":
+    if installed not in SUPPORTED_FLASHINFER_VERSIONS:
         raise RuntimeError(
-            "SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS requires flashinfer-python==0.6.17 "
+            "SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS requires flashinfer-python "
+            f"in {SUPPORTED_FLASHINFER_VERSIONS} "
             f"(found {installed}); unset the override for the upstream path"
         )
     module = import_module("flashinfer.cute_dsl.attention.monolithic.mla_decode")

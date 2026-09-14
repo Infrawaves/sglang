@@ -19,7 +19,7 @@ export SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS=4
   `0, 1, 2, 4, 8`; `1` also checks the adapter against the original B128 path.
 - Restart workers for every value. Changing the environment after startup does
   not update captured graph scalars or workspace pointers.
-- Requires `flashinfer-python==0.6.17`, DCP size 1, no speculative decoding,
+- Requires `flashinfer-python==0.6.17` or `0.6.18`, DCP size 1, no speculative decoding,
   ordinary one-query-token decode, and no skip-softmax. Other FlashInfer
   versions fail explicitly when the override is enabled; default `0` does not
   impose a version check.
@@ -34,8 +34,16 @@ is only a host planning bound, not a padded effective KV length.
 `cutedsl_mla_splitkv.py` creates an isolated copy of FlashInfer's monolithic
 Python wrapper with only its split/workspace planner replaced. It does not
 change the installed package or its process-global functions. This temporary
-private-API adapter is pinned to 0.6.17; replace it with a public split argument
-when one becomes available.
+private-API adapter accepts only 0.6.17 and 0.6.18; replace it with a public
+split argument when one becomes available.
+
+SGLang upstream commit `39e147443bfd750252892e1dc2e46af8439b0679` pins
+FlashInfer 0.6.18 and moves DCP metadata helpers to `TRTLLMMLABackend`. The
+fixed split override remains in the ordinary non-DCP decode hook; keep the
+upstream metadata helpers and fallback argument forwarding when rebasing.
+The two FlashInfer releases have identical monolithic decode wrappers and
+split/workspace planning interfaces. This source compatibility check does
+not replace GB300 numerical and performance validation after upgrading.
 
 Planning reserves the same M128-padded FP32 partial-output and LSE layout as
 FlashInfer, even for K3's 24 local heads. For B128, Q1 and latent dimension 512:
@@ -56,7 +64,7 @@ the decode layer loop.
 
 ## Single-GPU correctness and timing
 
-Run on an idle GB300 GPU with the branch installed and FlashInfer 0.6.17:
+Run on an idle GB300 GPU with the branch installed and FlashInfer 0.6.17 or 0.6.18:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
