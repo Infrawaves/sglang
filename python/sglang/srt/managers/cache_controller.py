@@ -556,8 +556,8 @@ class HiCacheController:
             model_name, storage_backend_extra_config
         )
         # Replicated MLA pages are written by one rank per DCP shard within
-        # each attention-TP replica. Rank-sharded pools (for example Mamba)
-        # continue to write on every owning rank.
+        # each attention-TP replica.
+        # TODO(zhangmj): Revisit writer ownership and load balancing across DCP replicas.
         self.backup_skip = (
             self.storage_config.is_mla_model
             and self.storage_config.tp_rank >= self.storage_config.dcp_size
