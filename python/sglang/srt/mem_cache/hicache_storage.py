@@ -38,6 +38,11 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Effective attention topology used to scope DCP/DP storage objects.
+    dcp_rank: int = 0
+    dcp_size: int = 1
+    attn_dp_rank: int = 0
+    attn_dp_size: int = 1
 
 
 @dataclass

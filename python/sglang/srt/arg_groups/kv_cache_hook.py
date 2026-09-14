@@ -148,14 +148,43 @@ def handle_cache_compatibility(server_args: Any) -> None:
             f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
             "is only supported on a PD decode server."
         )
-    if (
-        cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
-        and cfg.dcp_size > 1
-    ):
+    backup = cfg.disaggregation_decode_retraction_backup
+    if backup == "host_pool" and cfg.dcp_size > 1:
         raise ValueError(
-            f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
-            "does not support --dcp-size > 1."
+            "--disaggregation-decode-retraction-backup=host_pool does not "
+            "support --dcp-size > 1."
         )
+    if backup == "ssd" and cfg.dcp_size > 1:
+        if not use_mla_backend(server_args):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "requires an MLA-family model."
+            )
+        if not model_config_of(server_args).is_hybrid_swa:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "requires the supported MLA hybrid retraction stack; pure "
+                "MLA is not supported."
+            )
+        if cfg.hicache_storage_backend != "mooncake":
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "requires --hicache-storage-backend mooncake."
+            )
+        if cfg.attn_cp_size > 1:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "does not support attention context parallelism; "
+                "attn_cp_size must be 1."
+            )
+        attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
+        attn_tp_size = cfg.tp_size // attn_dp_size // cfg.attn_cp_size
+        if attn_tp_size % cfg.dcp_size != 0:
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=ssd with DCP "
+                "requires attn_tp_size to be divisible by dcp_size, got "
+                f"attn_tp_size={attn_tp_size}, dcp_size={cfg.dcp_size}."
+            )
     if (
         cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
         and cfg.enable_unified_memory

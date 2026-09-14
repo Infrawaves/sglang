@@ -2,7 +2,7 @@ import threading
 import unittest
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -18,11 +18,107 @@ from sglang.srt.mem_cache.common import (
     RetractionStorageState,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestMooncakeDcpKeyScoping(CustomTestCase):
+    def test_storage_config_uses_attention_local_identity(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        controller.mem_pool_host = SimpleNamespace(layout="layer_first")
+        controller.enable_storage_metrics = False
+        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+        parallel = SimpleNamespace(
+            tp_rank=7,
+            tp_size=8,
+            attn_tp_rank=3,
+            attn_tp_size=4,
+            pp_rank=0,
+            pp_size=1,
+            attn_dcp_rank=1,
+            attn_dcp_size=2,
+            attn_dp_rank=1,
+            attn_dp_size=2,
+        )
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.is_dp_attention_enabled", return_value=True),
+            patch(f"{module}.get_attention_dp_rank", return_value=1),
+        ):
+            config = controller._generate_storage_config()
+        self.assertEqual((config.tp_rank, config.tp_size), (3, 4))
+        self.assertEqual((config.dcp_rank, config.dcp_size), (1, 2))
+        self.assertEqual((config.attn_dp_rank, config.attn_dp_size), (1, 2))
+        self.assertTrue(config.is_mla_model)
+
+    def test_dcp1_suffixes_are_byte_compatible(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(2, 1, True, 0, 1, 0, 4),
+            ("2_1", "1"),
+        )
+
+    def test_dcp_and_dp_suffixes_scope_mla_and_mamba(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(3, 0, False, 1, 4, 0, 1),
+            ("3", "dcp1_4"),
+        )
+        self.assertEqual(
+            MooncakeStore._build_key_suffixes(3, 2, True, 1, 4, 1, 2),
+            ("3_2_dp1_2", "2_dp1_2_dcp1_4"),
+        )
+
+    def test_replicated_writer_is_selected_per_dcp_shard(self):
+        from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+        cases = [
+            (True, 0, 1, False),
+            (True, 1, 1, True),
+            (True, 3, 4, False),
+            (True, 4, 4, True),
+            (False, 5, 4, False),
+        ]
+        for is_mla, local_tp_rank, dcp_size, expected_skip in cases:
+            controller = HiCacheController.__new__(HiCacheController)
+            controller.enable_storage = False
+            controller._stop_storage_threads = lambda: None
+            controller.prefetch_hits_sync_groups = []
+            controller.prefetch_completion_sync_groups = []
+            controller._destroy_sync_groups = lambda _groups: None
+            controller._generate_storage_config = lambda *_args, **_kwargs: (
+                SimpleNamespace(
+                    is_mla_model=is_mla,
+                    tp_rank=local_tp_rank,
+                    dcp_size=dcp_size,
+                )
+            )
+            controller.storage_host_pool = object()
+            with patch.object(
+                StorageBackendFactory,
+                "create_backend",
+                side_effect=RuntimeError("stop after writer selection"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after writer"):
+                    controller.attach_storage_backend("mooncake")
+            self.assertEqual(controller.backup_skip, expected_skip)
 
 
 class TestRetractionStorageState(CustomTestCase):
@@ -193,6 +289,88 @@ class TestRetractionRestoreAdmission(CustomTestCase):
                 self._req(backup)
             )
         )
+
+    def test_side_pool_admission_uses_logical_page_size(self):
+        cache = self._make_cache(available=512, reclaimed=512)
+        cache.host_pool_group.entry_map[PoolName.SWA] = SimpleNamespace(
+            host_pool=SimpleNamespace(page_size=64, logical_page_size=512),
+            host_evict_fn=lambda _need: None,
+        )
+        backup = RetractionBackup(
+            storage_state=RetractionStorageState.L3_READY,
+            storage_hashes=["h0"],
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["s0", "s1"],
+                    host_indices=torch.arange(1024),
+                )
+            ],
+        )
+        self.assertFalse(cache.retraction_restore_admissible(self._req(backup)))
+
+    def test_side_pool_storage_transfer_uses_logical_page_size(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.host_pool_group = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    host_pool=SimpleNamespace(page_size=64, logical_page_size=512)
+                )
+            }
+        )
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(1024),
+        )
+        backup = RetractionBackup(pool_transfers=[transfer])
+
+        transfers = cache._retraction_storage_transfers(backup, ["k0", "k1", "k2"])
+        self.assertEqual(transfers[0].keys, ["k1", "k2"])
+
+
+class TestMooncakeLogicalPageAccounting(CustomTestCase):
+    def _make_store(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.mem_pool_host = SimpleNamespace(
+            page_size=64,
+            logical_page_size=512,
+            get_page_buffer_meta=lambda indices: ([1], [2]),
+        )
+        store.registered_pools = {
+            PoolName.KV: store.mem_pool_host,
+        }
+        store.is_mla_backend = False
+        store.should_split_heads = False
+        store._tag_keys = lambda keys: keys
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (keys, 1)
+        store._can_use_group_semantics = lambda: False
+        store._batch_exist = lambda keys: [1 for _ in keys]
+        store._get_batch_zero_copy_impl = lambda keys, ptrs, sizes: [0 for _ in keys]
+        store._batch_postprocess = lambda results, **kwargs: results
+        return store
+
+    def test_batch_preprocess_uses_logical_page_size(self):
+        store = self._make_store()
+        store._get_mha_buffer_meta = MagicMock(return_value=(["h"], [1], [2]))
+        result = store._batch_preprocess(["h"], torch.arange(512))
+        self.assertEqual(result, (["h"], [1], [2]))
+        store._get_mha_buffer_meta.assert_called_once()
+
+    def test_batch_io_uses_logical_page_size(self):
+        store = self._make_store()
+        transfer = PoolTransfer(
+            name=PoolName.KV,
+            keys=["h"],
+            host_indices=torch.arange(512),
+        )
+        result = store._batch_io_v2([transfer], is_set=False)
+        self.assertEqual(result, {PoolName.KV: [0]})
 
 
 class TestRetractionRestoreCollective(CustomTestCase):
