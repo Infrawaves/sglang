@@ -64,7 +64,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(specs, config())
+}
+
+fn build_ctx_with_config(specs: Vec<WorkerSpec>, cfg: Config) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -319,52 +322,88 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// Pin Pattern B's "prefill failure is invisible to the client"
-/// contract: when the spawned prefill task gets a 5xx (or any other
-/// upstream error), the decode response still reaches the client
-/// unmodified. The router intentionally does not wire fail-fast here —
-/// the decode side will eventually hang on `bootstrap_room` and time
-/// out, but the chat handler itself doesn't propagate the prefill
-/// error. Matches llm-d / aibrix behaviour.
-#[tokio::test]
-async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
-    let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
+async fn assert_prefill_failure_cancels_decode(
+    prefill_status: StatusCode,
+    expected_status: StatusCode,
+    streaming: bool,
+) {
+    let decode =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let prefill = crate::common::mock_worker::MockWorker::start_error_after_peer(
+        prefill_status,
         json!({"error": "simulated prefill failure"}),
+        Some(Arc::clone(&decode.captured)),
     )
     .await;
-    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    let ctx = build_ctx(vec![
-        WorkerSpec {
-            id: WorkerId("p1".into()),
-            url: prefill.url.clone(),
-            mode: WorkerMode::Prefill,
-            model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: Some(8997),
-        },
-        WorkerSpec {
-            id: WorkerId("d1".into()),
-            url: decode.url.clone(),
-            mode: WorkerMode::Decode,
-            model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
-        },
-    ]);
-    let app = build_router(ctx);
-
-    // Client must see decode's 200 — the failing prefill is invisible.
-    let res = app.oneshot(chat_request()).await.unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "decode response should reach the client even when prefill returned 5xx",
+    let mut cfg = config();
+    cfg.model.tokenizer_path = None; // Preserve the online --no-tokenizer path.
+    let ctx = build_ctx_with_config(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+        cfg,
     );
+    let app = build_router(Arc::clone(&ctx));
 
-    // Decode received its body (proves dual dispatch fired despite
-    // the prefill failure).
+    // Client must see the prefill failure instead of waiting for decode's
+    // bootstrap timeout.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model":"tiny", "rid":"caller-pd-rid", "stream": streaming,
+            "messages":[{"role":"user","content":"hi"}]})
+            .to_string(),
+        ))
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), app.oneshot(req))
+        .await
+        .expect("prefill failure must not wait for decode timeout")
+        .unwrap();
+    assert_eq!(res.status(), expected_status);
+
+    // Decode received its body (proves dual dispatch fired) and then got a
+    // targeted cancellation for the same request rid.
     let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
     let v = parse_body(&decode_body);
     assert_eq!(bootstrap_port(&v), Some(8997));
+    let rid = v
+        .get("rid")
+        .and_then(Value::as_str)
+        .expect("PD request must carry a scalar rid");
+    let start = Instant::now();
+    loop {
+        let aborts = decode.captured.lock().unwrap().abort_rids.clone();
+        if aborts.iter().any(|aborted| aborted == rid)
+            && ctx
+                .metrics
+                .render()
+                .contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#)
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "decode did not receive abort for rid {rid}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let metrics = ctx.metrics.render();
+    assert!(metrics.contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#));
 
     // Prefill also received its body — it just returned 5xx. The
     // bootstrap fields are present so the engine WOULD have honoured
@@ -372,4 +411,42 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
     let pv = parse_body(&prefill_body);
     assert_eq!(bootstrap_port(&pv), Some(8997));
+    assert_eq!(pv["rid"], v["rid"]);
+    assert_eq!(rid, "caller-pd-rid");
+    assert_eq!(decode.captured.lock().unwrap().abort_rids.len(), 1);
+}
+
+/// A prefill server failure maps to 502 and cancels the paired decode request.
+#[tokio::test]
+async fn pd_mode_prefill_5xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        false,
+    )
+    .await;
+}
+
+/// A prefill client rejection keeps its 4xx status and still cancels decode,
+/// because decode cannot complete without a successful prefill.
+#[tokio::test]
+async fn pd_mode_prefill_4xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST, false)
+        .await;
+}
+
+#[tokio::test]
+async fn pd_stream_prefill_5xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_stream_prefill_4xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST, true)
+        .await;
 }

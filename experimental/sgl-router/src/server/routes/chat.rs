@@ -20,8 +20,8 @@ use crate::policies::{
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    WorkerModeLabel,
+    MetricsRegistry, PdDecodeAbortOutcome, PolicySelectionFailureReason, RequestOutcome,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -33,6 +33,7 @@ use serde::Deserialize;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 /// Observability header carrying the final decode-pool URL for a
 /// PD-disaggregated request. The router fans the
@@ -168,6 +169,11 @@ struct RecordDurationOnDrop {
     metrics: Arc<MetricsRegistry>,
     model: String,
     start: std::time::Instant,
+}
+
+enum PdFirstResult {
+    Decode(Result<Response<Body>, ApiError>),
+    Prefill(Result<(), ApiError>),
 }
 
 impl Drop for RecordDurationOnDrop {
@@ -829,15 +835,26 @@ pub async fn chat_completions(
         room: generate_room_id(),
     });
     let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
+    let pd_rid = decode_peer
+        .as_ref()
+        .map(|_| request_rid(request_value.as_ref(), &body));
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
     // `input_ids` and/or bootstrap fields, or forwarding the original bytes
     // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    let outgoing_body = build_outgoing_body(
+        &body,
+        request_value,
+        forward_input_ids,
+        bootstrap.as_ref(),
+        pd_rid.as_deref(),
+    )?;
 
     let result = if let Some(decode_worker) = decode_peer {
-        // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
+        // PD-disagg dispatch: start both sides together, but do not expose a
+        // decode response until prefill has reported success. If prefill
+        // fails while decode is pending or successful, schedule a bounded abort
+        // for that decode request and return the error without waiting for cleanup.
         //
         // SGLang's HTTP-mode disagg-prefill requires three flat
         // top-level fields on the request body: `bootstrap_host`,
@@ -847,33 +864,8 @@ pub async fn chat_completions(
         // these here and fan the same modified body to both the
         // prefill and decode workers concurrently.
         //
-        // **Why spawn-and-forget for prefill instead of
-        // `tokio::join!`?** All three peer SGLang-HTTP-PD routers
-        // (Dynamo / llm-d / aibrix) converged on this shape: the
-        // prefill request must outlive the client connection because
-        // tying prefill to the client future opens a cancel-race
-        // window where the engine's NIXL RPC teardown can leak KV
-        // block refs (NVBugs 5969206 in Dynamo). The detached task
-        // also keeps the LoadGuard + ActiveLoadGuard alive for the full
-        // prefill duration — KV transfer can run for tens of seconds
-        // even when the client gave up.
-        //
-        // No watchdog for fail-fast on prefill 5xx: llm-d / aibrix both
-        // ship without one. On prefill failure the client experiences
-        // the SGLang decode-side bootstrap_room timeout (~30–60 s by
-        // default) instead of an immediate 502. A follow-up can wire a
-        // `tokio::sync::watch` channel if telemetry shows it matters.
-        //
-        // **Scope of the "detached" guarantee.** The spawn protects
-        // against client disconnect — the handler future being dropped
-        // does NOT cancel the prefill HTTP request. It does NOT protect
-        // against router shutdown: when `AppContext` tears down, the
-        // tokio runtime cancels all unfinished tasks including this
-        // one. A future follow-up could thread a `TaskTracker` /
-        // `JoinSet` through `AppContext` for graceful shutdown drain;
-        // the current implementation ships without one (matching SMG's
-        // shutdown behaviour).
         let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
+        let pd_rid = pd_rid.expect("PD dispatch implies a request rid");
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
@@ -881,15 +873,10 @@ pub async fn chat_completions(
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
         let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        let (prefill_tx, mut prefill_rx) = oneshot::channel();
         tokio::spawn(async move {
-            // The tuple binding extends both guards' lifetime to the
-            // end of this async block, which lasts until the prefill
-            // HTTP request returns (success / error / engine-side
-            // bootstrap_room timeout). The result is logged and
-            // swallowed — no channel back to the client. See the big
-            // comment above for the rationale.
             let _hold = prefill_holds;
-            match prefill_proxy
+            let outcome = match prefill_proxy
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
@@ -899,18 +886,27 @@ pub async fn chat_completions(
                 )
                 .await
             {
-                Ok(_) => tracing::debug!(
+                Ok(response) if response.status().is_success() => Ok(()),
+                Ok(response) => Err(ApiError::PrefillFailed {
+                    status: response.status(),
+                }),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &outcome {
+                tracing::warn!(
+                    prefill_url = %prefill_url,
+                    bootstrap_room,
+                    error = %error,
+                    "prefill request failed; cancelling paired decode request",
+                );
+            } else {
+                tracing::debug!(
                     prefill_url = %prefill_url,
                     bootstrap_room,
                     "prefill side completed",
-                ),
-                Err(e) => tracing::warn!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    error = %e,
-                    "prefill request failed; decode will time out on bootstrap_room",
-                ),
+                );
             }
+            let _ = prefill_tx.send(outcome);
         });
 
         // Synchronously await the decode worker. Its response is what
@@ -920,36 +916,139 @@ pub async fn chat_completions(
         let decode_active_guard =
             ctx.active_load
                 .register(decode_worker.id.clone(), decode_worker.url.clone(), 0, 1);
-        if streaming {
-            let stream_guards: Box<dyn Send + 'static> =
-                Box::new((decode_guard, decode_active_guard, make_duration_guard()));
-            let fetch = ctx.proxy.forward_streaming_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                outgoing_body,
-                Some(stream_guards),
-                Some(make_ttft_hook()),
-            );
-            tokio::select! {
-                biased;
-                r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        let decode_url = decode_worker.url.clone();
+        let decode_breaker = Arc::clone(&decode_worker.breaker);
+        let abort_headers = headers.clone();
+        let abort_decode = || {
+            let proxy = Arc::clone(&ctx.proxy);
+            let metrics = Arc::clone(&ctx.metrics);
+            let decode_url = decode_url.clone();
+            let decode_breaker = Arc::clone(&decode_breaker);
+            let abort_headers = abort_headers.clone();
+            let pd_rid = pd_rid.clone();
+            tokio::spawn(async move {
+                match proxy
+                    .abort_request_to(&decode_url, &decode_breaker, &abort_headers, &pd_rid)
+                    .await
+                {
+                    Ok(()) => {
+                        metrics.record_pd_decode_abort(PdDecodeAbortOutcome::Success);
+                        tracing::debug!(
+                            decode_url = %decode_url,
+                            rid = %pd_rid,
+                            "paired decode request cancelled",
+                        );
+                    }
+                    Err(error) => {
+                        metrics.record_pd_decode_abort(PdDecodeAbortOutcome::Failed);
+                        tracing::warn!(
+                            decode_url = %decode_url,
+                            rid = %pd_rid,
+                            error = %error,
+                            "failed to cancel paired decode request",
+                        );
+                    }
+                }
+            });
+        };
+        let pd_result = async {
+            if streaming {
+                let stream_guards: Box<dyn Send + 'static> =
+                    Box::new((decode_guard, decode_active_guard, make_duration_guard()));
+                let fetch = ctx.proxy.forward_streaming_to(
+                    &decode_worker.url,
+                    &decode_worker.breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    outgoing_body,
+                    Some(stream_guards),
+                    Some(make_ttft_hook()),
+                );
+                tokio::pin!(fetch);
+                let first = tokio::select! {
+                    biased;
+                    r = &mut fetch => PdFirstResult::Decode(r),
+                    prefill = &mut prefill_rx => PdFirstResult::Prefill(
+                        prefill.unwrap_or_else(|_| Err(ApiError::Internal(anyhow::anyhow!(
+                            "prefill result channel closed"
+                        )))),
+                    ),
+                };
+                match first {
+                    PdFirstResult::Decode(Ok(response)) if !response.status().is_success() => {
+                        Ok(response)
+                    }
+                    PdFirstResult::Decode(Ok(response)) => match prefill_rx.await {
+                        Ok(Ok(())) => Ok(response),
+                        Ok(Err(error)) => {
+                            abort_decode();
+                            Err(error)
+                        }
+                        Err(_) => {
+                            abort_decode();
+                            Err(ApiError::Internal(anyhow::anyhow!(
+                                "prefill result channel closed"
+                            )))
+                        }
+                    },
+                    PdFirstResult::Decode(Err(error)) => Err(error),
+                    PdFirstResult::Prefill(Ok(())) => fetch.await,
+                    PdFirstResult::Prefill(Err(error)) => {
+                        abort_decode();
+                        Err(error)
+                    }
+                }
+            } else {
+                let _decode_hold = (decode_guard, decode_active_guard);
+                let fetch = ctx.proxy.forward_json_to(
+                    &decode_worker.url,
+                    &decode_worker.breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    outgoing_body,
+                );
+                tokio::pin!(fetch);
+                let first = tokio::select! {
+                    biased;
+                    r = &mut fetch => PdFirstResult::Decode(r),
+                    prefill = &mut prefill_rx => PdFirstResult::Prefill(
+                        prefill.unwrap_or_else(|_| Err(ApiError::Internal(anyhow::anyhow!(
+                            "prefill result channel closed"
+                        )))),
+                    ),
+                };
+                match first {
+                    PdFirstResult::Decode(Ok(response)) if !response.status().is_success() => {
+                        Ok(response)
+                    }
+                    PdFirstResult::Decode(Ok(response)) => match prefill_rx.await {
+                        Ok(Ok(())) => Ok(response),
+                        Ok(Err(error)) => {
+                            abort_decode();
+                            Err(error)
+                        }
+                        Err(_) => {
+                            abort_decode();
+                            Err(ApiError::Internal(anyhow::anyhow!(
+                                "prefill result channel closed"
+                            )))
+                        }
+                    },
+                    PdFirstResult::Decode(Err(error)) => Err(error),
+                    PdFirstResult::Prefill(Ok(())) => fetch.await,
+                    PdFirstResult::Prefill(Err(error)) => {
+                        abort_decode();
+                        Err(error)
+                    }
+                }
             }
-        } else {
-            let _decode_hold = (decode_guard, decode_active_guard);
-            let fetch = ctx.proxy.forward_json_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                outgoing_body,
-            );
-            tokio::select! {
-                biased;
-                r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        };
+        tokio::select! {
+            biased;
+            result = pd_result => result,
+            _ = stale_token.cancelled() => {
+                abort_decode();
+                Err(ApiError::StaleRequestExpired { model: model_str })
             }
         }
     } else if streaming {
@@ -1207,6 +1306,18 @@ fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
+/// Reuse a caller-provided scalar rid when present; otherwise mint a stable
+/// router rid that can be sent to the decode worker's abort endpoint.
+fn request_rid(value: Option<&serde_json::Value>, body: &Bytes) -> String {
+    let body_value = value.cloned().or_else(|| serde_json::from_slice(body).ok());
+    body_value
+        .as_ref()
+        .and_then(|value| value.get("rid"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("sgl-router-{}", uuid::Uuid::new_v4()))
+}
+
 /// PD-disagg bootstrap fields injected into the body forwarded to both the
 /// prefill and decode workers. SGLang's HTTP disagg-prefill validator
 /// requires all three as flat top-level fields:
@@ -1248,8 +1359,9 @@ fn build_outgoing_body(
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() {
+    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -1294,6 +1406,12 @@ fn build_outgoing_body(
         obj.insert(
             "bootstrap_room".to_string(),
             serde_json::Value::Number(b.room.into()),
+        );
+    }
+    if let Some(rid) = rid {
+        obj.insert(
+            "rid".to_string(),
+            serde_json::Value::String(rid.to_string()),
         );
     }
     let bytes = serde_json::to_vec(&obj).map_err(|e| {
@@ -1605,6 +1723,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_rid_reuses_scalar_or_generates_router_id() {
+        let body = Bytes::from_static(br#"{"model":"x","rid":"caller-rid"}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request_rid(Some(&value), &body), "caller-rid");
+
+        let body = Bytes::from_static(br#"{"model":"x"}"#);
+        assert!(request_rid(None, &body).starts_with("sgl-router-"));
+    }
+
     /// When the prefill worker has no `bootstrap_port` configured
     /// (a misconfiguration the engine will reject loudly), the
     /// injected field MUST be JSON `null` — not omitted, not 0.
@@ -1619,7 +1747,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1640,7 +1769,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1655,7 +1784,7 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -1675,7 +1804,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1686,6 +1816,15 @@ mod tests {
             parsed.get("bootstrap_port"),
             Some(&serde_json::Value::Number(9.into()))
         );
+    }
+
+    #[test]
+    fn build_outgoing_body_injects_pd_rid() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-rid")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("rid"), Some(&serde_json::json!("router-rid")));
     }
 
     /// Tool / function requests are detected so the caller omits `input_ids`
@@ -1770,7 +1909,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
