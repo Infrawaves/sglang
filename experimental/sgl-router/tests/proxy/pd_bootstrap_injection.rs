@@ -64,7 +64,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(specs, config())
+}
+
+fn build_ctx_with_config(specs: Vec<WorkerSpec>, cfg: Config) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -119,6 +122,16 @@ fn parse_body(b: &Bytes) -> Value {
     serde_json::from_slice(b).expect("body must be valid JSON")
 }
 
+fn assert_internal_rid(value: &Value) -> &str {
+    let rid = value["rid"]
+        .as_str()
+        .expect("PD request must carry a scalar RID");
+    let uuid = rid.strip_prefix("sgl-router-").expect("router RID prefix");
+    assert_eq!(uuid.len(), 36, "internal RIDs must have fixed length");
+    assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().get_version_num(), 4);
+    rid
+}
+
 /// Helper: extract bootstrap_host as &str.
 fn bootstrap_host(v: &Value) -> Option<&str> {
     v.get("bootstrap_host").and_then(|x| x.as_str())
@@ -165,6 +178,8 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
     let pj = parse_body(&prefill_body);
     let dj = parse_body(&decode_body);
+    assert_eq!(assert_internal_rid(&pj), assert_internal_rid(&dj));
+    assert_eq!(pj["stream"], false);
 
     // Same bootstrap_room on both sides (one room minted per request).
     let p_room = bootstrap_room(&pj).expect("prefill body missing bootstrap_room");
@@ -319,21 +334,192 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// Pin Pattern B's "prefill failure is invisible to the client"
-/// contract: when the spawned prefill task gets a 5xx (or any other
-/// upstream error), the decode response still reaches the client
-/// unmodified. The router intentionally does not wire fail-fast here —
-/// the decode side will eventually hang on `bootstrap_room` and time
-/// out, but the chat handler itself doesn't propagate the prefill
-/// error. Matches llm-d / aibrix behaviour.
+async fn assert_prefill_failure_cancels_decode(
+    prefill_status: StatusCode,
+    expected_status: StatusCode,
+    streaming: bool,
+    scheduler_error: bool,
+) {
+    let decode =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let error = json!({"error": {
+        "message": "simulated scheduler failure",
+        "type": "InternalServerError",
+        "code": prefill_status.as_u16(),
+    }});
+    let prefill = if scheduler_error {
+        crate::common::mock_worker::MockWorker::start_scheduler_error_after_peer(
+            prefill_status,
+            error,
+            Some(Arc::clone(&decode.captured)),
+        )
+        .await
+    } else {
+        crate::common::mock_worker::MockWorker::start_error_after_peer(
+            prefill_status,
+            error,
+            Some(Arc::clone(&decode.captured)),
+        )
+        .await
+    };
+    let mut cfg = config();
+    cfg.model.tokenizer_path = None; // Preserve the online --no-tokenizer path.
+    let ctx = build_ctx_with_config(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+        cfg,
+    );
+    let app = build_router(Arc::clone(&ctx));
+
+    // Client must see the prefill failure instead of waiting for decode's
+    // bootstrap timeout.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model":"tiny", "rid":"caller-pd-rid", "stream": streaming,
+            "stream_options":{"include_usage":true},
+            "messages":[{"role":"user","content":"hi"}]})
+            .to_string(),
+        ))
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), app.oneshot(req))
+        .await
+        .expect("prefill failure must not wait for decode timeout")
+        .unwrap();
+    assert_eq!(res.status(), expected_status);
+
+    // Decode received its body (proves dual dispatch fired) and then got a
+    // targeted cancellation for the same request rid.
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let v = parse_body(&decode_body);
+    assert_eq!(bootstrap_port(&v), Some(8997));
+    let rid = assert_internal_rid(&v);
+    assert_eq!(v["stream"], streaming);
+    assert_eq!(v["stream_options"], json!({"include_usage":true}));
+    let start = Instant::now();
+    loop {
+        let aborts = decode.captured.lock().unwrap().abort_rids.clone();
+        if aborts.iter().any(|aborted| aborted == rid)
+            && ctx
+                .metrics
+                .render()
+                .contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#)
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "decode did not receive abort for rid {rid}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let metrics = ctx.metrics.render();
+    assert!(metrics.contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#));
+
+    // Prefill also received its body — it just returned 5xx. The
+    // bootstrap fields are present so the engine WOULD have honoured
+    // the bootstrap_room if the mock had succeeded.
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    let pv = parse_body(&prefill_body);
+    assert_eq!(bootstrap_port(&pv), Some(8997));
+    assert_eq!(pv["rid"], v["rid"]);
+    assert_ne!(rid, "caller-pd-rid");
+    assert_eq!(pv["stream"], false);
+    assert!(pv.get("stream_options").is_none());
+    assert_eq!(decode.captured.lock().unwrap().abort_rids.len(), 1);
+}
+
+/// A prefill server failure maps to 502 and cancels the paired decode request.
 #[tokio::test]
-async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
-    let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
+async fn pd_mode_prefill_5xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
         StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "simulated prefill failure"}),
+        StatusCode::BAD_GATEWAY,
+        false,
+        false,
     )
     .await;
-    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+}
+
+/// A prefill client rejection keeps its 4xx status and still cancels decode,
+/// because decode cannot complete without a successful prefill.
+#[tokio::test]
+async fn pd_mode_prefill_4xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_stream_prefill_5xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        true,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_stream_prefill_4xx_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST,
+        true,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_stream_scheduler_500_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        true,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_stream_scheduler_400_cancels_decode() {
+    assert_prefill_failure_cancels_decode(
+        StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST,
+        true,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pd_prefill_non_streaming_preserves_decode_sse() {
+    const CHUNK: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![CHUNK, DONE]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -350,26 +536,269 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             bootstrap_port: None,
         },
     ]);
-    let app = build_router(ctx);
+    let app = build_router(Arc::clone(&ctx));
+    let mut previous_rid = None;
+    for _ in 0..2 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"tiny", "rid":"same-caller-rid", "stream":true,
+                    "stream_options":{"include_usage":true},
+                    "messages":[{"role":"user","content":"hi"}],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, format!("{CHUNK}{DONE}"));
+        let p = parse_body(&await_captured_body(&prefill, Duration::from_secs(2), "prefill").await);
+        let d = parse_body(&await_captured_body(&decode, Duration::from_secs(2), "decode").await);
+        assert_eq!(p["stream"], false);
+        assert!(p.get("stream_options").is_none());
+        assert_eq!(d["stream"], true);
+        assert_eq!(d["stream_options"], json!({"include_usage":true}));
+        assert_eq!(assert_internal_rid(&p), assert_internal_rid(&d));
+        assert_ne!(d["rid"], "same-caller-rid");
+        assert_ne!(previous_rid.as_ref(), Some(&d["rid"]));
+        previous_rid = Some(d["rid"].clone());
+    }
+    assert!(decode.captured.lock().unwrap().abort_rids.is_empty());
 
-    // Client must see decode's 200 — the failing prefill is invisible.
-    let res = app.oneshot(chat_request()).await.unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "decode response should reach the client even when prefill returned 5xx",
+    // PD dispatch must retain the base router's stream-end accounting for
+    // the Decode worker that actually sends the client-visible SSE stream.
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 2"#,
+        decode.url,
     );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if ctx.metrics.render().lines().any(|line| line == expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both Decode streams must be counted");
+}
 
-    // Decode received its body (proves dual dispatch fired despite
-    // the prefill failure).
-    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
-    let v = parse_body(&decode_body);
-    assert_eq!(bootstrap_port(&v), Some(8997));
+/// Match SGLang's prefix-based abort while two Decode requests are active.
+/// The sibling must remain pending until explicitly completed by the test.
+#[tokio::test]
+async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
+    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
 
-    // Prefill also received its body — it just returned 5xx. The
-    // bootstrap fields are present so the engine WOULD have honoured
-    // the bootstrap_room if the mock had succeeded.
-    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    let pv = parse_body(&prefill_body);
-    assert_eq!(bootstrap_port(&pv), Some(8997));
+    #[derive(Default)]
+    struct DecodeState {
+        pending: HashMap<String, oneshot::Sender<StatusCode>>,
+        bodies: Vec<Value>,
+        aborted: Vec<String>,
+    }
+    let state = Arc::new(Mutex::new(DecodeState::default()));
+    let decode_app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    let rid = body["rid"].as_str().unwrap().to_string();
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.bodies.push(body);
+                        assert!(state.pending.insert(rid, tx).is_none());
+                    }
+                    let status = rx.await.unwrap();
+                    (
+                        status,
+                        Json(json!({"choices":[{"message":{"content":"ok"}}]})),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/abort_request",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    let prefix = body["rid"].as_str().unwrap();
+                    let mut state = state.lock().unwrap();
+                    let matches: Vec<_> = state
+                        .pending
+                        .keys()
+                        .filter(|rid| rid.starts_with(prefix))
+                        .cloned()
+                        .collect();
+                    for rid in matches {
+                        state.aborted.push(rid.clone());
+                        let _ = state
+                            .pending
+                            .remove(&rid)
+                            .unwrap()
+                            .send(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(Arc::clone(&state));
+    let prefill_app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    // Both decode requests must have arrived before the failure.
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if state.lock().unwrap().bodies.len() == 2 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let decode_body = state
+                        .lock()
+                        .unwrap()
+                        .bodies
+                        .iter()
+                        .find(|value| value["messages"] == body["messages"])
+                        .unwrap()
+                        .clone();
+                    assert_eq!(body["rid"], decode_body["rid"]);
+                    if body["messages"][0]["content"] == "fail" {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error":"prefill failed"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({})).into_response()
+                    }
+                },
+            ),
+        )
+        .with_state(Arc::clone(&state));
+    let p_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let d_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let p_url = format!("http://{}", p_listener.local_addr().unwrap());
+    let d_url = format!("http://{}", d_listener.local_addr().unwrap());
+    let p_task = tokio::spawn(async move { axum::serve(p_listener, prefill_app).await.unwrap() });
+    let d_task = tokio::spawn(async move { axum::serve(d_listener, decode_app).await.unwrap() });
+    // Ensure the listeners stop even if an assertion panics.
+    struct TestServers([tokio::task::JoinHandle<()>; 2]);
+    impl Drop for TestServers {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let _servers = TestServers([p_task, d_task]);
+    let mut cfg = config();
+    cfg.model.tokenizer_path = None;
+    let ctx = build_ctx_with_config(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: p_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: d_url,
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+        cfg,
+    );
+    let app = build_router(Arc::clone(&ctx));
+    let request = |rid: &str, content: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"tiny", "rid":rid, "stream":false,
+            "messages":[{"role":"user","content":content}]})
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let failed = tokio::spawn(app.clone().oneshot(request("request-1", "fail")));
+    let sibling = tokio::spawn(app.oneshot(request("request-10", "succeed")));
+    let response = tokio::time::timeout(Duration::from_secs(2), failed)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if ctx
+                .metrics
+                .render()
+                .contains(r#"sgl_router_pd_decode_abort_requests_total{outcome="success"} 1"#)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut state = state.lock().unwrap();
+        assert_eq!(state.bodies.len(), 2);
+        assert_eq!(
+            state.aborted.len(),
+            1,
+            "abort must only match the failed request"
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "sibling must remain active after abort"
+        );
+        let failed_body = state
+            .bodies
+            .iter()
+            .find(|b| b["messages"][0]["content"] == "fail")
+            .unwrap();
+        let failed_rid = assert_internal_rid(failed_body).to_string();
+        let sibling_body = state
+            .bodies
+            .iter()
+            .find(|b| b["messages"][0]["content"] == "succeed")
+            .unwrap();
+        let sibling_rid = assert_internal_rid(sibling_body).to_string();
+        assert_ne!(failed_rid, sibling_rid);
+        assert_eq!(state.aborted, vec![failed_rid]);
+        state
+            .pending
+            .remove(&sibling_rid)
+            .unwrap()
+            .send(StatusCode::OK)
+            .unwrap();
+    }
+    let response = tokio::time::timeout(Duration::from_secs(2), sibling)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
