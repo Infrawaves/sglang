@@ -6,12 +6,9 @@ GPU execution, real TP collectives and RDMA require deployment tests.
 """
 
 import ast
-import concurrent.futures
 import logging
 import os
-import threading
 import unittest
-from collections import defaultdict
 from contextlib import nullcontext
 from enum import Enum, auto
 from pathlib import Path
@@ -226,7 +223,12 @@ GLOBALS = dict(
     logger=logging.getLogger(__name__),
     FINISH_ABORT=lambda *args: args or "abort",
     HTTPStatus=NS(SERVICE_UNAVAILABLE=503),
-    KVPoll=NS(Failed="failed", WaitingForInput="ready", Success="success"),
+    KVPoll=NS(
+        Failed="failed",
+        WaitingForInput="ready",
+        Transferring="transferring",
+        Success="success",
+    ),
     should_force_retry=lambda r: False,
     poll_and_all_reduce_attn_cp_tp_group=lambda senders, *args: [
         s.poll for s in senders
@@ -269,7 +271,6 @@ Prefill = extract(
         "defer_round_robin_action",
         "process_pending_round_robin_actions",
         "process_disagg_prefill_inflight_queue",
-        "round_robin_release_ready",
         "process_batch_result_disagg_prefill",
         "handle_bootstrap_failure",
         "optimistic_release_and_requeue",
@@ -527,18 +528,8 @@ class Tensor:
         return self.values[:]
 
 
-TORCH = NS(
-    tensor=lambda values, **kwargs: Tensor(values),
-    uint8=None,
-    distributed=NS(all_reduce=lambda *args, **kwargs: None, ReduceOp=NS(MIN=None)),
-)
-
-
 class OverlapTests(unittest.TestCase):
     def setUp(self):
-        self.torch_patch = patch.dict(GLOBALS, torch=TORCH)
-        self.torch_patch.start()
-        self.addCleanup(self.torch_patch.stop)
         self.s = Harness()
         self.s.enable_overlap = True
         self.s.spec_algorithm = NS(is_eagle=lambda: False)
@@ -579,15 +570,17 @@ class OverlapTests(unittest.TestCase):
             req.disagg_kv_sender.poll.return_value = "failed"
 
         req.disagg_kv_sender.abort = Mock(side_effect=abort)
-        req.disagg_kv_sender.is_source_release_safe = Mock(return_value=True)
         return req
 
-    def test_abort_waits_for_result_and_source_then_releases_once(self):
+    def test_abort_waits_for_result_then_releases_once(self):
         s = self.s
         a = self.request("a")
         b = self.request("b")
         old, new = Batch([a], a), Batch([b], b)
         result = self.result(old)
+        result.copy_done.synchronize.side_effect = lambda: self.assertEqual(
+            a.cleanup, []
+        )
         s.result_queue = [(old, result)]
         s.chunked_req = a
         s.abort_request(NS(rid="a", abort_all=False, abort_message=None))
@@ -597,13 +590,9 @@ class OverlapTests(unittest.TestCase):
         # Next batch launches before A's result is processed.
         s.result_queue.append((new, self.result(new)))
         s.result_queue.pop(0)
-        a.disagg_kv_sender.is_source_release_safe.return_value = False
         s.process_batch_result_disagg_prefill(old, result)
         result.copy_done.synchronize.assert_called_once()
         self.assertEqual(a.inflight_middle_chunks, 0)
-        s.process_pending_round_robin_actions()
-        self.assertEqual(a.cleanup, [])
-        a.disagg_kv_sender.is_source_release_safe.return_value = True
         s.process_pending_round_robin_actions()
         s.process_pending_round_robin_actions()
         self.assertEqual(a.cleanup.count("kv"), 1)
@@ -747,153 +736,26 @@ class OverlapTests(unittest.TestCase):
         finish.assert_called_once_with(a, defer=False)
         retry.assert_not_called()
 
-    def test_inflight_failure_seals_local_sender_but_success_does_not(self):
-        for status, local_status in (
-            ("failed", "ready"),
-            ("failed", "failed"),
-            ("success", "success"),
+    def test_inflight_failure_uses_native_handler(self):
+        s = self.s
+        a = self.request("failed", middle=False)
+        a.pending_bootstrap = False
+        a.bootstrap_host = "fake"
+        a.finished_reason = None
+        s.disagg_prefill_inflight_queue = [a]
+        s.handle_inflight_transfer_failure = Mock()
+        # The native TP-reduced failure path also handles a locally ready sender.
+        with patch.dict(
+            GLOBALS,
+            poll_and_all_reduce_attn_cp_tp_group=lambda *args: ["failed"],
+            FINISH_ABORT=type("Abort", (), {}),
+            FAKE_BOOTSTRAP_HOST="fake",
         ):
-            with self.subTest(status=status, local_status=local_status):
-                s = self.s
-                a = self.request(status, middle=False)
-                a.disagg_kv_sender.poll.return_value = local_status
-                s.disagg_prefill_inflight_queue = [a]
-                s.output_streamer = Mock()
-
-                def source_ready():
-                    self.assertEqual(
-                        a.disagg_kv_sender.poll(),
-                        "failed" if status == "failed" else "success",
-                    )
-                    return False
-
-                a.disagg_kv_sender.is_source_release_safe.side_effect = source_ready
-                with patch.dict(
-                    GLOBALS, poll_and_all_reduce_attn_cp_tp_group=lambda *args: [status]
-                ):
-                    self.assertEqual(s.process_disagg_prefill_inflight_queue(), [])
-                self.assertEqual(
-                    a.disagg_kv_sender.abort.call_count,
-                    int(status == "failed" and local_status != "failed"),
-                )
-                self.assertEqual(s.disagg_prefill_inflight_queue, [a])
-                self.assertEqual(a.cleanup, [])
-
-    def test_other_rank_can_hold_release(self):
-        a = self.request("a")
-        self.s.suspend(a)
-        self.s.abort_request(NS(rid=a.rid, abort_all=False, abort_message=None))
-        self.assertEqual(self.s._pending_round_robin_actions[a], "retire")
-
-        def hold(tensor, **kwargs):
-            a.disagg_kv_sender.abort.assert_called_once()
-            self.assertEqual(a.disagg_kv_sender.poll(), "failed")
-            tensor.values = [0]
-
-        with patch.object(TORCH.distributed, "all_reduce", hold):
-            self.s.process_pending_round_robin_actions()
-        self.assertEqual(a.cleanup, [])
-        self.s.process_pending_round_robin_actions()
-        self.assertEqual(self.s.outputs, [a])
-
-
-MOON_GLOBALS = dict(
-    concurrent=concurrent,
-    logger=Mock(),
-    KVPoll=NS(Failed=0),
-    DisaggregationMode=NS(PREFILL="prefill"),
-    TraceNullContext=lambda: None,
-    TransferKVChunk=lambda **kwargs: NS(staging_counted=False, **kwargs),
-    get_schedule=lambda: NS(enable_chunked_prefill_round_robin=True),
-)
-Mooncake = extract(
-    "disaggregation/mooncake/conn.py",
-    "MooncakeKVManager",
-    [
-        "add_transfer_request",
-        "is_source_release_safe",
-        "_await_transfer_futures",
-        "transfer_worker",
-    ],
-    MOON_GLOBALS,
-)
-
-
-class SourceDrainTests(unittest.TestCase):
-    def manager(self):
-        m = Mooncake()
-        m._staging_outstanding = defaultdict(int)
-        m.enable_deferred_decode_kv_release = False
-        m.disaggregation_mode = "prefill"
-        m.request_status = {1: 2}
-        m.check_status = lambda room: m.request_status[room]
-        m.transfer_infos = {1: {"host:123": None}}
-        self.queued = []
-        m.transfer_queues = [NS(put=self.queued.append)]
-        return m
-
-    def test_aborted_queued_tasks_skip_without_reading_source(self):
-        m = self.manager()
-        for _ in range(2):
-            m.add_transfer_request(1, [], slice(0, 1), False)
-        m.request_status[1] = 0
-        self.assertTrue(m.is_source_release_safe(1))
-        m.enable_trace = False
-        m.bootstrap_port = 1
-        m._transfer_data = Mock(side_effect=AssertionError("read after abort"))
-        queued = iter(self.queued)
-        with self.assertRaisesRegex(RuntimeError, "end worker"):
-
-            def get():
-                try:
-                    return next(queued)
-                except StopIteration:
-                    raise RuntimeError("end worker")
-
-            m.transfer_worker(NS(get=get), None)
-        m._transfer_data.assert_not_called()
-        self.assertTrue(m.is_source_release_safe(1))
-        m.add_transfer_request(1, [], slice(0, 1), False)
-        self.assertEqual(len(self.queued), 2)
-
-    def test_active_transfer_must_drain_even_after_abort(self):
-        m = self.manager()
-        m._staging_outstanding[1] = 1
-        m.request_status[1] = 0
-        self.assertFalse(m.is_source_release_safe(1))
-        m._staging_outstanding[1] -= 1
-        self.assertTrue(m.is_source_release_safe(1))
-
-    def test_failure_still_waits_for_running_transfer(self):
-        m = self.manager()
-        failed = concurrent.futures.Future()
-        running = concurrent.futures.Future()
-        running.set_running_or_notify_cancel()
-        failed.set_result(1)
-        entered = threading.Event()
-        completed = threading.Event()
-        result = []
-
-        def ordered(futures):
-            yield failed
-            entered.set()
-            yield running
-
-        def wait():
-            result.append(m._await_transfer_futures([failed, running]))
-            completed.set()
-
-        with patch.object(concurrent.futures, "as_completed", ordered):
-            thread = threading.Thread(target=wait)
-            thread.start()
-            try:
-                self.assertTrue(entered.wait(1))
-                self.assertFalse(completed.is_set())
-            finally:
-                running.set_result(0)
-                thread.join(1)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(result, [1])
+            self.assertEqual(s.process_disagg_prefill_inflight_queue(), [a])
+        s.handle_inflight_transfer_failure.assert_called_once_with(a)
+        a.disagg_kv_sender.abort.assert_not_called()
+        self.assertEqual(s.outputs, [a])
+        self.assertEqual(s.disagg_prefill_inflight_queue, [])
 
 
 if __name__ == "__main__":

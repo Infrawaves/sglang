@@ -988,28 +988,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        release_ready = None
-        if self.enable_chunked_prefill_round_robin and self.enable_overlap:
-            # A peer rank's failure must also stop this rank's queued transfers.
-            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-                if (
-                    poll == KVPoll.Failed
-                    and req.disagg_kv_sender.poll() != KVPoll.Failed
-                ):
-                    req.disagg_kv_sender.abort()
-            release_ready = self.round_robin_release_ready(
-                self.disagg_prefill_inflight_queue
-            )
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for i, (req, poll) in enumerate(zip(self.disagg_prefill_inflight_queue, polls)):
-            if (
-                release_ready is not None
-                and poll in (KVPoll.Success, KVPoll.Failed)
-                and not release_ready[i]
-            ):
-                undone_reqs.append(req)
-                continue
+        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1250,22 +1231,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.waiting_queue = [r for r in self.waiting_queue if r is not req]
         return True
 
-    def round_robin_release_ready(self: Scheduler, reqs: List[Req]) -> List[bool]:
-        # Do not let one TP rank release a row that another rank still uses.
-        ready = torch.tensor(
-            [
-                not self.has_pending_prefill_result(req)
-                and req.disagg_kv_sender.is_source_release_safe()
-                for req in reqs
-            ],
-            dtype=torch.uint8,
-            device="cpu",
-        )
-        torch.distributed.all_reduce(
-            ready, op=torch.distributed.ReduceOp.MIN, group=self.attn_tp_cpu_group
-        )
-        return ready.tolist()
-
     def process_pending_round_robin_actions(self: Scheduler) -> None:
         # Insertion order follows broadcast aborts and TP-reduced bootstrap polls.
         pending = list(self._pending_round_robin_actions)
@@ -1273,12 +1238,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
         for req in pending:
             self.defer_round_robin_action(req, self._pending_round_robin_actions[req])
-            # Seal the room before checking active transfers; queued chunks will skip.
-            if req.disagg_kv_sender.poll() != KVPoll.Failed:
-                req.disagg_kv_sender.abort()
-        ready = self.round_robin_release_ready(pending)
-        for req, can_release in zip(pending, ready, strict=True):
-            if not can_release:
+            # Result callbacks synchronize before this queue is processed again.
+            if self.has_pending_prefill_result(req):
                 continue
             action = self._pending_round_robin_actions.pop(req)
             if action == "bootstrap_failure":

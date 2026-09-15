@@ -906,9 +906,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future. Deferred decode release and
-        RR source ownership both require all running writes to finish before
-        returning. Otherwise retain the original early-return behavior."""
+        cancel() is a no-op for a running future, so with deferred release on we
+        still drain the running ones before returning (no write may outlive this
+        call, which the drain-ack relies on). Off: original early-return."""
         ret = 0
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -919,10 +919,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not (
-                    self.enable_deferred_decode_kv_release
-                    or get_schedule().enable_chunked_prefill_round_robin
-                ):
+                if not self.enable_deferred_decode_kv_release:
                     return ret
         return ret
 
@@ -2373,11 +2370,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
 
-    def is_source_release_safe(self, room: int) -> bool:
-        # After abort seals the room, queued tasks skip their reads. Only tasks
-        # already dequeued (including deferred staging work) need to drain.
-        return self._staging_outstanding.get(room, 0) == 0
-
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -2554,9 +2546,6 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
-
-    def is_source_release_safe(self) -> bool:
-        return self.kv_mgr.is_source_release_safe(self.bootstrap_room)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
