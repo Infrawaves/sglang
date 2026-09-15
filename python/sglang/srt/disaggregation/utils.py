@@ -46,7 +46,12 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+MAX_DISAGGREGATION_TOP_LOGPROBS = 128
 _IS_HIP = is_hip()
+
+
+class InvalidDisaggregationMetadata(ValueError):
+    """Request metadata exceeds the capacity of the PD transfer buffers."""
 
 
 def poll_and_all_reduce_pp(
@@ -333,7 +338,7 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_sampling_mask_tokens: int,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = MAX_DISAGGREGATION_TOP_LOGPROBS,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
     ):
@@ -357,8 +362,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
@@ -507,7 +510,7 @@ class MetadataBuffers:
                 top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
                 max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
                 if top_logprobs_len > max_top_logprobs_len:
-                    raise RuntimeError(
+                    raise InvalidDisaggregationMetadata(
                         f"top_logprobs_num {top_logprobs_len} exceeds "
                         f"disaggregation metadata capacity {max_top_logprobs_len}. "
                         "Lower top_logprobs_num or increase the metadata buffer."
@@ -539,7 +542,7 @@ class MetadataBuffers:
                     mask_len = len(sampling_mask)
                     max_mask_len = self.output_token_sampling_mask_idx.shape[1]
                     if mask_len > max_mask_len:
-                        raise RuntimeError(
+                        raise InvalidDisaggregationMetadata(
                             f"Sampling mask length {mask_len} exceeds disaggregation "
                             f"metadata capacity {max_mask_len}. Increase "
                             "--sampling-mask-max-tokens."
