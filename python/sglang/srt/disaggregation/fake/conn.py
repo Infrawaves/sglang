@@ -88,9 +88,6 @@ class FakeKVSender(BaseKVSender):
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
-    def is_source_release_safe(self) -> bool:
-        return True
-
     def abort(self):
         self.conclude_state = KVPoll.Failed
 

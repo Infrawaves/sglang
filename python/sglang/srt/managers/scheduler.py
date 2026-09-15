@@ -1318,52 +1318,12 @@ class Scheduler(
             get_schedule().enable_chunked_prefill_round_robin
         )
         self.suspended_prefill_queue: List[Req] = []
-        # Terminal cleanup actions waiting for outstanding results and KV sends.
+        # Terminal cleanup actions waiting for outstanding GPU results.
         self._pending_round_robin_actions: dict[Req, str] = {}
         self._prefill_ready_seq = 0
-        if self.enable_chunked_prefill_round_robin:
-            self._validate_prefill_round_robin()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
-
-    def _validate_prefill_round_robin(self) -> None:
-        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-
-        supported = (
-            get_disagg().disaggregation_mode == "prefill"
-            and not self.enable_overlap_mlx
-            and (
-                not self.enable_overlap
-                or get_disagg().disaggregation_transfer_backend in ("mooncake", "fake")
-            )
-            and self.schedule_policy == "fcfs"
-            and not self.enable_priority_scheduling
-            and not self.enable_lora
-            and not self.enable_pdmux
-            and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
-            and get_exec().dllm.dllm_algorithm is None
-            and not get_schedule().enable_dynamic_chunking
-            and not get_schedule().enable_mixed_chunk
-            and self.chunked_prefill_size is not None
-            and self.ps.pp_size == 1
-            and self.ps.tp_size == self.ps.attn_tp_size
-            and self.ps.attn_cp_size
-            == self.ps.attn_dcp_size
-            == self.ps.attn_dp_size
-            == 1
-            and not self.enable_unified_memory
-            and not self.is_hybrid_swa
-            and type(self.token_to_kv_pool_allocator) is PagedTokenToKVPoolAllocator
-        )
-        if not supported:
-            raise ValueError(
-                "enable_chunked_prefill_round_robin requires PD prefill, "
-                "FCFS without priority, fixed chunks, PP1 with "
-                "one attention group and an independent paged full-KV allocator; "
-                "overlap requires Mooncake (or fake transfer); only DSPARK speculation is "
-                "supported. LoRA, DLLM, PDMux and mixed chunks are unsupported."
-            )
 
     def enqueue_prefill_ready(self, reqs) -> None:
         for req in reqs:
