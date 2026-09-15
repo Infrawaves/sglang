@@ -94,6 +94,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
@@ -3534,10 +3535,6 @@ class Scheduler(
         if self.enable_chunked_prefill_round_robin:
             if self.enable_overlap:
                 self.process_pending_round_robin_actions()
-                return
-            for req in tuple(self._pending_round_robin_actions):
-                self.detach_round_robin_request(req)
-                self._release_chunked_abort(req)
             return
         req = self._pending_chunked_abort_req
         if req is None:
@@ -5385,6 +5382,7 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        handled_round_robin_reqs = set()
         if self.enable_chunked_prefill_round_robin:
             candidates = list(self.iter_round_robin_requests())
             if self.enable_overlap:
@@ -5392,8 +5390,27 @@ class Scheduler(
                     req for batch, _ in self.result_queue for req in batch.reqs
                 )
             for req in candidates:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    self._pending_round_robin_actions[req] = "abort"
+                if (
+                    req in handled_round_robin_reqs
+                    or req in self.disagg_prefill_inflight_queue
+                    or not (recv_req.abort_all or req.rid.startswith(recv_req.rid))
+                ):
+                    continue
+                handled_round_robin_reqs.add(req)
+                if req in self._pending_round_robin_actions or is_aborted(req):
+                    continue
+                req.to_finish = (
+                    FINISH_ABORT(recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE)
+                    if recv_req.abort_message
+                    else FINISH_ABORT()
+                )
+                self.detach_round_robin_request(req)
+                # Pending results retain ownership and retire the request in their
+                # existing abort branch. A parked request has no callback left.
+                if not self.has_pending_prefill_result(req):
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        self.output_streamer.stream_output([req], req.return_logprob)
         elif (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5566,6 +5583,8 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
+            if req in handled_round_robin_reqs:
+                continue
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
