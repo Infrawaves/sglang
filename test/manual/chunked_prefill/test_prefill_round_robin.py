@@ -15,81 +15,64 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-SOURCE = (
-    Path(__file__).resolve().parents[3]
-    / "python/sglang/srt/managers/schedule_policy.py"
-)
+ROOT = Path(__file__).resolve().parents[3] / "python/sglang/srt"
 
 
-def load_adder_methods():
-    tree = ast.parse(SOURCE.read_text())
-    names = {
-        "ceil_paged_tokens",
-        "budget_state",
-        "_update_prefill_budget",
-        "add_chunked_req",
-        "add_one_req",
-        "add_one_req_ignore_eos",
-        "_round_robin_can_admit",
-    }
-    selected = [
-        ast.ImportFrom(
-            module="__future__", names=[ast.alias(name="annotations")], level=0
+def extract(path, class_name, names, namespace, extra=()):
+    names = names.split()
+    tree = ast.parse((ROOT / path).read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
+    )
+    cls.bases, cls.keywords, cls.decorator_list = [], [], []
+    cls.body = [
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    assert {n.name for n in cls.body} == set(names)
+    for n in cls.body:
+        n.decorator_list = []
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    extras = [
+        n
+        for n in tree.body
+        if (isinstance(n, ast.ClassDef) and n.name in extra)
+        or (
+            isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id in extra for t in n.targets)
         )
     ]
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name)
-            and t.id in {"CLIP_MAX_NEW_TOKENS", "IGNORE_EOS_RESERVE_TOKENS"}
-            for t in node.targets
-        ):
-            selected.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == "AddReqResult":
-            selected.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == "PrefillAdder":
-            node.body = [
-                n
-                for n in node.body
-                if isinstance(n, ast.FunctionDef) and n.name in names
-            ]
-            assert {n.name for n in node.body} == names
-            selected.append(node)
-    namespace = {"os": os, "Enum": Enum, "auto": auto}
-    module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
-    exec(compile(module, str(SOURCE), "exec"), namespace)
-    return namespace
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *extras, cls], type_ignores=[])
+            ),
+            str(ROOT / path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[class_name]
 
 
-ACTUAL = load_adder_methods()
-Result = ACTUAL["AddReqResult"]
-PAGE = 64
+ADDER_GLOBALS = {"os": os, "Enum": Enum, "auto": auto}
+PrefillAdder = extract(
+    "managers/schedule_policy.py",
+    "PrefillAdder",
+    """ceil_paged_tokens budget_state _update_prefill_budget add_chunked_req
+    add_one_req add_one_req_ignore_eos _round_robin_can_admit""",
+    ADDER_GLOBALS,
+    extra=("AddReqResult", "CLIP_MAX_NEW_TOKENS", "IGNORE_EOS_RESERVE_TOKENS"),
+)
+Result = ADDER_GLOBALS["AddReqResult"]
 
 
-class Request:
-    def __init__(self, length, ignore_eos=False, prefix=0):
-        self.full_untruncated_fill_ids = range(length)
-        self.origin_input_ids = range(length)
-        self.prefix_indices = range(prefix)
-        self.output_ids = []
-        self.kv = NS(kv_allocated_len=prefix)
-        self.sampling_params = NS(max_new_tokens=1, ignore_eos=ignore_eos)
-        self.host_hit_length = 0
-        self.retracted_stain = False
-        self.last_node = None
-        self.extend_range = None
-
-    def set_extend_range(self, start, end):
-        self.extend_range = NS(start=start, end=end, length=end - start)
-
-    def needs_host_load_back(self):
-        return False
-
-
-class Adder(ACTUAL["PrefillAdder"]):
+class Adder(PrefillAdder):
     def __init__(self, free, quantum):
         self.round_robin_requests = None
         self.free = free
-        self.page_size = PAGE
+        self.page_size = 64
         self.rem_total_token_offset = self.cur_rem_token_offset = 0
         self.rem_input_tokens = self.rem_chunk_tokens = quantum
         self.new_token_ratio = 1.0
@@ -127,40 +110,11 @@ class Adder(ACTUAL["PrefillAdder"]):
         pass
 
 
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[3] / "python/sglang/srt"
 SCHEDULE = NS(
     prefill_max_requests=None, enable_mixed_chunk=False, enable_dynamic_chunking=False
 )
 PARALLEL = NS(pp_max_micro_batch_size=32)
 MODE = NS(PREFILL="prefill", DECODE="decode", NULL="null")
-
-
-def extract(path, class_name, names, namespace):
-    tree = ast.parse((ROOT / path).read_text())
-    cls = next(
-        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
-    )
-    cls.bases, cls.keywords, cls.decorator_list = [], [], []
-    cls.body = [
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
-    ]
-    assert {n.name for n in cls.body} == set(names)
-    for n in cls.body:
-        n.decorator_list = []
-    future = ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    )
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[])),
-            str(ROOT / path),
-            "exec",
-        ),
-        namespace,
-    )
-    return namespace[class_name]
 
 
 class Batch:
@@ -237,52 +191,36 @@ GLOBALS = dict(
 Scheduler = extract(
     "managers/scheduler.py",
     "Scheduler",
-    [
-        "enqueue_prefill_ready",
-        "reset_prefill_ready_seq_if_idle",
-        "iter_round_robin_requests",
-        "detach_round_robin_request",
-        "_get_new_batch_prefill_raw",
-        "process_pending_chunked_abort",
-        "_release_chunked_abort",
-        "abort_request",
-    ],
+    """enqueue_prefill_ready reset_prefill_ready_seq_if_idle
+    iter_round_robin_requests detach_round_robin_request
+    _get_new_batch_prefill_raw process_pending_chunked_abort
+    _release_chunked_abort abort_request""",
     GLOBALS,
-)
-# Discover the existing mixin's name without importing the GPU package.
-prefill_tree = ast.parse((ROOT / "disaggregation/prefill.py").read_text())
-prefill_class = next(
-    n.name
-    for n in prefill_tree.body
-    if isinstance(n, ast.ClassDef)
-    and any(
-        isinstance(m, ast.FunctionDef) and m.name == "process_prefill_chunk"
-        for m in n.body
-    )
 )
 Prefill = extract(
     "disaggregation/prefill.py",
-    prefill_class,
-    [
-        "process_prefill_chunk",
-        "resolve_waiting_queue_bootstrap",
-        "has_bootstrapped_waiting_req",
-        "has_pending_prefill_result",
-        "defer_round_robin_action",
-        "process_pending_round_robin_actions",
-        "process_disagg_prefill_inflight_queue",
-        "process_batch_result_disagg_prefill",
-        "handle_bootstrap_failure",
-        "optimistic_release_and_requeue",
-        "_retire_aborted_prefill_result",
-    ],
+    "SchedulerDisaggregationPrefillMixin",
+    """process_prefill_chunk has_bootstrapped_waiting_req
+    has_pending_prefill_result defer_round_robin_action
+    process_pending_round_robin_actions process_disagg_prefill_inflight_queue
+    process_batch_result_disagg_prefill handle_bootstrap_failure
+    _retire_aborted_prefill_result""",
     GLOBALS,
 )
 
 
-class Req(Request):
+class Req:
     def __init__(self, name, length, prefix=0):
-        super().__init__(length, prefix=prefix)
+        self.full_untruncated_fill_ids = range(length)
+        self.origin_input_ids = range(length)
+        self.prefix_indices = range(prefix)
+        self.output_ids = []
+        self.kv = NS(kv_allocated_len=prefix)
+        self.sampling_params = NS(max_new_tokens=1, ignore_eos=False)
+        self.host_hit_length = 0
+        self.retracted_stain = False
+        self.last_node = None
+        self.extend_range = None
         self.rid = name
         self.prefill_ready_seq = None
         self.inflight_middle_chunks = 0
@@ -306,6 +244,12 @@ class Req(Request):
         self.to_finish = None
         self.seqlen = length
         self.kv.cache_protected_len = 0
+
+    def set_extend_range(self, start, end):
+        self.extend_range = NS(start=start, end=end, length=end - start)
+
+    def needs_host_load_back(self):
+        return False
 
     def init_next_round_input(self, tree_cache=None):
         self.matches.append(tree_cache)
@@ -520,14 +464,6 @@ class RoundRobinTests(unittest.TestCase):
         self.assertEqual(s.suspended_prefill_queue, [])
 
 
-class Tensor:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def tolist(self):
-        return self.values[:]
-
-
 class OverlapTests(unittest.TestCase):
     def setUp(self):
         self.s = Harness()
@@ -546,7 +482,7 @@ class OverlapTests(unittest.TestCase):
         batch.dp_cooperation_info = None
         return NS(
             logits_output=None,
-            next_token_ids=Tensor([1] * len(batch.reqs)),
+            next_token_ids=NS(tolist=lambda: [1] * len(batch.reqs)),
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
             copy_done=Mock(),
@@ -564,12 +500,7 @@ class OverlapTests(unittest.TestCase):
         req.time_stats.set_last_chunked_prefill_finish_time = Mock()
         req.time_stats.set_completion_time = Mock()
         req.inflight_middle_chunks = int(middle)
-        req.disagg_kv_sender.poll = Mock(return_value="ready")
-
-        def abort():
-            req.disagg_kv_sender.poll.return_value = "failed"
-
-        req.disagg_kv_sender.abort = Mock(side_effect=abort)
+        req.disagg_kv_sender.abort = Mock()
         return req
 
     def test_abort_waits_for_result_then_releases_once(self):
