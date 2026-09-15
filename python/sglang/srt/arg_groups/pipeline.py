@@ -146,6 +146,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.pd_disaggregation_hook import (
         handle_encoder_disaggregation,
         handle_pd_disaggregation,
+        validate_dcp_kv_layout,
     )
 
     handle_pd_disaggregation(server_args)
@@ -357,6 +358,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
     handle_model_capability_adjustments(server_args)
+
+    # Page DCP layout depends on the final model, attention backend, and
+    # speculative-decoding declarations, so validate it only after they settle.
+    validate_dcp_kv_layout(server_args)
 
     # Validate after all batch-size declarations are visible.
     validate_deepep_v2_speculative_draft(server_args)

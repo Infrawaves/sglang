@@ -201,3 +201,37 @@ def build_dcp_token_transfer_plan(
         + dst_local_offsets % physical_page_size
     )
     return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
+
+
+@dataclasses.dataclass(frozen=True)
+class DCPPageTransferPlan:
+    """Paired physical pages for one DCP page-layout transfer."""
+
+    src_page_indices: npt.NDArray[np.int32]
+    dst_page_indices: npt.NDArray[np.int32]
+
+
+def build_dcp_page_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+) -> DCPPageTransferPlan:
+    """Select this rank's pages, including the allocated final partial page."""
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP page transfer requires decode_prefix_len to align to the "
+            f"virtual DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+
+    first_page = (dcp_rank - src_page_offset) % dcp_size
+    src_pages = src_page_indices[first_page::dcp_size]
+    dst_start = (src_page_offset + first_page) // dcp_size
+    return DCPPageTransferPlan(
+        src_pages, dst_page_indices[dst_start : dst_start + src_pages.size]
+    )

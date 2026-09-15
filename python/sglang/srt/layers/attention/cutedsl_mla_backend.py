@@ -84,15 +84,19 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         return_lse: bool = False,
+        page_layout: bool = False,
     ):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
-        Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
-        With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
+        Without DCP this defers to the base cute-dsl path.
+        With token DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
         rank-local ``(out, lse)``, the LSE in natural log.
+        Page DCP uses local lengths for both inputs with ``cp_world=1`` and
+        ``cp_rank=0``. SGLang retains its real DCP group for Q exchange and
+        outer LSE merge, with the same rank-local return contract.
         """
-        if cp_world <= 1:
+        if cp_world <= 1 and not page_layout:
             return super()._run_decode_kernel(
                 query,
                 kv_cache,
@@ -169,6 +173,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 is_neox,
                 llama_4_scaling,
             )
+
+        page_layout = parallel.dcp_kv_layout == "page"
 
         # Query / KV preparation mirrors the base cute-dsl decode (both FP16 and
         # FP8 KV), then swaps to the DCP kernel call + rank-local return.
@@ -258,10 +264,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             seq_lens=local_seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
-            causal_seqs=global_seq_lens,
-            cp_world=parallel.dcp_size,
-            cp_rank=parallel.dcp_rank,
+            causal_seqs=local_seq_lens if page_layout else global_seq_lens,
+            cp_world=1 if page_layout else parallel.dcp_size,
+            cp_rank=0 if page_layout else parallel.dcp_rank,
             return_lse=True,
+            page_layout=page_layout,
         )
 
         output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)

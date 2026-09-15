@@ -154,6 +154,81 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
             )
         )
 
+    def test_mla_scatter_concat_fp8_dcp(self):
+        if torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("fused FP8 MLA scatter+concat requires SM90+")
+        for world_size, page_size in ((2, 0), (3, 0), (2, 1), (2, 64), (3, 3)):
+            self.assertTrue(can_use_set_mla_kv_concat_q_fp8(world_size, page_size))
+            stripe = page_size or 1
+            locations = sorted(
+                {
+                    0,
+                    1,
+                    stripe - 1,
+                    stripe,
+                    stripe + 1,
+                    world_size * stripe - 1,
+                    world_size * stripe,
+                    world_size * stripe + 1,
+                    2 * world_size * stripe + 1,
+                }
+            )
+            if page_size:
+                locations.append(-1)
+            _, _, k_nope, k_rope, q_nope, q_rope = _make_mla_inputs(
+                len(locations), num_heads=3, seed=1
+            )
+            kv_rows = torch.cat((k_nope, k_rope), dim=-1).to(torch.float8_e4m3fn)
+            query_ref = torch.cat((q_nope, q_rope), dim=-1).to(torch.float8_e4m3fn)
+            for rank in range(world_size):
+                # Independently enumerate this rank's stripes and physical rows.
+                owned_slots = [
+                    slot
+                    for start in range(
+                        rank * stripe, max(locations) + 1, world_size * stripe
+                    )
+                    for slot in range(start, start + stripe)
+                ]
+                local_rows = {slot: row for row, slot in enumerate(owned_slots)}
+                for loc_dtype in (torch.int32, torch.int64):
+                    with self.subTest(
+                        world_size=world_size,
+                        page_size=page_size,
+                        rank=rank,
+                        loc_dtype=loc_dtype,
+                    ):
+                        pool = torch.full(
+                            (MLA_PAGES, MLA_DIM),
+                            0.5,
+                            dtype=torch.float8_e4m3fn,
+                            device="cuda",
+                        )
+                        expected = pool.clone()
+                        for token, slot in enumerate(locations):
+                            if slot in local_rows:
+                                expected[local_rows[slot]] = kv_rows[token]
+                        query = set_mla_kv_concat_q_fp8(
+                            pool,
+                            torch.tensor(locations, dtype=loc_dtype, device="cuda"),
+                            k_nope,
+                            k_rope,
+                            q_nope,
+                            q_rope,
+                            dcp_world_size=world_size,
+                            dcp_rank=rank,
+                            dcp_page_size=page_size,
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                pool.view(torch.uint8), expected.view(torch.uint8)
+                            )
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                query.view(torch.uint8), query_ref.view(torch.uint8)
+                            )
+                        )
+
     def test_replayssm_ring_fold(self):
         batch_size, num_steps = 8, 4
         num_value_heads, num_key_heads = 8, 2
