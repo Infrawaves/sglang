@@ -1266,11 +1266,7 @@ class SchedulerDisaggregationPrefillMixin:
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
-                    if not self.enable_overlap or (
-                        self.enable_chunked_prefill_round_robin
-                        and not self.has_pending_prefill_result(req)
-                    ):
-                        # Without a pending result, no result callback can retry it.
+                    if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
