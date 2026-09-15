@@ -1287,8 +1287,6 @@ class SchedulerDisaggregationPrefillMixin:
                 if self._retire_aborted_prefill_result(req, defer=False):
                     req.time_stats.set_completion_time()
                     self.output_streamer.stream_output([req], req.return_logprob)
-            else:
-                self._release_chunked_abort(req)
 
     def process_prefill_chunk(
         self: Scheduler,
