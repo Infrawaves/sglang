@@ -568,8 +568,8 @@ class SchedulerDisaggregationPrefillMixin:
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
                 if self.enable_chunked_prefill_round_robin and not self.enable_overlap:
-                    self.detach_round_robin_request(req)
-                self.handle_bootstrap_failure(req)
+                    self.detach_round_robin_request(req, remove_from_queue=False)
+                self.handle_bootstrap_failure(req, remove_from_queues=False)
                 failed.add(req)
             elif (
                 poll == KVPoll.WaitingForInput
@@ -581,6 +581,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
         if failed:
+            self.suspended_prefill_queue = [
+                req for req in self.suspended_prefill_queue if req not in failed
+            ]
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in failed
             ]
@@ -1149,9 +1152,15 @@ class SchedulerDisaggregationPrefillMixin:
         return True
 
     def handle_bootstrap_failure(
-        self: Scheduler, req: Req, *, defer: bool = True
+        self: Scheduler,
+        req: Req,
+        *,
+        defer: bool = True,
+        remove_from_queues: bool = True,
     ) -> None:
-        if defer and self.defer_round_robin_action(req, "bootstrap_failure"):
+        if defer and self.defer_round_robin_action(
+            req, "bootstrap_failure", remove_from_queues=remove_from_queues
+        ):
             return
         self.clear_pending_chunk_send(req)
         error_message = (
@@ -1217,7 +1226,9 @@ class SchedulerDisaggregationPrefillMixin:
             any(r is req for r in batch.reqs) for batch, _ in self.result_queue
         )
 
-    def defer_round_robin_action(self: Scheduler, req: Req, action: str) -> bool:
+    def defer_round_robin_action(
+        self: Scheduler, req: Req, action: str, *, remove_from_queues: bool = True
+    ) -> bool:
         if not (self.enable_chunked_prefill_round_robin and self.enable_overlap):
             return False
         # Preserve the first terminal cleanup action.
@@ -1225,10 +1236,11 @@ class SchedulerDisaggregationPrefillMixin:
             self._pending_round_robin_actions[req] = action
         if self.chunked_req is req:
             self.chunked_req = None
-        self.suspended_prefill_queue = [
-            r for r in self.suspended_prefill_queue if r is not req
-        ]
-        self.waiting_queue = [r for r in self.waiting_queue if r is not req]
+        if remove_from_queues:
+            self.suspended_prefill_queue = [
+                r for r in self.suspended_prefill_queue if r is not req
+            ]
+            self.waiting_queue = [r for r in self.waiting_queue if r is not req]
         return True
 
     def process_pending_round_robin_actions(self: Scheduler) -> None:

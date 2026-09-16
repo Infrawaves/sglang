@@ -1354,12 +1354,15 @@ class Scheduler(
                 seen.add(id(req))
                 yield req
 
-    def detach_round_robin_request(self, req: Req) -> None:
+    def detach_round_robin_request(
+        self, req: Req, *, remove_from_queue: bool = True
+    ) -> None:
         if self.chunked_req is req:
             self.chunked_req = None
-        self.suspended_prefill_queue = [
-            r for r in self.suspended_prefill_queue if r is not req
-        ]
+        if remove_from_queue:
+            self.suspended_prefill_queue = [
+                r for r in self.suspended_prefill_queue if r is not req
+            ]
         self._pending_round_robin_actions.pop(req, None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
