@@ -196,7 +196,7 @@ Scheduler = extract(
     "managers/scheduler.py",
     "Scheduler",
     """enqueue_prefill_ready reset_prefill_ready_seq_if_idle
-    iter_round_robin_requests detach_round_robin_request
+    iter_round_robin_requests remove_prefill_ready_requests
     _get_new_batch_prefill_raw process_pending_chunked_abort
     _release_chunked_abort abort_request""",
     GLOBALS,
@@ -204,7 +204,7 @@ Scheduler = extract(
 Prefill = extract(
     "disaggregation/prefill.py",
     "SchedulerDisaggregationPrefillMixin",
-    """process_prefill_chunk has_bootstrapped_waiting_req
+    """process_prefill_chunk has_bootstrapped_waiting_req resolve_waiting_queue_bootstrap
     has_pending_prefill_result defer_round_robin_action
     process_pending_round_robin_actions process_disagg_prefill_inflight_queue
     process_batch_result_disagg_prefill handle_bootstrap_failure optimistic_release_and_requeue
@@ -335,7 +335,7 @@ class Harness(Scheduler, Prefill):
         req.pending_bootstrap = False
 
     def retry(self, req):
-        self.detach_round_robin_request(req)
+        self.remove_prefill_ready_requests((req,))
         req.kv.holds_kv = False
         self.enqueue_prefill_ready([req])
 
@@ -360,6 +360,37 @@ class Harness(Scheduler, Prefill):
 
 
 class RoundRobinTests(unittest.TestCase):
+    def test_bootstrap_failures_are_removed_in_one_batch(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                s = Harness()
+                s.enable_overlap = overlap
+                a, b, live = [Req(name, 128) for name in ("a", "b", "live")]
+                s.waiting_queue = [a]
+                s.suspended_prefill_queue = [b, live]
+                for req in (a, b, live):
+                    req.disagg_kv_sender.poll = (
+                        "transferring" if req is live else "failed"
+                    )
+                if overlap:
+                    s.handle_bootstrap_failure = lambda req: (
+                        Prefill.handle_bootstrap_failure(s, req)
+                    )
+                remove = s.remove_prefill_ready_requests = Mock(
+                    wraps=s.remove_prefill_ready_requests
+                )
+                s.resolve_waiting_queue_bootstrap()
+                remove.assert_called_once_with({a, b})
+                self.assertEqual(s.waiting_queue, [])
+                self.assertEqual(s.suspended_prefill_queue, [live])
+                if overlap:
+                    self.assertEqual(
+                        s._pending_round_robin_actions,
+                        {a: "bootstrap_failure", b: "bootstrap_failure"},
+                    )
+                else:
+                    self.assertEqual(s.failed, [a, b])
+
     def test_reservation_uses_planned_end_without_double_counting(self):
         other, candidate = Req("other", 257, prefix=64), Req("new", 128)
         adder = Adder(512, 128)
@@ -435,7 +466,7 @@ class RoundRobinTests(unittest.TestCase):
         s.suspend(a)
         s.reset_prefill_ready_seq_if_idle()
         self.assertEqual(s._prefill_ready_seq, 1)
-        s.detach_round_robin_request(a)
+        s.remove_prefill_ready_requests((a,))
         s.reset_prefill_ready_seq_if_idle()
         s.enqueue_prefill_ready([a])
         self.assertEqual(a.prefill_ready_seq, 0)
@@ -506,6 +537,23 @@ class OverlapTests(unittest.TestCase):
         req.inflight_middle_chunks = int(middle)
         req.disagg_kv_sender.abort = Mock()
         return req
+
+    def test_result_terminal_action_is_removed_before_next_admission(self):
+        s = self.s
+        a = self.request("a", middle=False)
+        live = Req("live", 64)
+        s.suspend(a)
+        s.enqueue_prefill_ready([live])
+        a.to_finish = "abort"
+        batch = Batch([a], None)
+        s.process_batch_result_disagg_prefill(batch, self.result(batch))
+        self.assertEqual(s._pending_round_robin_actions[a], "retire")
+        self.assertIn(a, s.suspended_prefill_queue)
+        self.assertEqual(a.cleanup, [])
+        s.process_pending_round_robin_actions()
+        self.assertNotIn(a, s.suspended_prefill_queue)
+        self.assertEqual(a.cleanup.count("kv"), 1)
+        self.assertEqual(s.batch().reqs, [live])
 
     def test_abort_waits_for_result_then_releases_once(self):
         s = self.s

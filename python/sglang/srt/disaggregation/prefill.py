@@ -567,8 +567,6 @@ class SchedulerDisaggregationPrefillMixin:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
-                if self.enable_chunked_prefill_round_robin and not self.enable_overlap:
-                    self.detach_round_robin_request(req)
                 self.handle_bootstrap_failure(req)
                 failed.add(req)
             elif (
@@ -581,9 +579,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
         if failed:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in failed
-            ]
+            if self.enable_chunked_prefill_round_robin:
+                self.remove_prefill_ready_requests(failed)
+            else:
+                self.waiting_queue = [
+                    req for req in self.waiting_queue if req not in failed
+                ]
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -1225,10 +1226,6 @@ class SchedulerDisaggregationPrefillMixin:
             self._pending_round_robin_actions[req] = action
         if self.chunked_req is req:
             self.chunked_req = None
-        self.suspended_prefill_queue = [
-            r for r in self.suspended_prefill_queue if r is not req
-        ]
-        self.waiting_queue = [r for r in self.waiting_queue if r is not req]
         return True
 
     def process_pending_round_robin_actions(self: Scheduler) -> None:
@@ -1236,8 +1233,8 @@ class SchedulerDisaggregationPrefillMixin:
         pending = list(self._pending_round_robin_actions)
         if not pending:
             return
+        self.remove_prefill_ready_requests(pending)
         for req in pending:
-            self.defer_round_robin_action(req, self._pending_round_robin_actions[req])
             # Result callbacks synchronize before this queue is processed again.
             if self.has_pending_prefill_result(req):
                 continue
@@ -1559,7 +1556,8 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         if self.enable_chunked_prefill_round_robin:
-            self.detach_round_robin_request(req)
+            self.remove_prefill_ready_requests((req,))
+            self._pending_round_robin_actions.pop(req, None)
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

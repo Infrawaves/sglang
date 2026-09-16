@@ -1354,13 +1354,16 @@ class Scheduler(
                 seen.add(id(req))
                 yield req
 
-    def detach_round_robin_request(self, req: Req) -> None:
-        if self.chunked_req is req:
+    def remove_prefill_ready_requests(self, reqs) -> None:
+        reqs = set(reqs)
+        if not reqs:
+            return
+        if self.chunked_req in reqs:
             self.chunked_req = None
+        self.waiting_queue = [r for r in self.waiting_queue if r not in reqs]
         self.suspended_prefill_queue = [
-            r for r in self.suspended_prefill_queue if r is not req
+            r for r in self.suspended_prefill_queue if r not in reqs
         ]
-        self._pending_round_robin_actions.pop(req, None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -5351,6 +5354,7 @@ class Scheduler(
                 candidates.extend(
                     req for batch, _ in self.result_queue for req in batch.reqs
                 )
+            cancelled = []
             for req in candidates:
                 if (
                     req in handled_round_robin_reqs
@@ -5366,7 +5370,9 @@ class Scheduler(
                     if recv_req.abort_message
                     else FINISH_ABORT()
                 )
-                self.detach_round_robin_request(req)
+                cancelled.append(req)
+            self.remove_prefill_ready_requests(cancelled)
+            for req in cancelled:
                 # Pending results retain ownership and retire the request in their
                 # existing abort branch. A parked request has no callback left.
                 if not self.has_pending_prefill_result(req):
