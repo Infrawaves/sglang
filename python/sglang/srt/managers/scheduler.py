@@ -5396,6 +5396,7 @@ class Scheduler(
                     if recv_req.abort_message
                     else FINISH_ABORT()
                 )
+                req.time_stats.trace_ctx.abort(abort_info=req.to_finish)
                 cancelled.append(req)
             self.remove_prefill_ready_requests(cancelled)
             for req in cancelled:

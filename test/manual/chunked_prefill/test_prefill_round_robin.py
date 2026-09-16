@@ -154,6 +154,20 @@ def cache_chunk(req, cache, **kwargs):
     req.prefix_indices = range(req.kv.kv_allocated_len)
 
 
+def release_metadata(req, allocator):
+    if req.metadata_buffer_index >= 0:
+        req.cleanup.append("metadata")
+        req.metadata_buffer_index = -1
+
+
+def release_kv(req, cache, **kwargs):
+    req.cleanup.append("kv")
+    if req.kv.holds_mamba:
+        req.cleanup.append("mamba")
+    req.kv.holds_kv = req.kv.holds_mamba = False
+    req.kv.kv_allocated_len = 0
+
+
 GLOBALS = dict(
     array=array,
     get_schedule=lambda: SCHEDULE,
@@ -175,8 +189,8 @@ GLOBALS = dict(
     maybe_cache_unfinished_req=cache_chunk,
     is_aborted=lambda r: r.aborted or r.to_finish is not None,
     prepare_abort=lambda r, reason: setattr(r, "aborted", True),
-    maybe_release_metadata_buffer=lambda req, allocator: req.cleanup.append("metadata"),
-    release_kv_cache=lambda req, cache, **kwargs: req.cleanup.append("kv"),
+    maybe_release_metadata_buffer=release_metadata,
+    release_kv_cache=release_kv,
     _make_abort_req=lambda req, **kwargs: req.rid,
     logger=logging.getLogger(__name__),
     FINISH_ABORT=lambda *args: args or "abort",
@@ -198,7 +212,7 @@ Scheduler = extract(
     """_validate_prefill_round_robin enqueue_prefill_ready reset_prefill_ready_seq_if_idle
     iter_round_robin_requests remove_prefill_ready_requests
     _get_new_batch_prefill_raw process_pending_chunked_abort
-    _release_chunked_abort abort_request pause_generation _poll_timeout_aborts""",
+    _release_aborted_request _release_chunked_abort abort_request pause_generation continue_generation _poll_timeout_aborts""",
     GLOBALS,
 )
 Prefill = extract(
@@ -239,7 +253,7 @@ class Req:
             abort=lambda: self.cleanup.append("sender"), poll="ready"
         )
         self.time_stats = NS(
-            trace_ctx=NS(abort=lambda **kwargs: None),
+            trace_ctx=NS(abort=Mock()),
             set_completion_time=Mock(),
             set_prefill_finished_time=Mock(),
         )
@@ -314,7 +328,6 @@ class Harness(Scheduler, Prefill):
         self.collect_inflight_reqs = lambda: set()
         self.clear_pending_chunk_send = lambda req: req.cleanup.append("pending_send")
         self.req_to_metadata_buffer_idx_allocator = None
-        self._release_aborted_request = lambda rid: None
         self.outputs = []
         self.output_streamer = NS(
             stream_output=lambda reqs, *args: self.outputs.extend(reqs)
@@ -441,6 +454,17 @@ class RoundRobinTests(unittest.TestCase):
             self.assertEqual(s._poll_timeout_aborts(), [])
             GLOBALS["envs"].SGLANG_REQ_WAITING_TIMEOUT.get = lambda: 10
             self.assertEqual([r.rid for r in s._poll_timeout_aborts()], [waiting.rid])
+        s.enable_chunked_prefill_round_robin = True
+        s.last_batch = None
+        expired.kv.holds_kv = True
+        expired.kv.kv_allocated_len = 64
+        aborts[0].abort_all = False
+        s.abort_request(aborts[0])
+        self.assertNotIn(expired, s.suspended_prefill_queue)
+        self.assertEqual(s.outputs, [expired])
+        self.assertEqual(expired.to_finish, ("Request running timeout reached.", 503))
+        self.assertFalse(expired.kv.holds_kv)
+        self.assertEqual(expired.metadata_buffer_index, -1)
 
     def test_round_robin_configuration_limits(self):
         valid = dict(
@@ -648,6 +672,51 @@ class OverlapTests(unittest.TestCase):
         req.disagg_kv_sender.abort = Mock()
         return req
 
+    def test_abort_cache_cleanup_uses_existing_feature_gates(self):
+        for flag in (
+            None,
+            "enable_hierarchical_cache",
+            "enable_hicache_storage",
+            "enable_unified_cache_external_linker",
+        ):
+            with self.subTest(flag=flag):
+                self.setUp()
+                s = self.s
+                req = self.request("cache")
+                s.suspend(req)
+                if flag:
+                    setattr(s, flag, True)
+
+                def cache_cleanup(rid):
+                    self.assertEqual(rid, req.rid)
+                    self.assertTrue(req.kv.holds_kv)
+                    self.assertEqual(req.metadata_buffer_index, -1)
+
+                s.tree_cache.release_aborted_request = Mock(side_effect=cache_cleanup)
+                batch = Batch([req], req)
+                result = self.result(batch)
+                s.result_queue = [(batch, result)]
+                abort = NS(rid=req.rid, abort_all=False, abort_message="cancelled")
+                s.abort_request(abort)
+                req.time_stats.trace_ctx.abort.assert_called_once_with(
+                    abort_info=("cancelled", 503)
+                )
+                s.tree_cache.release_aborted_request.assert_not_called()
+                self.assertTrue(req.kv.holds_kv)
+                s.result_queue.pop(0)
+                s.process_batch_result_disagg_prefill(batch, result)
+                s.process_pending_round_robin_actions()
+                s.abort_request(abort)
+                s.process_pending_round_robin_actions()
+                self.assertEqual(
+                    s.tree_cache.release_aborted_request.call_count,
+                    int(flag is not None),
+                )
+                self.assertFalse(req.kv.holds_kv)
+                self.assertEqual(req.cleanup.count("kv"), 1)
+                self.assertEqual(s.outputs, [req])
+                req.time_stats.trace_ctx.abort.assert_called_once()
+
     def test_result_terminal_action_is_removed_before_next_admission(self):
         s = self.s
         a = self.request("a", middle=False)
@@ -666,51 +735,76 @@ class OverlapTests(unittest.TestCase):
         self.assertEqual(s.batch().reqs, [live])
 
     def test_paused_abort_without_result_releases_immediately(self):
-        s = self.s
-        req = self.request("parked")
-        s.suspend(req)
-        s.last_batch = Batch([req])
-        s.collect_inflight_reqs = lambda: [req]
-        s.pause_generation(NS(mode="in_place"))
-        self.assertTrue(s._engine_paused)
-        s.abort_request(NS(rid=req.rid, abort_all=False, abort_message="cancelled"))
-        self.assertEqual(s._pending_round_robin_actions, {})
-        self.assertEqual(s.outputs, [req])
-        self.assertEqual(req.cleanup.count("kv"), 1)
-        self.assertEqual(req.cleanup.count("metadata"), 1)
-        self.assertEqual(req.to_finish, ("cancelled", 503))
-        req.disagg_kv_sender.abort.assert_called_once()
-        s.abort_request(NS(rid=req.rid, abort_all=False, abort_message="again"))
-        self.assertEqual(s.outputs, [req])
-        self.assertEqual(req.cleanup.count("kv"), 1)
-        self.assertEqual(req.to_finish, ("cancelled", 503))
+        for with_mamba in (False, True):
+            with self.subTest(with_mamba=with_mamba):
+                self.setUp()
+                s = self.s
+                req = self.request("parked")
+                req.kv.holds_mamba = with_mamba
+                s.suspend(req)
+                s.last_batch = Batch([req])
+                s.collect_inflight_reqs = lambda: [req]
+                s.pause_generation(NS(mode="in_place"))
+                self.assertTrue(s._engine_paused)
+                s.abort_request(
+                    NS(rid=req.rid, abort_all=False, abort_message="cancelled")
+                )
+                self.assertEqual(s._pending_round_robin_actions, {})
+                self.assertEqual(s.outputs, [req])
+                self.assertEqual(req.cleanup.count("kv"), 1)
+                self.assertEqual(req.cleanup.count("metadata"), 1)
+                self.assertEqual(req.to_finish, ("cancelled", 503))
+                req.disagg_kv_sender.abort.assert_called_once()
+                s.abort_request(NS(rid=req.rid, abort_all=False, abort_message="again"))
+                self.assertEqual(s.outputs, [req])
+                self.assertEqual(req.cleanup.count("kv"), 1)
+                self.assertEqual(req.to_finish, ("cancelled", 503))
+                self.assertFalse(req.kv.holds_kv)
+                self.assertFalse(req.kv.holds_mamba)
+                self.assertEqual(req.metadata_buffer_index, -1)
+                self.assertEqual(req.cleanup.count("mamba"), int(with_mamba))
+                req.time_stats.trace_ctx.abort.assert_called_once_with(
+                    abort_info=("cancelled", 503)
+                )
 
     def test_abort_waits_for_result_then_releases_once(self):
-        s = self.s
-        a = self.request("a")
-        b = self.request("b")
-        old, new = Batch([a], a), Batch([b], b)
-        result = self.result(old)
-        result.copy_done.synchronize.side_effect = lambda: self.assertEqual(
-            a.cleanup, []
-        )
-        s.result_queue = [(old, result)]
-        s.chunked_req = a
-        s.abort_request(NS(rid="a", abort_all=False, abort_message=None))
-        s.process_pending_chunked_abort()
-        self.assertIsNone(s.chunked_req)
-        self.assertEqual(a.cleanup, [])
-        # Next batch launches before A's result is processed.
-        s.result_queue.append((new, self.result(new)))
-        s.result_queue.pop(0)
-        s.process_batch_result_disagg_prefill(old, result)
-        result.copy_done.synchronize.assert_called_once()
-        self.assertEqual(a.inflight_middle_chunks, 0)
-        s.process_pending_round_robin_actions()
-        s.process_pending_round_robin_actions()
-        self.assertEqual(a.cleanup.count("kv"), 1)
-        self.assertEqual(s.outputs, [a])
-        self.assertEqual(s.result_queue[0][0].reqs, [b])
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                self.setUp()
+                s = self.s
+                a = self.request("a")
+                b = self.request("b")
+                old, new = Batch([a], a), Batch([b], b)
+                result = self.result(old)
+                result.copy_done.synchronize.side_effect = lambda: self.assertEqual(
+                    a.cleanup, []
+                )
+                s.result_queue = [(old, result)]
+                s.chunked_req = a
+                if paused:
+                    s.pause_generation(NS(mode="in_place"))
+                s.abort_request(NS(rid="a", abort_all=False, abort_message=None))
+                if not paused:
+                    s.process_pending_chunked_abort()
+                self.assertIsNone(s.chunked_req)
+                self.assertEqual(a.cleanup, [])
+                if paused:
+                    self.assertEqual(s.outputs, [])
+                    self.assertTrue(a.kv.holds_kv)
+                    self.assertEqual(a.metadata_buffer_index, 0)
+                    s.continue_generation(NS(torch_empty_cache=False))
+                    self.assertFalse(s._engine_paused)
+                # Next batch launches before A's result is processed.
+                s.result_queue.append((new, self.result(new)))
+                s.result_queue.pop(0)
+                s.process_batch_result_disagg_prefill(old, result)
+                result.copy_done.synchronize.assert_called_once()
+                self.assertEqual(a.inflight_middle_chunks, 0)
+                s.process_pending_round_robin_actions()
+                s.process_pending_round_robin_actions()
+                self.assertEqual(a.cleanup.count("kv"), 1)
+                self.assertEqual(s.outputs, [a])
+                self.assertEqual(s.result_queue[0][0].reqs, [b])
 
     def test_abort_finds_final_result_without_current_or_suspended(self):
         s = self.s
@@ -747,6 +841,7 @@ class OverlapTests(unittest.TestCase):
         self.assertIs(a.to_finish, reason_after_first_abort)
         self.assertEqual(a.to_finish, ("timeout", 503))
         self.assertIs(pending.to_finish, reason)
+        pending.time_stats.trace_ctx.abort.assert_not_called()
         self.assertEqual(s._pending_round_robin_actions[pending], "bootstrap_failure")
         for i, (batch, result) in enumerate(zip(batches, results)):
             s.result_queue.pop(0)
