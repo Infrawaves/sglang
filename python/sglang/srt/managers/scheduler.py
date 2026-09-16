@@ -1333,6 +1333,8 @@ class Scheduler(
             self.waiting_queue.append(req)
 
     def reset_prefill_ready_seq_if_idle(self) -> None:
+        if not self.enable_chunked_prefill_round_robin:
+            return
         if (
             not self.waiting_queue
             and not self.suspended_prefill_queue
