@@ -195,7 +195,7 @@ GLOBALS = dict(
 Scheduler = extract(
     "managers/scheduler.py",
     "Scheduler",
-    """enqueue_prefill_ready reset_prefill_ready_seq_if_idle
+    """_validate_prefill_round_robin enqueue_prefill_ready reset_prefill_ready_seq_if_idle
     iter_round_robin_requests remove_prefill_ready_requests
     _get_new_batch_prefill_raw process_pending_chunked_abort
     _release_chunked_abort abort_request""",
@@ -360,6 +360,31 @@ class Harness(Scheduler, Prefill):
 
 
 class RoundRobinTests(unittest.TestCase):
+    def test_round_robin_configuration_limits(self):
+        valid = dict(
+            enable_chunked_prefill_round_robin=True,
+            disaggregation_mode=MODE.PREFILL,
+            ps=NS(pp_size=1),
+            enable_pdmux=False,
+            is_hybrid_swa=False,
+            chunked_prefill_size=128,
+        )
+        Scheduler._validate_prefill_round_robin(NS(**valid))
+        for field, value in (
+            ("disaggregation_mode", MODE.NULL),
+            ("disaggregation_mode", MODE.DECODE),
+            ("ps", NS(pp_size=2)),
+            ("enable_pdmux", True),
+            ("is_hybrid_swa", True),
+            ("chunked_prefill_size", None),
+        ):
+            with self.subTest(field=field, value=value):
+                config = dict(valid, **{field: value})
+                with self.assertRaises(ValueError):
+                    Scheduler._validate_prefill_round_robin(NS(**config))
+                config["enable_chunked_prefill_round_robin"] = False
+                Scheduler._validate_prefill_round_robin(NS(**config))
+
     def test_bootstrap_failures_are_removed_in_one_batch(self):
         for overlap in (False, True):
             with self.subTest(overlap=overlap):

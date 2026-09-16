@@ -1317,6 +1317,7 @@ class Scheduler(
         self.enable_chunked_prefill_round_robin = (
             get_schedule().enable_chunked_prefill_round_robin
         )
+        self._validate_prefill_round_robin()
         self.suspended_prefill_queue: List[Req] = []
         # Terminal cleanup actions waiting for outstanding GPU results.
         self._pending_round_robin_actions: dict[Req, str] = {}
@@ -1324,6 +1325,22 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+
+    def _validate_prefill_round_robin(self) -> None:
+        if not self.enable_chunked_prefill_round_robin:
+            return
+        if (
+            self.disaggregation_mode != DisaggregationMode.PREFILL
+            or self.ps.pp_size != 1
+            or self.enable_pdmux
+            or self.is_hybrid_swa
+            or self.chunked_prefill_size is None
+        ):
+            raise ValueError(
+                "--enable-chunked-prefill-round-robin requires PD prefill, "
+                "PP=1 and chunked prefill enabled; colocated serving, PDMux "
+                "and hybrid SWA are unsupported."
+            )
 
     def enqueue_prefill_ready(self, reqs) -> None:
         for req in reqs:
