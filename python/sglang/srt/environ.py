@@ -655,7 +655,7 @@ class Envs:
     # PD disaggregation runtime
     # ===================================================================
     # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
-    # computed dynamically at runtime based on cpu_count; see disaggregation backends.
+    # computed dynamically from cpu_count; Mooncake DCP window mode defaults to 16.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
@@ -750,6 +750,9 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    # Enable on both PD peers; requires strict drain-before-release semantics.
+    SGLANG_MOONCAKE_DCP_WINDOW_PACK = EnvBool(False)
+    SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB = EnvInt(512)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
 

@@ -36,7 +36,11 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    DCPWindowConfigError,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -193,9 +197,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert len(reusing) <= 1, (
+            "only one chunked request may reuse req_pool_idx in a batch"
+        )
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -1054,7 +1058,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            try:
+                parallel_info_ready = self.kv_manager.try_ensure_parallel_info(
+                    bootstrap_addr
+                )
+            except DCPWindowConfigError as exc:
+                logger.error("PD window bootstrap rejected %s: %s", bootstrap_addr, exc)
+                for decode_req in reqs:
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
+                        self.kv_manager.record_failure(
+                            decode_req.req.bootstrap_room, str(exc)
+                        )
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                continue
+            if parallel_info_ready:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1884,9 +1903,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        assert req_pool_indices is not None, (
+            "req_pool_indices is full! There is a bug in memory estimation."
+        )
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -2154,6 +2173,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.staging_handler = None
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            or envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get()
         )
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
@@ -2306,9 +2326,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert (
-                output_token_sampling_mask_idx is not None
-            ), "sampling mask buffer disabled on decode side"
+            assert output_token_sampling_mask_idx is not None, (
+                "sampling mask buffer disabled on decode side"
+            )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)
@@ -2390,6 +2410,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
+                if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get():
+                    # Every failure needs a drain handshake, including failures
+                    # propagated from Prefill or another Decode rank. Do this
+                    # before failure_exception can clear receiver bookkeeping.
+                    decode_req.kv_receiver.abort()
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2418,9 +2443,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
-                    self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.abort_notified
+                if self.enable_deferred_kv_release and getattr(
+                    decode_req.kv_receiver, "abort_notified", False
                 ):
                     # Decode-initiated abort: a prefill write may still target
                     # these pages, so hold them until the drain ack or timeout.
@@ -2530,7 +2554,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            if not drained and (now < deadline or kv_mgr.enable_dcp_window_pack):
+                if kv_mgr.enable_dcp_window_pack and now >= deadline:
+                    logger.error(
+                        "DCP window room %s has no complete drain ACK; retaining "
+                        "KV/state/metadata until coordinated transport recovery",
+                        room,
+                    )
+                    deadline = float("inf")
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
@@ -2552,6 +2583,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get() and (
+            self.queue or self._deferred_releases
+        ):
+            raise RuntimeError(
+                "Cannot release memory with protected DCP window requests"
+            )
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
@@ -2855,8 +2892,7 @@ class SchedulerDisaggregationDecodeMixin:
                 and not req.is_retracted
                 and not req.is_demoted
                 and len(req.origin_input_ids) <= max_input_len
-                and len(req.output_ids) - req.last_demote_output_len
-                >= min_output_len
+                and len(req.output_ids) - req.last_demote_output_len >= min_output_len
             )
 
         demoted_any = False
@@ -2868,9 +2904,7 @@ class SchedulerDisaggregationDecodeMixin:
                 break
 
             victim = candidates.pop(0)
-            victim_index = next(
-                i for i, r in enumerate(batch.reqs) if r is victim
-            )
+            victim_index = next(i for i, r in enumerate(batch.reqs) if r is victim)
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
@@ -2894,16 +2928,12 @@ class SchedulerDisaggregationDecodeMixin:
 
             batch.filter_batch(
                 keep_indices=[
-                    index
-                    for index, _ in enumerate(batch.reqs)
-                    if index != victim_index
+                    index for index, _ in enumerate(batch.reqs) if index != victim_index
                 ]
             )
             batch.batch_is_full = False
             self.new_token_ratio_tracker.current = (
-                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
-                    batch.reqs
-                )
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(batch.reqs)
             )
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",

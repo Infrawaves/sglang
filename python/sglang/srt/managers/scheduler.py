@@ -3114,16 +3114,24 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
+        hold_window = (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get()
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
+            if hold_window:
+                self.hold_dcp_window_abort(req)
+            else:
+                req.disagg_kv_sender.abort()
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and not hold_window:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if not hold_window:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3508,9 +3516,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -4415,8 +4422,17 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                window = getattr(
+                    self.disagg_prefill_bootstrap_queue.kv_manager,
+                    "_window_scheduler",
+                    None,
+                )
+                if window is not None:
+                    idle &= window.idle()
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get():
+                    idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.demotion_queue) == 0
@@ -4814,6 +4830,14 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.beam_coordinator.retire_group(req)
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get()
+                and not req.disagg_kv_sender.safe_to_release()
+            ):
+                prepare_abort(req, "Aborted")
+                self.hold_dcp_window_abort(req)
+                continue
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

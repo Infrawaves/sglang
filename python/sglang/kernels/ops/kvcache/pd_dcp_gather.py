@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import triton
@@ -35,6 +35,8 @@ def copy_mla_rows_into_pack(
     row_indices: torch.Tensor,
     pack: torch.Tensor,
     token_item_lens: Sequence[int],
+    *,
+    src_metadata: Optional[torch.Tensor] = None,
 ) -> None:
     if len(kv_data_ptrs) != len(token_item_lens):
         raise ValueError(
@@ -45,6 +47,8 @@ def copy_mla_rows_into_pack(
         return
 
     n = int(row_indices.numel())
+    if n == 0:
+        return
     metadata = []
     offset = 0
     for ptr, item_len in zip(kv_data_ptrs, token_item_lens):
@@ -54,7 +58,10 @@ def copy_mla_rows_into_pack(
         metadata.extend((int(ptr), item_len, offset))
         offset += n * item_len
 
-    src_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
+    if src_metadata is None:
+        src_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
+    elif src_metadata.numel() != len(metadata):
+        raise ValueError("PD DCP gather metadata size mismatch")
     max_item_len = max(int(item_len) for item_len in token_item_lens)
     grid = (len(kv_data_ptrs), triton.cdiv(n * max_item_len, 1024))
     _copy_mla_rows_into_pack_kernel[grid](

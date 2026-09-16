@@ -150,6 +150,14 @@ class BaseKVSender(ABC):
     def pop_decode_prefix_len(self) -> int:
         return 0
 
+    def safe_to_release(self) -> bool:
+        """Backends with asynchronous source ownership override this gate."""
+        return True
+
+    def assert_safe_to_release(self) -> None:
+        if not self.safe_to_release():
+            raise RuntimeError("Cannot release source pages before KV transfer drains")
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 

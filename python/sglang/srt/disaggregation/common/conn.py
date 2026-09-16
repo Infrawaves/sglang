@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
     get_parallel,
     get_serving,
 )
@@ -49,6 +50,10 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DCPWindowConfigError(RuntimeError):
+    """A PD peer cannot participate in the configured window protocol."""
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -102,6 +107,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    dcp_window_pack: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -164,8 +170,10 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_dcp_window_pack = envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get()
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            or self.enable_dcp_window_pack
         )
         self._dcp_pack_buffers = None
         # for p/d multi node infer
@@ -189,6 +197,8 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
+        if self.enable_dcp_window_pack:
+            self._validate_dcp_window_config()
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
@@ -243,7 +253,9 @@ class CommonKVManager(BaseKVManager):
             self.transfer_infos = {}
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
-            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            self._deferred_ack_targets: Dict[
+                int, Union[Tuple[str, int], Set[Tuple[str, int]]]
+            ] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -292,6 +304,48 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _validate_dcp_window_config(self) -> None:
+        prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        expected = (1, 8, 1) if prefill else (8, 1, 8)
+        actual = (get_parallel().tp_size, self.pp_size, self.dcp_size)
+        if (
+            get_disagg().disaggregation_transfer_backend != "mooncake"
+            or actual != expected
+            or self.attn_cp_size != 1
+            or self.attn_dp_size != 1
+            or self.system_dp_size != 1
+            or self.kv_args.page_size != 64
+            or self.server_args.kv_cache_dtype != "fp8_e4m3"
+            or not (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            raise ValueError(
+                "DCP window pack requires Mooncake FP8 MLA, page_size=64, "
+                "prefill TP1/PP8/DCP1 and decode TP8/PP1/DCP8 (CP=DP=1); "
+                f"local TP/PP/DCP={actual}"
+            )
+        if (
+            self.server_args.speculative_algorithm is not None
+            or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or get_memory().enable_unified_memory
+            or getattr(self.kv_args, "mla_compression_ratios", None) is not None
+            or (not prefill and not self.server_args.disable_radix_cache)
+        ):
+            raise ValueError(
+                "DCP window pack does not support speculative decoding, staging, "
+                "unified/compressed KV or decode prefix caching"
+            )
+        if envs.SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB.get() not in (64, 128, 256, 512):
+            raise ValueError("DCP pack buffer must be 64, 128, 256 or 512 MiB")
+        args = self.kv_args
+        if not (
+            len(args.kv_data_ptrs) == len(args.kv_item_lens) == len(args.kv_data_lens)
+        ) or any(n <= 0 or n % args.page_size for n in args.kv_item_lens):
+            raise ValueError(
+                "DCP window pack requires positive page-aligned per-layer KV geometry"
+            )
+        if args.kv_data_ptrs and len(args.kv_layer_ids) != len(args.kv_data_ptrs):
+            raise ValueError("DCP window pack requires explicit local MLA layer IDs")
 
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
@@ -363,6 +417,20 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        window = getattr(self, "_window_scheduler", None)
+        if window is not None:
+            with window.condition:
+                if bootstrap_room in window.aborted_rooms:
+                    # Includes an abort arriving before this room's sender.
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+                    return
+                if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                    return
+                self._update_status(bootstrap_room, status)
+        else:
+            self._update_status(bootstrap_room, status)
+
+    def _update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:
             # Do not resurrect a cleared entry with Failed: once clear() has
             # popped the room from request_status, any late update_status(Failed)
@@ -386,7 +454,11 @@ class CommonKVManager(BaseKVManager):
     def register_deferred_abort_room(self, bootstrap_room: int) -> None:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
         from a prior request that reused this bootstrap_room."""
-        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+        if self.enable_dcp_window_pack:
+            # Arm before sending ABORT, and never wipe a fast/duplicate ACK.
+            self._deferred_abort_ack_tracker.setdefault(bootstrap_room, set())
+        else:
+            self._deferred_abort_ack_tracker[bootstrap_room] = set()
 
     def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
         """Record a prefill rank's drain ack (decode receiver thread). Only counts
@@ -434,9 +506,16 @@ class CommonKVManager(BaseKVManager):
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
+        window = getattr(self, "_window_scheduler", None)
+        if window is not None and not window.safe_to_release(room):
+            return
         target = self._deferred_ack_targets.pop(room, None)
         if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+            if self.enable_dcp_window_pack:
+                for decode_ip, decode_port in target:
+                    self._send_abort_ack(decode_ip, decode_port, room)
+            else:
+                self._send_abort_ack(target[0], target[1], room)
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
@@ -444,7 +523,13 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        if self.enable_dcp_window_pack:
+            # All eight decode ranks need an ACK from every PP source.
+            self._deferred_ack_targets.setdefault(room, set()).add(
+                (decode_ip, decode_port)
+            )
+        else:
+            self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -642,6 +727,14 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
+        if info.dcp_window_pack != self.enable_dcp_window_pack:
+            raise DCPWindowConfigError(
+                "DCP window pack must be explicitly enabled on both PD peers"
+            )
+        if self.enable_dcp_window_pack and (
+            info.attn_tp_size != 1 or info.pp_size != 8 or info.dp_size != 1
+        ):
+            raise DCPWindowConfigError("DCP window pack requires prefill TP1/PP8/DP1")
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -822,6 +915,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "dcp_window_pack": self.enable_dcp_window_pack,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1010,9 +1104,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1066,8 +1160,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
@@ -1622,6 +1715,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        if self.kv_mgr.enable_dcp_window_pack:
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1639,6 +1734,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        if self.kv_mgr.enable_dcp_window_pack:
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
@@ -1678,6 +1775,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.dcp_window_pack: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1746,6 +1844,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        window_pack = bool(data.get("dcp_window_pack", False))
+        if self.dcp_window_pack is not None and self.dcp_window_pack != window_pack:
+            return web.Response(
+                text="Inconsistent DCP window pack across prefill ranks", status=400
+            )
+        self.dcp_window_pack = window_pack
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1843,9 +1947,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                dcp_window_pack=bool(self.dcp_window_pack),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if not self.dcp_window_pack:
+                # Preserve the old response shape for disabled deployments.
+                payload.pop("dcp_window_pack")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(

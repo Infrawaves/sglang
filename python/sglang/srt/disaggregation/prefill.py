@@ -125,6 +125,9 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
+    sender = getattr(req, "disagg_kv_sender", None)
+    if sender is not None and hasattr(sender, "assert_safe_to_release"):
+        sender.assert_safe_to_release()
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
@@ -514,6 +517,27 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _dcp_window_producer_events(self: Scheduler):
+        streams = [self.forward_stream, self.schedule_stream]
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        if controller is not None:
+            streams.append(controller.l2_transfer_engine.host_to_device_stream)
+        events = []
+        for stream in streams:
+            event = torch.cuda.Event()
+            event.record(stream)
+            events.append(event)
+        return tuple(events)
+
+    def hold_dcp_window_abort(self: Scheduler, req: Req) -> None:
+        """Retain source KV/state/metadata until compute and transfers drain."""
+        req.disagg_kv_sender._window_abort_events = self._dcp_window_producer_events()
+        req.disagg_kv_sender.abort()
+        self.clear_pending_chunk_send(req)
+        req.pending_bootstrap = False
+        if req not in self.disagg_prefill_inflight_queue:
+            self.disagg_prefill_inflight_queue.append(req)
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -853,9 +877,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
+                    assert req.metadata_buffer_index >= 0, (
+                        f"Req {req.rid} does not have metadata buffer allocated"
+                    )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -895,6 +919,11 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get() and (
+                not req.disagg_kv_sender.safe_to_release()
+            ):
+                undone_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1002,6 +1031,8 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
+        if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get() and self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1020,6 +1051,12 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        if (
+            envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get()
+            and not req.disagg_kv_sender.safe_to_release()
+        ):
+            self.hold_dcp_window_abort(req)
+            return
         self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
@@ -1349,6 +1386,13 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get():
+                # PP always runs on forward_stream, including non-overlap.
+                # Snapshot fresh events: HiCache's layer event ring can be
+                # reused before a queued transfer gets a chance to gather.
+                req.disagg_kv_sender._window_wait_event = (
+                    self._dcp_window_producer_events()
+                )
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last else None,
@@ -1364,6 +1408,10 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
+        if envs.SGLANG_MOONCAKE_DCP_WINDOW_PACK.get():
+            # A bootstrapping retry has no transfer. Never reset a sender that
+            # still owns source pages if a caller violates that invariant.
+            req.disagg_kv_sender.assert_safe_to_release()
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
