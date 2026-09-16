@@ -1012,13 +1012,14 @@ pub async fn chat_completions(
         .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+    // status are visible without DEBUG. `request_id` is the gateway's
+    // Venus-Request-Id or the client's X-Request-Id (echoed end-to-end);
+    // `worker` is the engine the policy selected. The cache-aware routing
+    // rationale is logged separately at DEBUG by the policy.
+    // First hit wins; `-` when the client sent neither.
+    let request_id = ["venus-request-id", "x-request-id"]
+        .iter()
+        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
         .unwrap_or("-");
     let http_status = match &result {
         Ok(resp) => resp.status().as_u16(),
