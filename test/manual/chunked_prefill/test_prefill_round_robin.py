@@ -198,7 +198,7 @@ Scheduler = extract(
     """_validate_prefill_round_robin enqueue_prefill_ready reset_prefill_ready_seq_if_idle
     iter_round_robin_requests remove_prefill_ready_requests
     _get_new_batch_prefill_raw process_pending_chunked_abort
-    _release_chunked_abort abort_request""",
+    _release_chunked_abort abort_request pause_generation _poll_timeout_aborts""",
     GLOBALS,
 )
 Prefill = extract(
@@ -360,6 +360,88 @@ class Harness(Scheduler, Prefill):
 
 
 class RoundRobinTests(unittest.TestCase):
+    def test_resume_rejected_without_appending(self):
+        original = Adder.add_chunked_req
+
+        def exhausted(adder, req):
+            adder.is_hybrid_swa = True
+            adder._swa_req_ring = False
+            adder.rem_swa_tokens = 0
+            return original(adder, req)
+
+        for location in ("mixed", "suspended", "current"):
+            with self.subTest(location=location):
+                s = Harness()
+                req = Req("resume", 384, prefix=64)
+                req.set_extend_range(0, 64)
+                fresh = Req("fresh", 64)
+                if location == "mixed":
+                    s.enqueue_prefill_ready([fresh])
+                if location == "current":
+                    s.chunked_req = req
+                else:
+                    s.suspend(req)
+                seq = req.prefill_ready_seq
+                count = req.inflight_middle_chunks
+                with patch.object(Adder, "add_chunked_req", exhausted):
+                    batch = s.batch()
+                if location == "mixed":
+                    self.assertEqual(batch.reqs, [fresh])
+                else:
+                    self.assertIsNone(batch)
+                self.assertEqual(req.inflight_middle_chunks, count)
+                self.assertEqual(req.prefill_ready_seq, seq)
+                self.assertIs(s.chunked_req, req if location == "current" else None)
+                self.assertEqual(
+                    s.suspended_prefill_queue, [] if location == "current" else [req]
+                )
+                batch = s.batch()
+                self.assertEqual(batch.reqs.count(req), 1)
+                self.assertNotIn(req, s.suspended_prefill_queue)
+                self.assertEqual(req.inflight_middle_chunks, count + 1)
+
+    def test_suspended_running_timeout(self):
+        s = Harness()
+        s.ps = NS(pp_size=1)
+        expired, recent, unstarted, done = [
+            Req(n, 128) for n in ("old", "new", "zero", "done")
+        ]
+        for req, entry in zip((expired, recent, unstarted, done), (1, 99, 0, 1)):
+            req.time_stats.forward_entry_time = entry
+        done.finished = lambda: True
+        s.suspended_prefill_queue = [expired, recent, unstarted, done]
+        waiting = Req("waiting", 128)
+        waiting.time_stats.wait_queue_entry_time = 1
+        s.waiting_queue = [waiting]
+        running_timeout = NS(get=lambda: 10)
+        with patch.dict(
+            GLOBALS,
+            envs=NS(
+                SGLANG_REQ_WAITING_TIMEOUT=NS(get=lambda: 0),
+                SGLANG_REQ_RUNNING_TIMEOUT=running_timeout,
+            ),
+            time=NS(perf_counter=lambda: 100),
+            AbortReq=NS,
+        ):
+            self.assertEqual([r.rid for r in s._poll_timeout_aborts()], [expired.rid])
+            s.last_batch = Batch([expired])
+            aborts = s._poll_timeout_aborts()
+            self.assertEqual(len(aborts), 1)
+            self.assertEqual(aborts[0].finished_reason["status_code"], 503)
+            self.assertEqual(
+                aborts[0].abort_message, "Request running timeout reached."
+            )
+            s.enable_chunked_prefill_round_robin = False
+            s.last_batch = None
+            self.assertEqual(s._poll_timeout_aborts(), [])
+            s.ps.pp_size = 2
+            s.running_mbs, s.mbs = [Batch([expired])], [None]
+            self.assertEqual([r.rid for r in s._poll_timeout_aborts()], [expired.rid])
+            running_timeout.get = lambda: 0
+            self.assertEqual(s._poll_timeout_aborts(), [])
+            GLOBALS["envs"].SGLANG_REQ_WAITING_TIMEOUT.get = lambda: 10
+            self.assertEqual([r.rid for r in s._poll_timeout_aborts()], [waiting.rid])
+
     def test_round_robin_configuration_limits(self):
         valid = dict(
             enable_chunked_prefill_round_robin=True,
@@ -579,6 +661,26 @@ class OverlapTests(unittest.TestCase):
         self.assertNotIn(a, s.suspended_prefill_queue)
         self.assertEqual(a.cleanup.count("kv"), 1)
         self.assertEqual(s.batch().reqs, [live])
+
+    def test_paused_abort_without_result_releases_immediately(self):
+        s = self.s
+        req = self.request("parked")
+        s.suspend(req)
+        s.last_batch = Batch([req])
+        s.collect_inflight_reqs = lambda: [req]
+        s.pause_generation(NS(mode="in_place"))
+        self.assertTrue(s._engine_paused)
+        s.abort_request(NS(rid=req.rid, abort_all=False, abort_message="cancelled"))
+        self.assertEqual(s._pending_round_robin_actions, {})
+        self.assertEqual(s.outputs, [req])
+        self.assertEqual(req.cleanup.count("kv"), 1)
+        self.assertEqual(req.cleanup.count("metadata"), 1)
+        self.assertEqual(req.to_finish, ("cancelled", 503))
+        req.disagg_kv_sender.abort.assert_called_once()
+        s.abort_request(NS(rid=req.rid, abort_all=False, abort_message="again"))
+        self.assertEqual(s.outputs, [req])
+        self.assertEqual(req.cleanup.count("kv"), 1)
+        self.assertEqual(req.to_finish, ("cancelled", 503))
 
     def test_abort_waits_for_result_then_releases_once(self):
         s = self.s

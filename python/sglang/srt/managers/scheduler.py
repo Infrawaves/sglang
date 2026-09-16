@@ -3375,26 +3375,31 @@ class Scheduler(
                 inflight_batches = [self.running_batch, self.last_batch]
             else:
                 inflight_batches = [*self.running_mbs, *self.mbs]
+            running_reqs = [
+                req
+                for batch in inflight_batches
+                if batch is not None
+                for req in batch.reqs
+            ]
+            if self.enable_chunked_prefill_round_robin:
+                running_reqs.extend(self.suspended_prefill_queue)
             seen_rids = set()
-            for batch in inflight_batches:
-                if batch is None:
+            for req in running_reqs:
+                if req.rid in seen_rids or req.finished():
                     continue
-                for req in batch.reqs:
-                    if req.rid in seen_rids or req.finished():
-                        continue
-                    seen_rids.add(req.rid)
-                    if 0 < req.time_stats.forward_entry_time < deadline:
-                        aborts.append(
-                            AbortReq(
-                                rid=req.rid,
-                                abort_message="Request running timeout reached.",
-                                finished_reason={
-                                    "type": "abort",
-                                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                                    "message": "Request running timeout reached.",
-                                },
-                            )
+                seen_rids.add(req.rid)
+                if 0 < req.time_stats.forward_entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request running timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request running timeout reached.",
+                            },
                         )
+                    )
 
         return aborts
 
@@ -3953,7 +3958,11 @@ class Scheduler(
                     break
                 if id(req) in resume_ids:
                     req.init_next_round_input()
-                    round_robin_chunked_req = adder.add_chunked_req(req)
+                    previous_size = len(adder.can_run_list)
+                    chunked_req = adder.add_chunked_req(req)
+                    if len(adder.can_run_list) == previous_size:
+                        break
+                    round_robin_chunked_req = chunked_req
                     if (
                         round_robin_chunked_req is not None
                         or adder.budget_state() != AddReqResult.CONTINUE
@@ -5393,7 +5402,7 @@ class Scheduler(
                 # Pending results retain ownership and retire the request in their
                 # existing abort branch. A parked request has no callback left.
                 if not self.has_pending_prefill_result(req):
-                    if self._retire_aborted_prefill_result(req):
+                    if self._retire_aborted_prefill_result(req, defer=False):
                         req.time_stats.set_completion_time()
                         self.output_streamer.stream_output([req], req.return_logprob)
         elif (chunked_req := self.chunked_req) is not None:
