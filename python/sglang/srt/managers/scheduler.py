@@ -1330,7 +1330,7 @@ class Scheduler(
         if not self.enable_chunked_prefill_round_robin:
             return
         if (
-            self.disaggregation_mode != DisaggregationMode.PREFILL
+            get_disagg().disaggregation_mode != "prefill"
             or self.ps.pp_size != 1
             or self.enable_pdmux
             or self.is_hybrid_swa

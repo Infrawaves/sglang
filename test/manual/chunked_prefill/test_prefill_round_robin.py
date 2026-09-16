@@ -445,7 +445,6 @@ class RoundRobinTests(unittest.TestCase):
     def test_round_robin_configuration_limits(self):
         valid = dict(
             enable_chunked_prefill_round_robin=True,
-            disaggregation_mode=MODE.PREFILL,
             ps=NS(pp_size=1),
             enable_pdmux=False,
             is_hybrid_swa=False,
@@ -462,10 +461,14 @@ class RoundRobinTests(unittest.TestCase):
         ):
             with self.subTest(field=field, value=value):
                 config = dict(valid, **{field: value})
-                with self.assertRaises(ValueError):
+                mode = config.pop("disaggregation_mode", MODE.PREFILL)
+                with patch.dict(
+                    GLOBALS, get_disagg=lambda: NS(disaggregation_mode=mode)
+                ):
+                    with self.assertRaises(ValueError):
+                        Scheduler._validate_prefill_round_robin(NS(**config))
+                    config["enable_chunked_prefill_round_robin"] = False
                     Scheduler._validate_prefill_round_robin(NS(**config))
-                config["enable_chunked_prefill_round_robin"] = False
-                Scheduler._validate_prefill_round_robin(NS(**config))
 
     def test_bootstrap_failures_are_removed_in_one_batch(self):
         for overlap in (False, True):
