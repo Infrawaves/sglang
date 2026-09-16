@@ -567,7 +567,7 @@ class SchedulerDisaggregationPrefillMixin:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
-                if not self.enable_overlap:
+                if self.enable_chunked_prefill_round_robin and not self.enable_overlap:
                     self.detach_round_robin_request(req)
                 self.handle_bootstrap_failure(req)
                 failed.add(req)
