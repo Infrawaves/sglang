@@ -108,10 +108,9 @@ async fn access_log_and_record(
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
-    let request_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+    let request_id = ["venus-request-id", "x-request-id"]
+        .iter()
+        .find_map(|name| req.headers().get(*name).and_then(|v| v.to_str().ok()))
         .unwrap_or("-")
         .to_owned();
     let start = std::time::Instant::now();
@@ -432,6 +431,25 @@ mod tests {
             logs.contains("status=404") && logs.contains("outcome=\"client_error\""),
             "the access log must carry the final status and its outcome; captured:\n{logs}",
         );
+    }
+
+    #[tokio::test]
+    async fn access_log_prefers_venus_request_id() {
+        let (buf, _guard) = capture_logs();
+        let ctx = Arc::new(AppContext::stub());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/nope")
+            .header("venus-request-id", "rid-venus")
+            .header("x-request-id", "rid-client")
+            .body(Body::empty())
+            .unwrap();
+        let res = build_router(ctx).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let logs = captured(&buf);
+        assert!(logs.contains("request_id=\"rid-venus\""), "{logs}");
+        assert!(!logs.contains("rid-client"), "{logs}");
     }
 
     /// A routed request carries the worker and model it was dispatched to, via
