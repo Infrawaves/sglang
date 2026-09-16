@@ -204,7 +204,7 @@ Scheduler = extract(
 Prefill = extract(
     "disaggregation/prefill.py",
     "SchedulerDisaggregationPrefillMixin",
-    """process_prefill_chunk has_bootstrapped_waiting_req resolve_waiting_queue_bootstrap
+    """process_prefill_chunk has_bootstrapped_waiting_req
     has_pending_prefill_result defer_round_robin_action
     process_pending_round_robin_actions process_disagg_prefill_inflight_queue
     process_batch_result_disagg_prefill handle_bootstrap_failure optimistic_release_and_requeue
@@ -360,42 +360,6 @@ class Harness(Scheduler, Prefill):
 
 
 class RoundRobinTests(unittest.TestCase):
-    def test_bootstrap_failures_filter_queues_once(self):
-        class CountedQueue(list):
-            scans = 0
-
-            def __iter__(self):
-                self.scans += 1
-                return super().__iter__()
-
-        for overlap in (False, True):
-            with self.subTest(overlap=overlap):
-                s = Harness()
-                s.enable_overlap = overlap
-                a, b, live = [Req(name, 128) for name in ("a", "b", "live")]
-                for req in (a, b, live):
-                    req.disagg_kv_sender.poll = (
-                        "transferring" if req is live else "failed"
-                    )
-                waiting = s.waiting_queue = CountedQueue([a])
-                suspended = s.suspended_prefill_queue = CountedQueue([b, live])
-                if overlap:
-                    s.handle_bootstrap_failure = lambda req, **kwargs: (
-                        Prefill.handle_bootstrap_failure(s, req, **kwargs)
-                    )
-                s.resolve_waiting_queue_bootstrap()
-                self.assertEqual(s.waiting_queue, [])
-                self.assertEqual(s.suspended_prefill_queue, [live])
-                # One scan for polling candidates, one for bulk removal.
-                self.assertEqual((waiting.scans, suspended.scans), (2, 2))
-                if overlap:
-                    self.assertEqual(
-                        s._pending_round_robin_actions,
-                        {a: "bootstrap_failure", b: "bootstrap_failure"},
-                    )
-                else:
-                    self.assertEqual(s.failed, [a, b])
-
     def test_reservation_uses_planned_end_without_double_counting(self):
         other, candidate = Req("other", 257, prefix=64), Req("new", 128)
         adder = Adder(512, 128)
