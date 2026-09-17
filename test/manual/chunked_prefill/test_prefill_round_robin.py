@@ -364,9 +364,9 @@ class Harness(Scheduler, Prefill):
         self.enable_hierarchical_cache = self.enable_unified_cache_external_linker = (
             False
         )
-        self.enable_hicache_storage = self.enable_lmcache = (
-            self.enable_priority_preemption
-        ) = self.is_hybrid_swa = False
+        self.enable_hicache_storage = False
+        self.enable_lmcache = False
+        self.enable_priority_preemption = self.is_hybrid_swa = False
         self.enable_priority_scheduling = self.enable_lora = self.enable_overlap = False
         self.is_mixed_chunk = False
         self.dllm_config = self.min_free_slots_delayer = self.dynamic_chunk_sizer = None
@@ -795,7 +795,7 @@ class OverlapTests(unittest.TestCase):
                     self.assertEqual(req.metadata_buffer_index, -1)
 
                 s.tree_cache.finish = Mock(side_effect=cache_cleanup)
-                s.tree_cache.release_aborted_request = Mock(side_effect=cache_cleanup)
+                s.tree_cache.release_aborted_request = Mock()
                 batch = Batch([req], req)
                 result = self.result(batch)
                 s.result_queue = [(batch, result)]
