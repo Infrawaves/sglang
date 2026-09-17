@@ -1088,6 +1088,7 @@ class Req(ReqDllmMixin):
         self.token_indices_to_pool = token_indices_to_pool
 
         # For req-level memory management
+        self.prefill_ready_seq: Optional[int] = None
         self.kv = ReqKvInfo()
 
         # Full-KV-derived boundary whose SWA window should be inserted after
