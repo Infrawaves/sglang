@@ -349,7 +349,6 @@ class TestDcpPageHandoffCpu(CustomTestCase):
             kv_data_ptrs=[buffer.ctypes.data for buffer in source],
             kv_item_lens=[buffer[0].nbytes * 2 for buffer in source],
             kv_layer_ids=[11, 17],
-            num_draft_entries=0,
         )
         manager.enable_custom_mem_pool = False
         manager.enable_deferred_decode_kv_release = False
@@ -418,7 +417,6 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                     kv_item_lens=[source[0].nbytes * 2],
                     kv_data_ptrs=[source.ctypes.data],
                     kv_layer_ids=[0],
-                    num_draft_entries=0,
                     state_types=[StateType.MAMBA],
                     state_data_ptrs=[[mamba_source.ctypes.data]],
                     state_item_lens=[[mamba_source[0].nbytes]],

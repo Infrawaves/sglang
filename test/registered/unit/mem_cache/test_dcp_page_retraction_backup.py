@@ -44,7 +44,6 @@ def _hybrid_pool() -> HybridLinearKVPool:
         conv=[torch.arange(10, dtype=torch.float32).reshape(1, 5, 2)],
         temporal=torch.arange(10, dtype=torch.float32).reshape(1, 5, 2) + 100,
     )
-    mamba._slot_siblings = []
     pool.mamba_pool = mamba
     pool._mamba_translate = lambda ids: ids
     return pool

@@ -34,7 +34,6 @@ class TestMooncakeDcpPage(CustomTestCase):
             kv_data_ptrs=[buffer.ctypes.data for buffer in sources],
             kv_item_lens=[buffer[0].nbytes * self.page_size for buffer in sources],
             kv_layer_ids=[11, 17],
-            num_draft_entries=0,
         )
         manager.enable_custom_mem_pool = custom_pool
         manager.enable_deferred_decode_kv_release = False

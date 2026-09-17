@@ -485,7 +485,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        """Build the block table from KV lengths, already rank-local under DCP."""
+        """
+        Create block KV indices tensor using Triton kernel.
+
+        Args:
+            batch_size: Batch size
+            max_blocks: Maximum number of blocks per sequence
+            req_pool_indices: Request pool indices
+            seq_lens: Sequence lengths (rank-local under DCP)
+            device: Target device
+
+        Returns:
+            Block KV indices tensor
+        """
         block_kv_indices = torch.full(
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
@@ -730,7 +742,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         metadata: TRTLLMMLADecodeMetadata,
     ):
-        """Refresh capture-stable local lengths and the token DCP global bound."""
+        """DCP variant of the capture+replay body.
+
+        Refreshes rank-local and token DCP global lengths into the capture-stable
+        buffers once per step, and rebuilds the page table over this rank's
+        cyclic slice.
+        """
         if forward_mode.is_target_verify():
             torch.add(
                 seq_lens[:bs],
