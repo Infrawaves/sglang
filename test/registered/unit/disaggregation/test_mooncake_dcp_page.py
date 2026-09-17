@@ -20,7 +20,7 @@ class TestMooncakeDcpPage(CustomTestCase):
     page_size = 4
     widths = (3, 5)
 
-    def _case(self, *, custom_pool=False, max_batch_indices=0):
+    def _case(self, *, custom_pool=False):
         sources = [
             ((np.arange(64 * width) + layer * 41) % 251)
             .astype(np.uint8)
@@ -41,7 +41,6 @@ class TestMooncakeDcpPage(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.pp_size = 1
-        manager.max_transfer_batch_indices = max_batch_indices
         transport = CopyTransport(sources, destinations)
         manager._transfer_data = transport
         return manager, sources, destinations, transport
@@ -67,14 +66,10 @@ class TestMooncakeDcpPage(CustomTestCase):
     def test_fragmented_chunks_copy_owned_pages_including_unused_tail(self):
         source_pages = np.array([7, 1, 9, 3, 12, 4, 8], dtype=np.int32)
         destination_pages = np.array([10, 2, 14], dtype=np.int32)
-        for rank, custom_pool, max_batch_indices in product(
-            range(3), (False, True), (0, 1)
-        ):
-            with self.subTest(
-                rank=rank, custom_pool=custom_pool, max_batch_indices=max_batch_indices
-            ):
+        for rank, custom_pool in product(range(3), (False, True)):
+            with self.subTest(rank=rank, custom_pool=custom_pool):
                 manager, sources, destinations, transport = self._case(
-                    custom_pool=custom_pool, max_batch_indices=max_batch_indices
+                    custom_pool=custom_pool
                 )
                 with (
                     concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
