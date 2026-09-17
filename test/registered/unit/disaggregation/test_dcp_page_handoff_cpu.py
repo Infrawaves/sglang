@@ -171,7 +171,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
             batch_size=1,
             block_kv_indices=torch.tensor([[20, 4, 6, 9]], dtype=torch.int32),
             seq_lens_k=torch.tensor([7], dtype=torch.int32),
-            global_seq_lens_k=torch.tensor([19], dtype=torch.int32),
+            global_seq_lens_k=None,
             max_seq_len_k=7,
         )
         backend.token_to_kv_pool = pool
@@ -357,7 +357,6 @@ class TestDcpPageHandoffCpu(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.pp_size = 1
-        manager.max_transfer_batch_indices = 0
         req, tree_cache, source_slots_all = self._allocate_page_retraction(pool)
         self._send_page_chunks(manager=manager, destination=destination, source=source)
         received_rows, received = self._assert_handoff_bytes(pool=pool, source=source)
@@ -406,7 +405,6 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 manager.attn_tp_rank = 0
                 manager.attn_cp_size = 1
                 manager.attn_cp_rank = 0
-                manager.max_transfer_batch_indices = 0
                 manager._staging_outstanding = defaultdict(int)
                 manager.request_status = {room: KVPoll.WaitingForInput}
                 manager.failed_sessions = set()

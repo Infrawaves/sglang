@@ -249,14 +249,21 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
-        if metadata.seq_lens_k is not None and metadata.global_seq_lens_k is not None:
-            # Hoisted path: int32 rank-local + global lens maintained once per
-            # step by metadata init / graph replay-prep.
+        if metadata.seq_lens_k is not None:
+            # Reuse the per-step int32 lengths across all MLA layers.
             local_seq_lens = metadata.seq_lens_k[: forward_batch.batch_size]
-            global_seq_lens = metadata.global_seq_lens_k[: forward_batch.batch_size]
         else:
-            global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
-            local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
+            local_seq_lens = self._get_dcp_local_seq_lens(
+                forward_batch.seq_lens[: forward_batch.batch_size]
+            )
+        if page_layout:
+            causal_seq_lens = local_seq_lens
+        else:
+            causal_seq_lens = (
+                metadata.global_seq_lens_k
+                if metadata.global_seq_lens_k is not None
+                else forward_batch.seq_lens
+            )[: forward_batch.batch_size]
         raw_out, lse = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
@@ -264,7 +271,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             seq_lens=local_seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
-            causal_seqs=local_seq_lens if page_layout else global_seq_lens,
+            causal_seqs=causal_seq_lens,
             cp_world=1 if page_layout else parallel.dcp_size,
             cp_rank=0 if page_layout else parallel.dcp_rank,
             return_lse=True,
