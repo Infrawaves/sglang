@@ -978,9 +978,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
+            "Generic HiCache L3 page path is not DCP-aware; use Mooncake "
+            "zero-copy I/O for --dcp-size > 1."
         )
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
@@ -1039,6 +1038,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
+        indices = self.maybe_dcp_kernel_indices(indices)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
