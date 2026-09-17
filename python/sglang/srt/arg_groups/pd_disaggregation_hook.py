@@ -27,6 +27,15 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
     if cfg.dcp_kv_layout != "page":
         return
 
+    if not (
+        cfg.disaggregation_mode == "decode"
+        or (cfg.disaggregation_mode == "prefill" and cfg.dcp_size == 1)
+    ):
+        raise ValueError(
+            "--dcp-kv-layout page requires a PD decode server or a DCP1 prefill "
+            "server; standalone and DCP-sharded prefill paths still use "
+            "token-layout KV indexing."
+        )
     if cfg.disaggregation_transfer_backend != "mooncake":
         raise ValueError(
             "--dcp-kv-layout page requires --disaggregation-transfer-backend mooncake."

@@ -35,7 +35,13 @@ class TestDcpKvLayout(CustomTestCase):
         self.assertEqual(parsed.dcp_kv_layout, "page")
 
     def test_token_keeps_existing_config_combinations(self):
-        validate_dcp_kv_layout(ServerArgs(model_path="dummy"))
+        for overrides in (
+            {},
+            {"disaggregation_mode": "null", "enable_unified_memory": True},
+            {"disaggregation_mode": "prefill", "dcp_size": 2},
+        ):
+            with self.subTest(overrides=overrides):
+                validate_dcp_kv_layout(ServerArgs(model_path="dummy", **overrides))
 
     def test_token_publishes_through_parallel_context(self):
         reset_context()
@@ -64,6 +70,18 @@ class TestDcpKvLayout(CustomTestCase):
         ]
 
         validate_dcp_kv_layout(server_args)
+
+    def test_page_rejects_token_indexed_execution_paths(self):
+        """Page KV must not reach standalone/unified or sharded-prefill writers."""
+        for overrides in (
+            {"disaggregation_mode": "null", "enable_unified_memory": True},
+            {"disaggregation_mode": "prefill", "dcp_size": 2},
+        ):
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, "PD decode.*DCP1 prefill"),
+            ):
+                validate_dcp_kv_layout(_page_args(**overrides))
 
     def test_page_rejects_unsupported_static_combinations(self):
         cases = (
