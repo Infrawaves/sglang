@@ -1,4 +1,4 @@
-"""Unit tests for bench_serving streaming with reasoning chunks.
+"""Unit tests for bench_serving reasoning and metadata-only streaming chunks.
 
 Reasoning models (DeepSeek-R1, MiMo, Qwen3 reasoning, Kimi-K2, ...) stream their
 chain-of-thought via fields such as OpenAI's `delta.reasoning_content` and
@@ -16,10 +16,12 @@ import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
     calculate_metrics,
     set_global_args,
 )
@@ -121,10 +123,12 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 print_requests=False,
                 tokenizer="",
                 header=None,
+                return_logprob=False,
+                cache_report=False,
             )
         )
 
-    def _run(self, chunks):
+    def _run(self, chunks, request_func=async_request_openai_chat_completions):
         port = _free_port()
 
         class Handler(_SSEHandler):
@@ -137,7 +141,11 @@ class TestBenchServingReasoningStream(CustomTestCase):
         try:
             req = RequestFuncInput(
                 prompt="hello",
-                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                api_url=(
+                    f"http://127.0.0.1:{port}/v1/completions"
+                    if request_func is async_request_openai_completions
+                    else f"http://127.0.0.1:{port}/v1/chat/completions"
+                ),
                 prompt_len=1,
                 output_len=64,
                 model="dummy-model",
@@ -145,7 +153,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 image_data=None,
                 extra_request_body={},
             )
-            return asyncio.run(async_request_openai_chat_completions(req))
+            return asyncio.run(request_func(req))
         finally:
             server.shutdown()
             server.server_close()
@@ -260,6 +268,56 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "ok")
         self.assertGreater(out.ttft, 0.0)
+
+    def test_completions_cache_metadata_does_not_count_as_text(self):
+        details = {"device": 1024, "host": 0}
+        chunks = [
+            {"choices": [{"text": "hi "}]},
+            {"choices": [{"text": "there"}]},
+            {"choices": [{"text": "", "finish_reason": "length"}]},
+            {"choices": [], "sglext": {"cached_tokens_details": details}},
+            {"choices": [], "usage": {"completion_tokens": 2}},
+        ]
+        with patch("sglang.benchmark.serving.args.cache_report", True):
+            out = self._run(chunks, async_request_openai_completions)
+
+        self.assertTrue(out.success, msg=out.error)
+        self.assertEqual(out.generated_text, "hi there")
+        self.assertEqual(out.cached_tokens_details, details)
+        self.assertEqual(out.cached_tokens, 1024)
+        self.assertEqual(out.output_len, 2)
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(len(out.itl), 1)
+        self.assertGreater(out.itl[0], 0.0)
+        self.assertEqual(out.text_chunks, ["there"])
+
+    def test_completions_usage_only_chunk_without_cache_report(self):
+        chunks = [
+            {"choices": [{"text": "ok"}]},
+            {"choices": [], "usage": {"completion_tokens": 1}},
+        ]
+        out = self._run(chunks, async_request_openai_completions)
+
+        self.assertTrue(out.success, msg=out.error)
+        self.assertEqual(out.generated_text, "ok")
+        self.assertEqual(out.output_len, 1)
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.itl, [])
+
+    def test_completions_text_stream_without_metadata_unchanged(self):
+        chunks = [
+            {"choices": [{"text": "hi "}]},
+            {"choices": [{"text": "there"}]},
+            {"choices": [{"text": "", "finish_reason": "length"}]},
+        ]
+        out = self._run(chunks, async_request_openai_completions)
+
+        self.assertTrue(out.success, msg=out.error)
+        self.assertEqual(out.generated_text, "hi there")
+        self.assertEqual(out.output_len, 64)
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(len(out.itl), 1)
+        self.assertEqual(out.text_chunks, ["there"])
 
 
 class TestBenchServingReasoningNonStream(CustomTestCase):

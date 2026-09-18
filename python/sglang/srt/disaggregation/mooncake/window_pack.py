@@ -7,15 +7,25 @@ import logging
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.dcp_window_pack import DCPWindowPack
-from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
+from sglang.srt.disaggregation.common.dcp_window_pack import DCPWindowPack, WindowPeer
+from sglang.srt.disaggregation.common.dcp_window_plan import DCPDestinationPlan
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChunkProgress:
+    windows: int = 0
+    gathers: int = 0
+    sends: int = 0
+    tokens: int = 0
+    bytes: int = 0
 
 
 @dataclass
@@ -23,6 +33,7 @@ class PendingChunk:
     chunk: object
     cursor: int = 0
     queued_at: float = field(default_factory=time.perf_counter)
+    progress: ChunkProgress = field(default_factory=ChunkProgress)
 
 
 @dataclass
@@ -42,12 +53,15 @@ class Window:
     shards: list
     queued_at: float
     ready: torch.cuda.Event | None = None
+    progress: ChunkProgress = field(default_factory=ChunkProgress)
 
 
 class MooncakeWindowScheduler:
     def __init__(self, manager, workers, initial_mb):
         self.manager = manager
         self.pack = DCPWindowPack(manager.kv_args, manager.engine, initial_mb)
+        self.peer_cache = {}
+        self.registration_cache = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="mooncake-window-send"
         )
@@ -135,13 +149,37 @@ class MooncakeWindowScheduler:
 
     def _peers(self, chunk):
         manager = self.manager
+        cached = self.peer_cache.get(chunk.room)
+        if cached is not None:
+            with manager.session_lock:
+                for peer in cached:
+                    req = peer.request
+                    session = req.mooncake_session_id
+                    if session in manager.failed_sessions:
+                        raise RuntimeError("DCP window destination session has failed")
+                    if (
+                        manager.decode_kv_args_table.get(session)
+                        is not peer.registration
+                    ):
+                        raise RuntimeError(
+                            "DCP registration changed during an active room"
+                        )
+                    if req.dst_kv_indices is not peer.page_table:
+                        raise RuntimeError(
+                            "DCP destination pages changed during an active room"
+                        )
+            return cached
         requests = list(manager.transfer_infos[chunk.room].values())
         peers = []
         for req in requests:
             if req.is_dummy:
                 continue
             reg = manager.decode_kv_args_table[req.mooncake_session_id]
-            manager._validate_window_peer(reg)
+            registered = self.registration_cache.get(req.mooncake_session_id)
+            if registered is None or registered[0] is not reg:
+                indices = manager._validate_window_peer(reg)
+                registered = (reg, tuple(reg.dst_kv_ptrs[i] for i in indices))
+                self.registration_cache[req.mooncake_session_id] = registered
             if req.decode_prefix_len or req.dst_device_kv_indices is not None:
                 raise ValueError(
                     "DCP window pack does not support decode prefix reuse or HiSparse"
@@ -149,11 +187,21 @@ class MooncakeWindowScheduler:
             with manager.session_lock:
                 if req.mooncake_session_id in manager.failed_sessions:
                     raise RuntimeError("DCP window destination session has failed")
-            peers.append((req, reg))
-        if {reg.dst_dcp_rank for _, reg in peers} != set(range(8)):
+            peers.append(
+                WindowPeer(
+                    req,
+                    reg,
+                    req.dst_kv_indices,
+                    DCPDestinationPlan(req.dst_kv_indices, manager.kv_args.page_size),
+                    registered[1],
+                )
+            )
+        if {peer.registration.dst_dcp_rank for peer in peers} != set(range(8)):
             raise ValueError("DCP window requires all eight destination ranks")
         if len(peers) != 8:
             raise ValueError("DCP window requires exactly one destination per DCP rank")
+        peers.sort(key=lambda peer: peer.registration.dst_dcp_rank)
+        self.peer_cache[chunk.room] = peers
         return peers
 
     def _take(self):
@@ -183,7 +231,7 @@ class MooncakeWindowScheduler:
                     self.rooms.append(room)
                 else:
                     del self.pending[room]
-                return chunk, start, end, done, pending.queued_at
+                return chunk, start, end, done, pending.queued_at, pending.progress
         return None
 
     def _prepare(self, buf):
@@ -202,19 +250,31 @@ class MooncakeWindowScheduler:
             item = self._take()
         if item is None:
             return None
-        chunk, start, end, done, queued_at = item
-        peers = self._peers(chunk)
-        window = Window(chunk, start, end, done, buf, peers, [], queued_at)
+        chunk, start, end, done, queued_at, progress = item
+        window = Window(
+            chunk, start, end, done, buf, [], [], queued_at, progress=progress
+        )
         # Keep partial gathers alive even if enqueue/JIT raises before ready
         # has been recorded. Fatal errors retain this list until process exit.
         self.retained_windows.append(window)
-        if buf is not None and peers and end > start:
-            window.ready, window.shards = self.pack.gather(
-                buf, chunk, start, end, peers
-            )
-        else:
-            window.buffer = None
+        with self._trace("DCP_PREPARE", window):
+            window.peers = self._peers(chunk)
+            if buf is not None and window.peers and end > start:
+                window.ready, window.shards = self.pack.gather(
+                    buf, chunk, start, end, window.peers
+                )
+            else:
+                window.buffer = None
         return window
+
+    def _trace(self, name, window):
+        if not self.pack.enable_nvtx:
+            return nullcontext()
+        base = (window.chunk.index_slice.start or 0) * self.manager.kv_args.page_size
+        return torch.cuda.nvtx.range(
+            f"{name} pp={self.manager.pp_rank} room={window.chunk.room} "
+            f"tokens={base + window.start}:{base + window.end}"
+        )
 
     def _send_shard(self, window, shard, blocks):
         # Pending pool tasks can be skipped after abort. A running sync API
@@ -222,25 +282,42 @@ class MooncakeWindowScheduler:
         with self.condition:
             if self.manager.request_status.get(window.chunk.room) == KVPoll.Failed:
                 return 0
-        started = time.perf_counter()
-        ret = self.manager._transfer_data(shard.request.mooncake_session_id, blocks)
-        logger.debug(
-            "DCP window room=%s rank=%d descriptors=%d send_ms=%.3f ret=%s",
-            window.chunk.room,
-            shard.registration.dst_dcp_rank,
-            len(blocks),
-            (time.perf_counter() - started) * 1000,
-            ret,
-        )
+        with self.manager.session_lock:
+            if shard.request.mooncake_session_id in self.manager.failed_sessions:
+                raise RuntimeError("DCP window destination session has failed")
+        started = time.perf_counter() if self.pack.log_details else None
+        trace = nullcontext()
+        if self.pack.enable_nvtx:
+            base = (
+                window.chunk.index_slice.start or 0
+            ) * self.manager.kv_args.page_size
+            trace = torch.cuda.nvtx.range(
+                f"DCP_SEND pp={self.manager.pp_rank} room={window.chunk.room} "
+                f"buf={window.buffer.payload.get_ptr():x} "
+                f"tokens={base + window.start}:{base + window.end} "
+                f"rank={shard.registration.dst_dcp_rank} blocks={len(blocks)}"
+            )
+        with trace:
+            ret = self.manager._transfer_data(shard.request.mooncake_session_id, blocks)
+        if self.pack.log_details or ret != 0:
+            logger.warning(
+                "DCP window room=%s rank=%d descriptors=%d send_ms=%.3f ret=%s",
+                window.chunk.room,
+                shard.registration.dst_dcp_rank,
+                len(blocks),
+                (time.perf_counter() - started) * 1000 if started is not None else -1,
+                ret,
+            )
         return ret
 
     def _launch(self, window):
         buf = window.buffer
         if buf is not None:
-            window.ready.synchronize()
+            with self._trace("DCP_WAIT_GATHER", window):
+                window.ready.synchronize()
             buf.state = "READY"
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
+            if self.pack.log_details:
+                logger.warning(
                     "DCP window room=%s gather_ms=%.3f queued_to_ready_ms=%.3f",
                     window.chunk.room,
                     buf.gather_started.elapsed_time(buf.ready),
@@ -252,19 +329,12 @@ class MooncakeWindowScheduler:
         else:
             raise RuntimeError("DCP window chunk has no producer event")
         self.futures = []
-        for shard in window.shards:
-            reg = shard.registration
-            indices = resolve_dcp_dst_entry_indices(
-                self.manager.kv_args.kv_layer_ids,
-                reg.dst_kv_layer_ids,
-                len(self.manager.kv_args.kv_data_ptrs),
-                len(reg.dst_kv_ptrs),
-            )
-            dst_ptrs = [reg.dst_kv_ptrs[i] for i in indices]
-            blocks = self.pack.blocks(buf, shard, window.end - window.start, dst_ptrs)
-            self.futures.append(
-                self.pool.submit(self._send_shard, window, shard, blocks)
-            )
+        with self._trace("DCP_SUBMIT_SEND", window):
+            for shard in window.shards:
+                if shard.blocks:
+                    self.futures.append(
+                        self.pool.submit(self._send_shard, window, shard, shard.blocks)
+                    )
         if buf is not None:
             buf.state = "SENDING"
         return self.futures
@@ -294,7 +364,8 @@ class MooncakeWindowScheduler:
         if window.chunk_done and chunk.is_last_chunk:
             # Coordinator calls the existing state path directly. Its per-layer
             # tasks may use this pool; no pool worker waits on child pool tasks.
-            for req, reg in window.peers:
+            for peer in window.peers:
+                req, reg = peer.request, peer.registration
                 if manager.request_status.get(chunk.room) == KVPoll.Failed:
                     break
                 if chunk.state_indices:
@@ -325,7 +396,8 @@ class MooncakeWindowScheduler:
                             "Last DCP chunk completed before earlier chunks"
                         )
                     manager.update_status(chunk.room, KVPoll.Success)
-                    for req, _ in window.peers:
+                    for peer in window.peers:
+                        req = peer.request
                         manager.sync_status_to_decode_endpoint(
                             req.endpoint,
                             req.dst_port,
@@ -338,13 +410,33 @@ class MooncakeWindowScheduler:
             self.retained_windows.remove(window)
             manager._staging_outstanding[chunk.room] -= 1
             manager._maybe_ack_drained_abort(chunk.room)
-        logger.debug(
-            "DCP window room=%s tokens=%d bytes=%d elapsed_ms=%.3f",
-            chunk.room,
-            window.end - window.start,
-            (window.end - window.start) * sum(self.pack.token_bytes),
-            (time.perf_counter() - window.queued_at) * 1000,
-        )
+        progress = window.progress
+        progress.windows += 1
+        progress.gathers += int(window.buffer is not None)
+        progress.sends += sum(bool(shard.blocks) for shard in window.shards)
+        progress.tokens += window.end - window.start
+        progress.bytes += (window.end - window.start) * sum(self.pack.token_bytes)
+        if (
+            window.chunk_done
+            and manager.request_status.get(chunk.room) != KVPoll.Failed
+        ):
+            logger.warning(
+                "DCP window chunk room=%s windows=%d gathers=%d sends=%d tokens=%d bytes=%d ret=0",
+                chunk.room,
+                progress.windows,
+                progress.gathers,
+                progress.sends,
+                progress.tokens,
+                progress.bytes,
+            )
+        if self.pack.log_details:
+            logger.warning(
+                "DCP window room=%s tokens=%d bytes=%d elapsed_ms=%.3f",
+                chunk.room,
+                window.end - window.start,
+                (window.end - window.start) * sum(self.pack.token_bytes),
+                (time.perf_counter() - window.queued_at) * 1000,
+            )
 
     def _quarantine(self, error):
         with self.condition:
@@ -400,7 +492,8 @@ class MooncakeWindowScheduler:
                 index = 1 - index
                 buf = self.pack.buffers[index] if self.pack.buffers else None
                 following = self._prepare(buf)
-                self._wait(self.futures)
+                with self._trace("DCP_WAIT_SEND", current):
+                    self._wait(self.futures)
                 self._finish(current)
                 current = following
         except Exception as error:
@@ -436,4 +529,5 @@ class MooncakeWindowScheduler:
             self.last_received.discard(room)
             self.next_page.pop(room, None)
             self.rejected_producers.pop(room, None)
+            self.peer_cache.pop(room, None)
             self.manager._staging_outstanding.pop(room, None)

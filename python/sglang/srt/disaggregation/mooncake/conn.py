@@ -222,6 +222,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.log_dcp_details = envs.SGLANG_MOONCAKE_DCP_LOG_DETAILS.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -698,9 +699,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
+        if not self.log_dcp_details:
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+            if ret != 0:
+                logger.warning("PD_TRANSFER peer=%s ret=%s", mooncake_session_id, ret)
+            return ret
+        send_bytes = sum(lengths)
+        ret = -1
+        start_ns = time.monotonic_ns()
+        try:
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+            return ret
+        finally:
+            end_ns = time.monotonic_ns()
+            duration_ns = max(1, end_ns - start_ns)
+            # Decimal GB/s: bytes / nanoseconds. Failed bytes are not throughput.
+            logger.warning(
+                "PD_TRANSFER pid=%d pp=%d peer=%s bytes=%d descriptors=%d "
+                "start_ns=%d end_ns=%d send_ms=%.3f effective_GBps=%.6f ret=%s",
+                os.getpid(),
+                self.pp_rank,
+                mooncake_session_id,
+                send_bytes,
+                len(lengths),
+                start_ns,
+                end_ns,
+                duration_ns / 1e6,
+                send_bytes / duration_ns if ret == 0 else 0.0,
+                ret,
+            )
 
     def _send_kvcache_generic(
         self,
@@ -967,6 +998,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError("DCP window peer must register per-layer KV geometry")
         if [info.dst_kv_item_lens[i] for i in indices] != self.kv_args.kv_item_lens:
             raise ValueError("DCP window source/destination KV geometry differs")
+        return indices
 
     def send_kvcache(
         self,

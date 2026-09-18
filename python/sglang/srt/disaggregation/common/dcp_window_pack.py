@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import PagedMLAGather
+from sglang.srt.environ import envs
 from sglang.srt.disaggregation.common.dcp_pack import dcp_pack_buffer_bytes
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
+from sglang.srt.disaggregation.common.dcp_window_plan import (
+    DCPDestinationPlan,
+    dcp_rank_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,27 +25,34 @@ _UNSAFE_REGISTRATIONS = []
 
 
 @dataclass
+class WindowPeer:
+    request: object
+    registration: object
+    page_table: object
+    destination: DCPDestinationPlan
+    dst_ptrs: tuple
+
+
+@dataclass
 class WindowShard:
     request: object
     registration: object
-    dst_rows: np.ndarray
     row_offset: int
+    blocks: list
 
 
 class WindowBuffer:
-    def __init__(self, size, max_tokens, kv_args, pool):
+    def __init__(self, size, max_tokens, kv_args, pool, log_details=False):
         device = f"cuda:{kv_args.gpu_id}"
         self.payload = StagingBuffer(size, device, kv_args.gpu_id, pool)
-        self.rows = torch.empty(max_tokens, dtype=torch.int64, device=device)
-        self.host_rows = torch.empty(max_tokens, dtype=torch.int64, pin_memory=True)
-        self.metadata = torch.empty(
-            len(kv_args.kv_data_ptrs) * 3, dtype=torch.int64, device=device
+        max_pages = (max_tokens + kv_args.page_size - 1) // kv_args.page_size
+        self.pages = torch.empty(max_pages, dtype=torch.int32, device=device)
+        self.host_pages = torch.empty(max_pages, dtype=torch.int32, pin_memory=True)
+        self.host_pages_array = self.host_pages.numpy()
+        self.gather_started = (
+            torch.cuda.Event(enable_timing=True) if log_details else None
         )
-        self.host_metadata = torch.empty_like(
-            self.metadata, device="cpu", pin_memory=True
-        )
-        self.gather_started = torch.cuda.Event(enable_timing=True)
-        self.ready = torch.cuda.Event(enable_timing=True)
+        self.ready = torch.cuda.Event(enable_timing=log_details)
         self.state = "FREE"
         self.registered = False
 
@@ -52,10 +63,12 @@ class DCPWindowPack:
             _get_custom_mem_pool,
         )
 
-        if initial_mb not in (64, 128, 256, 512):
-            raise ValueError("DCP pack buffer must be 64, 128, 256 or 512 MiB")
+        if initial_mb not in (32, 64, 128):
+            raise ValueError("DCP pack buffer must be 32, 64 or 128 MiB")
         self.kv_args = kv_args
         self.engine = engine
+        self.enable_nvtx = envs.SGLANG_MOONCAKE_DCP_NVTX.get()
+        self.log_details = envs.SGLANG_MOONCAKE_DCP_LOG_DETAILS.get()
         self.buffers = []
         self.token_bytes = [n // kv_args.page_size for n in kv_args.kv_item_lens]
         self.virtual_page = kv_args.page_size * 8
@@ -67,8 +80,12 @@ class DCPWindowPack:
         self.stream = torch.cuda.Stream(device=kv_args.gpu_id)
         if not self.token_bytes:
             return
+        self.source_page_limit = min(
+            length // width
+            for length, width in zip(kv_args.kv_data_lens, kv_args.kv_item_lens)
+        )
         pool, allocator = _get_custom_mem_pool(f"cuda:{kv_args.gpu_id}")
-        for size_mb in (512, 256, 128, 64):
+        for size_mb in (128, 64, 32):
             if size_mb > initial_mb:
                 continue
             size = size_mb * 1024**2
@@ -80,7 +97,9 @@ class DCPWindowPack:
             try:
                 for _ in range(2):
                     self.buffers.append(
-                        WindowBuffer(size, self.max_tokens, kv_args, pool)
+                        WindowBuffer(
+                            size, self.max_tokens, kv_args, pool, self.log_details
+                        )
                     )
             except torch.cuda.OutOfMemoryError:
                 self.buffers.clear()
@@ -90,9 +109,9 @@ class DCPWindowPack:
                 break
             gc.collect()
             torch.cuda.empty_cache()
-            if size_mb == 64:
+            if size_mb == 32:
                 raise RuntimeError(
-                    "DCP window pack could not allocate two 64 MiB buffers"
+                    "DCP window pack could not allocate two 32 MiB buffers"
                 )
             logger.warning(
                 "DCP window pack PP%d OOM at 2 x %d MiB; retrying 2 x %d MiB",
@@ -101,6 +120,13 @@ class DCPWindowPack:
                 size_mb // 2,
             )
 
+        with torch.cuda.stream(self.stream):
+            self.gather_plan = PagedMLAGather(
+                kv_args.kv_data_ptrs,
+                self.token_bytes,
+                f"cuda:{kv_args.gpu_id}",
+                kv_args.page_size,
+            )
         try:
             for buf in self.buffers:
                 # Treat even a failed registration as potentially partial.
@@ -110,7 +136,7 @@ class DCPWindowPack:
         except Exception:
             self.close()
             raise
-        logger.info(
+        logger.warning(
             "DCP window pack PP%d: requested=%d MiB actual=2 x %d MiB "
             "allocator=%s registered=2 token_bytes=%s window_tokens=%d",
             kv_args.pp_rank,
@@ -167,79 +193,70 @@ class DCPWindowPack:
             cursor // page_size : (end + page_size - 1) // page_size
         ]
         if pages.size and (
-            np.any(pages < 0)
-            or any(
-                (int(pages.max()) + 1) * item_len > length
-                for item_len, length in zip(
-                    self.kv_args.kv_item_lens, self.kv_args.kv_data_lens
-                )
-            )
+            int(pages.min()) < 0
+            or int(pages.max()) >= min(self.source_page_limit, 2**31)
         ):
             raise ValueError("DCP source page outside registered KV memory")
-        shards = []
-        n = 0
-        for req, reg in sorted(peers, key=lambda peer: peer[1].dst_dcp_rank):
-            if np.any(req.dst_kv_indices < 0):
-                raise ValueError("Negative DCP destination page")
-            plan = build_dcp_token_transfer_plan(
-                pages,
-                req.dst_kv_indices,
-                physical_page_size=page_size,
-                dcp_size=8,
-                dcp_rank=reg.dst_dcp_rank,
-                src_page_offset=(chunk.index_slice.start or 0) + cursor // page_size,
-                decode_prefix_len=req.decode_prefix_len or 0,
-                num_kv_tokens=end - cursor,
-            )
-            count = len(plan.src_token_indices)
-            buf.host_rows.numpy()[n : n + count] = plan.src_token_indices
-            shards.append(WindowShard(req, reg, plan.dst_token_indices, n))
-            n += count
-        if n != end - cursor or n > self.max_tokens:
-            raise ValueError("DCP peers do not partition the window exactly once")
-        metadata = buf.host_metadata.numpy().reshape(-1, 3)
-        offset = 0
-        for i, (ptr, width) in enumerate(
-            zip(self.kv_args.kv_data_ptrs, self.token_bytes)
-        ):
-            metadata[i] = (ptr, width, offset)
-            offset += n * width
+        n = end - cursor
+        if not 0 < n <= self.max_tokens:
+            raise ValueError("Invalid DCP gather window size")
+        start_token = (chunk.index_slice.start or 0) * page_size + cursor
+        buf.host_pages_array[: pages.size] = pages
         if chunk.wait_event is None:
             raise RuntimeError("DCP window requires a source KV producer event")
         with torch.cuda.stream(self.stream):
+            # The page table is CPU-owned and independent of KV production.
+            # Upload it before waiting for the GPU writers of the source KV.
+            buf.pages[: pages.size].copy_(
+                buf.host_pages[: pages.size], non_blocking=True
+            )
             for event in chunk.wait_event:
                 self.stream.wait_event(event)
-            buf.gather_started.record(self.stream)
-            buf.rows[:n].copy_(buf.host_rows[:n], non_blocking=True)
-            buf.metadata.copy_(buf.host_metadata, non_blocking=True)
-            copy_mla_rows_into_pack(
-                self.kv_args.kv_data_ptrs,
-                buf.rows[:n],
-                buf.payload.buffer,
-                self.token_bytes,
-                src_metadata=buf.metadata,
-            )
+            if buf.gather_started is not None:
+                buf.gather_started.record(self.stream)
+            trace = nullcontext()
+            if self.enable_nvtx:
+                base = (chunk.index_slice.start or 0) * page_size
+                trace = torch.cuda.nvtx.range(
+                    f"DCP_GATHER pp={self.kv_args.pp_rank} room={chunk.room} "
+                    f"buf={buf.payload.get_ptr():x} tokens={base + cursor}:{base + end}"
+                )
+            with trace:
+                self.gather_plan(
+                    buf.pages[: pages.size], n, buf.payload.buffer, start_token
+                )
             buf.ready.record(self.stream)
+        # Descriptor construction needs addresses, not the gathered contents.
+        # Do it while the kernel is queued/running, before the caller waits.
+        trace = (
+            torch.cuda.nvtx.range(
+                f"DCP_DESCRIPTORS pp={self.kv_args.pp_rank} room={chunk.room} tokens={start_token}:{start_token + n}"
+            )
+            if self.enable_nvtx
+            else nullcontext()
+        )
+        with trace:
+            shards = self.prepare_shards(buf, n, start_token, peers)
         return buf.ready, shards
 
-    def blocks(self, buf, shard, num_rows, dst_ptrs):
-        """Coalesce destination slots; packed source slots are consecutive."""
-        rows = shard.dst_rows
-        if not len(rows):
-            return []
-        starts = np.r_[0, np.flatnonzero(np.diff(rows) != 1) + 1]
-        ends = np.r_[starts[1:], len(rows)]
-        blocks = []
-        layer_base = buf.payload.get_ptr()
-        for width, dst in zip(self.token_bytes, dst_ptrs):
-            src = layer_base + shard.row_offset * width
-            blocks.extend(
-                (
-                    src + int(start) * width,
-                    dst + int(rows[start]) * width,
-                    int(end - start) * width,
+    def prepare_shards(self, buf, num_rows, start_token, peers):
+        layout = dcp_rank_layout(num_rows, start_token)
+        shards = []
+        base = buf.payload.get_ptr()
+        for peer in peers:
+            rank = peer.registration.dst_dcp_rank
+            first, count, row_offset = layout[rank]
+            runs = peer.destination.runs((start_token + first) // 8, count)
+            blocks = []
+            for width, prefix, dst in zip(
+                self.token_bytes, self.gather_plan.layer_offsets, peer.dst_ptrs
+            ):
+                src = base + num_rows * prefix + row_offset * width
+                blocks.extend(
+                    (src + offset * width, dst + row * width, length * width)
+                    for offset, row, length in runs
                 )
-                for start, end in zip(starts, ends)
+            shards.append(
+                WindowShard(peer.request, peer.registration, row_offset, blocks)
             )
-            layer_base += num_rows * width
-        return blocks
+        return shards

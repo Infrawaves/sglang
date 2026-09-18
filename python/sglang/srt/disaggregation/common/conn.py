@@ -335,8 +335,8 @@ class CommonKVManager(BaseKVManager):
                 "DCP window pack does not support speculative decoding, staging, "
                 "unified/compressed KV or decode prefix caching"
             )
-        if envs.SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB.get() not in (64, 128, 256, 512):
-            raise ValueError("DCP pack buffer must be 64, 128, 256 or 512 MiB")
+        if envs.SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB.get() not in (32, 64, 128):
+            raise ValueError("DCP pack buffer must be 32, 64 or 128 MiB")
         args = self.kv_args
         if not (
             len(args.kv_data_ptrs) == len(args.kv_item_lens) == len(args.kv_data_lens)

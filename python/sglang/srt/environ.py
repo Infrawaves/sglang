@@ -752,7 +752,12 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     # Enable on both PD peers; requires strict drain-before-release semantics.
     SGLANG_MOONCAKE_DCP_WINDOW_PACK = EnvBool(False)
-    SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB = EnvInt(512)
+    SGLANG_MOONCAKE_DCP_PACK_BUFFER_MB = EnvInt(128)
+    # Optional host ranges for correlating window gathers and Mooncake sends in nsys.
+    SGLANG_MOONCAKE_DCP_NVTX = EnvBool(False)
+    # Opt-in per-window/send timings and PD_TRANSFER bandwidth logs. Normal
+    # window runs emit only one completion summary per chunk plus failures.
+    SGLANG_MOONCAKE_DCP_LOG_DETAILS = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
 
