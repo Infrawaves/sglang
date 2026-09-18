@@ -159,6 +159,10 @@ pub enum ApiError {
     #[error("worker circuit breaker open: {worker}")]
     BreakerOpen { worker: String },
 
+    /// A PD prefill worker rejected the request after decode was dispatched.
+    #[error("prefill worker returned status {status}")]
+    PrefillFailed { status: StatusCode },
+
     /// The worker URL emitted by discovery failed to parse.  Always a
     /// config / discovery-backend bug, not a transient infra issue — but
     /// from the client's perspective the worker is unreachable, so 503.
@@ -195,6 +199,10 @@ impl ApiError {
             ApiError::StaleRequestExpired { .. } => ErrorClass::Timeout,
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
+            ApiError::PrefillFailed { status } if status.is_client_error() => {
+                ErrorClass::BadRequest
+            }
+            ApiError::PrefillFailed { .. } => ErrorClass::Upstream,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
             ApiError::Internal(_) => ErrorClass::Internal,
         }
@@ -225,6 +233,10 @@ impl ApiError {
             ApiError::StaleRequestExpired { .. } => "stale_request_expired",
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
+            ApiError::PrefillFailed { status } if status.is_client_error() => {
+                "prefill_request_rejected"
+            }
+            ApiError::PrefillFailed { .. } => "prefill_worker_error",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
             ApiError::Internal(_) => "internal_error",
         }
@@ -239,6 +251,7 @@ impl ApiError {
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
+            ApiError::PrefillFailed { status } if status.is_server_error() => Some(*status),
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
@@ -250,6 +263,7 @@ impl ApiError {
             | ApiError::StaleRequestExpired { .. }
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
+            | ApiError::PrefillFailed { .. }
             | ApiError::WorkerMisconfigured { .. }
             | ApiError::Internal(_) => None,
         }
@@ -259,6 +273,11 @@ impl ApiError {
     /// via `into_response`. Exposed so a caller holding the error, rather than
     /// the response, can label it with the status the client actually saw.
     pub fn status_code(&self) -> StatusCode {
+        if let ApiError::PrefillFailed { status } = self {
+            if status.is_client_error() {
+                return *status;
+            }
+        }
         self.class().status()
     }
 }
@@ -278,7 +297,7 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.class().status();
+        let status = self.status_code();
         let code = self.error_code();
         let typ = match status.as_u16() {
             400..=499 => "invalid_request_error",
@@ -347,6 +366,10 @@ impl IntoResponse for ApiError {
             ApiError::BreakerOpen { worker } => {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
+            }
+            ApiError::PrefillFailed { status } => {
+                tracing::warn!(prefill_status = %status, "prefill worker rejected PD request");
+                "prefill worker rejected the request".to_string()
             }
             ApiError::WorkerMisconfigured { worker, source } => {
                 tracing::error!(

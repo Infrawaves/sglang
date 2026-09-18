@@ -14,7 +14,7 @@ use crate::server::header_utils::should_forward_request_header;
 use crate::workers::WireProtocol;
 use anyhow::Context;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::{Client, Url};
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 /// so one bad value can balloon into tens of KB that just repeats the request
 /// back. Arbitrary value; it holds the useful prefix of every observed case.
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
+const ABORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Truncate an upstream error body to [`MAX_UPSTREAM_ERROR_BODY_BYTES`].
 ///
@@ -198,6 +199,40 @@ impl Proxy {
     /// fans out across workers and so cannot use any one worker's protocol.
     pub fn admin_client(&self) -> &Client {
         &self.default_client
+    }
+
+    /// Cancel a paired decode request even if its worker's circuit breaker is open.
+    pub async fn abort_request_to(
+        &self,
+        worker_url: &str,
+        protocol: WireProtocol,
+        headers: &HeaderMap,
+        rid: &str,
+    ) -> Result<(), ApiError> {
+        let worker = Url::parse(worker_url).map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("parse decode worker abort URL"))
+        })?;
+        let url = worker.join("/abort_request").map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("join decode worker abort path"))
+        })?;
+        let mut request = self
+            .client_for(protocol)
+            .post(url)
+            .json(&serde_json::json!({"rid": rid, "abort_all": false}))
+            .timeout(ABORT_REQUEST_TIMEOUT);
+        if let Some(auth) = headers.get(AUTHORIZATION) {
+            request = request.header(AUTHORIZATION, auth);
+        }
+        let response = request.send().await.map_err(|e| {
+            Self::classify_reqwest_error_for(worker.clone(), e, "/abort_request")
+        })?;
+        if !response.status().is_success() {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "decode abort request returned {}",
+                response.status()
+            )));
+        }
+        Ok(())
     }
 
     /// Classify a reqwest error into the right `ApiError` variant, given an

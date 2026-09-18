@@ -24,6 +24,7 @@ pub struct CapturedHeaders {
     pub seen: HashSet<String>,            // names (kept for backwards compat)
     pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
+    pub abort_rids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -45,11 +46,17 @@ pub struct MockWorker {
 }
 
 #[allow(dead_code)] // shared across all axum variants
-fn abort_request_route<S>(log: Arc<Mutex<Vec<Value>>>) -> axum::routing::MethodRouter<S>
+fn abort_request_route<S>(
+    log: Arc<Mutex<Vec<Value>>>,
+    captured: Arc<Mutex<CapturedHeaders>>,
+) -> axum::routing::MethodRouter<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     post(move |Json(body): Json<Value>| async move {
+        if let Some(rid) = body.get("rid").and_then(Value::as_str) {
+            captured.lock().unwrap().abort_rids.push(rid.to_string());
+        }
         log.lock().unwrap().push(body);
         StatusCode::OK
     })
@@ -74,7 +81,10 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
-            .route("/abort_request", abort_request_route(abort_log.clone()))
+            .route(
+                "/abort_request",
+                abort_request_route(abort_log.clone(), captured.clone()),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -144,7 +154,10 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(hang_handler))
             .route("/server_info", get(serve_tiny_server_info))
-            .route("/abort_request", abort_request_route(abort_log.clone()))
+            .route(
+                "/abort_request",
+                abort_request_route(abort_log.clone(), captured.clone()),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -227,7 +240,10 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(slow_chat))
             .route("/server_info", get(serve_tiny_server_info))
-            .route("/abort_request", abort_request_route(abort_log.clone()))
+            .route(
+                "/abort_request",
+                abort_request_route(abort_log.clone(), captured.clone()),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -342,6 +358,35 @@ impl MockWorker {
     /// Used to test router behaviour when the upstream returns an error.
     #[allow(dead_code)]
     pub async fn start_returning_error(status: StatusCode, body: Value) -> Self {
+        Self::start_error_after_peer(status, body, None).await
+    }
+
+    /// Gate the response on a peer receiving its chat request, so PD failure
+    /// tests exercise cancellation of an accepted decode without timing races.
+    pub async fn start_error_after_peer(
+        status: StatusCode,
+        body: Value,
+        peer: Option<Arc<Mutex<CapturedHeaders>>>,
+    ) -> Self {
+        Self::start_error_response(status, body, peer, false).await
+    }
+
+    /// Model scheduler failures: streaming requests get HTTP 200 with an SSE
+    /// error event; non-streaming requests get the error's HTTP status.
+    pub async fn start_scheduler_error_after_peer(
+        status: StatusCode,
+        body: Value,
+        peer: Option<Arc<Mutex<CapturedHeaders>>>,
+    ) -> Self {
+        Self::start_error_response(status, body, peer, true).await
+    }
+
+    async fn start_error_response(
+        status: StatusCode,
+        body: Value,
+        peer: Option<Arc<Mutex<CapturedHeaders>>>,
+        scheduler_error: bool,
+    ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let body_arc = Arc::new(body.to_string());
@@ -351,6 +396,8 @@ impl MockWorker {
             captured: Arc<Mutex<CapturedHeaders>>,
             body_str: Arc<String>,
             status: StatusCode,
+            peer: Option<Arc<Mutex<CapturedHeaders>>>,
+            scheduler_error: bool,
         }
 
         async fn error_handler(
@@ -358,6 +405,10 @@ impl MockWorker {
             headers: HeaderMap,
             body: Bytes,
         ) -> Response<Body> {
+            let streaming = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| value.get("stream").and_then(Value::as_bool))
+                .unwrap_or(false);
             {
                 let mut g = s.captured.lock().unwrap();
                 g.last_body = Some(body);
@@ -367,6 +418,25 @@ impl MockWorker {
                         g.headers.insert(k.as_str().to_string(), val.to_string());
                     }
                 }
+            }
+            if let Some(peer) = &s.peer {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if peer.lock().unwrap().last_body.is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("decode must receive the chat request before prefill fails");
+            }
+            if s.scheduler_error && streaming {
+                return (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {}\n\ndata: [DONE]\n\n", s.body_str),
+                )
+                    .into_response();
             }
             let mut r = Response::new(Body::from(s.body_str.as_ref().clone()));
             *r.status_mut() = s.status;
@@ -381,11 +451,16 @@ impl MockWorker {
             captured: captured.clone(),
             body_str: body_arc,
             status,
+            peer,
+            scheduler_error,
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))
             .route("/server_info", get(serve_tiny_server_info))
-            .route("/abort_request", abort_request_route(abort_log.clone()))
+            .route(
+                "/abort_request",
+                abort_request_route(abort_log.clone(), captured.clone()),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

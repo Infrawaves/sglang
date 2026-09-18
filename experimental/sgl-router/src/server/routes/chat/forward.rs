@@ -9,8 +9,8 @@ use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
-    StaleRequestOutcome, WorkerModeLabel,
+    classify_stream_end, outcome_from_status, MetricsRegistry, PdDecodeAbortOutcome,
+    RequestLogContext, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{LoadGuard, Worker};
@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -81,8 +82,12 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let engine_rid = request.engine_rid(pd.is_some());
-    let body = request.into_outgoing_body(
+    let engine_rid = if pd.is_some() {
+        Some(format!("sgl-router-{}", uuid::Uuid::new_v4()))
+    } else {
+        request.engine_rid(false)
+    };
+    let bodies = request.into_outgoing_bodies(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
@@ -90,12 +95,12 @@ pub(super) async fn forward_chat_request(
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
-    let (response_worker, response_load_guards) = if let Some((decode, bootstrap)) = pd {
-        spawn_prefill_request(
+    let (response_worker, response_load_guards, prefill_result) = if let Some((decode, bootstrap)) = pd {
+        let prefill_result = spawn_prefill_request(
             ctx,
             prefill,
             headers.clone(),
-            body.clone(),
+            bodies.prefill.expect("PD dispatch has a prefill body"),
             prefill_load_guards,
             bootstrap.room,
         );
@@ -104,31 +109,66 @@ pub(super) async fn forward_chat_request(
             ctx.router_inflight_load
                 .register(decode.id.clone(), decode.url.clone(), 0, 1),
         );
-        (decode, decode_load_guards)
+        (decode, decode_load_guards, Some(prefill_result))
     } else {
-        (prefill, prefill_load_guards)
+        (prefill, prefill_load_guards, None)
     };
 
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.
     let expiration_token = response_load_guards.1.cancel_token().clone();
-    let response_future = forward_to_response_worker(
+    let mut response_future = Box::pin(forward_to_response_worker(
         ctx,
         &response_worker,
         &headers,
-        body,
-        engine_rid.as_deref(),
+        bodies.response,
+        if prefill_result.is_some() { None } else { engine_rid.as_deref() },
         response_load_guards,
         &metrics,
         expiration_token.clone(),
-    );
+    ));
     // A ready response wins if request expiration fires in the same poll.
-    let result = tokio::select! {
-        biased;
-        result = response_future => result,
-        _ = expiration_token.cancelled() => Err(ApiError::StaleRequestExpired {
-            model: metrics.model.clone(),
-        }),
+    let result = if let Some(mut prefill_result) = prefill_result {
+        let paired_response = async {
+            tokio::select! {
+                biased;
+                decode = &mut response_future => match decode {
+                    Ok(response) if response.status().is_success() => {
+                        match (&mut prefill_result).await {
+                            Ok(Ok(())) => Ok(response),
+                            other => {
+                                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                                Err(prefill_failure(other))
+                            }
+                        }
+                    }
+                    other => other,
+                },
+                prefill = &mut prefill_result => match prefill {
+                    Ok(Ok(())) => response_future.await,
+                    other => {
+                        spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                        Err(prefill_failure(other))
+                    }
+                },
+            }
+        };
+        tokio::select! {
+            biased;
+            result = paired_response => result,
+            _ = expiration_token.cancelled() => {
+                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                Err(ApiError::StaleRequestExpired { model: metrics.model.clone() })
+            },
+        }
+    } else {
+        tokio::select! {
+            biased;
+            result = &mut response_future => result,
+            _ = expiration_token.cancelled() => Err(ApiError::StaleRequestExpired {
+                model: metrics.model.clone(),
+            }),
+        }
     };
     let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
@@ -164,12 +204,13 @@ fn spawn_prefill_request(
     body: Bytes,
     load_guards: LoadGuards,
     bootstrap_room: u64,
-) {
+) -> oneshot::Receiver<Result<(), ApiError>> {
     let proxy = Arc::clone(&ctx.proxy);
+    let (sender, receiver) = oneshot::channel();
     // Let prefill finish KV transfer after client cancellation; router shutdown still cancels it.
     tokio::spawn(async move {
         let _load_guards = load_guards;
-        match proxy
+        let result = match proxy
             .forward_json_to(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
@@ -181,17 +222,42 @@ fn spawn_prefill_request(
             )
             .await
         {
-            Ok(_) => tracing::debug!(
-                prefill_url = %prefill_worker.url, bootstrap_room, "prefill side completed",
-            ),
-            // Prefill failures surface to the client through decode's bootstrap timeout.
-            Err(error) => tracing::warn!(
-                prefill_url = %prefill_worker.url,
-                bootstrap_room,
-                %error,
-                "prefill request failed; decode will time out on bootstrap_room",
-            ),
+            Ok(response) if response.status().is_success() => Ok(()),
+            Ok(response) => Err(ApiError::PrefillFailed { status: response.status() }),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
+            tracing::warn!(prefill_url = %prefill_worker.url, bootstrap_room, %error, "prefill request failed");
         }
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn prefill_failure(result: Result<Result<(), ApiError>, oneshot::error::RecvError>) -> ApiError {
+    match result {
+        Ok(Err(error)) => error,
+        Err(_) => ApiError::Internal(anyhow::anyhow!("prefill result channel closed")),
+        Ok(Ok(())) => unreachable!("successful prefill is handled before this call"),
+    }
+}
+
+fn spawn_decode_abort(ctx: &AppContext, worker: &Worker, headers: &HeaderMap, rid: &str) {
+    let proxy = Arc::clone(&ctx.proxy);
+    let metrics = Arc::clone(&ctx.metrics);
+    let url = worker.url.clone();
+    let protocol = worker.protocol();
+    let headers = headers.clone();
+    let rid = rid.to_owned();
+    tokio::spawn(async move {
+        let outcome = match proxy.abort_request_to(&url, protocol, &headers, &rid).await {
+            Ok(()) => PdDecodeAbortOutcome::Success,
+            Err(error) => {
+                tracing::warn!(decode_url = %url, %rid, %error, "paired decode abort failed");
+                PdDecodeAbortOutcome::Failed
+            }
+        };
+        metrics.record_pd_decode_abort(outcome);
     });
 }
 

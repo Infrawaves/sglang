@@ -34,6 +34,11 @@ pub(super) struct PreparedChatRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
 
+pub(super) struct OutgoingBodies {
+    pub(super) response: Bytes,
+    pub(super) prefill: Option<Bytes>,
+}
+
 impl PreparedChatRequest {
     pub(super) fn prepare(
         ctx: &AppContext,
@@ -125,6 +130,27 @@ impl PreparedChatRequest {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
         Ok(body)
+    }
+
+    pub(super) fn into_outgoing_bodies(
+        self,
+        ctx: &AppContext,
+        bootstrap: Option<&BootstrapFields>,
+        engine_rid: Option<&str>,
+    ) -> Result<OutgoingBodies, ApiError> {
+        let response = self.into_outgoing_body(ctx, bootstrap, engine_rid)?;
+        let prefill = if bootstrap.is_some() {
+            let mut value: Value = serde_json::from_slice(&response).map_err(|_| invalid_request())?;
+            let fields = value.as_object_mut().ok_or_else(invalid_request)?;
+            fields.insert("stream".into(), Value::Bool(false));
+            fields.remove("stream_options");
+            Some(Bytes::from(serde_json::to_vec(&value).map_err(|e| {
+                ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request"))
+            })?))
+        } else {
+            None
+        };
+        Ok(OutgoingBodies { response, prefill })
     }
 }
 
