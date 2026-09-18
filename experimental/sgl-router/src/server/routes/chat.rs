@@ -837,9 +837,12 @@ pub async fn chat_completions(
         pd_rid.as_deref(),
     )?;
 
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+    // `request_id` is the gateway's Venus-Request-Id or the client's
+    // X-Request-Id (echoed end-to-end). First hit wins; `-` when the
+    // client sent neither.
+    let request_id = ["venus-request-id", "x-request-id"]
+        .iter()
+        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
         .unwrap_or("-");
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch: start both sides together, but do not expose a
@@ -1129,10 +1132,10 @@ pub async fn chat_completions(
         .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
+    // status are visible without DEBUG. `worker` is the engine the policy
+    // selected; `request_id` was resolved above so the PD dispatch log
+    // and this access log agree. The cache-aware routing rationale is
+    // logged separately at DEBUG by the policy.
     let http_status = match &result {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.status_code().as_u16(),

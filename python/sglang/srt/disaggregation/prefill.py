@@ -552,7 +552,11 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        candidates = [
+            req
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
+            if not is_aborted(req)
+        ]
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -575,14 +579,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
         if failed:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in failed
-            ]
+            if self.enable_chunked_prefill_round_robin:
+                self.remove_prefill_ready_requests(failed)
+            else:
+                self.waiting_queue = [
+                    req for req in self.waiting_queue if req not in failed
+                ]
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
-            for req in self.waiting_queue
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -620,7 +627,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.reset_prefill_ready_seq_if_idle()
+            self.enqueue_prefill_ready(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -659,7 +667,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.reset_prefill_ready_seq_if_idle()
+            self.enqueue_prefill_ready(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -689,6 +698,8 @@ class SchedulerDisaggregationPrefillMixin:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
+                if self.enable_chunked_prefill_round_robin:
+                    self.process_pending_round_robin_actions()
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
@@ -697,6 +708,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if self.enable_chunked_prefill_round_robin:
+                self.process_pending_round_robin_actions()
 
             # Update last_batch
             self.last_batch = batch
@@ -774,6 +787,15 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if (
+                self.enable_chunked_prefill_round_robin
+                and self.enable_overlap
+                and req in self._pending_round_robin_actions
+            ):
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                advance_logprob_pt(i, req)
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -880,6 +902,12 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
+                if self.enable_chunked_prefill_round_robin:
+                    still_chunking = (
+                        self.chunked_req is req
+                        or any(r is req for r in self.suspended_prefill_queue)
+                        or self.has_pending_prefill_result(req)
+                    )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
                 if is_aborted(req):
@@ -1088,8 +1116,12 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
-    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
+    def _retire_aborted_prefill_result(
+        self: Scheduler, req: Req, *, defer: bool = True
+    ) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        if defer and self.defer_round_robin_action(req, "retire"):
+            return False
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1111,13 +1143,16 @@ class SchedulerDisaggregationPrefillMixin:
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+        self._release_aborted_request(req.rid)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
 
-    def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+    def handle_bootstrap_failure(
+        self: Scheduler, req: Req, *, defer: bool = True
+    ) -> None:
+        if defer and self.defer_round_robin_action(req, "bootstrap_failure"):
+            return
         self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
@@ -1177,6 +1212,39 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
+    def has_pending_prefill_result(self: Scheduler, req: Req) -> bool:
+        return self.enable_overlap and any(
+            any(r is req for r in batch.reqs) for batch, _ in self.result_queue
+        )
+
+    def defer_round_robin_action(self: Scheduler, req: Req, action: str) -> bool:
+        if not (self.enable_chunked_prefill_round_robin and self.enable_overlap):
+            return False
+        # Preserve the first terminal cleanup action.
+        if req not in self._pending_round_robin_actions:
+            self._pending_round_robin_actions[req] = action
+        if self.chunked_req is req:
+            self.chunked_req = None
+        return True
+
+    def process_pending_round_robin_actions(self: Scheduler) -> None:
+        # Insertion order follows broadcast aborts and TP-reduced bootstrap polls.
+        pending = list(self._pending_round_robin_actions)
+        if not pending:
+            return
+        self.remove_prefill_ready_requests(pending)
+        for req in pending:
+            # Result callbacks synchronize before this queue is processed again.
+            if self.has_pending_prefill_result(req):
+                continue
+            action = self._pending_round_robin_actions.pop(req)
+            if action == "bootstrap_failure":
+                self.handle_bootstrap_failure(req, defer=False)
+            elif action == "retire":
+                if self._retire_aborted_prefill_result(req, defer=False):
+                    req.time_stats.set_completion_time()
+                    self.output_streamer.stream_output([req], req.return_logprob)
+
     def process_prefill_chunk(
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
@@ -1219,6 +1287,18 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+        if (
+            self.enable_chunked_prefill_round_robin
+            and req is not None
+            and self.chunked_req is req
+            and not req.pending_bootstrap
+            and (self.waiting_queue or self.suspended_prefill_queue)
+        ):
+            req.prefill_ready_seq = self._prefill_ready_seq
+            self._prefill_ready_seq += 1
+            self.suspended_prefill_queue.append(req)
+            self.chunked_req = None
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
@@ -1474,6 +1554,9 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
+        if self.enable_chunked_prefill_round_robin:
+            self.remove_prefill_ready_requests((req,))
+            self._pending_round_robin_actions.pop(req, None)
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1505,4 +1588,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
-            self.waiting_queue.insert(0, req)
+            if self.enable_chunked_prefill_round_robin:
+                self.enqueue_prefill_ready([req])
+            else:
+                self.waiting_queue.insert(0, req)
