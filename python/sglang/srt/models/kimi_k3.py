@@ -101,6 +101,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -160,7 +161,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
+from sglang.srt.utils import LazyValue, is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -574,13 +575,6 @@ class KimiK3MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        # K3 allocates one weight slot per logical expert. Online relocation
-        # and extra replicas require a separate weight-layout implementation.
-        if get_exec().moe.enable_eplb or get_exec().moe.ep_num_redundant_experts:
-            raise ValueError(
-                "Kimi-K3 supports initial expert placement without online EPLB "
-                "or redundant experts."
-            )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
@@ -626,10 +620,21 @@ class KimiK3MoE(nn.Module):
 
             moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
+        num_logical_experts = getattr(config, "n_routed_experts", None)
+        if num_logical_experts is None:
+            num_logical_experts = getattr(config, "num_experts", None)
+        if num_logical_experts is None:
+            raise ValueError("Kimi-K3 MoE requires a routed expert count")
+        num_physical_experts = (
+            num_logical_experts + get_exec().moe.ep_num_redundant_experts
+        )
+
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            # FusedMoE stores physical experts locally. EPLB may add redundant
+            # physical slots, while the router continues to emit logical ids.
+            num_experts=num_physical_experts,
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -1116,6 +1121,58 @@ class KimiK3MoE(nn.Module):
             ):
                 y.mul_(self.routed_scaling_factor)
         return y
+
+    def _validate_mega_moe_weight_aliases(self) -> None:
+        """Check that EPLB-visible Parameters back MegaMoE's tensors.
+
+        K3's MXFP4 post-load path deliberately repoints the registered
+        ``Parameter.data`` objects at the transformed MegaMoE tensors to avoid
+        retaining both layouts.  EPLB updates those Parameters in place, so
+        no separate cache refresh is needed.  Keep this assertion close to the
+        EPLB integration so a future quantization path cannot silently leave
+        MegaMoE using stale weights.
+        """
+        if not self._use_mega_moe:
+            return
+        if not hasattr(self.experts, "mega_l1_weights") or not hasattr(
+            self.experts, "mega_l2_weights"
+        ):
+            raise RuntimeError(
+                "K3 MegaMoE weights were not built before EPLB requested "
+                "expert weights"
+            )
+        aliases = (
+            ("w13_weight", self.experts.mega_l1_weights[0]),
+            ("w13_weight_scale", self.experts.mega_l1_weights[1]),
+            ("w2_weight", self.experts.mega_l2_weights[0]),
+            ("w2_weight_scale", self.experts.mega_l2_weights[1]),
+        )
+        for name, mega_tensor in aliases:
+            parameter = getattr(self.experts, name, None)
+            if parameter is None or parameter.data_ptr() != mega_tensor.data_ptr():
+                raise RuntimeError(
+                    f"K3 MegaMoE tensor {name} is not backed by the registered "
+                    "Parameter; EPLB cannot update it safely"
+                )
+
+    def get_moe_weights(self) -> list[torch.Tensor]:
+        """Return all local physical routed-expert tensors for EPLB.
+
+        This intentionally enumerates registered Parameters rather than the
+        ``mega_l*_weights`` tuples.  In K3 MXFP4 those tuples alias the
+        registered Parameters, including their transformed scales, so the
+        updater's in-place row copies update the exact tensors consumed by
+        DeepGEMM without duplicating storage or copy operations.
+        """
+        self._validate_mega_moe_weight_aliases()
+        return [
+            param.data
+            for name, param in self.experts.named_parameters()
+            if name != "correction_bias"
+            and filter_moe_weight_param_global_expert(
+                name, param, self.experts.num_local_experts
+            )
+        ]
 
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
@@ -3678,10 +3735,15 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_model_config_for_expert_location(config):
         from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
+        num_logical_experts = getattr(config, "n_routed_experts", None)
+        if num_logical_experts is None:
+            num_logical_experts = getattr(config, "num_experts", None)
+        if num_logical_experts is None:
+            return None
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
-            num_groups=config.num_expert_group,
+            num_logical_experts=num_logical_experts,
+            num_groups=getattr(config, "num_expert_group", None) or None,
         )
 
     # ModelSlim describes quantization with the original checkpoint module
@@ -3743,6 +3805,17 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -4254,6 +4327,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
             config.text_config
         )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        if self.language_model is None:
+            return {}
+        return self.language_model.routed_experts_weights_of_layer
 
     supports_cuda_vmm_feature_transport = True
 
