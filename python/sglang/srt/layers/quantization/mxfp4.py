@@ -672,6 +672,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 layer.mega_l1_weights = l1_pair
                 layer.mega_l2_weights = l2_pair
+                # Keep the transformed tensors behind registered Parameters.
+                # EPLB moves physical experts by copying Parameter rows; the
+                # MegaMoE tuples then observe the same storage for both weights
+                # and scales without retaining a second layout.
                 layer.w13_weight.data = l1_pair[0]
                 layer.w13_weight_scale.data = l1_pair[1]
                 layer.w2_weight.data = l2_pair[0]
