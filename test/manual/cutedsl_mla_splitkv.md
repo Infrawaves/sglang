@@ -64,29 +64,103 @@ the decode layer loop.
 
 ## Single-GPU correctness and timing
 
-Run on an idle GB300 GPU with the branch installed and FlashInfer 0.6.17 or 0.6.18:
+Run on an idle GB300 GPU with the branch installed and FlashInfer 0.6.17 or 0.6.18.
+The benchmark compares each fixed split with **FlashInfer's stock heuristic
+planner for the same batch and inputs**. The stock effective split can change
+with batch size. This is stock parity, not an independent high-precision
+reference or a model accuracy test.
+
+Reproduce the B128 case, including timing:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
-  --batch-size 128 --heads 24 --splits 1 2 4 8 \
-  --max-seq-len 1048576 --enable-pdl
+  --batch-size 128 --heads 24 --splits 1 4 8 16 32 --dtype fp8 \
+  --max-seq-len 1048576 --enable-pdl \
+  --output-jsonl splitkv-b128.jsonl
 ```
 
-The script compares the stock monolithic wrapper and the override on identical
-Q, KV, page tables and length arrays. It uses randomly placed, disjoint pages
-and checks finite outputs, numerical differences and graph replay after
-changing device metadata. CUDA Graph timings include the main kernel and the
-split reduction. Reported tolerances are experimental screening thresholds,
-not a replacement for model accuracy validation.
+Scan multiple batches first with `--check-only` to skip timing:
 
-Built-in cases keep B and query width constant:
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-sizes 1 2 4 8 16 32 64 128 --heads 24 \
+  --splits 1 4 8 16 32 --dtype fp8 --max-seq-len 1048576 \
+  --enable-pdl --check-only --output-jsonl splitkv-batch-sweep.jsonl
+```
 
-- Uniform: every request has 64K context.
-- Mixed, matched mean: 75% at 8K and 25% at 232K (64K mean for B128).
-- Mixed, shorter mean: 87.5% at 8K and 12.5% at 256K (39K mean for B128).
+`--batch-size` and `--batch-sizes` are mutually exclusive. Fixed splits default
+to `1 4 8 16 32`. Within each case, all candidates use identical Q, KV, page
+tables and length arrays; pages are randomly placed and disjoint. Different
+batches are separate test inputs, so their error values are not a controlled
+comparison of batch size alone.
 
-Use `--help` for custom lengths, dtype, padding rows and timing controls. The
-standalone script does not start a model or modify a running service.
+Each JSONL event identifies the case, candidate and comparison phase:
+
+- `case_start` and `candidate_start` identify work before it runs, including a
+  candidate that subsequently fails.
+- `check` reports `reference_split`, `effective_split`, maximum/mean absolute
+  error, RMSE, mismatch count/fraction, nonfinite counts and the worst absolute
+  error index. Check phases cover stock repeatability, eager-versus-graph
+  parity where applicable, initial inputs, changed metadata and restored
+  metadata.
+- `result` reports the candidate outcome and timing when eligible; `summary`
+  reports the overall outcome. `--output-jsonl` saves the events as well as
+  printing them.
+
+The top-level `result.max_abs_error` describes the initial-input comparison
+(`stock_repeat` for stock). Inspect `phase_checks` for every phase's errors.
+A single `check.passed` only describes that comparison; use the final
+`result.status` and `reference_valid` to determine whether a candidate passed.
+
+Numerical mismatches continue to the remaining candidates and batches by
+default, then the process exits with status 1. Use `--fail-fast` to stop at
+the first failed check. CUDA/runtime exceptions still terminate the run.
+Failed candidates are not timed. If the stock baseline fails its own checks,
+results have `reference_valid: false`; comparisons against that baseline do
+not establish a pass for any fixed split. Tolerances are experimental
+screening thresholds, not proof of model-level correctness.
+
+Built-in cases use these actual KV lengths before `--length-scale`:
+
+- `uniform64k`: every request has 64K context.
+- `mixedmean64k`: 75% at 8K and 25% at 232K (64K mean for B128).
+- `shortermeanlongtail`: 87.5% at 8K and 12.5% at 256K (39K mean for B128).
+
+`--max-seq-len` sets the planning capacity, **not the actual KV length**.
+Small batches cannot preserve the stated mixture percentages; inspect the
+reported actual lengths. To test a real 1M KV sequence, scale only the uniform
+case (scaling the mixed cases by 16 would exceed the 1M bound):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-size 1 --heads 24 --splits 1 4 8 16 32 --dtype fp8 \
+  --distributions uniform64k --length-scale 16 --max-seq-len 1048576 \
+  --enable-pdl --check-only --output-jsonl splitkv-1m.jsonl
+```
+
+To isolate PDL or graph behavior after a failed case, keep the batch, case,
+seed and splits unchanged. Starting from a graph + PDL failure, use these
+two separate comparisons; each changes one execution setting:
+
+```bash
+# Graph without PDL; compare with the original --enable-pdl run.
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-size 128 --heads 24 --splits 1 4 8 16 32 --dtype fp8 \
+  --distributions uniform64k --max-seq-len 1048576 --check-only \
+  --execution-mode graph --output-jsonl splitkv-b128-no-pdl.jsonl
+
+# Eager with PDL; compare with the original graph + PDL run.
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-size 128 --heads 24 --splits 1 4 8 16 32 --dtype fp8 \
+  --distributions uniform64k --max-seq-len 1048576 --check-only \
+  --enable-pdl --execution-mode eager --output-jsonl splitkv-b128-eager.jsonl
+```
+
+Graph mode is the default. Timing includes MLA and its split reduction using
+repeated data without an L2 flush; it is not end-to-end ITL or a simulation of
+long autoregressive generation. The standalone script does not start a model
+or modify a running service. Use `--help` for custom lengths, padding rows and
+timing controls.
 
 ## End-to-end A/B
 
