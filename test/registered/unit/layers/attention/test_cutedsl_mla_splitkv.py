@@ -14,9 +14,18 @@
 """CPU coverage for CuTeDSL MLA split planning and isolated wrapper overrides."""
 
 import importlib.metadata
+import importlib.util
+import io
+import json
+import math
+import tempfile
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
+
+import torch
 
 from sglang.srt.layers.attention.cutedsl_mla_splitkv import (
     create_cutedsl_mla_decode_with_splits,
@@ -174,6 +183,211 @@ def cute_dsl_mla_decode(
         for value in (0, -1, 33, True, 4.0, "4"):
             with self.subTest(num_splits=value), self.assertRaises(ValueError):
                 create_cutedsl_mla_decode_with_splits(value)
+
+
+class TestCuTeDSLMLABenchmark(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = (
+            Path(__file__).resolve().parents[4] / "manual/bench_cutedsl_mla_splitkv.py"
+        )
+        spec = importlib.util.spec_from_file_location("bench_cutedsl_mla_splitkv", path)
+        cls.bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.bench)
+
+    def test_batch_sweep_uses_each_batch_and_preserves_actual_lengths(self):
+        args = self.bench.parse_args(
+            [
+                "--batch-sizes",
+                "1",
+                "4",
+                "128",
+                "4",
+                "--distributions",
+                "uniform64k",
+                "mixedmean64k",
+                "--max-seq-len",
+                "1048576",
+            ]
+        )
+        cases = self.bench.build_cases(args)
+        self.assertEqual(len(cases), 6)
+        for case, name, lengths in cases:
+            with self.subTest(batch=case.batch_size, distribution=name):
+                self.assertEqual(case.active_batch_size, case.batch_size)
+                self.assertEqual(len(lengths), case.batch_size)
+                self.assertEqual(sum(lengths), 65536 * case.batch_size)
+                self.assertEqual(case.max_seq_len, 1048576)
+                self.assertLess(max(lengths), case.max_seq_len)
+                if name == "uniform64k":
+                    self.assertEqual(set(lengths), {65536})
+        self.assertEqual(
+            [case.batch_size for case, _, _ in cases], [1, 1, 4, 4, 128, 128]
+        )
+
+    def test_custom_lengths_keep_active_count_separate_from_graph_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lengths.json"
+            lengths = [1, 128, 65536, 1048576]
+            path.write_text(json.dumps(lengths))
+            args = self.bench.parse_args(
+                [
+                    "--batch-sizes",
+                    "8",
+                    "128",
+                    "--active-batch-size",
+                    "4",
+                    "--lengths-json",
+                    str(path),
+                    "--length-scale",
+                    "16",
+                    "--max-seq-len",
+                    "1048576",
+                ]
+            )
+            cases = self.bench.build_cases(args)
+        self.assertEqual(len(cases), 2)
+        for case, name, actual in cases:
+            with self.subTest(batch=case.batch_size):
+                self.assertEqual(name, "custom")
+                self.assertEqual(case.active_batch_size, 4)
+                self.assertEqual(actual, lengths)
+                self.assertLess(len(actual), case.batch_size)
+
+    def test_single_batch_cli_still_supports_true_one_million_context(self):
+        args = self.bench.parse_args(
+            [
+                "--batch-size",
+                "1",
+                "--distributions",
+                "uniform64k",
+                "--length-scale",
+                "16",
+                "--max-seq-len",
+                "1048576",
+            ]
+        )
+        [(case, name, lengths)] = self.bench.build_cases(args)
+        self.assertEqual((case.batch_size, case.active_batch_size), (1, 1))
+        self.assertEqual(name, "uniform64k")
+        self.assertEqual(lengths, [1048576])
+        self.assertEqual(args.splits, [1, 4, 8, 16, 32])
+
+    def test_invalid_cli_geometry_and_conflicting_batch_flags_are_rejected(self):
+        invalid = [
+            ["--batch-size", "1", "--batch-sizes", "1", "2"],
+            ["--batch-sizes", "0", "8"],
+            ["--batch-sizes", "4", "8", "--active-batch-size", "5"],
+            ["--active-batch-size", "0"],
+            ["--max-seq-len", "0"],
+            ["--length-scale", "nan"],
+            ["--splits", "1", "33"],
+            ["--atol", "-0.1"],
+            ["--rtol", "inf"],
+        ]
+        for argv in invalid:
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    self.bench.parse_args(argv)
+                self.assertEqual(error.exception.code, 2)
+
+    def test_invalid_custom_lengths_and_too_small_bound_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lengths.json"
+            for payload in ([1], [1, 0], [1, True], [1, 2.0], {"lengths": [1, 2]}):
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload))
+                    args = self.bench.parse_args(
+                        ["--batch-size", "2", "--lengths-json", str(path)]
+                    )
+                    with self.assertRaises(ValueError):
+                        self.bench.build_cases(args)
+            path.write_text("[1, 129]")
+            args = self.bench.parse_args(
+                [
+                    "--batch-size",
+                    "2",
+                    "--lengths-json",
+                    str(path),
+                    "--max-seq-len",
+                    "128",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "below an actual KV length"):
+                self.bench.build_cases(args)
+        args = self.bench.parse_args(["--batch-size", "1", "--max-seq-len", "65535"])
+        with self.assertRaisesRegex(ValueError, "below an actual KV length"):
+            self.bench.build_cases(args)
+
+    def test_metrics_apply_absolute_plus_relative_tolerance_and_handle_zero(self):
+        actual = torch.tensor([0.125, 2.25, 100.5])
+        expected = torch.tensor([0.0, 2.0, 100.0])
+        result = self.bench.compare_outputs(actual, expected, atol=0.125, rtol=0.005)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["mismatch_count"], 1)
+        self.assertAlmostEqual(result["mismatch_fraction"], 1 / 3)
+        self.assertEqual(result["max_abs_error"], 0.5)
+        self.assertAlmostEqual(result["mean_abs_error"], 7 / 24)
+        self.assertAlmostEqual(result["rmse"], math.sqrt(7 / 64))
+        self.assertEqual(result["max_rel_error"], 0.125)
+        self.assertEqual(result["zero_ref_mismatch_count"], 0)
+        zeros = self.bench.compare_outputs(
+            torch.tensor([0.0, 0.25]), torch.zeros(2), atol=0.125, rtol=0.01
+        )
+        self.assertEqual(zeros["zero_ref_mismatch_count"], 1)
+        self.assertIsNone(zeros["max_rel_error"])
+        self.assertFalse(zeros["passed"])
+        self.assertTrue(
+            self.bench.compare_outputs(expected, expected, 0.0, 0.0)["passed"]
+        )
+
+    def test_nonfinite_pairs_fail_and_all_metrics_remain_valid_json(self):
+        for actual, expected, finite_pairs, mismatch_count in (
+            ([float("inf")], [float("inf")], 0, 1),
+            ([float("nan"), 0.0], [0.0, float("nan")], 0, 2),
+            ([float("inf"), 1.0], [float("-inf"), 1.0], 1, 1),
+        ):
+            with self.subTest(actual=actual, expected=expected):
+                result = self.bench.compare_outputs(
+                    torch.tensor(actual), torch.tensor(expected), 0.002, 0.01
+                )
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["finite_pairs"], finite_pairs)
+                self.assertEqual(result["mismatch_count"], mismatch_count)
+                self.assertEqual(result["nonfinite_actual"], 1)
+                self.assertEqual(result["nonfinite_reference"], 1)
+                if not finite_pairs:
+                    self.assertIsNone(result["max_abs_error"])
+                    self.assertIsNone(result["worst_abs_index"])
+                    self.assertIsNone(result["rmse"])
+                json.dumps(result, allow_nan=False)
+
+    def test_worst_error_index_identifies_the_correct_batch_and_head(self):
+        expected = torch.zeros((3, 1, 2, 4))
+        actual = expected.clone()
+        actual[0, 0, 0, 1] = 0.25
+        actual[2, 0, 1, 3] = -3.0
+        result = self.bench.compare_outputs(actual, expected, 0.002, 0.01)
+        self.assertEqual(result["worst_abs_index"], [2, 0, 1, 3])
+        self.assertEqual(result["worst_abs_actual"], -3.0)
+        self.assertEqual(result["worst_abs_reference"], 0.0)
+        self.assertEqual(result["max_abs_error"], 3.0)
+        self.assertEqual(result["mismatch_count"], 2)
+        self.assertEqual(result["numel"], 24)
+
+    def test_unstable_stock_reference_cannot_report_a_candidate_pass(self):
+        for passed, reference_valid, expected in (
+            (True, True, "pass"),
+            (False, True, "fail"),
+            (True, False, "invalid_reference"),
+            (False, False, "invalid_reference"),
+        ):
+            with self.subTest(passed=passed, reference_valid=reference_valid):
+                checks = {"initial": {"passed": True}, "replay": {"passed": passed}}
+                self.assertEqual(
+                    self.bench.result_status(checks, reference_valid), expected
+                )
 
 
 if __name__ == "__main__":
