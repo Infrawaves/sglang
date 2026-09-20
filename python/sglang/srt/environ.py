@@ -1729,6 +1729,8 @@ class Envs:
     # it doesn't drop requests. Set to 0 (or any value <= 0) to disable
     # (unbounded concurrency).
     SGLANG_K3_VIDEO_MAX_CONCURRENT_PREPROCESS = EnvInt(2)
+    # Maximum number of video requests waiting for a GPU preprocessing slot.
+    SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH = EnvInt(8)
     # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
     # events (current in-flight count) at INFO level, on top of the
     # always-on per-request duration/frame-count/token-count logs. Off by
