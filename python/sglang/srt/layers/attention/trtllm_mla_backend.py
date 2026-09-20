@@ -431,12 +431,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return max_seq_len
-        # Token striping is the page formula with a stripe size of one.
-        stripe_size = self.page_size if parallel.dcp_kv_layout == "page" else 1
-        whole_stripes, remainder = divmod(max_seq_len, parallel.dcp_size * stripe_size)
-        local_max = whole_stripes * stripe_size + min(
-            max(remainder - parallel.dcp_rank * stripe_size, 0), stripe_size
-        )
+        if parallel.dcp_kv_layout == "page":
+            tokens_per_round = parallel.dcp_size * self.page_size
+            full_rounds, remainder = divmod(max_seq_len, tokens_per_round)
+            local_max = full_rounds * self.page_size + min(
+                max(remainder - parallel.dcp_rank * self.page_size, 0),
+                self.page_size,
+            )
+        else:
+            local_max = max_seq_len // parallel.dcp_size + int(
+                parallel.dcp_rank < max_seq_len % parallel.dcp_size
+            )
         # A positive scheduling bound is required even when every sequence in a
         # padded graph row is empty on this rank.
         return max(local_max, 1)
