@@ -55,6 +55,70 @@ class TestKimiK3Eplb(CustomTestCase):
             )
         )
 
+    def test_expert_metrics_metadata_allows_eplb_layout(self):
+        config = SimpleNamespace(
+            num_hidden_layers=5,
+            n_routed_experts=4,
+            num_experts=4,
+            num_expert_group=None,
+        )
+        runtime_moe = SimpleNamespace(
+            expert_distribution_recorder_mode="stat",
+            moe_a2a_backend="megamoe",
+            elastic_ep_backend=None,
+            enable_eplb=True,
+            ep_num_redundant_experts=2,
+            init_expert_location="init_by_eplb",
+        )
+        with (
+            patch.object(
+                kimi_k3,
+                "get_exec",
+                return_value=SimpleNamespace(moe=runtime_moe),
+            ),
+            patch.object(
+                kimi_k3,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=1),
+            ),
+        ):
+            metadata = (
+                kimi_k3.KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+                    config
+                )
+            )
+        self.assertEqual(metadata.num_logical_experts, 4)
+        self.assertEqual(metadata.num_layers, 5)
+
+    def test_expert_metrics_metadata_rejects_unsupported_recorder(self):
+        config = SimpleNamespace(
+            num_hidden_layers=5,
+            n_routed_experts=4,
+            num_experts=4,
+            num_expert_group=None,
+        )
+        runtime_moe = SimpleNamespace(
+            expert_distribution_recorder_mode="per_token",
+            moe_a2a_backend="megamoe",
+            elastic_ep_backend=None,
+        )
+        with (
+            patch.object(
+                kimi_k3,
+                "get_exec",
+                return_value=SimpleNamespace(moe=runtime_moe),
+            ),
+            patch.object(
+                kimi_k3,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=1),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            kimi_k3.KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+                config
+            )
+
     def test_routed_paths_pass_dispatch_info(self):
         hidden = torch.ones(1, 3)
         info = object()
@@ -89,6 +153,7 @@ class TestKimiK3Eplb(CustomTestCase):
                 moe.topk.assert_called_once_with(
                     hidden,
                     None,
+                    num_token_non_padded=None,
                     expert_location_dispatch_info=info,
                 )
                 expert_call.assert_called_once_with(hidden, topk_output)

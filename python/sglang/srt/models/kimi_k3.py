@@ -439,6 +439,10 @@ class KimiK3MoE(nn.Module):
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
+        self._record_expert_distribution = (
+            getattr(get_exec().moe, "expert_distribution_recorder_mode", None)
+            is not None
+        )
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -937,11 +941,16 @@ class KimiK3MoE(nn.Module):
         select_experts. Shared by the fused router and the merged front."""
         # EPLB remaps logical TopK ids to physical expert ids in TopK's
         # post-processing. Fused routing emits ids inside its kernel and has
-        # no dispatch-info hook, so keep every fused route off while an EP
-        # dispatch algorithm is active.
+        # no dispatch-info hook, so keep every fused route off while a physical
+        # expert remap (EPLB, an initial placement, or redundant experts) is
+        # active.
+        moe_runtime = get_exec().moe
         if (
             self._eligible_for_fused_front
-            or get_exec().moe.ep_dispatch_algorithm is not None
+            or getattr(moe_runtime, "enable_eplb", False)
+            or getattr(moe_runtime, "ep_dispatch_algorithm", None) is not None
+            or getattr(moe_runtime, "init_expert_location", "trivial") != "trivial"
+            or getattr(moe_runtime, "ep_num_redundant_experts", 0) > 0
         ):
             return False
         cfg = self.topk.topk_config
@@ -990,7 +999,11 @@ class KimiK3MoE(nn.Module):
             and self._routing_contract_ok
         )
 
-    def _ep_front(self, hidden_states: torch.Tensor):
+    def _ep_front(
+        self,
+        hidden_states: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         """Merged front: returns ``(topk_output, routed_input)``, or None when the
         shape is not covered and the caller should run the unmerged path."""
         if not self._ep_front_eligible:
@@ -1029,9 +1042,22 @@ class KimiK3MoE(nn.Module):
                 self.layer_idx,
                 hidden_states.shape[0],
             )
-        return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+        return (
+            build_precomputed_topk_output(
+                w,
+                i,
+                cfg,
+                self.layer_idx,
+                num_token_non_padded=num_token_non_padded,
+            ),
+            routed,
+        )
 
-    def _ep_front_overlap(self, hidden_states: torch.Tensor):
+    def _ep_front_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         """Overlap the exact fp32 gate+top-k with the latent down projection.
 
         The side stream is joined before returning. It is then free for the
@@ -1058,6 +1084,7 @@ class KimiK3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_idx
                 ),
@@ -1100,6 +1127,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1131,9 +1159,9 @@ class KimiK3MoE(nn.Module):
         # The gate and the latent down-proj read the same hidden_states, so the
         # merged-weight strategies compute both in one GEMM; see
         # kernels/ops/moe/moe_front.py for the strategy table.
-        routed_input = self._ep_front(hidden_states)
+        routed_input = self._ep_front(hidden_states, num_token_non_padded)
         if routed_input is None:
-            routed_input = self._ep_front_overlap(hidden_states)
+            routed_input = self._ep_front_overlap(hidden_states, num_token_non_padded)
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
@@ -1145,6 +1173,7 @@ class KimiK3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_idx
                 ),
@@ -1249,13 +1278,21 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
-    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+    def _forward_routed(
+        self,
+        hidden_states,
+        router_logits,
+        routed_input,
+        latent,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_idx
                 ),
@@ -1267,7 +1304,13 @@ class KimiK3MoE(nn.Module):
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
-    def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
+    def _forward_routed_deferred(
+        self,
+        hidden_states,
+        router_logits,
+        routed_input,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         """Routed experts with the in-op finalize skipped: returns the
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
@@ -1278,6 +1321,7 @@ class KimiK3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_idx
                 ),
@@ -1305,7 +1349,11 @@ class KimiK3MoE(nn.Module):
         return norm.weight, norm.variance_epsilon
 
     def _forward_fused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight, then land both TP-partial sums in
@@ -1368,10 +1416,19 @@ class KimiK3MoE(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
-                    hidden_states, router_logits, routed_input
+                    hidden_states,
+                    router_logits,
+                    routed_input,
+                    num_token_non_padded,
                 )
             else:
-                self._forward_routed(hidden_states, router_logits, routed_input, latent)
+                self._forward_routed(
+                    hidden_states,
+                    router_logits,
+                    routed_input,
+                    latent,
+                    num_token_non_padded,
+                )
             with torch.cuda.stream(self.alt_stream):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1416,7 +1473,13 @@ class KimiK3MoE(nn.Module):
                 )
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            self._forward_routed(
+                hidden_states,
+                router_logits,
+                routed_input,
+                latent,
+                num_token_non_padded,
+            )
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
@@ -1447,6 +1510,7 @@ class KimiK3MoE(nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        token_offset: int = -1,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
@@ -1470,10 +1534,39 @@ class KimiK3MoE(nn.Module):
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
+
+        num_token_non_padded = None
+        if self._record_expert_distribution:
+            assert forward_batch is not None
+            num_token_non_padded = forward_batch.global_num_token_non_padded
+            if token_offset >= 0:
+                if (
+                    forward_batch.attn_tp_sequence_sharded
+                    and get_parallel().attn_cp_size == 1
+                ):
+                    # The runner already localized this contiguous SP shard.
+                    num_token_non_padded = forward_batch.num_token_non_padded
+                else:
+                    # Model-managed SP keeps the global count; localize it to
+                    # the rows owned by this MoE invocation.
+                    assert num_token_non_padded is not None
+                    num_token_non_padded = torch.clamp(
+                        num_token_non_padded - token_offset, 0, num_tokens
+                    )
+            assert num_token_non_padded is not None
+
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_fused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                num_token_non_padded=num_token_non_padded,
+            )
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                num_token_non_padded=num_token_non_padded,
+            )
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
@@ -2872,9 +2965,21 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        if self._is_moe_layer:
+            # Under SP-MoE, ``hidden_states`` is a contiguous shard of the
+            # attention output.  Pass its global row offset so the expert
+            # recorder can localize the non-padded token count before it
+            # records the post-EPLB physical expert ids.
+            out = self.mlp(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+                token_offset=shard_lo,
+            )
+        else:
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
@@ -3141,6 +3246,27 @@ class KimiK3LinearForCausalLM(nn.Module):
             num_logical_experts = getattr(config, "num_experts", None)
         if num_logical_experts is None:
             return None
+
+        # Expert-distribution recording is also the data source consumed by
+        # EPLBManager.  Keep the recorder on the same physical layout that the
+        # model uses: MegaMoE's standard dispatcher, stat accumulation, and PP=1
+        # are required, while EPLB/redundant/non-trivial placements are valid
+        # because the recorder counts the post-remap physical expert ids and
+        # the metadata is updated together with the weights.
+        moe = get_exec().moe
+        recorder_mode = getattr(moe, "expert_distribution_recorder_mode", None)
+        if recorder_mode is not None:
+            if (
+                recorder_mode != "stat"
+                or getattr(moe, "moe_a2a_backend", None) != "megamoe"
+                or getattr(moe, "elastic_ep_backend", None) is not None
+                or get_parallel().pp_size != 1
+            ):
+                raise ValueError(
+                    "Kimi-K3 expert distribution metrics with EPLB require "
+                    "--moe-a2a-backend megamoe, recorder mode stat, PP=1 "
+                    "and no elastic EP."
+                )
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=num_logical_experts,
