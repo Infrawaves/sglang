@@ -1535,21 +1535,13 @@ class KimiK3MoE(nn.Module):
         if self._record_expert_distribution:
             assert forward_batch is not None
             num_token_non_padded = forward_batch.global_num_token_non_padded
-            if token_offset >= 0:
-                if (
-                    forward_batch.attn_tp_sequence_sharded
-                    and get_parallel().attn_cp_size == 1
-                ):
-                    # The runner already localized this contiguous SP shard.
-                    num_token_non_padded = forward_batch.num_token_non_padded
-                else:
-                    # Model-managed SP keeps the global count; localize it to
-                    # the rows owned by this MoE invocation.
-                    assert num_token_non_padded is not None
-                    num_token_non_padded = torch.clamp(
-                        num_token_non_padded - token_offset, 0, num_tokens
-                    )
             assert num_token_non_padded is not None
+            if token_offset >= 0:
+                # This base predates the runner's explicit SP verdict. Use the
+                # immutable global count and this layer's actual shard offset.
+                num_token_non_padded = torch.clamp(
+                    num_token_non_padded - token_offset, 0, num_tokens
+                )
 
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(

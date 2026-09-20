@@ -454,6 +454,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
             enable_num_token_non_padded=enable_num_token_non_padded(),
+            enable_global_num_token_non_padded=(
+                get_exec().moe.expert_distribution_recorder_mode is not None
+            ),
             require_gathered_buffer=self.require_gathered_buffer,
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
@@ -916,6 +919,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
+        global_num_token_non_padded = None
+        if registry.has_slot("global_num_token_non_padded"):
+            global_num_token_non_padded = _slot("global_num_token_non_padded")
+            global_num_token_non_padded.fill_(num_tokens)
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
@@ -1007,6 +1014,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            global_num_token_non_padded=global_num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,

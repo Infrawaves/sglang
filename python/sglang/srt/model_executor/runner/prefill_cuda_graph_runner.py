@@ -351,6 +351,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
+            enable_global_num_token_non_padded=(
+                get_exec().moe.expert_distribution_recorder_mode is not None
+            ),
             require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
@@ -616,6 +619,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _capture_num_token_non_padded(self, num_tokens: int) -> Optional[torch.Tensor]:
+        if self.buffer_registry.has_slot("global_num_token_non_padded"):
+            self.buffer_registry.get_slot("global_num_token_non_padded").buffer.fill_(num_tokens)
         if not self.buffer_registry.has_slot("num_token_non_padded"):
             return None
 
@@ -1357,6 +1362,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
+                global_num_token_non_padded=(
+                    _slot("global_num_token_non_padded")
+                    if registry.has_slot("global_num_token_non_padded")
+                    else None
+                ),
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 # All-None ids are safe: kernels no-op at rank 0 and replay
@@ -1627,6 +1637,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
+            global_num_token_non_padded=(
+                _slot("global_num_token_non_padded")
+                if registry.has_slot("global_num_token_non_padded")
+                else forward_batch.global_num_token_non_padded
+            ),
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,

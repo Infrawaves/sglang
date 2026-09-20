@@ -85,13 +85,9 @@ class TestKimiK3ExpertMetrics(CustomTestCase):
                 with self.subTest(valid=valid, shard=shard):
                     self.batch.num_token_non_padded = torch.tensor(count)
                     self.batch.attn_tp_sequence_sharded = True
-                    with patch(
-                        "sglang.srt.models.kimi_k3.torch.clamp",
-                        side_effect=AssertionError("Runner-local count was recomputed"),
-                    ):
-                        routed = KimiK3MoE.forward(
-                            owner, ids, forward_batch=self.batch, token_offset=shard * 2
-                        )
+                    routed = KimiK3MoE.forward(
+                        owner, ids, forward_batch=self.batch, token_offset=shard * 2
+                    )
                     expected = ids.clone()
                     expected[count:] = -1
                     torch.testing.assert_close(routed, expected)
@@ -106,9 +102,10 @@ class TestKimiK3ExpertMetrics(CustomTestCase):
                     torch.testing.assert_close(routed, expected)
                     torch.testing.assert_close(self.recorded_ids, expected)
 
-    def test_graph_batch_uses_existing_local_scalar(self):
-        # Decode capture batches historically only carry the LOCAL scalar.
-        self.batch.num_token_non_padded = torch.tensor(1)
+    def test_graph_batch_uses_global_scalar_and_layer_offset(self):
+        # This backport retains a distinct GLOBAL scalar in graph batches.
+        self.batch.global_num_token_non_padded = torch.tensor(3)
+        self.batch.num_token_non_padded = torch.tensor(0)
         self.batch.attn_tp_sequence_sharded = True
         ids = torch.tensor([[0, 32], [0, 32]], dtype=torch.int32)
         routed = KimiK3MoE.forward(

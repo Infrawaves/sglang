@@ -21,7 +21,9 @@ def make_module(cls):
 
 
 class TestKimiK3Eplb(CustomTestCase):
-    def test_expert_metadata(self):
+    @patch.object(kimi_k3, "get_exec", return_value=SimpleNamespace(
+        moe=SimpleNamespace(expert_distribution_recorder_mode=None)))
+    def test_expert_metadata(self, _exec):
         for groups in (None, 0, 1, 2):
             with self.subTest(groups=groups):
                 config = SimpleNamespace(

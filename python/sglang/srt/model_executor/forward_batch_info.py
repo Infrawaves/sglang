@@ -529,6 +529,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Preserve the unsharded count for K3 per-layer SP and recorder padding.
+    global_num_token_non_padded: Optional[torch.Tensor] = None
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -858,6 +860,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int32,
                 pin_memory=is_pin_memory_available(device),
             ).to(device, non_blocking=True)
+        ret.global_num_token_non_padded = ret.num_token_non_padded
         ret.num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(batch, device)
