@@ -2174,15 +2174,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     dcp_kv_layout = decode_kv_args.dcp_kv_layout
-                    if (
-                        self.dcp_size > 1
-                        and dcp_kv_layout != get_parallel().dcp_kv_layout
-                    ):
-                        raise RuntimeError(
-                            "DCP-sharded prefill must use the same KV layout as "
-                            f"decode, got prefill={get_parallel().dcp_kv_layout}, "
-                            f"decode={dcp_kv_layout}."
-                        )
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
