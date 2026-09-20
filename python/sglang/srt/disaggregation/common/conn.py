@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -149,6 +150,7 @@ class CommonKVManager(BaseKVManager):
     # ``[room, status, prefill_rank]``; backends whose control socket also
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
+    requires_transfer_drain = False
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
@@ -279,6 +281,8 @@ class CommonKVManager(BaseKVManager):
             # drained. Entry exists only while the room is held, so a stale/late
             # ack for a reused bootstrap_room is dropped.
             self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
+            self._deferred_abort_tokens: Dict[int, str] = {}
+            self._deferred_abort_expected: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -393,6 +397,9 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        lifetime = getattr(self, "_transfer_lifetime", None)
+        if status == KVPoll.Failed and lifetime is not None:
+            lifetime.close(bootstrap_room)
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -620,27 +627,57 @@ class CommonKVManager(BaseKVManager):
             prefill_rank,
         )
 
-    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
-        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
-        from a prior request that reused this bootstrap_room."""
-        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+    def register_deferred_abort_room(
+        self,
+        bootstrap_room: int,
+        *,
+        token: Optional[str] = None,
+        expected_ranks: Optional[Set[int]] = None,
+    ) -> None:
+        """Arm BEFORE sending ABORT; duplicate cancellation must preserve ACKs.
 
-    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
-        """Record a prefill rank's drain ack (decode receiver thread). Only counts
-        while the room is held; grabs the set by reference to avoid racing clear."""
+        Mooncake binds ACKs to a receiver-generated token, so delayed ACKs from
+        an earlier use of a room cannot authorize reuse of the current buffers.
+        Other backends keep their existing rank-tagged protocol.
+        """
+        if token is not None:
+            previous = self._deferred_abort_tokens.setdefault(bootstrap_room, token)
+            if previous != token:
+                raise RuntimeError("A bootstrap room still has an undrained receiver")
+            if expected_ranks is not None:
+                self._deferred_abort_expected[bootstrap_room] = set(expected_ranks)
+        self._deferred_abort_ack_tracker.setdefault(bootstrap_room, set())
+
+    def note_abort_ack(
+        self,
+        bootstrap_room: int,
+        prefill_rank: int,
+        token: Optional[str] = None,
+    ) -> None:
+        if self.requires_transfer_drain:
+            expected_token = self._deferred_abort_tokens.get(bootstrap_room)
+            if expected_token is None or token != expected_token:
+                return
+            expected = self._deferred_abort_expected.get(bootstrap_room)
+            if expected is not None and prefill_rank not in expected:
+                return
         acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
         if acks is not None:
             acks.add(prefill_rank)
 
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
-        """True once every prefill rank that could still write these pages has acked."""
-        return (
-            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
-            >= required_acks
-        )
+        if bootstrap_room not in self._deferred_abort_ack_tracker:
+            return False
+        acks = self._deferred_abort_ack_tracker[bootstrap_room]
+        expected = getattr(self, "_deferred_abort_expected", {}).get(bootstrap_room)
+        if expected is not None:
+            return len(expected) == required_acks and expected.issubset(acks)
+        return len(acks) >= required_acks
 
     def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+        getattr(self, "_deferred_abort_tokens", {}).pop(bootstrap_room, None)
+        getattr(self, "_deferred_abort_expected", {}).pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
         """Stable per-sender id, matching what the transfer worker syncs on Success."""
@@ -1604,6 +1641,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self._abort_token = uuid.uuid4().hex
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -1677,6 +1715,15 @@ class CommonKVReceiver(BaseKVReceiver):
                                 bootstrap_info["is_dummy"] = False
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
+                            )
+                            bootstrap_info["abort_rank"] = (
+                                target_tp_rank
+                                * (
+                                    self.prefill_info.pp_size
+                                    * self.prefill_info.attn_cp_size
+                                )
+                                + target_pp_rank * self.prefill_info.attn_cp_size
+                                + target_cp_rank
                             )
                             bootstrap_infos.append(bootstrap_info)
                         else:
@@ -1837,13 +1884,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.retry_abort()
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -1853,6 +1894,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
+        self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1861,13 +1903,22 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.retry_abort()
+
+    def retry_abort(self):
+        """Retry the same cancellation; never reset an already received ACK."""
+        infos = getattr(self, "bootstrap_infos", None)
+        if infos is None:
+            return
+        if self.kv_mgr.enable_deferred_decode_kv_release:
+            kwargs = {}
+            if self.kv_mgr.requires_transfer_drain:
+                kwargs["token"] = self._abort_token
+                if all("abort_rank" in info for info in infos):
+                    kwargs["expected_ranks"] = {info["abort_rank"] for info in infos}
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room, **kwargs)
+        self._send_abort_notification()
+        self.abort_notified = True
 
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -1882,6 +1933,11 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
                         ]
+                        + (
+                            [self._abort_token.encode("ascii")]
+                            if self.kv_mgr.requires_transfer_drain
+                            else []
+                        )
                     )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
