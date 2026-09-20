@@ -2339,36 +2339,10 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe, DeepEP, Mooncake, Ascend-FuseEP or
-        # MoRI): o_proj defers its attention-TP reduction; this layer completes
-        # it as a reduce-scatter
-        # so the whole MoE region (agg2, norms, gate, latent projs, tp1
-        # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
-        # then all-gathers rows back after the MoE tail add. RS+AG moves the
-        # same bytes the o_proj all-reduce did, the shared-expert all-reduce
-        # disappears via tp1 weights, and each rank dispatches only its shard
-        # through the a2a (kills the attn_tp-fold dispatch redundancy) —
-        # strictly less communication + MoE-front compute /attn_tp. Works the
-        # same under DP attention: the attn_tp group is then the
-        # within-replica subgroup, rows are the DP-local batch, and
-        # KimiK3MoE skips the DP gather under EP a2a so the shard flows
-        # straight into the a2a. With attn_tp == 1 (full DP attention) there
-        # is no attention reduce to convert — the MoE-side gather skip alone
-        # removes the replication. Dense layers are excluded: their
-        # column-parallel MLP has no per-token decomposition that survives a
-        # token shard.
-        _a2a_backend = get_moe_a2a_backend()
-        self._sp_moe = (
-            (
-                _a2a_backend.is_megamoe()
-                or _a2a_backend.is_deepep()
-                or _a2a_backend.is_mooncake()
-                or _a2a_backend.is_ascend_fuseep()
-                or _a2a_backend.is_mori()
-            )
-            and self._is_moe_layer
-            and get_parallel().attn_tp_group.world_size > 1
-        )
+        # Disable SP-MoE at construction for the EP accuracy A/B: retain
+        # o_proj's attention-TP all-reduce and send the full DP-local batch
+        # through the existing EP MoE fallback on every attention-TP rank.
+        self._sp_moe = False
 
         # The fused all-reduce only serves the attn-res path (attn_res is
         # config-static), so the standard path stays byte-for-byte untouched
