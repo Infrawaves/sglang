@@ -592,11 +592,19 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            // For non-streaming requests, preserve headers. Non-2xx bodies
+            // are truncated for the same reason as the streaming branch
+            // below — an oversized `Union` validation error should not be
+            // forwarded unbounded.
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    let body = if status.is_success() {
+                        body
+                    } else {
+                        truncate_error_body(body)
+                    };
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
