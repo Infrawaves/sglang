@@ -51,7 +51,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, get_dcp_page_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -415,14 +415,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if not parallel.dcp_enabled:
             return seq_lens
         if parallel.dcp_kv_layout == "page":
-            virtual_page_size = parallel.dcp_size * self.page_size
-            whole_pages = seq_lens // virtual_page_size
-            tail = torch.clamp(
-                seq_lens % virtual_page_size - parallel.dcp_rank * self.page_size,
-                min=0,
-                max=self.page_size,
+            local_seq_lens = get_dcp_page_lens(
+                seq_lens,
+                dcp_size=parallel.dcp_size,
+                dcp_rank=parallel.dcp_rank,
+                page_size=self.page_size,
             )
-            local_seq_lens = whole_pages * self.page_size + tail
         else:
             local_seq_lens = get_dcp_lens(
                 seq_lens, parallel.dcp_size, parallel.dcp_rank
