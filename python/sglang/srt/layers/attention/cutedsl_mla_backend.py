@@ -257,6 +257,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 forward_batch.seq_lens[: forward_batch.batch_size]
             )
         if page_layout:
+            # With q_len=1 every valid local KV is visible. For multiple queries,
+            # cp_world=1 would incorrectly subtract the query suffix on every rank;
+            # page shards need per-query local bounds, not a shared local tail.
             causal_seq_lens = local_seq_lens
         else:
             causal_seq_lens = (
