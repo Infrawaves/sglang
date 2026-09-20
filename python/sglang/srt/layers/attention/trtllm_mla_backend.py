@@ -495,7 +495,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             batch_size: Batch size
             max_blocks: Maximum number of blocks per sequence
             req_pool_indices: Request pool indices
-            seq_lens: Sequence lengths (rank-local under DCP)
+            seq_lens: Sequence lengths
             device: Target device
 
         Returns:
@@ -509,7 +509,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._fill_dcp_block_kv_indices(
                 block_kv_indices,
                 req_pool_indices,
-                seq_lens,
+                self._get_dcp_local_seq_lens(seq_lens),
             )
             return block_kv_indices
 
@@ -1016,13 +1016,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            if get_parallel().dcp_enabled:
-                metadata = self.forward_decode_metadata
-                metadata.global_seq_lens_k = metadata.seq_lens_k
-                seq_lens = self._get_dcp_local_seq_lens(seq_lens)
-                metadata.seq_lens_k = seq_lens
-                max_seq = self._get_dcp_local_max_seq_len(max_seq)
-
             block_kv_indices = self._create_block_kv_indices(
                 bs,
                 max_seqlen_pad,
@@ -1034,6 +1027,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
             self.forward_decode_metadata.batch_size = bs
+
+            if get_parallel().dcp_enabled:
+                metadata = self.forward_decode_metadata
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ) and metadata.seq_lens_k is not None:
+                    # The branches above stored the global lengths in
+                    # seq_lens_k; keep them as global_seq_lens_k and derive the
+                    # rank-local view once per step rather than per MLA layer.
+                    metadata.global_seq_lens_k = metadata.seq_lens_k
+                    metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                        metadata.global_seq_lens_k
+                    )
+                metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                    metadata.max_seq_len_k
+                )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:

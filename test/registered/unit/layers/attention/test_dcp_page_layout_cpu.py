@@ -253,8 +253,8 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
 
 
 class TestDcpPageMetadataContracts(CustomTestCase):
-    def test_eager_page_table_and_metadata_share_local_lengths(self):
-        """Page-table preparation must reuse the per-step local-length tensor."""
+    def test_eager_page_table_takes_global_lengths_and_metadata_stores_local(self):
+        """Page-table creation consumes global lengths, not pre-sharded lengths."""
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = 2
         backend.max_context_len = 16
@@ -288,9 +288,9 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                 patch.object(trt_module, "get_parallel", return_value=parallel),
                 patch.object(
                     backend,
-                    "_get_dcp_local_seq_lens",
-                    wraps=backend._get_dcp_local_seq_lens,
-                ) as local_lengths,
+                    "_create_block_kv_indices",
+                    wraps=backend._create_block_kv_indices,
+                ) as create_table,
             ):
                 backend.init_forward_metadata(batch)
                 metadata = batch.decode_trtllm_mla_metadata
@@ -305,11 +305,20 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                         metadata.global_seq_lens_k,
                         torch.tensor(expected_global, dtype=torch.int32),
                     )
-                self.assertEqual(local_lengths.call_count, int(enabled))
+                torch.testing.assert_close(
+                    create_table.call_args.args[3],
+                    torch.tensor(
+                        expected_global
+                        if expected_global is not None
+                        else expected_local,
+                        dtype=torch.int32,
+                    ),
+                    check_dtype=False,
+                )
                 if enabled and mode == ForwardMode.DECODE:
                     self.assertIs(metadata.global_seq_lens_k, batch.seq_lens)
                 if enabled:
-                    self.assertIs(
+                    torch.testing.assert_close(
                         backend._fill_dcp_block_kv_indices.call_args.args[2],
                         metadata.seq_lens_k,
                     )
