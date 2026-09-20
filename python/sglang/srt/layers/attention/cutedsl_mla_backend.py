@@ -84,7 +84,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         return_lse: bool = False,
-        page_layout: bool = False,
     ):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
@@ -96,7 +95,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         ``cp_rank=0``. SGLang retains its real DCP group for Q exchange and
         outer LSE merge, with the same rank-local return contract.
         """
-        if cp_world <= 1 and not page_layout:
+        if cp_world <= 1:
             return super()._run_decode_kernel(
                 query,
                 kv_cache,
@@ -114,6 +113,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "causal_seqs (global per-request KV lengths) is required for DCP "
                 "MLA decode."
             )
+        if get_parallel().dcp_kv_layout == "page":
+            # With q_len=1 every valid local KV is visible. For multiple queries,
+            # cp_world=1 would incorrectly subtract the query suffix on every rank;
+            # page shards need per-query local bounds, not a shared local tail.
+            causal_seqs = seq_lens
+            cp_world, cp_rank = 1, 0
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -173,8 +178,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 is_neox,
                 llama_4_scaling,
             )
-
-        page_layout = parallel.dcp_kv_layout == "page"
 
         # Query / KV preparation mirrors the base cute-dsl decode (both FP16 and
         # FP8 KV), then swaps to the DCP kernel call + rank-local return.
@@ -249,24 +252,14 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
-        if metadata.seq_lens_k is not None:
-            # Reuse the per-step int32 lengths across all MLA layers.
+        if metadata.seq_lens_k is not None and metadata.global_seq_lens_k is not None:
+            # Hoisted path: int32 rank-local + global lens maintained once per
+            # step by metadata init / graph replay-prep.
             local_seq_lens = metadata.seq_lens_k[: forward_batch.batch_size]
+            global_seq_lens = metadata.global_seq_lens_k[: forward_batch.batch_size]
         else:
-            local_seq_lens = self._get_dcp_local_seq_lens(
-                forward_batch.seq_lens[: forward_batch.batch_size]
-            )
-        if page_layout:
-            # With q_len=1 every valid local KV is visible. For multiple queries,
-            # cp_world=1 would incorrectly subtract the query suffix on every rank;
-            # page shards need per-query local bounds, not a shared local tail.
-            causal_seq_lens = local_seq_lens
-        else:
-            causal_seq_lens = (
-                metadata.global_seq_lens_k
-                if metadata.global_seq_lens_k is not None
-                else forward_batch.seq_lens
-            )[: forward_batch.batch_size]
+            global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+            local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
         raw_out, lse = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
@@ -274,11 +267,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             seq_lens=local_seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
-            causal_seqs=causal_seq_lens,
-            cp_world=1 if page_layout else parallel.dcp_size,
-            cp_rank=0 if page_layout else parallel.dcp_rank,
+            causal_seqs=global_seq_lens,
+            cp_world=parallel.dcp_size,
+            cp_rank=parallel.dcp_rank,
             return_lse=True,
-            page_layout=page_layout,
         )
 
         output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)

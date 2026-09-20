@@ -652,10 +652,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            if parallel.dcp_kv_layout == "token" and metadata.global_seq_lens_k is None:
-                # Token DCP also needs a global causal bound; page DCP uses local lengths.
+        if get_parallel().dcp_enabled:
+            if metadata.global_seq_lens_k is None:
+                # A DCP decode consumes both the rank-local and the global
+                # lens, and the branches above allocate this only for verify.
                 metadata.global_seq_lens_k = torch.zeros(
                     (bs,), dtype=torch.int32, device=device
                 )
@@ -742,7 +742,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """DCP variant of the capture+replay body.
 
-        Refreshes rank-local and token DCP global lengths into the capture-stable
+        Refreshes the global and rank-local lengths into the capture-stable
         buffers once per step, and rebuilds the page table over this rank's
         cyclic slice.
         """
@@ -766,8 +766,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
-            if metadata.global_seq_lens_k is not None:
-                metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.global_seq_lens_k.copy_(seq_lens)
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
             local_seq_lens = metadata.seq_lens_k
 
@@ -1012,11 +1011,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            parallel = get_parallel()
-            if parallel.dcp_enabled:
+            if get_parallel().dcp_enabled:
                 metadata = self.forward_decode_metadata
-                if parallel.dcp_kv_layout == "token":
-                    metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.global_seq_lens_k = metadata.seq_lens_k
                 seq_lens = self._get_dcp_local_seq_lens(seq_lens)
                 metadata.seq_lens_k = seq_lens
                 max_seq = self._get_dcp_local_max_seq_len(max_seq)

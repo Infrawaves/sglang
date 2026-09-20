@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.mem_cache import memory_pool as memory_pool_module
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -263,7 +264,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
             is_translating=True, fill_read_table=MagicMock()
         )
         cases = (
-            ("page", True, ForwardMode.DECODE, [0, 2, 3], None),
+            ("page", True, ForwardMode.DECODE, [0, 2, 3], [1, 4, 9]),
             ("token", True, ForwardMode.DECODE, [0, 1, 3], [1, 4, 9]),
             ("token", True, ForwardMode.TARGET_VERIFY, [1, 2, 4], [3, 6, 11]),
             ("token", True, ForwardMode.DRAFT_EXTEND_V2, [1, 1, 3], [3, 4, 10]),
@@ -276,7 +277,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
             batch = SimpleNamespace(
                 forward_mode=mode,
                 batch_size=3,
-                seq_lens=torch.tensor([1, 4, 9]),
+                seq_lens=torch.tensor([1, 4, 9], dtype=torch.int32),
                 seq_lens_cpu=torch.tensor([1, 4, 9]),
                 req_pool_indices=torch.arange(3),
                 extend_seq_lens=torch.tensor([1, 3, 2]),
@@ -305,6 +306,8 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                         torch.tensor(expected_global, dtype=torch.int32),
                     )
                 self.assertEqual(local_lengths.call_count, int(enabled))
+                if enabled and mode == ForwardMode.DECODE:
+                    self.assertIs(metadata.global_seq_lens_k, batch.seq_lens)
                 if enabled:
                     self.assertIs(
                         backend._fill_dcp_block_kv_indices.call_args.args[2],
@@ -387,19 +390,17 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                     metadata = backend.decode_cuda_graph_metadata[batch_size]
                     block_storage = metadata.block_kv_indices.data_ptr()
                     lens_storage = metadata.seq_lens_k.data_ptr()
+                    global_lens_storage = metadata.global_seq_lens_k.data_ptr()
                     backend._apply_cuda_graph_metadata(
                         batch_size,
                         torch.arange(batch_size),
                         lengths,
                         ForwardMode.DECODE,
                     )
-                    if layout == "page":
-                        self.assertIsNone(metadata.global_seq_lens_k)
-                    else:
-                        torch.testing.assert_close(
-                            metadata.global_seq_lens_k,
-                            torch.tensor(seq_lens, dtype=torch.int32),
-                        )
+                    torch.testing.assert_close(
+                        metadata.global_seq_lens_k,
+                        torch.tensor(seq_lens, dtype=torch.int32),
+                    )
                     torch.testing.assert_close(
                         metadata.seq_lens_k,
                         torch.tensor(
@@ -415,6 +416,9 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                         metadata.block_kv_indices.data_ptr(), block_storage
                     )
                     self.assertEqual(metadata.seq_lens_k.data_ptr(), lens_storage)
+                    self.assertEqual(
+                        metadata.global_seq_lens_k.data_ptr(), global_lens_storage
+                    )
                     self.assertEqual(
                         metadata.max_seq_len_k, 6 if layout == "page" else 5
                     )
@@ -456,6 +460,29 @@ class TestDcpPageMetadataContracts(CustomTestCase):
 
 
 class TestCuteDslDcpWrapperContracts(CustomTestCase):
+    def test_single_rank_keeps_the_base_decode_path(self):
+        backend = object.__new__(CuteDslMLABackend)
+        expected = torch.zeros((1, 1, 1, 512))
+        for layout in ("token", "page"):
+            with (
+                self.subTest(layout=layout),
+                get_context().override_server_args(dcp_size=1, dcp_kv_layout=layout),
+                patch.object(
+                    backend, "_call_trtllm_batch_decode_mla", return_value=expected
+                ),
+            ):
+                output = backend._run_decode_kernel(
+                    query=torch.zeros((1, 1, 1, 576)),
+                    kv_cache=torch.empty((1, 1, 64, 576)),
+                    block_tables=torch.zeros((1, 1), dtype=torch.int32),
+                    seq_lens=torch.ones(1, dtype=torch.int32),
+                    max_seq_len=1,
+                    layer=SimpleNamespace(),
+                    cp_world=1,
+                    cp_rank=0,
+                )
+                self.assertIs(output, expected)
+
     def test_forward_decode_derives_page_local_and_token_global_coordinates(self):
         backend = object.__new__(CuteDslMLABackend)
         backend.data_type = torch.bfloat16
@@ -509,9 +536,7 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                     else None
                 )
                 metadata.global_seq_lens_k = (
-                    forward_batch.seq_lens
-                    if layout == "token" and cached_length is not None
-                    else None
+                    forward_batch.seq_lens if cached_length is not None else None
                 )
                 with self.subTest(layout=layout, cached_length=cached_length):
                     with (
@@ -520,6 +545,11 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                             "_get_dcp_local_seq_lens",
                             wraps=backend._get_dcp_local_seq_lens,
                         ) as local_lengths,
+                        patch.object(
+                            backend,
+                            "_run_decode_kernel",
+                            wraps=backend._run_decode_kernel,
+                        ) as run_kernel,
                         patch.object(
                             cute_module,
                             "get_parallel",
@@ -552,7 +582,15 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                     self.assertEqual(
                         local_lengths.call_count, int(cached_length is None)
                     )
+                    self.assertEqual(run_kernel.call_args.kwargs["cp_world"], 3)
+                    self.assertEqual(run_kernel.call_args.kwargs["cp_rank"], 1)
+                    torch.testing.assert_close(
+                        run_kernel.call_args.kwargs["causal_seqs"],
+                        forward_batch.seq_lens,
+                    )
                     kwargs = calls[-1]
+                    self.assertTrue(kwargs["enable_dcp"])
+                    self.assertTrue(kwargs["return_lse"])
                     torch.testing.assert_close(
                         kwargs["seq_lens"],
                         torch.tensor([2 if layout == "page" else 3], dtype=torch.int32),
@@ -568,6 +606,15 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                         kwargs["causal_seqlens_kv_global"],
                         torch.tensor([causal_seq], dtype=torch.int32),
                     )
+                    if layout == "page":
+                        self.assertIs(
+                            kwargs["causal_seqlens_kv_global"], kwargs["seq_lens"]
+                        )
+                    elif cached_length is not None:
+                        self.assertEqual(
+                            kwargs["causal_seqlens_kv_global"].data_ptr(),
+                            metadata.global_seq_lens_k.data_ptr(),
+                        )
 
 
 if __name__ == "__main__":

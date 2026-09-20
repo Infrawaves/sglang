@@ -171,7 +171,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
             batch_size=1,
             block_kv_indices=torch.tensor([[20, 4, 6, 9]], dtype=torch.int32),
             seq_lens_k=torch.tensor([7], dtype=torch.int32),
-            global_seq_lens_k=None,
+            global_seq_lens_k=torch.tensor([19], dtype=torch.int32),
             max_seq_len_k=7,
         )
         backend.token_to_kv_pool = pool
