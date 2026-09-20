@@ -2528,7 +2528,6 @@ def precomputed_topk_postprocess_is_noop(
     return (
         _is_cuda
         and topk_config.num_fused_shared_experts == 0
-        and num_token_non_padded is None
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -2540,6 +2539,8 @@ def build_precomputed_topk_output(
     topk_ids: torch.Tensor,
     topk_config: TopKConfig,
     layer_id: int,
+    *,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
     capture hook and the expert-distribution recorder that select_experts would.
@@ -2547,6 +2548,7 @@ def build_precomputed_topk_output(
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
