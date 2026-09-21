@@ -79,12 +79,15 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
             ) as fused,
         ):
             for layout, expected_page_size in (("token", 0), ("page", 64)):
+                backend.dcp_kv_layout = layout
                 with (
                     self.subTest(layout=layout),
                     patch.object(
                         trt_module,
                         "get_parallel",
-                        return_value=_parallel(layout=layout),
+                        return_value=_parallel(
+                            layout="page" if layout == "token" else "token"
+                        ),
                     ),
                 ):
                     query = backend._set_kv_and_concat_q_fp8_fused(
@@ -198,7 +201,8 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                         self.assertEqual(query.dtype, torch.float8_e4m3fn)
                     self.assertEqual(load.call_count, count)
 
-    def test_backend_prewarms_fp8_for_both_layouts(self):
+    def test_backend_keeps_its_layout_after_fp8_warmup(self):
+        """Ambient config changes must not reinterpret an existing backend's KV."""
         model_runner = SimpleNamespace(
             model_config=SimpleNamespace(
                 num_attention_heads=8,
@@ -257,6 +261,16 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                     backend.__init__(model_runner, backend="cute-dsl")
                     self.assertTrue(backend._fused_set_kv_concat_q_fp8)
                     warmup.assert_called_with(3, page_size)
+                    parallel.dcp_kv_layout = "page" if layout == "token" else "token"
+                    # N=3, rank=1, S=64: length 65 gives 22 token rows or 1 page row.
+                    expected_length = 22 if layout == "token" else 1
+                    torch.testing.assert_close(
+                        backend._get_dcp_local_seq_lens(torch.tensor([65])),
+                        torch.tensor([expected_length], dtype=torch.int32),
+                    )
+                    self.assertEqual(
+                        backend._get_dcp_local_max_seq_len(65), expected_length
+                    )
 
 
 class TestDcpPageMetadataContracts(CustomTestCase):
@@ -279,6 +293,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
             ("token", False, ForwardMode.TARGET_VERIFY, [3, 6, 11], [3, 6, 11]),
         )
         for layout, enabled, mode, expected_local, expected_global in cases:
+            backend.dcp_kv_layout = layout
             parallel = _parallel(layout=layout)
             parallel.dcp_enabled = enabled
             batch = SimpleNamespace(
@@ -341,6 +356,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                 ("page", 64),
             ):
                 backend.page_size = page_size
+                backend.dcp_kv_layout = layout
                 for rank in range(dcp_size):
                     expected = [0]
                     for position in range(3 * dcp_size * page_size + 1):
@@ -383,6 +399,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
         )
 
         for layout in ("page", "token"):
+            backend.dcp_kv_layout = layout
             backend.decode_cuda_graph_metadata = {}
             for batch_size, seq_lens, page_lens, token_lens in (
                 (3, [1, 4, 9], [0, 2, 3], [0, 1, 3]),
@@ -442,6 +459,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
     def test_page_table_launch_passes_page_layout_constants(self):
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = 2
+        backend.dcp_kv_layout = "page"
         backend.req_to_token = torch.tensor(
             [[30, 31, 32, 33, 34, 35, 6, 7, 8, 9, 10, 11]], dtype=torch.int64
         )
@@ -461,7 +479,7 @@ class TestDcpPageMetadataContracts(CustomTestCase):
         with (
             patch.object(trt_module, "create_mla_kv_page_table_for_dcp", Kernel()),
             patch.object(
-                trt_module, "get_parallel", return_value=_parallel(layout="page")
+                trt_module, "get_parallel", return_value=_parallel(layout="token")
             ),
         ):
             backend._fill_dcp_block_kv_indices(
@@ -480,6 +498,7 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
         backend = object.__new__(CuteDslMLABackend)
         expected = torch.zeros((1, 1, 1, 512))
         for layout in ("token", "page"):
+            backend.dcp_kv_layout = layout
             with (
                 self.subTest(layout=layout),
                 get_context().override_server_args(dcp_size=1, dcp_kv_layout=layout),
@@ -545,6 +564,8 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                 ("token", 8, 3, 1, 3),
                 ("page", 2, 1, 0, 2),
             ):
+                backend.dcp_kv_layout = layout
+                parallel = _parallel(layout="page" if layout == "token" else "token")
                 metadata = backend.forward_decode_metadata
                 metadata.seq_lens_k = (
                     torch.tensor([cached_length], dtype=torch.int32)
@@ -569,12 +590,12 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                         patch.object(
                             cute_module,
                             "get_parallel",
-                            return_value=_parallel(layout=layout),
+                            return_value=parallel,
                         ),
                         patch.object(
                             trt_module,
                             "get_parallel",
-                            return_value=_parallel(layout=layout),
+                            return_value=parallel,
                         ),
                         patch.object(
                             cute_module,

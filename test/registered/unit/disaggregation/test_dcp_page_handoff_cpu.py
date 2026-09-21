@@ -159,6 +159,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
 
     def _cute_decode_inputs(self, pool):
         backend = object.__new__(CuteDslMLABackend)
+        backend.dcp_kv_layout = "page"
         backend.data_type = torch.float32
         backend.q_data_type = torch.float32
         backend.kv_cache_dim = 576

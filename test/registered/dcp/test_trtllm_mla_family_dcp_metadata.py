@@ -32,6 +32,7 @@ DCP_RANK = 2
 
 def _make_backend(backend_cls, bs: int):
     backend = object.__new__(backend_cls)
+    backend.dcp_kv_layout = "token"
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.full((bs, 4), -1, dtype=torch.int32, device="cuda"),
@@ -254,6 +255,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                     base, base + (end - start), dtype=torch.int32, device="cuda"
                 )
         backend = object.__new__(TRTLLMMLABackend)
+        backend.dcp_kv_layout = "token"
         backend.page_size = self.PAGE_SIZE
         backend.req_to_token = req_to_token
         backend.kv_index_translator = translator
@@ -402,6 +404,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         """Belt and braces: reaching the helper with a resolved loc asserts
         rather than silently storing into the sink."""
         backend = object.__new__(TRTLLMMLABackend)
+        backend.dcp_kv_layout = "token"
         backend.kv_index_translator = SimpleNamespace(is_translating=True)
         parallel = SimpleNamespace(
             dcp_enabled=True,

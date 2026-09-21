@@ -112,7 +112,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "causal_seqs (global per-request KV lengths) is required for DCP "
                 "MLA decode."
             )
-        if get_parallel().dcp_kv_layout == "page":
+        if self.dcp_kv_layout == "page":
             # With q_len=1 every valid local KV is visible. For multiple queries,
             # cp_world=1 would incorrectly subtract the query suffix on every rank;
             # page shards need per-query local bounds, not a shared local tail.

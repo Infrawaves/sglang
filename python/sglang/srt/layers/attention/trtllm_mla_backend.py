@@ -287,6 +287,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
+        self.dcp_kv_layout = get_parallel().dcp_kv_layout
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         # Per-instance shape eligibility: wide-EP DP-attention can push
@@ -371,15 +372,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # fp8 sibling: quantize + KV scatter + q concat in one launch
         # (replaces mla_quantize_without_rope_for_fp8's concat + three aten
         # casts plus the KV-row write on the fp8 decode path).
-        parallel = get_parallel()
         self._fused_set_kv_concat_q_fp8 = (
             self.data_type == torch.float8_e4m3fn
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8(
-                parallel.attn_dcp_size,
-                self.page_size if parallel.dcp_kv_layout == "page" else 0,
+                get_parallel().attn_dcp_size,
+                self.page_size if self.dcp_kv_layout == "page" else 0,
             )
         )
 
@@ -414,7 +414,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return seq_lens
-        if parallel.dcp_kv_layout == "page":
+        if self.dcp_kv_layout == "page":
             local_seq_lens = get_dcp_page_lens(
                 seq_lens,
                 dcp_size=parallel.dcp_size,
@@ -431,7 +431,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return max_seq_len
-        if parallel.dcp_kv_layout == "page":
+        if self.dcp_kv_layout == "page":
             tokens_per_round = parallel.dcp_size * self.page_size
             full_rounds, remainder = divmod(max_seq_len, tokens_per_round)
             local_max = full_rounds * self.page_size + min(
@@ -475,7 +475,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
-            PAGE_LAYOUT=parallel.dcp_kv_layout == "page",
+            PAGE_LAYOUT=self.dcp_kv_layout == "page",
             PAGES_PER_BLOCK=pages_per_block,
             HAS_V2P=v2p is not None,
         )
@@ -1403,7 +1403,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
         parallel = get_parallel()
-        dcp_page_size = self.page_size if parallel.dcp_kv_layout == "page" else 0
+        dcp_page_size = self.page_size if self.dcp_kv_layout == "page" else 0
         if not set_mla_kv_concat_q_fp8_covered(
             kv_buffer=kv_2d,
             loc=loc,

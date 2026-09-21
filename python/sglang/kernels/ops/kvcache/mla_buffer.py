@@ -282,7 +282,6 @@ def set_mla_kv_buffer_dcp_sharded_triton(
 ):
     """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them."""
     parallel = get_parallel()
-    page_layout = parallel.dcp_kv_layout == "page"
     _set_mla_kv_buffer_impl(
         kv_buffer,
         loc,
@@ -292,7 +291,7 @@ def set_mla_kv_buffer_dcp_sharded_triton(
         dcp_world_size=parallel.attn_dcp_size,
         dcp_rank=parallel.attn_dcp_rank,
         dcp_page_size=physical_page_size,
-        page_layout=page_layout,
+        page_layout=parallel.dcp_kv_layout == "page",
     )
 
 
