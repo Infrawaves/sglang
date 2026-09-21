@@ -371,12 +371,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # fp8 sibling: quantize + KV scatter + q concat in one launch
         # (replaces mla_quantize_without_rope_for_fp8's concat + three aten
         # casts plus the KV-row write on the fp8 decode path).
+        parallel = get_parallel()
         self._fused_set_kv_concat_q_fp8 = (
             self.data_type == torch.float8_e4m3fn
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
-            and can_use_set_mla_kv_concat_q_fp8()
+            and can_use_set_mla_kv_concat_q_fp8(
+                parallel.attn_dcp_size,
+                self.page_size if parallel.dcp_kv_layout == "page" else 0,
+            )
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -1398,6 +1402,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # reads below.
         kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        parallel = get_parallel()
+        dcp_page_size = self.page_size if parallel.dcp_kv_layout == "page" else 0
         if not set_mla_kv_concat_q_fp8_covered(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1405,9 +1411,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_page_size=dcp_page_size,
         ):
             return None
-        parallel = get_parallel()
         # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
         # is also its only skip in token mode. A DCP-resolved loc never reaches
         # here -- see `_resolve_fused_write_loc`.
@@ -1423,7 +1430,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
-            dcp_page_size=self.page_size if parallel.dcp_kv_layout == "page" else 0,
+            dcp_page_size=dcp_page_size,
         )
 
     def _dummy_dcp_decode_for_autotune(

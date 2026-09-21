@@ -326,11 +326,10 @@ struct SetMlaKVConcatQFp8Params {
   // Token DCP cyclic sharding of the KV pool: ``loc`` is VIRTUAL; the physical
   // row on the owner rank is loc / world, and only the owner
   // (loc % world == rank) writes. world=1/rank=0 = identity (non-DCP).
-  // With dcp_page_size > 0 (physical page size in tokens), apply this mapping
+  // With kDcpPageSize > 0 (physical page size in tokens), apply this mapping
   // to page indices instead, preserving the offset within each page.
-  int32_t dcp_world_size;
+  // World/page sizes are compile-time constants; rank is supplied at launch.
   int32_t dcp_rank;
-  int32_t dcp_page_size;
   // Q quantize + concat side.
   const bf16_t* __restrict__ q_nope;
   const bf16_t* __restrict__ q_rope;
@@ -360,7 +359,7 @@ SGL_DEVICE uint2 bf16x8_to_fp8x8(const int4 v) {
   return out;
 }
 
-template <int kNumWarps, bool kUsePDL, typename TLoc>
+template <int kDcpWorldSize, int kDcpPageSize, int kNumWarps, bool kUsePDL, typename TLoc>
 __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVConcatQFp8Params params) {
   using namespace device;
 
@@ -380,15 +379,15 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
     const int64_t vloc = static_cast<int64_t>(static_cast<const TLoc*>(params.loc)[item_id]);
     int64_t local_row;
     bool is_owner;
-    if (params.dcp_page_size > 0) {
-      const int64_t page_id = vloc / params.dcp_page_size;
-      const int64_t page_offset = vloc % params.dcp_page_size;
+    if constexpr (kDcpPageSize > 0) {
+      const int64_t page_id = vloc / kDcpPageSize;
+      const int64_t page_offset = vloc % kDcpPageSize;
       // C++ signed division can map negative padding to page 0; it must not write.
-      is_owner = vloc >= 0 && page_id % params.dcp_world_size == params.dcp_rank;
-      local_row = (page_id / params.dcp_world_size) * params.dcp_page_size + page_offset;
+      is_owner = vloc >= 0 && page_id % kDcpWorldSize == params.dcp_rank;
+      local_row = (page_id / kDcpWorldSize) * kDcpPageSize + page_offset;
     } else {
-      is_owner = vloc % params.dcp_world_size == params.dcp_rank;
-      local_row = vloc / params.dcp_world_size;
+      is_owner = vloc % kDcpWorldSize == params.dcp_rank;
+      local_row = vloc / kDcpWorldSize;
     }
     // Non-owner ranks write nothing for this token (mirrors the Triton writer).
     if (!is_owner) {
@@ -454,10 +453,12 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kUsePDL>
+template <int kDcpWorldSize, int kDcpPageSize, bool kUsePDL>
 struct SetMlaKVConcatQFp8Kernel {
+  static_assert(kDcpWorldSize >= 1, "DCP world size must be positive");
+
   template <int kNumWarps, typename TLoc>
-  static constexpr auto kernel = set_mla_kv_concat_q_fp8_kernel<kNumWarps, kUsePDL, TLoc>;
+  static constexpr auto kernel = set_mla_kv_concat_q_fp8_kernel<kDcpWorldSize, kDcpPageSize, kNumWarps, kUsePDL, TLoc>;
 
   static void
   run(tvm::ffi::TensorView kv_buffer,
@@ -468,9 +469,7 @@ struct SetMlaKVConcatQFp8Kernel {
       tvm::ffi::TensorView q_rope,
       tvm::ffi::TensorView q_out,
       int64_t num_warps_per_block,
-      int64_t dcp_world_size,
-      int64_t dcp_rank,
-      int64_t dcp_page_size) {
+      int64_t dcp_rank) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -538,8 +537,8 @@ struct SetMlaKVConcatQFp8Kernel {
         .verify(q_out);
 
     CHECK_HOST(D_buf.unwrap() >= kFp8RowBytes) << "kv_buffer last dim too small";
-    CHECK_HOST(dcp_world_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_world_size)
-        << "invalid dcp world/rank: " << dcp_world_size << "/" << dcp_rank;
+    CHECK_HOST(dcp_rank >= 0 && dcp_rank < kDcpWorldSize)
+        << "invalid dcp world/rank: " << kDcpWorldSize << "/" << dcp_rank;
     CHECK_HOST(S_loc.unwrap() == 1) << "loc must be contiguous; got stride " << S_loc.unwrap();
 
     // Alignment tripwires (mirrored by python covered() so uncovered layouts
@@ -574,9 +573,7 @@ struct SetMlaKVConcatQFp8Kernel {
         .stride_rope = S_rope.unwrap(),
         .stride_buffer_bytes = S_buf.unwrap(),
         .batch_size = batch,
-        .dcp_world_size = static_cast<int32_t>(dcp_world_size),
         .dcp_rank = static_cast<int32_t>(dcp_rank),
-        .dcp_page_size = static_cast<int32_t>(dcp_page_size),
         .q_nope = static_cast<const bf16_t*>(q_nope.data_ptr()),
         .q_rope = static_cast<const bf16_t*>(q_rope.data_ptr()),
         .q_out = static_cast<uint8_t*>(q_out.data_ptr()),

@@ -96,8 +96,10 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                     )
                     self.assertEqual(fused.call_args.kwargs["dcp_world_size"], 3)
                     self.assertEqual(fused.call_args.kwargs["dcp_rank"], 1)
-                    self.assertNotIn("dcp_world_size", covered.call_args.kwargs)
-                    self.assertNotIn("dcp_page_size", covered.call_args.kwargs)
+                    self.assertEqual(covered.call_args.kwargs["dcp_world_size"], 3)
+                    self.assertEqual(
+                        covered.call_args.kwargs["dcp_page_size"], expected_page_size
+                    )
 
     def test_regular_writer_launches_page_constants(self):
         calls = []
@@ -132,8 +134,8 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
         self.assertEqual(calls[0]["DCP_PAGE_SIZE"], 2)
         self.assertTrue(calls[0]["PAGE_LAYOUT"])
 
-    def test_fp8_warmup_and_launch_reuse_module_across_layouts(self):
-        """DCP geometry changes must reuse the module and reach the runtime FFI."""
+    def test_fp8_warmup_and_launch_share_geometry_specializations(self):
+        """Warmup and launch share each world/page specialization across ranks."""
         # Keep the real JIT cache and wrapper; replace only compilation/launch.
         module_cache = fused_module.cache_once(
             fused_module.set_mla_kv_concat_q_fp8_module.__wrapped__
@@ -152,14 +154,34 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
             patch.object(fused_module, "is_arch_support_pdl", return_value=False),
             patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
         ):
-            self.assertTrue(fused_module.can_use_set_mla_kv_concat_q_fp8.__wrapped__())
-            self.assertEqual(load.call_args.args, ("set_mla_kv_concat_q_fp8", "false"))
-            self.assertEqual(
-                load.call_args.kwargs["cuda_wrappers"],
-                [("set_mla_kv_concat_q_fp8", "SetMlaKVConcatQFp8Kernel<false>::run")],
-            )
-            for world_size, page_size in ((1, 0), (2, 0), (3, 64), (8, 64), (3, 3)):
+            for count, (world_size, page_size) in enumerate(
+                ((1, 0), (2, 0), (3, 64), (8, 64), (3, 3)), start=1
+            ):
                 with self.subTest(world_size=world_size, page_size=page_size):
+                    self.assertTrue(
+                        fused_module.can_use_set_mla_kv_concat_q_fp8.__wrapped__(
+                            world_size, page_size
+                        )
+                    )
+                    self.assertEqual(load.call_count, count)
+                    self.assertEqual(
+                        load.call_args.args,
+                        (
+                            "set_mla_kv_concat_q_fp8",
+                            str(world_size),
+                            str(page_size),
+                            "false",
+                        ),
+                    )
+                    self.assertEqual(
+                        load.call_args.kwargs["cuda_wrappers"],
+                        [
+                            (
+                                "set_mla_kv_concat_q_fp8",
+                                f"SetMlaKVConcatQFp8Kernel<{world_size}, {page_size}, false>::run",
+                            )
+                        ],
+                    )
                     for rank in range(world_size):
                         query = fused_module.set_mla_kv_concat_q_fp8(
                             *inputs,
@@ -169,12 +191,12 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                             dcp_page_size=page_size,
                         )
                         args = load.return_value.set_mla_kv_concat_q_fp8.call_args.args
-                        self.assertEqual(len(args), 11)
-                        self.assertEqual(args[-4:], (4, world_size, rank, page_size))
+                        self.assertEqual(len(args), 9)
+                        self.assertEqual(args[-2:], (4, rank))
                         self.assertIs(query, args[6])
                         self.assertEqual(query.shape, (1, 1, 576))
                         self.assertEqual(query.dtype, torch.float8_e4m3fn)
-                    self.assertEqual(load.call_count, 1)
+                    self.assertEqual(load.call_count, count)
 
     def test_backend_prewarms_fp8_for_both_layouts(self):
         model_runner = SimpleNamespace(
@@ -223,7 +245,7 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                 trt_module, "can_use_set_mla_kv_concat_q_fp8", return_value=True
             ) as warmup,
         ):
-            for layout in ("token", "page"):
+            for layout, page_size in (("token", 0), ("page", 64)):
                 parallel = _parallel(layout=layout)
                 parallel.attn_tp_size = 1
                 backend = object.__new__(TRTLLMMLABackend)
@@ -234,7 +256,7 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                 ):
                     backend.__init__(model_runner, backend="cute-dsl")
                     self.assertTrue(backend._fused_set_kv_concat_q_fp8)
-                    warmup.assert_called_with()
+                    warmup.assert_called_with(3, page_size)
 
 
 class TestDcpPageMetadataContracts(CustomTestCase):

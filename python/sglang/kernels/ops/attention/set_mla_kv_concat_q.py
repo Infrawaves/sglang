@@ -179,8 +179,10 @@ def set_mla_kv_concat_q(
 
 
 @cache_once
-def set_mla_kv_concat_q_fp8_module(use_pdl: bool) -> Module:
-    args = make_cpp_args(use_pdl)
+def set_mla_kv_concat_q_fp8_module(
+    dcp_world_size: int, dcp_page_size: int, use_pdl: bool
+) -> Module:
+    args = make_cpp_args(dcp_world_size, dcp_page_size, use_pdl)
     return load_jit(
         "set_mla_kv_concat_q_fp8",
         *args,
@@ -192,13 +194,18 @@ def set_mla_kv_concat_q_fp8_module(use_pdl: bool) -> Module:
 
 
 @cache_once
-def can_use_set_mla_kv_concat_q_fp8() -> bool:
+def can_use_set_mla_kv_concat_q_fp8(
+    dcp_world_size: int = 1, dcp_page_size: int = 0
+) -> bool:
     """SM90+ (TMA bulk store) and the module compiles. Row widths are fixed
-    at 512/64 (the MLA absorb layout) inside the kernel."""
+    at 512/64 (the MLA absorb layout) inside the kernel.
+    Preload the actual DCP specialization before graph capture."""
     if torch.cuda.get_device_capability()[0] < 9:
         return False
     try:
-        set_mla_kv_concat_q_fp8_module(is_arch_support_pdl())
+        set_mla_kv_concat_q_fp8_module(
+            dcp_world_size, dcp_page_size, is_arch_support_pdl()
+        )
         return True
     except Exception:  # pragma: no cover - compile-time only
         return False
@@ -211,6 +218,8 @@ def covered_fp8(
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
+    dcp_world_size: int = 1,
+    dcp_page_size: int = 0,
 ) -> bool:
     """Per-call gate for the fused fp8 quantize+scatter+concat kernel,
     mirroring the launcher tripwires. Expects flattened views: kv_buffer
@@ -246,7 +255,7 @@ def covered_fp8(
         or kv_buffer.shape[-1] < 576
     ):
         return False
-    if not can_use_set_mla_kv_concat_q_fp8():
+    if not can_use_set_mla_kv_concat_q_fp8(dcp_world_size, dcp_page_size):
         return False
     if any(t.stride(-1) != 1 for t in (kv_buffer, k_nope, k_rope, q_nope, q_rope)):
         return False
@@ -284,6 +293,7 @@ def set_mla_kv_concat_q_fp8(
     With ``dcp_page_size > 0``, the same mapping applies to page indices
     instead of token indices, preserving the offset within each page.
     ``dcp_page_size`` is the physical page size in tokens.
+    World/page sizes select the JIT module; rank remains a launch parameter.
 
     Shapes (leading singleton dims on the k sources are flattened away):
         kv_buffer:    [num_pages, 576] fp8_e4m3/uint8 (or [num_pages, 1, 576])
@@ -306,7 +316,9 @@ def set_mla_kv_concat_q_fp8(
     if num_warps <= 0:
         num_warps = _pick_num_warps(n_loc + q_nope.shape[0] * q_nope.shape[1])
 
-    module = set_mla_kv_concat_q_fp8_module(is_arch_support_pdl())
+    module = set_mla_kv_concat_q_fp8_module(
+        dcp_world_size, dcp_page_size, is_arch_support_pdl()
+    )
     module.set_mla_kv_concat_q_fp8(
         buf,
         loc,
@@ -316,8 +328,6 @@ def set_mla_kv_concat_q_fp8(
         q_rope,
         q_out,
         num_warps,
-        dcp_world_size,
         dcp_rank,
-        dcp_page_size,
     )
     return q_out
