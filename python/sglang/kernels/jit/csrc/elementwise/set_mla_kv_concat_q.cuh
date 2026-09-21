@@ -304,7 +304,7 @@ struct SetMlaKVConcatQKernel {
 };
 
 // ---------------------------------------------------------------------------
-// fp8 variant. Shares the translation unit, not the kernel: dims are fixed
+// fp8 variant. Shares the translation unit, not the kernel: dims are runtime
 // rather than template parameters, it shards DCP slots by token or page,
 // converts per lane instead of bulk-copying, and counts strides in elements.
 // Only the module that instantiates it pays for it.
