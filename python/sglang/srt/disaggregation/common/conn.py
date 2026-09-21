@@ -40,7 +40,6 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_serving,
-    get_spec,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
@@ -110,8 +109,7 @@ class PrefillServerInfo:
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
 
-    # Prefill page-transfer support; omitted from legacy /route responses.
-    supports_dcp_page: Optional[bool] = None
+    supports_dcp_page: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -625,7 +623,6 @@ class CommonKVManager(BaseKVManager):
         if bootstrap_addr in self.prefill_info_table:
             return True
 
-        page_layout = get_parallel().dcp_kv_layout == "page"
         info: PrefillServerInfo = None
         try:
             url = (
@@ -633,8 +630,6 @@ class CommonKVManager(BaseKVManager):
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
-            if page_layout:
-                url += "&want_dcp_page_support=1"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -649,13 +644,6 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
-        if page_layout and info.supports_dcp_page is not True:
-            raise RuntimeError(
-                f"Prefill server {bootstrap_addr} does not advertise DCP page "
-                "transfer support. Page decode requires a page-capable "
-                "Mooncake prefill server with DCP size 1 and no speculative decoding."
-            )
-
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -683,6 +671,16 @@ class CommonKVManager(BaseKVManager):
                     "PD decode DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
+
+        if (
+            get_parallel().dcp_kv_layout == "page"
+            and info.supports_dcp_page is not True
+        ):
+            raise RuntimeError(
+                f"Prefill server {bootstrap_addr} does not advertise DCP page "
+                "transfer support. Page decode requires a page-capable "
+                "Mooncake prefill server with DCP size 1."
+            )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -839,7 +837,6 @@ class CommonKVManager(BaseKVManager):
             "supports_dcp_page": (
                 get_disagg().disaggregation_transfer_backend == "mooncake"
                 and self.dcp_size == 1
-                and get_spec().speculative_algorithm is None
             ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
@@ -1894,11 +1891,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 prefill_http_port=self.prefill_http_port,
                 supports_dcp_page=self.supports_dcp_page,
             )
-            info_data = dataclasses.asdict(info)
-            # Older decode servers reject unknown PrefillServerInfo fields.
-            if request.query.get("want_dcp_page_support") != "1":
-                info_data.pop("supports_dcp_page")
-            return web.json_response(info_data, status=200)
+            # Not backward compatible with decode servers predating the page DCP changes.
+            return web.json_response(dataclasses.asdict(info), status=200)
 
         if not self._is_ready():
             return web.Response(

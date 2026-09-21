@@ -242,7 +242,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             ("token", "mooncake", None, 1, True),
             ("page", "mooncake", None, 1, True),
             ("token", "nixl", None, 1, False),
-            ("token", "mooncake", "EAGLE", 1, False),
+            ("token", "mooncake", "EAGLE", 1, True),
             ("token", "mooncake", None, 2, False),
         ):
             with self.subTest(
@@ -499,19 +499,16 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
         return data
 
     @staticmethod
-    def _static_query(*, want_page_support=False):
-        query = {
+    def _static_query():
+        return {
             "prefill_dp_rank": "-1",
             "prefill_cp_rank": "-1",
             "target_tp_rank": "-1",
             "target_pp_rank": "-1",
         }
-        if want_page_support:
-            query["want_dcp_page_support"] = "1"
-        return query
 
-    def test_route_page_support_is_opt_in(self):
-        for supported in (None, False, True):
+    def test_route_returns_page_support(self):
+        for supported in (False, True):
             with self.subTest(supported=supported):
                 server = self._make_server(tp_size=2)
                 for rank in range(2):
@@ -525,16 +522,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                         )
                     )
 
-                legacy = asyncio.run(
-                    server._handle_route_get(_RouteRequest(query=self._static_query()))
-                )
-                self.assertEqual(legacy.status, 200)
-                self.assertNotIn("supports_dcp_page", json.loads(legacy.text))
-
                 response = asyncio.run(
-                    server._handle_route_get(
-                        _RouteRequest(query=self._static_query(want_page_support=True))
-                    )
+                    server._handle_route_get(_RouteRequest(query=self._static_query()))
                 )
                 self.assertEqual(response.status, 200)
                 self.assertIs(json.loads(response.text)["supports_dcp_page"], supported)
@@ -555,11 +544,9 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
             "follow_bootstrap_room": True,
         }
         for decode_layout, support_fields, accepted in (
-            ("page", {}, False),
-            ("page", {"supports_dcp_page": None}, False),
             ("page", {"supports_dcp_page": False}, False),
             ("page", {"supports_dcp_page": True}, True),
-            ("token", {}, True),
+            ("token", {"supports_dcp_page": False}, True),
         ):
             with self.subTest(
                 decode_layout=decode_layout, support_fields=support_fields
@@ -595,10 +582,6 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     manager._resolve_rank_mapping.assert_not_called()
 
                 mock_get.assert_called_once()
-                self.assertEqual(
-                    "want_dcp_page_support=1" in mock_get.call_args.args[0],
-                    decode_layout == "page",
-                )
 
     @patch("sglang.srt.disaggregation.mooncake.conn.get_parallel")
     def test_token_and_page_share_cached_registration_and_room_metadata(self, parallel):
