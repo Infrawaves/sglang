@@ -181,6 +181,7 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.dcp_kv_layout = parallel.dcp_kv_layout
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
@@ -672,10 +673,7 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
-        if (
-            get_parallel().dcp_kv_layout == "page"
-            and info.supports_dcp_page is not True
-        ):
+        if self.dcp_kv_layout == "page" and info.supports_dcp_page is not True:
             raise RuntimeError(
                 f"Prefill server {bootstrap_addr} does not advertise DCP page "
                 "transfer support. Page decode requires a page-capable "

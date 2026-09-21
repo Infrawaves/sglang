@@ -529,10 +529,7 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                 self.assertIs(json.loads(response.text)["supports_dcp_page"], supported)
 
     @patch("sglang.srt.disaggregation.common.conn.requests.get")
-    @patch("sglang.srt.disaggregation.common.conn.get_parallel")
-    def test_decode_checks_page_support_before_caching_prefill_info(
-        self, mock_parallel, mock_get
-    ):
+    def test_decode_checks_page_support_before_caching_prefill_info(self, mock_get):
         bootstrap_addr = "127.0.0.1:30000"
         prefill_info = {
             "attn_tp_size": 1,
@@ -556,10 +553,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                 manager.kv_args = SimpleNamespace(page_size=16)
                 manager.kv_cache_dtype_str = "auto"
                 manager.dcp_size = 1
+                manager.dcp_kv_layout = decode_layout
                 manager._resolve_rank_mapping = MagicMock()
-                mock_parallel.return_value = SimpleNamespace(
-                    dcp_kv_layout=decode_layout
-                )
                 mock_get.reset_mock()
                 response = MagicMock(status_code=200)
                 response.json.return_value = {**prefill_info, **support_fields}
@@ -583,12 +578,10 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
 
                 mock_get.assert_called_once()
 
-    @patch("sglang.srt.disaggregation.mooncake.conn.get_parallel")
-    def test_token_and_page_share_cached_registration_and_room_metadata(self, parallel):
+    def test_token_and_page_share_cached_registration_and_room_metadata(self):
         bootstrap_addr = "127.0.0.1:30000"
-        for layout, registration_frames in (("token", 19), ("page", 20)):
+        for layout in ("token", "page"):
             with self.subTest(layout=layout):
-                parallel.return_value = SimpleNamespace(dcp_kv_layout=layout)
                 manager = SimpleNamespace(
                     kv_args=SimpleNamespace(
                         kv_data_ptrs=[4096],
@@ -605,6 +598,7 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     attn_tp_size=2,
                     dcp_size=2,
                     dcp_rank=0,
+                    dcp_kv_layout=layout,
                     is_mla_backend=True,
                     enable_staging=False,
                     local_ip="127.0.0.1",
@@ -655,17 +649,15 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                 ]
                 self.assertEqual(
                     [len(message) for message in messages],
-                    [registration_frames, 10, 10],
+                    [20, 10, 10],
                 )
                 registration = KVArgsRegisterInfo.from_zmq(messages[0])
                 self.assertEqual(registration.dcp_kv_layout, layout)
-                if layout == "page":
-                    self.assertEqual(messages[0][19:], [b"page"])
+                self.assertEqual(messages[0][19:], [layout.encode("ascii")])
 
-    @patch("sglang.srt.disaggregation.mooncake.conn.get_parallel")
-    def test_prefill_registers_decode_layout_and_validates_geometry(self, parallel):
-        parallel.return_value = SimpleNamespace(dcp_kv_layout="token")
+    def test_prefill_registers_decode_layout_and_validates_geometry(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.dcp_kv_layout = "token"
         manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager.server_args = object()
         manager.kv_args = SimpleNamespace(

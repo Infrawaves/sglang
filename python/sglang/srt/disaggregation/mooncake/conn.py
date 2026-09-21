@@ -69,7 +69,6 @@ from sglang.srt.observability.trace import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
-    get_parallel,
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
@@ -2590,9 +2589,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
-            dst_dcp_kv_layout = (
-                b"page" if get_parallel().dcp_kv_layout == "page" else b""
-            )
+            dst_dcp_kv_layout = self.kv_mgr.dcp_kv_layout.encode("ascii")
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)

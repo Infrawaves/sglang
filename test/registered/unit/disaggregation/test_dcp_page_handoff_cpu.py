@@ -378,13 +378,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
             ("token", 0, 6, [0, 3]),
             ("page", 2, 2, []),  # No local MLA page; Mamba and aux still transfer.
         ):
-            with (
-                self.subTest(layout=layout, rank=rank),
-                patch(
-                    "sglang.srt.disaggregation.mooncake.conn.get_parallel",
-                    return_value=SimpleNamespace(dcp_kv_layout="token"),
-                ),
-            ):
+            with self.subTest(layout=layout, rank=rank):
                 source = np.arange(16, dtype=np.uint8).reshape(8, 2)
                 destination = np.full_like(source, 0xEE)
                 mamba_source = np.arange(32, dtype=np.uint8).reshape(4, 8)
@@ -392,6 +386,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 mamba_destination = np.full_like(mamba_source, 0xEE)
                 aux_destination = np.full_like(aux_source, 0xEE)
                 manager = object.__new__(MooncakeKVManager)
+                manager.dcp_kv_layout = "token"
                 manager.enable_trace = False
                 manager.enable_staging = False
                 manager.enable_custom_mem_pool = False
