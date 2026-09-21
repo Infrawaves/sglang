@@ -377,17 +377,16 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
     // --- KV role: quantize one token's row into smem, TMA-scatter it ---
     const uint32_t item_id = flat_warp;
     const int64_t vloc = static_cast<int64_t>(static_cast<const TLoc*>(params.loc)[item_id]);
-    int64_t local_row;
+    int64_t loc;
     bool is_owner;
     if constexpr (kDcpPageSize > 0) {
       const int64_t page_id = vloc / kDcpPageSize;
       const int64_t page_offset = vloc % kDcpPageSize;
-      // C++ signed division can map negative padding to page 0; it must not write.
-      is_owner = vloc >= 0 && page_id % kDcpWorldSize == params.dcp_rank;
-      local_row = (page_id / kDcpWorldSize) * kDcpPageSize + page_offset;
+      is_owner = page_id % kDcpWorldSize == params.dcp_rank;
+      loc = (page_id / kDcpWorldSize) * kDcpPageSize + page_offset;
     } else {
       is_owner = vloc % kDcpWorldSize == params.dcp_rank;
-      local_row = vloc / kDcpWorldSize;
+      loc = vloc / kDcpWorldSize;
     }
     // Non-owner ranks write nothing for this token (mirrors the Triton writer).
     if (!is_owner) {
@@ -421,7 +420,7 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
           cuda::ptx::space_shared,
-          params.kv_buffer + local_row * params.stride_buffer_bytes,
+          params.kv_buffer + loc * params.stride_buffer_bytes,
           &smem[warp_in_cta][0],
           static_cast<uint32_t>(kFp8RowBytes));
     }
@@ -455,8 +454,6 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
 
 template <int kDcpWorldSize, int kDcpPageSize, bool kUsePDL>
 struct SetMlaKVConcatQFp8Kernel {
-  static_assert(kDcpWorldSize >= 1, "DCP world size must be positive");
-
   template <int kNumWarps, typename TLoc>
   static constexpr auto kernel = set_mla_kv_concat_q_fp8_kernel<kDcpWorldSize, kDcpPageSize, kNumWarps, kUsePDL, TLoc>;
 
@@ -537,8 +534,6 @@ struct SetMlaKVConcatQFp8Kernel {
         .verify(q_out);
 
     CHECK_HOST(D_buf.unwrap() >= kFp8RowBytes) << "kv_buffer last dim too small";
-    CHECK_HOST(dcp_rank >= 0 && dcp_rank < kDcpWorldSize)
-        << "invalid dcp world/rank: " << kDcpWorldSize << "/" << dcp_rank;
     CHECK_HOST(S_loc.unwrap() == 1) << "loc must be contiguous; got stride " << S_loc.unwrap();
 
     // Alignment tripwires (mirrored by python covered() so uncovered layouts

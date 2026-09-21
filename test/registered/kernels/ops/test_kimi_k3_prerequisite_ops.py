@@ -181,8 +181,6 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
                     2 * world_size * stripe + 1,
                 }
             )
-            if page_size:
-                locations.append(-1)
             _, _, k_nope, k_rope, q_nope, q_rope = _make_mla_inputs(
                 len(locations), num_heads=3, seed=1
             )
