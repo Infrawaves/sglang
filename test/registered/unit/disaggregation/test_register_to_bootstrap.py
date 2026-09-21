@@ -1,4 +1,6 @@
-"""Unit tests for srt/disaggregation/common/conn bootstrap registration and layout."""
+"""Unit tests for srt/disaggregation/common/conn -- register_to_bootstrap retry logic
+and page-layout negotiation.
+"""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
