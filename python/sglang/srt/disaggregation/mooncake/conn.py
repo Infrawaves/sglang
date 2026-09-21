@@ -203,7 +203,9 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
-            dcp_kv_layout=(msg[19].decode("ascii") if len(msg) > 19 else "token"),
+            dcp_kv_layout=(
+                msg[19].decode("ascii") if len(msg) > 19 and msg[19] != b"" else "token"
+            ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
@@ -2589,6 +2591,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
+            dst_dcp_kv_layout = (
+                b"page" if get_parallel().dcp_kv_layout == "page" else b""
+            )
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -2614,8 +2619,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            dst_dcp_kv_layout,
                         ]
-                        + ([b"page"] if get_parallel().dcp_kv_layout == "page" else [])
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
