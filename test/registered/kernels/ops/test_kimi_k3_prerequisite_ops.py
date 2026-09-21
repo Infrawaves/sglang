@@ -155,10 +155,18 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
         )
 
     def test_mla_scatter_concat_fp8_dcp(self):
+        """Runtime DCP geometry preserves owner-only KV stores and every query."""
         if torch.cuda.get_device_capability()[0] < 9:
             self.skipTest("fused FP8 MLA scatter+concat requires SM90+")
-        for world_size, page_size in ((2, 0), (3, 0), (2, 1), (2, 64), (3, 3)):
-            self.assertTrue(can_use_set_mla_kv_concat_q_fp8(world_size, page_size))
+        self.assertTrue(can_use_set_mla_kv_concat_q_fp8())
+        for world_size, page_size in (
+            (2, 0),
+            (3, 0),
+            (2, 1),
+            (2, 64),
+            (8, 64),
+            (3, 3),
+        ):
             stripe = page_size or 1
             locations = sorted(
                 {
