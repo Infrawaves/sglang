@@ -87,13 +87,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
     ):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
-        Without DCP this defers to the base cute-dsl path.
+        Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
         With token DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
         rank-local ``(out, lse)``, the LSE in natural log.
-        Page DCP uses local lengths for both inputs with ``cp_world=1`` and
-        ``cp_rank=0``. SGLang retains its real DCP group for Q exchange and
-        outer LSE merge, with the same rank-local return contract.
+        Page DCP uses local lengths for both inputs and passes ``cp_world=1``
+        and ``cp_rank=0`` to the kernel.
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(

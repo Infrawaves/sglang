@@ -304,8 +304,9 @@ struct SetMlaKVConcatQKernel {
 };
 
 // ---------------------------------------------------------------------------
-// fp8 variant. Fixed row widths, runtime DCP geometry (token or page layout),
-// per-lane conversion instead of bulk-copying, and strides counted in elements.
+// fp8 variant. Shares the translation unit, not the kernel: dims are fixed
+// rather than template parameters, it shards DCP slots by token or page,
+// converts per lane instead of bulk-copying, and counts strides in elements.
 // Only the module that instantiates it pays for it.
 // ---------------------------------------------------------------------------
 constexpr int kFp8NopeDim = 512;
@@ -322,7 +323,11 @@ struct SetMlaKVConcatQFp8Params {
   int64_t stride_rope;          // elements
   int64_t stride_buffer_bytes;  // bytes
   uint32_t batch_size;
-  // ``loc`` is DCP-widened; a positive dcp_page_size selects page layout.
+  // Token DCP cyclic sharding of the KV pool: ``loc`` is VIRTUAL; the physical
+  // row on the owner rank is loc / world, and only the owner
+  // (loc % world == rank) writes. world=1/rank=0 = identity (non-DCP).
+  // With dcp_page_size > 0 (physical page size in tokens), apply this mapping
+  // to page indices instead, preserving the offset within each page.
   int32_t dcp_world_size;
   int32_t dcp_rank;
   int32_t dcp_page_size;
