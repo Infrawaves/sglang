@@ -454,8 +454,6 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
 
 template <int kDcpWorldSize, int kDcpPageSize, bool kUsePDL>
 struct SetMlaKVConcatQFp8Kernel {
-  static_assert(kDcpWorldSize >= 1, "DCP world size must be positive");
-
   template <int kNumWarps, typename TLoc>
   static constexpr auto kernel = set_mla_kv_concat_q_fp8_kernel<kDcpWorldSize, kDcpPageSize, kNumWarps, kUsePDL, TLoc>;
 
