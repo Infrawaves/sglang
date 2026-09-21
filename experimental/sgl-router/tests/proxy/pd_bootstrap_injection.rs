@@ -802,3 +802,48 @@ async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn responses_pd_dispatch_uses_request_id_and_preserves_decode_streaming() {
+    use http_body_util::BodyExt;
+
+    for streaming in [false, true] {
+        let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+        let decode = crate::common::mock_worker::MockWorker::start(vec![
+            "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+        ]).await;
+        let ctx = build_ctx(vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()), url: prefill.url.clone(), mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())], bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()), url: decode.url.clone(), mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())], bootstrap_port: None,
+            },
+        ]);
+        let req = Request::builder().method("POST").uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "model": "tiny", "input": "hi", "stream": streaming, "request_id": "caller-id"
+            }).to_string())).unwrap();
+        let res = build_router(ctx).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = res.into_body().collect().await.unwrap();
+        let p = parse_body(&await_captured_body(&prefill, Duration::from_secs(2), "prefill").await);
+        let d = parse_body(&await_captured_body(&decode, Duration::from_secs(2), "decode").await);
+        assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+        assert_eq!(p["bootstrap_host"], "127.0.0.1");
+        assert_eq!(p["bootstrap_port"], 8997);
+        assert_eq!(p["request_id"], d["request_id"]);
+        assert!(p["request_id"].as_str().unwrap().starts_with("sgl-router-"));
+        assert_ne!(p["request_id"], "caller-id");
+        assert_eq!(p["stream"], false);
+        assert_eq!(d["stream"], streaming);
+        for value in [&p, &d] {
+            assert_eq!(value["input"], "hi");
+            assert!(value.get("rid").is_none());
+            assert!(value.get("input_ids").is_none());
+        }
+    }
+}

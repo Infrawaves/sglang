@@ -109,7 +109,7 @@ fn prefill_policy_reason(
     }
 }
 
-/// Maximum buffered chat-completions body (32MiB). Sized for base64 multimodal inputs;
+/// Maximum buffered inference body (32MiB), shared by chat and responses. Sized for base64 multimodal inputs;
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
@@ -136,6 +136,8 @@ struct RequestProbe {
     max_tokens: Option<u64>,
     #[serde(default)]
     max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 impl RequestProbe {
@@ -195,6 +197,36 @@ fn policy_selection_failed(
     }
 }
 
+/// The upstream protocol determines its URL, output budget and PD request ID.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceEndpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl InferenceEndpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Responses => "/v1/responses",
+        }
+    }
+
+    fn request_id_field(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "rid",
+            Self::Responses => "request_id",
+        }
+    }
+
+    fn output_budget(self, probe: &RequestProbe) -> Option<u64> {
+        match self {
+            Self::ChatCompletions => probe.requested_max_output_tokens(),
+            Self::Responses => probe.max_output_tokens,
+        }
+    }
+}
+
 /// POST /v1/chat/completions — parse model from body, select a healthy
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
@@ -204,13 +236,25 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    proxy_inference(ctx, headers, body, InferenceEndpoint::ChatCompletions).await
+}
+
+pub(crate) async fn proxy_inference(
+    ctx: Arc<AppContext>,
+    headers: HeaderMap,
+    body: Bytes,
+    endpoint: InferenceEndpoint,
+) -> Result<Response<Body>, ApiError> {
+    let upstream_path = endpoint.path();
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
-    let requested_max_output_tokens = probe.requested_max_output_tokens();
-    let model_str = probe
-        .model
-        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    let requested_max_output_tokens = endpoint.output_budget(&probe);
+    let model_str = match probe.model {
+        Some(model) => model,
+        None if endpoint == InferenceEndpoint::Responses => ctx.config.model.id.clone(),
+        None => return Err(ApiError::BadRequest("missing `model` field".into())),
+    };
     let model_id = ModelId(model_str.clone());
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
@@ -259,11 +303,15 @@ pub async fn chat_completions(
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
-    let want_tokens = should_tokenize_request(
-        ctx.tokenizers.has_chat_encoder(&model_str),
-        policy.needs_request_tokens(),
-        ctx.bucket_selector.is_enabled(),
-    );
+    // Responses may contain instructions, tool items and stored history. The
+    // chat encoder cannot reproduce that prompt; use load-based fallback and
+    // the body-size estimate until a Responses-aware encoder is available.
+    let want_tokens = endpoint == InferenceEndpoint::ChatCompletions
+        && should_tokenize_request(
+            ctx.tokenizers.has_chat_encoder(&model_str),
+            policy.needs_request_tokens(),
+            ctx.bucket_selector.is_enabled(),
+        );
     let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".into())
@@ -834,7 +882,7 @@ pub async fn chat_completions(
         request_value,
         forward_input_ids,
         bootstrap.as_ref(),
-        pd_rid.as_deref(),
+        pd_rid.as_deref().map(|rid| (endpoint.request_id_field(), rid)),
     )?;
 
     // `request_id` is the gateway's Venus-Request-Id or the client's
@@ -883,7 +931,7 @@ pub async fn chat_completions(
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
-                    "/v1/chat/completions",
+                    upstream_path,
                     &prefill_headers,
                     prefill_body,
                 )
@@ -963,7 +1011,7 @@ pub async fn chat_completions(
                 let fetch = ctx.proxy.forward_streaming_to(
                     &decode_worker.url,
                     &decode_worker.breaker,
-                    "/v1/chat/completions",
+                    upstream_path,
                     &headers,
                     outgoing_body,
                     Some(stream_guards),
@@ -1009,7 +1057,7 @@ pub async fn chat_completions(
                 let fetch = ctx.proxy.forward_json_to(
                     &decode_worker.url,
                     &decode_worker.breaker,
-                    "/v1/chat/completions",
+                    upstream_path,
                     &headers,
                     outgoing_body,
                 );
@@ -1066,7 +1114,7 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            "/v1/chat/completions",
+            upstream_path,
             &headers,
             outgoing_body,
             Some(stream_guards),
@@ -1095,7 +1143,7 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,
-            "/v1/chat/completions",
+            upstream_path,
             &headers,
             outgoing_body,
         );
@@ -1162,14 +1210,14 @@ pub async fn chat_completions(
     tracing::info!(
         request_id = %request_id,
         method = "POST",
-        path = "/v1/chat/completions",
+        path = upstream_path,
         model = %metrics_model,
         worker = %metrics_worker_url,
         outcome = outcome_str,
         http_status,
         stream = streaming,
         latency_ms = elapsed.as_millis() as u64,
-        "chat_completions",
+        "inference_request",
     );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
@@ -1364,7 +1412,7 @@ fn build_outgoing_body(
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
-    rid: Option<&str>,
+    rid: Option<(&str, &str)>,
 ) -> Result<OutgoingBodies, ApiError> {
     if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
@@ -1417,16 +1465,17 @@ fn build_outgoing_body(
             serde_json::Value::Number(b.room.into()),
         );
     }
+    let rid_field = rid.map_or("rid", |(field, _)| field);
     let caller_rid = obj
-        .get("rid")
+        .get(rid_field)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
-    if let Some(rid) = rid {
+    if let Some((field, rid)) = rid {
         // SGLang aborts by RID prefix. Every PD request gets a fresh UUID of
         // fixed length, so caller IDs such as request-1 and request-10 cannot
         // cancel each other. Preserve the caller value only for tracing.
         obj.insert(
-            "rid".to_string(),
+            field.to_string(),
             serde_json::Value::String(rid.to_string()),
         );
     }
@@ -1607,11 +1656,11 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     //      Other fields are ignored; the worker is authoritative for the
     //      rest of the schema.
     let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions body rejected as non-object JSON");
+        tracing::debug!(error = %e, "inference body rejected as non-object JSON");
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
     })?;
     let probe: RequestProbe = serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions request-probe deserialize failed");
+        tracing::debug!(error = %e, "inference request-probe deserialize failed");
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
     })?;
     Ok(probe)
@@ -1848,7 +1897,7 @@ mod tests {
     fn build_outgoing_body_injects_pd_rid() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[],"rid":"caller-rid"}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-rid")).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, Some(("rid", "router-rid"))).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out.primary).unwrap();
         assert_eq!(parsed.get("rid"), Some(&serde_json::json!("router-rid")));
         assert_eq!(out.caller_rid.as_deref(), Some("caller-rid"));
@@ -2041,6 +2090,18 @@ mod tests {
             parse_probe(&body).unwrap().requested_max_output_tokens(),
             Some(256)
         );
+    }
+
+    #[test]
+    fn output_budget_uses_the_endpoint_schema() {
+        let body = Bytes::from_static(
+            br#"{"model":"tiny","max_tokens":64,"max_completion_tokens":128,"max_output_tokens":256}"#,
+        );
+        let probe = parse_probe(&body).unwrap();
+        assert_eq!(InferenceEndpoint::Responses.output_budget(&probe), Some(256));
+        assert_eq!(InferenceEndpoint::ChatCompletions.output_budget(&probe), Some(128));
+        let probe = parse_probe(&Bytes::from_static(br#"{"model":"tiny","max_tokens":64}"#)).unwrap();
+        assert_eq!(InferenceEndpoint::Responses.output_budget(&probe), None);
     }
 
     #[test]

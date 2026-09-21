@@ -1659,3 +1659,78 @@ async fn streaming_error_event_then_transport_failure_records_upstream_error() {
     );
     wait_for_metric(&ctx, &expected).await;
 }
+
+#[tokio::test]
+async fn responses_routes_preserve_body_and_response_schema() {
+    {
+        let route = "/v1/responses";
+        let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+        let ctx = build_ctx_with_worker(&worker.url);
+        let body = serde_json::json!({
+            "model": "tiny",
+            "instructions": "Be concise",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "max_output_tokens": 64,
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "store": false
+        }).to_string();
+        let req = Request::builder().method("POST").uri(route)
+            .header("content-type", "application/json")
+            .header("x-request-id", "responses-test")
+            .body(Body::from(body.clone())).unwrap();
+        let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["object"], "response");
+        assert_eq!(value["output"][0]["content"][0]["text"], "ok");
+        let captured = worker.captured.lock().unwrap();
+        assert_eq!(captured.last_body.as_ref().unwrap().as_ref(), body.as_bytes());
+        assert_eq!(captured.headers.get("x-request-id").unwrap(), "responses-test");
+        assert!(ctx.metrics.render().contains(&format!(
+            "sgl_router_requests_total{{route=\"{route}\",method=\"POST\"}} 1"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn responses_streams_named_sse_events_unchanged() {
+    let chunks = vec![
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\"}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    ];
+    let expected = chunks.concat();
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    {
+        let route = "/v1/responses";
+        let req = Request::builder().method("POST").uri(route)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"tiny","input":"hi","stream":true}"#)).unwrap();
+        let res = build_router(build_ctx_with_worker(&worker.url)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn responses_validation_and_body_limit_apply_before_dispatch() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    {
+        let route = "/v1/responses";
+        let app = build_router(build_ctx_with_worker(&worker.url));
+        for body in ["null", "[]", "{", r#"{"model":3}"#, r#"{"model":"tiny","stream":"yes"}"#] {
+            let req = Request::builder().method("POST").uri(route)
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap();
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        }
+        let req = Request::builder().method("POST").uri(route)
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; MAX_CHAT_BODY_BYTES + 1])).unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+}

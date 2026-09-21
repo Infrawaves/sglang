@@ -60,6 +60,7 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/v1/responses", post(responses))
             .route("/abort_request", post(abort_request))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
@@ -511,4 +512,23 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
         }]
     });
     Json(resp).into_response()
+}
+
+async fn responses(state: State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let response = chat(state, headers, body).await;
+    if value["stream"].as_bool().unwrap_or(false) {
+        return response;
+    }
+    Json(serde_json::json!({
+        "id": "resp-test",
+        "object": "response",
+        "model": value["model"],
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}]
+        }]
+    })).into_response()
 }

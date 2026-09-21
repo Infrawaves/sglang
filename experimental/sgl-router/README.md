@@ -3,10 +3,20 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`,
+and `/v1/responses` (buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery.
+
+Responses requests are forwarded to the worker's `/v1/responses` endpoint;
+workers must support that API. The router preserves the Responses payload and
+uses `max_output_tokens` for decode bucket routing. Responses prompt encoding
+remains on the worker: the router does not inject chat `input_ids`, and cache-aware
+routing falls back to load selection with a body-size input-token estimate.
+PD mode shares bootstrap metadata and a generated `request_id` across both workers.
+This adds POST creation only, without response storage or GET/delete/cancel routes.
+Worker-local history (`previous_response_id`) requires affinity to the worker
+holding that history; the router does not resolve response IDs to workers.
 
 ## Building
 
