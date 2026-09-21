@@ -760,11 +760,12 @@ class KimiK3ImageProcessor(
         self.media_proc_cfg = _apply_k3_video_config_overrides(
             dict(_processor.media_processor.media_proc_cfg)
         )
-        max_concurrent = envs.SGLANG_K3_VIDEO_MAX_CONCURRENT_PREPROCESS.get()
-        self._video_gpu_semaphore = (
-            asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+        max_inflight_frames = envs.SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES.get()
+        self._video_gpu_frame_budget = (
+            max_inflight_frames if max_inflight_frames > 0 else None
         )
-        self._video_gpu_inflight = 0
+        self._video_gpu_inflight_frames = 0
+        self._video_gpu_condition = asyncio.Condition()
         max_queue_depth = envs.SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH.get()
         self._video_gpu_queue_depth_limit = (
             max_queue_depth if max_queue_depth > 0 else None
@@ -772,63 +773,105 @@ class KimiK3ImageProcessor(
         self._video_gpu_queue_depth = 0
 
     @asynccontextmanager
-    async def _video_gpu_preprocess_slot(self, active: bool):
-        """Bound GPU preprocessing concurrency and the waiting queue depth."""
-        if not active or self._video_gpu_semaphore is None:
+    async def _video_gpu_preprocess_slot(self, sampled_frames: int):
+        """Block until enough of the global video-frame budget is free.
+
+        ``SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES`` bounds one request's own
+        preprocessing cost, but nothing else here bounds how many of those
+        per-request peaks land on the GPU at the same time -- two or more
+        requests that are each individually within budget can still add up
+        past available memory. This closes that gap one level up: weighted
+        by sampled frame count rather than by request count, so a request
+        with a small video waits less than one with a big video -- there
+        is no fixed number of concurrency "slots", just a shared frame
+        budget. A request whose own frame count already exceeds the budget
+        is let through alone (once no other video request is in flight)
+        rather than blocked forever. A no-op for non-video requests
+        (``sampled_frames <= 0``; images are cheap enough not to need this)
+        or when the budget is disabled.
+
+        ``SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH`` bounds how many requests may be
+        waiting at this gate at once, on top of the frame budget itself. A
+        sustained burst of video requests each individually within
+        ``SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES`` still pays its own decode
+        cost (on the IO thread pool, before this gate is ever reached)
+        regardless of how long the queue here already is -- an unbounded
+        queue means an unbounded amount of already-decoded frame tensors
+        sitting in host memory behind it. A request that would push the
+        queue past this depth is rejected with 400 (Bad Request) before it
+        joins the queue, instead of queueing indefinitely; the current
+        queue depth (not counting this rejected request) is logged at INFO
+        level whenever a request has to queue.
+        """
+        if sampled_frames <= 0 or self._video_gpu_frame_budget is None:
             yield
             return
         debug = envs.SGLANG_K3_VIDEO_DEBUG_LOG.get()
-        limit = envs.SGLANG_K3_VIDEO_MAX_CONCURRENT_PREPROCESS.get()
+        budget = self._video_gpu_frame_budget
         queue_depth_limit = self._video_gpu_queue_depth_limit
-        queued = self._video_gpu_inflight >= limit
-        if queued:
-            if (
-                queue_depth_limit is not None
-                and self._video_gpu_queue_depth >= queue_depth_limit
-            ):
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    detail="Internal video format error",
+        async with self._video_gpu_condition:
+            must_queue = (
+                self._video_gpu_inflight_frames > 0
+                and self._video_gpu_inflight_frames + sampled_frames > budget
+            )
+            if must_queue:
+                if (
+                    queue_depth_limit is not None
+                    and self._video_gpu_queue_depth >= queue_depth_limit
+                ):
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        detail="Internal video format error",
+                    )
+                self._video_gpu_queue_depth += 1
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: queueing for %d frames of "
+                    "budget (%d/%d in use); %d request(s) now queued",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                    self._video_gpu_queue_depth,
                 )
-            self._video_gpu_queue_depth += 1
-            logger.info(
-                "Kimi-K3 video GPU-preprocess: queueing (%d/%d active); "
-                "%d request(s) now queued",
-                self._video_gpu_inflight,
-                limit,
-                self._video_gpu_queue_depth,
-            )
-        if debug:
-            logger.info(
-                "Kimi-K3 video GPU-preprocess: waiting for a slot (%d/%d in use)",
-                self._video_gpu_inflight,
-                limit,
-            )
-        try:
-            async with self._video_gpu_semaphore:
-                if queued:
+            if debug:
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: waiting for %d frames of "
+                    "budget (%d/%d in use)",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                )
+            try:
+                while (
+                    self._video_gpu_inflight_frames > 0
+                    and self._video_gpu_inflight_frames + sampled_frames > budget
+                ):
+                    await self._video_gpu_condition.wait()
+            finally:
+                if must_queue:
                     self._video_gpu_queue_depth -= 1
-                    queued = False
-                self._video_gpu_inflight += 1
+            self._video_gpu_inflight_frames += sampled_frames
+            if debug:
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: acquired %d frames of "
+                    "budget (%d/%d in use)",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                )
+        try:
+            yield
+        finally:
+            async with self._video_gpu_condition:
+                self._video_gpu_inflight_frames -= sampled_frames
                 if debug:
                     logger.info(
-                        "Kimi-K3 video GPU-preprocess: acquired slot (%d/%d in use)",
-                        self._video_gpu_inflight,
-                        limit,
+                        "Kimi-K3 video GPU-preprocess: released %d frames of "
+                        "budget (%d/%d in use)",
+                        sampled_frames,
+                        self._video_gpu_inflight_frames,
+                        budget,
                     )
-                try:
-                    yield
-                finally:
-                    self._video_gpu_inflight -= 1
-                    if debug:
-                        logger.info(
-                            "Kimi-K3 video GPU-preprocess: released slot (%d/%d in use)",
-                            self._video_gpu_inflight,
-                            limit,
-                        )
-        finally:
-            if queued:
-                self._video_gpu_queue_depth -= 1
+                self._video_gpu_condition.notify_all()
 
     @staticmethod
     def _resolve_visual_modalities(request_obj, image_count, video_count):
@@ -1152,6 +1195,10 @@ class KimiK3ImageProcessor(
                 f"{len(loaded_videos)} video(s)"
             )
 
+        # Read by _video_gpu_preprocess_slot below regardless of whether
+        # this request has any video (stays 0 for image-only requests, in
+        # which case that slot is a no-op).
+        total_sampled_frames = 0
         if video_data:
             modalities = self._resolve_visual_modalities(
                 request_obj, expected_image_count, len(video_data)
@@ -1159,7 +1206,6 @@ class KimiK3ImageProcessor(
             image_iter = iter(loaded_images)
             video_iter = iter(loaded_videos)
             visual_items = []
-            total_sampled_frames = 0
             for source_index, modality in enumerate(modalities):
                 if modality == "image":
                     visual_items.append(
@@ -1244,7 +1290,7 @@ class KimiK3ImageProcessor(
 
         if self._should_defer_gpu_preprocessing(base_output.images):
             return self._build_deferred_output(base_output)
-        async with self._video_gpu_preprocess_slot(bool(video_data)):
+        async with self._video_gpu_preprocess_slot(total_sampled_frames):
             mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 base_output,
                 self.mm_tokens,
