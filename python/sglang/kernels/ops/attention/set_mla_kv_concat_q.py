@@ -278,10 +278,12 @@ def set_mla_kv_concat_q_fp8(
     aten fp8 casts + the KV-row write on the fp8 decode path).
 
     Under token DCP, ``loc`` is VIRTUAL: the physical row is ``loc //
-    dcp_world_size`` and only the owner rank writes. A positive
-    ``dcp_page_size`` selects page DCP: it is the physical page size S, the
-    owner is ``(loc // S) % world``, and the local row preserves the page
-    offset. Query conversion still runs for every token.
+    dcp_world_size`` and only the owner rank (``loc % dcp_world_size ==
+    dcp_rank``) writes its KV row (query conversion still runs for every
+    token). world=1/rank=0 is the non-DCP identity.
+    With ``dcp_page_size > 0``, the same mapping applies to page indices
+    instead of token indices, preserving the offset within each page.
+    ``dcp_page_size`` is the physical page size in tokens.
 
     Shapes (leading singleton dims on the k sources are flattened away):
         kv_buffer:    [num_pages, 576] fp8_e4m3/uint8 (or [num_pages, 1, 576])
