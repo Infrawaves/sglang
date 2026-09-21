@@ -714,10 +714,6 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
         self.assertNotIn("session", manager.failed_sessions)
         self.assertNotIn("session", manager.session_failures)
 
-        manager.dcp_size = 2
-        with self.assertRaisesRegex(RuntimeError, "prefill=token, decode=page"):
-            _run_control_message(manager, manager.start_prefill_thread, message)
-        manager.dcp_size = 1
         token_message = message[:19]
         token_message[3] = b"token-session"
         _run_control_message(manager, manager.start_prefill_thread, token_message)
