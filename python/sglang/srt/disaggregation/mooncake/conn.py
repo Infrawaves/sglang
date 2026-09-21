@@ -2175,7 +2175,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    dcp_kv_layout = decode_kv_args.dcp_kv_layout
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
@@ -2187,7 +2186,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
-                        if dcp_kv_layout == "token":
+                        if decode_kv_args.dcp_kv_layout == "token":
                             self._init_dcp_pack_buffers_once(
                                 decode_kv_args.dst_dcp_size
                             )
