@@ -454,6 +454,8 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
 
 template <int kDcpWorldSize, int kDcpPageSize, bool kUsePDL>
 struct SetMlaKVConcatQFp8Kernel {
+  static_assert(kDcpWorldSize >= 1, "DCP world size must be positive");
+
   template <int kNumWarps, typename TLoc>
   static constexpr auto kernel = set_mla_kv_concat_q_fp8_kernel<kDcpWorldSize, kDcpPageSize, kNumWarps, kUsePDL, TLoc>;
 
@@ -534,6 +536,8 @@ struct SetMlaKVConcatQFp8Kernel {
         .verify(q_out);
 
     CHECK_HOST(D_buf.unwrap() >= kFp8RowBytes) << "kv_buffer last dim too small";
+    CHECK_HOST(dcp_rank >= 0 && dcp_rank < kDcpWorldSize)
+        << "invalid dcp world/rank: " << kDcpWorldSize << "/" << dcp_rank;
     CHECK_HOST(S_loc.unwrap() == 1) << "loc must be contiguous; got stride " << S_loc.unwrap();
 
     // Alignment tripwires (mirrored by python covered() so uncovered layouts
