@@ -11,6 +11,49 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Remove the trailing `.0` emitted for integer `response.created_at` values
+/// by some Responses serializers. The router only needs this small wire-level
+/// compatibility fix; all other bytes are passed through unchanged.
+pub fn normalize_created_at_chunk(bytes: Bytes) -> Bytes {
+    const KEY: &[u8] = b"\"created_at\":";
+    let input = &bytes[..];
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut changed = false;
+
+    while let Some(offset) = input[cursor..]
+        .windows(KEY.len())
+        .position(|window| window == KEY)
+    {
+        let key_start = cursor + offset;
+        let number_start = key_start + KEY.len();
+        output.extend_from_slice(&input[cursor..number_start]);
+        let mut number_end = number_start;
+        while number_end < input.len() && input[number_end].is_ascii_digit() {
+            number_end += 1;
+        }
+        if number_end > number_start
+            && input[number_end..].starts_with(b".0")
+            && input
+                .get(number_end + 2)
+                .map_or(true, |byte| !byte.is_ascii_digit())
+        {
+            output.extend_from_slice(&input[number_start..number_end]);
+            cursor = number_end + 2;
+            changed = true;
+        } else {
+            cursor = number_start;
+        }
+    }
+
+    if !changed {
+        bytes
+    } else {
+        output.extend_from_slice(&input[cursor..]);
+        Bytes::from(output)
+    }
+}
+
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
@@ -201,6 +244,24 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn normalize_created_at_chunk_removes_only_integer_float_suffix() {
+        let converted = normalize_created_at_chunk(Bytes::from_static(
+            br#"data: {"response":{"created_at":1790067051.0,"other":1.5}}"#,
+        ));
+        assert_eq!(
+            converted,
+            Bytes::from_static(br#"data: {"response":{"created_at":1790067051,"other":1.5}}"#,)
+        );
+        let unchanged = normalize_created_at_chunk(Bytes::from_static(
+            br#"data: {"response":{"created_at":1790067051.01}}"#,
+        ));
+        assert_eq!(
+            unchanged,
+            Bytes::from_static(br#"data: {"response":{"created_at":1790067051.01}}"#)
+        );
+    }
 
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {

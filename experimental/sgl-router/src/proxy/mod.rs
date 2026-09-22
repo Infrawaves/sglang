@@ -12,9 +12,11 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::either::Either;
 
 /// Cap on a non-2xx upstream body forwarded to the client. A worker validation
 /// error on a `Union` field emits one entry per branch, each echoing `input`,
@@ -337,12 +339,15 @@ impl Proxy {
                 }
             }))
         };
-        let body = sse::bytes_stream_to_body(
-            resp.bytes_stream(),
-            stream_guards,
-            on_complete,
-            on_first_byte,
-        );
+        let stream = if path == "/v1/responses" {
+            Either::Left(
+                resp.bytes_stream()
+                    .map(|chunk| chunk.map(sse::normalize_created_at_chunk)),
+            )
+        } else {
+            Either::Right(resp.bytes_stream())
+        };
+        let body = sse::bytes_stream_to_body(stream, stream_guards, on_complete, on_first_byte);
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(

@@ -1694,13 +1694,15 @@ async fn responses_routes_preserve_body_and_response_schema() {
 }
 
 #[tokio::test]
-async fn responses_streams_named_sse_events_unchanged() {
+async fn responses_streams_named_sse_events_normalize_created_at() {
     let chunks = vec![
-        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\"}}\n\n",
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\",\"created_at\":1790067051.0}}\n\n",
         "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
         "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     ];
-    let expected = chunks.concat();
+    let expected = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\",\"created_at\":1790067051}}\n\n\
+        event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+        event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
     let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
     {
         let route = "/v1/responses";
