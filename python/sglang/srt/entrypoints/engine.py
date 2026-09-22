@@ -1050,6 +1050,15 @@ class Engine(EngineScoreMixin, EngineBase):
         # Engine.__init__ or CLI entry).
         load_plugins()
 
+        # Foundry patches the scheduler spawn site to put its hook library in
+        # LD_PRELOAD, which only takes effect at child process start -- so this
+        # runs before _launch_scheduler_processes below, not inside the children.
+        from sglang.srt.foundry_shim import (
+            apply_server_args as apply_foundry_server_args,
+        )
+
+        apply_foundry_server_args(server_args)
+
         # Not read-only: the LoRA checks normalize adapter paths through late
         # resolution, which a published config refuses. Hence before publish --
         # and before the parser detection below, which consumes the "auto"

@@ -5424,6 +5424,12 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # `spawn` carries no Python state, and the record arrives already resolved,
+    # so this child installs Foundry's patches itself. Before publish: the
+    # patches wrap the ModelRunner lifecycle this process is about to enter.
+    from sglang.srt.foundry_shim import apply_server_args as apply_foundry_server_args
+
+    apply_foundry_server_args(server_args)
     # Publish before anything in this process reads configuration.
     publish(server_args, role="scheduler")
     dp_rank = configure_scheduler_process(

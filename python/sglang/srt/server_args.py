@@ -1928,6 +1928,11 @@ class ServerArgs:
         "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
         NS("exec.graph"),
     ] = False
+    foundry_graph_extension_config_path: A[
+        Optional[str],
+        "Path to a Foundry CUDA-graph persistence TOML (mode = save|load). Captured decode graphs are written to / restored from the archive it names, skipping capture on a restored start. Forces decode capture to the 'full' backend and disables prefill capture.",
+        NS("exec.graph"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Communication and kernels
@@ -4140,6 +4145,12 @@ class ServerArgs:
         # Model-capability adjustments that legacy code applied at model-load
         # time; last declarations of the resolution, mirroring that order.
         handle_model_capability_adjustments(self)
+
+        # Overrides the resolved cuda-graph config and reads the resolved
+        # speculative algorithm, so it runs after both.
+        from sglang.srt.arg_groups.foundry_hook import handle_foundry_graph_extension
+
+        handle_foundry_graph_extension(self)
 
         # Validate after all batch-size declarations are visible.
         validate_deepep_v2_speculative_draft(self)
