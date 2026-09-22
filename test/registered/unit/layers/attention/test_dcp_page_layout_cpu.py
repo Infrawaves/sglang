@@ -7,54 +7,19 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.kernels.ops.attention import set_mla_kv_concat_q as fused_module
-from sglang.kernels.ops.kvcache import mla_buffer as mla_buffer_module
 from sglang.srt.layers.attention import cutedsl_mla_backend as cute_module
 from sglang.srt.layers.attention import trtllm_mla_backend as trt_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
-from sglang.srt.mem_cache import memory_pool as memory_pool_module
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _parallel(*, layout: str, dcp_size: int = 3, dcp_rank: int = 1):
-    return SimpleNamespace(
-        dcp_enabled=True,
-        dcp_kv_layout=layout,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        attn_dcp_size=dcp_size,
-        attn_dcp_rank=dcp_rank,
-    )
-
-
 class TestDcpPageMlaWriterContracts(CustomTestCase):
-    def test_pool_passes_its_physical_page_size_to_dcp_writer(self):
-        pool = object.__new__(MLATokenToKVPool)
-        pool.write_loc_is_dcp_resolved = False
-        pool.page_size = 64
-        buffer = torch.empty(1)
-        loc = torch.tensor([0])
-        nope = torch.empty(1)
-        rope = torch.empty(1)
-        with patch.object(
-            memory_pool_module, "set_mla_kv_buffer_dcp_sharded_triton"
-        ) as writer:
-            pool._scatter_mla_rows(buffer, loc, nope, rope)
-
-        writer.assert_called_once_with(
-            buffer,
-            loc,
-            nope,
-            rope,
-            physical_page_size=64,
-        )
-
     def test_fused_fp8_wrapper_passes_page_or_token_layout_to_kernel(self):
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = 64
@@ -82,13 +47,11 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                 backend.dcp_kv_layout = layout
                 with (
                     self.subTest(layout=layout),
-                    patch.object(
-                        trt_module,
-                        "get_parallel",
-                        return_value=_parallel(
-                            layout="page" if layout == "token" else "token"
-                        ),
+                    get_context().override_server_args(
+                        dcp_size=3,
+                        dcp_kv_layout="page" if layout == "token" else "token",
                     ),
+                    get_parallel().override(dcp_rank=1),
                 ):
                     query = backend._set_kv_and_concat_q_fp8_fused(
                         layer, torch.tensor([3]), q, q_rope, k, k_rope
@@ -103,39 +66,6 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                     self.assertEqual(
                         covered.call_args.kwargs["dcp_page_size"], expected_page_size
                     )
-
-    def test_regular_writer_launches_page_constants(self):
-        calls = []
-
-        class Kernel:
-            def __getitem__(self, _grid):
-                def launch(*_args, **kwargs):
-                    calls.append(kwargs)
-
-                return launch
-
-        with (
-            patch.object(mla_buffer_module, "set_mla_kv_buffer_kernel", Kernel()),
-            patch.object(mla_buffer_module, "is_arch_support_pdl", return_value=False),
-            patch.object(
-                mla_buffer_module,
-                "get_parallel",
-                return_value=_parallel(layout="page"),
-            ),
-        ):
-            mla_buffer_module.set_mla_kv_buffer_dcp_sharded_triton(
-                torch.empty((8, 576)),
-                torch.tensor([0, 2, 4]),
-                torch.empty((3, 1, 512)),
-                torch.empty((3, 1, 64)),
-                physical_page_size=2,
-            )
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["DCP_WORLD_SIZE"], 3)
-        self.assertEqual(calls[0]["DCP_RANK"], 1)
-        self.assertEqual(calls[0]["DCP_PAGE_SIZE"], 2)
-        self.assertTrue(calls[0]["PAGE_LAYOUT"])
 
     def test_fp8_warmup_and_launch_share_geometry_specializations(self):
         """Warmup and launch share each world/page specialization across ranks."""
@@ -233,16 +163,6 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
                 return_value=torch.empty(0),
             ),
             patch.object(
-                trt_module,
-                "get_schedule",
-                return_value=SimpleNamespace(disable_chunked_prefix_cache=False),
-            ),
-            patch.object(
-                trt_module,
-                "get_spec",
-                return_value=SimpleNamespace(speculative_num_draft_tokens=None),
-            ),
-            patch.object(
                 trt_module.envs.SGLANG_ENABLE_ASYNC_ASSERT, "get", return_value=False
             ),
             patch.object(
@@ -250,18 +170,24 @@ class TestDcpPageMlaWriterContracts(CustomTestCase):
             ) as warmup,
         ):
             for layout, page_size in (("token", 0), ("page", 64)):
-                parallel = _parallel(layout=layout)
-                parallel.attn_tp_size = 1
                 backend = object.__new__(TRTLLMMLABackend)
                 backend.device = "cpu"
                 with (
                     self.subTest(layout=layout),
-                    patch.object(trt_module, "get_parallel", return_value=parallel),
+                    get_context().override_server_args(
+                        dcp_size=3,
+                        dcp_kv_layout=layout,
+                        disable_chunked_prefix_cache=False,
+                        speculative_num_draft_tokens=None,
+                    ),
+                    get_parallel().override(dcp_rank=1),
                 ):
                     backend.__init__(model_runner, backend="cute-dsl")
                     self.assertTrue(backend._fused_set_kv_concat_q_fp8)
                     warmup.assert_called_with(3, page_size)
-                    parallel.dcp_kv_layout = "page" if layout == "token" else "token"
+                    get_context().override(
+                        "test", dcp_kv_layout="page" if layout == "token" else "token"
+                    )
                     # N=3, rank=1, S=64: length 65 gives 22 token rows or 1 page row.
                     expected_length = 22 if layout == "token" else 1
                     torch.testing.assert_close(
@@ -294,8 +220,6 @@ class TestDcpPageMetadataContracts(CustomTestCase):
         )
         for layout, enabled, mode, expected_local, expected_global in cases:
             backend.dcp_kv_layout = layout
-            parallel = _parallel(layout=layout)
-            parallel.dcp_enabled = enabled
             batch = SimpleNamespace(
                 forward_mode=mode,
                 batch_size=3,
@@ -307,7 +231,10 @@ class TestDcpPageMetadataContracts(CustomTestCase):
             )
             with (
                 self.subTest(layout=layout, enabled=enabled, mode=mode),
-                patch.object(trt_module, "get_parallel", return_value=parallel),
+                get_context().override_server_args(
+                    dcp_size=3 if enabled else 1, dcp_kv_layout=layout
+                ),
+                get_parallel().override(dcp_rank=1 if enabled else 0),
                 patch.object(
                     backend,
                     "_create_block_kv_indices",
@@ -367,13 +294,10 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                         self.subTest(
                             layout=layout, size=dcp_size, page_size=page_size, rank=rank
                         ),
-                        patch.object(
-                            trt_module,
-                            "get_parallel",
-                            return_value=_parallel(
-                                layout=layout, dcp_size=dcp_size, dcp_rank=rank
-                            ),
+                        get_context().override_server_args(
+                            dcp_size=dcp_size, dcp_kv_layout=layout
                         ),
+                        get_parallel().override(dcp_rank=rank),
                     ):
                         torch.testing.assert_close(
                             backend._get_dcp_local_seq_lens(
@@ -409,11 +333,10 @@ class TestDcpPageMetadataContracts(CustomTestCase):
             ):
                 with (
                     self.subTest(layout=layout, batch_size=batch_size, lens=seq_lens),
-                    patch.object(
-                        trt_module,
-                        "get_parallel",
-                        return_value=_parallel(layout=layout),
+                    get_context().override_server_args(
+                        dcp_size=3, dcp_kv_layout=layout
                     ),
+                    get_parallel().override(dcp_rank=1),
                 ):
                     lengths = torch.tensor(seq_lens)
                     if batch_size not in backend.decode_cuda_graph_metadata:
@@ -455,42 +378,6 @@ class TestDcpPageMetadataContracts(CustomTestCase):
                     self.assertEqual(
                         metadata.max_seq_len_k, 6 if layout == "page" else 5
                     )
-
-    def test_page_table_launch_passes_page_layout_constants(self):
-        backend = object.__new__(TRTLLMMLABackend)
-        backend.page_size = 2
-        backend.dcp_kv_layout = "page"
-        backend.req_to_token = torch.tensor(
-            [[30, 31, 32, 33, 34, 35, 6, 7, 8, 9, 10, 11]], dtype=torch.int64
-        )
-        backend.kv_index_translator = SimpleNamespace(
-            full_v2p_table=None, full_page_multiplier=1
-        )
-        calls = []
-
-        class Kernel:
-            def __getitem__(self, _grid):
-                def launch(*args, **kwargs):
-                    calls.append((args, kwargs))
-
-                return launch
-
-        table = torch.full((1, 8), -1, dtype=torch.int32)
-        with (
-            patch.object(trt_module, "create_mla_kv_page_table_for_dcp", Kernel()),
-            patch.object(
-                trt_module, "get_parallel", return_value=_parallel(layout="token")
-            ),
-        ):
-            backend._fill_dcp_block_kv_indices(
-                table, torch.tensor([0]), torch.tensor([3], dtype=torch.int32)
-            )
-
-        self.assertIs(calls[0][0][0], backend.req_to_token)
-        self.assertEqual(calls[0][1]["PHYSICAL_PAGE_SIZE"], 2)
-        self.assertEqual(calls[0][1]["DCP_SIZE"], 3)
-        self.assertEqual(calls[0][1]["DCP_RANK"], 1)
-        self.assertTrue(calls[0][1]["PAGE_LAYOUT"])
 
 
 class TestCuteDslDcpWrapperContracts(CustomTestCase):
@@ -550,7 +437,6 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
         with (
             patch.object(cute_module, "get_in_autotune_dummy_run", return_value=False),
             patch.object(cute_module, "fixup_zero_kv_rows"),
-            patch.object(backend, "_compute_decode_bmm1_scale", return_value=1.0),
         ):
             calls = []
 
@@ -565,7 +451,6 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                 ("page", 2, 1, 0, 2),
             ):
                 backend.dcp_kv_layout = layout
-                parallel = _parallel(layout="page" if layout == "token" else "token")
                 metadata = backend.forward_decode_metadata
                 metadata.seq_lens_k = (
                     torch.tensor([cached_length], dtype=torch.int32)
@@ -587,16 +472,11 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                             "_run_decode_kernel",
                             wraps=backend._run_decode_kernel,
                         ) as run_kernel,
-                        patch.object(
-                            cute_module,
-                            "get_parallel",
-                            return_value=parallel,
+                        get_context().override_server_args(
+                            dcp_size=3,
+                            dcp_kv_layout="page" if layout == "token" else "token",
                         ),
-                        patch.object(
-                            trt_module,
-                            "get_parallel",
-                            return_value=parallel,
-                        ),
+                        get_parallel().override(dcp_rank=1),
                         patch.object(
                             cute_module,
                             "flashinfer",

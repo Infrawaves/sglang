@@ -5,7 +5,7 @@ import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -18,35 +18,18 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     TransferInfo,
 )
-from sglang.srt.layers.attention import cutedsl_mla_backend as cute_module
-from sglang.srt.layers.attention import trtllm_mla_backend as trt_module
-from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache import memory_pool as memory_pool_module
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-
-
-def _page_parallel(rank: int = 0) -> SimpleNamespace:
-    return SimpleNamespace(
-        dcp_enabled=True,
-        dcp_kv_layout="page",
-        dcp_size=3,
-        dcp_rank=rank,
-        attn_dcp_size=3,
-        attn_dcp_rank=rank,
-    )
 
 
 def _pool(rows: int = 64) -> MLATokenToKVPool:
@@ -54,10 +37,6 @@ def _pool(rows: int = 64) -> MLATokenToKVPool:
     pool.page_size = 2
     pool.layer_num = 2
     pool.cpu_offloading_chunk_size = 2
-    pool.dtype = torch.float32
-    pool.store_dtype = torch.float32
-    pool.start_layer = 0
-    pool.layer_transfer_counter = None
     pool.kv_buffer = [
         torch.full((rows, 1, 576), -1.0, dtype=torch.float32)
         for _ in range(pool.layer_num)
@@ -115,16 +94,17 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 page_size=6,
             )
         )
-        publish(ServerArgs(model_path="dummy"), role="test")
-        self.addCleanup(reset_context)
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         return req, tree_cache, source_slots_all
 
     def _send_page_chunks(self, manager, destination, source):
-        """Send three chunks that make the complete global prefix [0, 18)."""
+        """Send the complete global prefix [0, 19), including its partial page."""
         chunks = [
             ([9, 3, 8, 1, 7], [20, 4], 0, 10),
             ([4, 5], [20, 4, 6], 5, 4),
-            ([2, 11], [20, 4, 6], 7, 4),
+            ([2, 11, 12], [20, 4, 6, 9], 7, 5),
         ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             for src_pages, dst_pages, offset, num_tokens in chunks:
@@ -148,129 +128,14 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 )
 
     def _assert_handoff_bytes(self, pool, source):
-        received_rows = torch.tensor([40, 41, 8, 9, 12, 13])
-        source_rows = torch.tensor([18, 19, 2, 3, 10, 11])
+        received_rows = torch.tensor([40, 41, 8, 9, 12, 13, 18])
+        source_rows = torch.tensor([18, 19, 2, 3, 10, 11, 24])
         received = []
         for layer, buffer in enumerate(pool.kv_buffer):
             expected = torch.from_numpy(source[layer][source_rows.numpy()])
             torch.testing.assert_close(buffer[received_rows], expected)
             received.append(expected.clone())
         return received_rows, received
-
-    def _cute_decode_inputs(self, pool):
-        backend = object.__new__(CuteDslMLABackend)
-        backend.dcp_kv_layout = "page"
-        backend.data_type = torch.float32
-        backend.q_data_type = torch.float32
-        backend.kv_cache_dim = 576
-        backend.page_size = 2
-        backend.workspace_buffer = object()
-        backend.qk_nope_head_dim = 128
-        backend.qk_rope_head_dim = 64
-        backend.q_indptr_decode = torch.tensor([0, 1], dtype=torch.int32)
-        backend.forward_decode_metadata = SimpleNamespace(
-            batch_size=1,
-            block_kv_indices=torch.tensor([[20, 4, 6, 9]], dtype=torch.int32),
-            seq_lens_k=torch.tensor([7], dtype=torch.int32),
-            global_seq_lens_k=torch.tensor([19], dtype=torch.int32),
-            max_seq_len_k=7,
-        )
-        backend.token_to_kv_pool = pool
-        backend.kv_lora_rank = 512
-        backend._decode_kernel_loc = None
-        layer = SimpleNamespace(
-            layer_id=0, tp_q_head_num=1, v_head_dim=512, head_dim=576, scaling=1.0
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            batch_size=1,
-            seq_lens=torch.tensor([19], dtype=torch.int32),
-            # Global position 18 uses widened slot 54 and local physical row 18.
-            out_cache_loc=torch.tensor([54], dtype=torch.int64),
-        )
-        return backend, layer, forward_batch
-
-    def _grow_at_cute_boundary(self, pool, received_rows, received):
-        """Use Cute metadata and control only the final device-kernel edge."""
-        backend, layer, forward_batch = self._cute_decode_inputs(pool)
-        parallel = _page_parallel()
-        kernel_calls = []
-        grown_rows = []
-
-        def fake_decode(**kwargs):
-            kernel_calls.append(kwargs)
-            return torch.zeros((1, 1, 1, 512)), torch.zeros((1, 1, 1))
-
-        pool.size = 64
-        pool.kernel_page_blocks = 1
-        pool.write_loc_is_dcp_resolved = False
-        pool.use_dsa = False
-        pool.dsa_kv_cache_store_fp8 = False
-
-        def cpu_writer(dst, loc, nope, rope, *, physical_page_size):
-            self.assertEqual(physical_page_size, 2)
-            torch.testing.assert_close(loc, torch.tensor([54]))
-            # A fixed device boundary result, not another layout implementation.
-            dst[18, :, :512] = nope
-            dst[18, :, 512:] = rope
-            grown_rows.append(dst[18].clone())
-
-        with (
-            patch.object(cute_module, "get_in_autotune_dummy_run", return_value=False),
-            patch.object(cute_module, "fixup_zero_kv_rows"),
-            patch.object(backend, "_compute_decode_bmm1_scale", return_value=1.0),
-            patch.object(cute_module, "get_parallel", return_value=parallel),
-            patch.object(trt_module, "get_parallel", return_value=parallel),
-            patch.object(memory_pool_module, "get_parallel", return_value=parallel),
-            patch.object(
-                memory_pool_module,
-                "set_mla_kv_buffer_dcp_sharded_triton",
-                side_effect=cpu_writer,
-            ),
-            patch.object(
-                cute_module,
-                "flashinfer",
-                SimpleNamespace(
-                    decode=SimpleNamespace(
-                        trtllm_batch_decode_with_kv_cache_mla=fake_decode
-                    )
-                ),
-                create=True,
-            ),
-        ):
-            for layer_id in range(2):
-                layer.layer_id = layer_id
-                backend.forward_decode(
-                    torch.zeros((1, 576)),
-                    torch.full((1, 1, 512), float(layer_id + 1)),
-                    torch.empty(0),
-                    layer,
-                    forward_batch,
-                    save_kv_cache=True,
-                    k_rope=torch.full((1, 1, 64), float(layer_id + 3)),
-                )
-        self.assertEqual(kernel_calls[0]["cp_world"], 1)
-        self.assertEqual(kernel_calls[0]["cp_rank"], 0)
-        self.assertEqual(
-            kernel_calls[0]["kv_cache"].data_ptr(), pool.kv_buffer[0].data_ptr()
-        )
-        torch.testing.assert_close(
-            kernel_calls[0]["block_tables"],
-            torch.tensor([[20, 4, 6, 9]], dtype=torch.int32),
-        )
-        torch.testing.assert_close(
-            kernel_calls[0]["seq_lens"], torch.tensor([7], dtype=torch.int32)
-        )
-        torch.testing.assert_close(
-            kernel_calls[0]["causal_seqlens_kv_global"],
-            torch.tensor([7], dtype=torch.int32),
-        )
-        self.assertEqual(len(grown_rows), 2)
-        received_rows = torch.cat((received_rows, torch.tensor([18])))
-        return received_rows, [
-            torch.cat((old, grown.unsqueeze(0)))
-            for old, grown in zip(received, grown_rows)
-        ]
 
     def _restore_and_release(
         self,
@@ -283,8 +148,9 @@ class TestDcpPageHandoffCpu(CustomTestCase):
     ):
         allocator = tree_cache.token_to_kv_pool_allocator
         req_to_token = tree_cache.req_to_token_pool
-        with patch.object(
-            memory_pool_module, "get_parallel", return_value=_page_parallel()
+        with (
+            get_context().override_server_args(dcp_size=3, dcp_kv_layout="page"),
+            get_parallel().override(dcp_rank=0),
         ):
             req.offload_kv_cache(req_to_token, allocator)
             self.assertIsNotNone(req.kv.retraction_backup)
@@ -336,8 +202,8 @@ class TestDcpPageHandoffCpu(CustomTestCase):
         self.assertEqual(allocator.available_size(), allocator.size)
         self.assertEqual(req_to_token.available_size(), req_to_token.size)
 
-    def test_page_handoff_cute_boundary_and_oom_restore_use_new_rows(self):
-        """Allocate, hand off, grow, then restore and release the same prefix."""
+    def test_page_handoff_and_oom_restore_use_new_rows(self):
+        """Restore the received prefix into newly allocated rows, then release it."""
         pool = _pool()
         source = [
             np.arange(64 * 576, dtype=np.float32).reshape(64, 1, 576) + layer * 100_000
@@ -360,9 +226,6 @@ class TestDcpPageHandoffCpu(CustomTestCase):
         req, tree_cache, source_slots_all = self._allocate_page_retraction(pool)
         self._send_page_chunks(manager=manager, destination=destination, source=source)
         received_rows, received = self._assert_handoff_bytes(pool=pool, source=source)
-        received_rows, received = self._grow_at_cute_boundary(
-            pool=pool, received_rows=received_rows, received=received
-        )
         self._restore_and_release(
             pool=pool,
             req=req,

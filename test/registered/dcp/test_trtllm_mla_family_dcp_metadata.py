@@ -44,9 +44,7 @@ def _make_backend(backend_cls, bs: int):
 
 
 def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
-    parallel = SimpleNamespace(
-        dcp_enabled=True, dcp_size=DCP_SIZE, dcp_rank=DCP_RANK, dcp_kv_layout="token"
-    )
+    parallel = SimpleNamespace(dcp_enabled=True, dcp_size=DCP_SIZE, dcp_rank=DCP_RANK)
     with (
         patch.object(backend_module, "get_parallel", return_value=parallel),
         patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
@@ -255,8 +253,8 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                     base, base + (end - start), dtype=torch.int32, device="cuda"
                 )
         backend = object.__new__(TRTLLMMLABackend)
-        backend.dcp_kv_layout = "token"
         backend.page_size = self.PAGE_SIZE
+        backend.dcp_kv_layout = "token"
         backend.req_to_token = req_to_token
         backend.kv_index_translator = translator
         return backend, req_to_token
@@ -271,10 +269,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
         # One 128-page row: the padded width `_calc_padded_blocks` produces.
         block_kv_indices = torch.full((bs, 128), -1, dtype=torch.int32, device="cuda")
         parallel = SimpleNamespace(
-            dcp_enabled=True,
-            dcp_size=self.DCP_SIZE,
-            dcp_rank=self.DCP_RANK,
-            dcp_kv_layout="token",
+            dcp_enabled=True, dcp_size=self.DCP_SIZE, dcp_rank=self.DCP_RANK
         )
         with patch.object(backend_module, "get_parallel", return_value=parallel):
             backend._fill_dcp_block_kv_indices(
@@ -404,13 +399,10 @@ class TestFusedFp8WriteGate(CustomTestCase):
         """Belt and braces: reaching the helper with a resolved loc asserts
         rather than silently storing into the sink."""
         backend = object.__new__(TRTLLMMLABackend)
-        backend.dcp_kv_layout = "token"
         backend.kv_index_translator = SimpleNamespace(is_translating=True)
+        backend.dcp_kv_layout = "token"
         parallel = SimpleNamespace(
-            dcp_enabled=True,
-            dcp_kv_layout="token",
-            attn_dcp_size=DCP_SIZE,
-            attn_dcp_rank=DCP_RANK,
+            dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
         )
         layer = SimpleNamespace(
             tp_q_head_num=1, v_head_dim=512, head_dim=576, layer_id=0

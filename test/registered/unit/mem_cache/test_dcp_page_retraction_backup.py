@@ -1,7 +1,4 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import torch
 
 from sglang.srt.mem_cache.memory_pool import (
@@ -9,6 +6,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MLATokenToKVPool,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,15 +23,6 @@ def _pool(rows: int = 32) -> MLATokenToKVPool:
         for layer in range(pool.layer_num)
     ]
     return pool
-
-
-def _page_parallel(rank: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        dcp_enabled=True,
-        dcp_size=3,
-        dcp_rank=rank,
-        dcp_kv_layout="page",
-    )
 
 
 def _hybrid_pool() -> HybridLinearKVPool:
@@ -58,10 +47,8 @@ class TestDCPPageRetractionBackup(CustomTestCase):
         for rank in range(3):
             with (
                 self.subTest(rank=rank),
-                patch(
-                    "sglang.srt.mem_cache.memory_pool.get_parallel",
-                    return_value=_page_parallel(rank),
-                ),
+                get_context().override_server_args(dcp_size=3, dcp_kv_layout="page"),
+                get_parallel().override(dcp_rank=rank),
             ):
                 pool = _pool()
                 source_rows = [10, 11, 2] if rank == 0 else [10, 11]
@@ -90,9 +77,9 @@ class TestDCPPageRetractionBackup(CustomTestCase):
         pool = _pool()
         first_page = torch.tensor([30, 31])
 
-        with patch(
-            "sglang.srt.mem_cache.memory_pool.get_parallel",
-            return_value=_page_parallel(rank=2),
+        with (
+            get_context().override_server_args(dcp_size=3, dcp_kv_layout="page"),
+            get_parallel().override(dcp_rank=2),
         ):
             backup = pool.get_cpu_copy(first_page)
             pool.load_cpu_copy(backup, torch.tensor([48, 49]))
@@ -106,9 +93,9 @@ class TestDCPPageRetractionBackup(CustomTestCase):
         source_state = torch.tensor([1])
         destination_state = torch.tensor([3])
 
-        with patch(
-            "sglang.srt.mem_cache.memory_pool.get_parallel",
-            return_value=_page_parallel(rank=0),
+        with (
+            get_context().override_server_args(dcp_size=3, dcp_kv_layout="page"),
+            get_parallel().override(dcp_rank=0),
         ):
             backup = pool.get_cpu_copy(source, mamba_indices=source_state)
             expected_mla = [[chunk.clone() for chunk in layer] for layer in backup[0]]
@@ -138,15 +125,11 @@ class TestDCPPageRetractionBackup(CustomTestCase):
         )
 
     def test_non_page_layout_keeps_existing_cpu_copy_format(self):
-        for parallel in (
-            SimpleNamespace(dcp_enabled=False),
-            SimpleNamespace(dcp_enabled=True, dcp_kv_layout="token"),
-        ):
+        for dcp_size in (1, 3):
             with (
-                self.subTest(parallel=parallel),
-                patch(
-                    "sglang.srt.mem_cache.memory_pool.get_parallel",
-                    return_value=parallel,
+                self.subTest(dcp_size=dcp_size),
+                get_context().override_server_args(
+                    dcp_size=dcp_size, dcp_kv_layout="token"
                 ),
             ):
                 pool = _pool()

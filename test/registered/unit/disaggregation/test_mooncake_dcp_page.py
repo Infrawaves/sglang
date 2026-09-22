@@ -104,6 +104,19 @@ class TestMooncakeDcpPage(CustomTestCase):
                     np.testing.assert_array_equal(destination, expected)
                 self.assertEqual(transport.bytes_sent, len(owned) * sum(self.widths))
 
+    def test_page_send_propagates_transport_failure(self):
+        """A failed page transfer must not be reported as a successful handoff."""
+        for custom_pool in (False, True):
+            with self.subTest(custom_pool=custom_pool):
+                manager, _, destinations, _ = self._case(custom_pool=custom_pool)
+                with (
+                    concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
+                    patch.object(manager, "_transfer_data", return_value=-9),
+                ):
+                    self.assertEqual(
+                        self._send(manager, destinations, executor=executor), -9
+                    )
+
     def test_generic_send_merges_pages_without_crossing_physical_gaps(self):
         manager, sources, destinations, transport = self._case()
         with patch.object(manager, "_transfer_data", wraps=transport) as transfer:

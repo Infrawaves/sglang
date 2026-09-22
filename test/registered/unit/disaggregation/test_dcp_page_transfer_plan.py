@@ -113,15 +113,19 @@ class TestDcpPageTransferPlan(CustomTestCase):
         self.assertEqual(plan.dst_page_indices.size, 0)
 
     def test_rejects_misaligned_prefix(self):
-        with self.assertRaisesRegex(ValueError, "virtual DCP page size"):
-            _build_plan(
-                src=[0],
-                dst=[0],
-                page_size=2,
-                dcp_size=2,
-                dcp_rank=0,
-                decode_prefix_len=1,
-            )
+        for prefix in (1, 2):
+            with (
+                self.subTest(prefix=prefix),
+                self.assertRaisesRegex(ValueError, "virtual DCP page size"),
+            ):
+                _build_plan(
+                    src=[0],
+                    dst=[0],
+                    page_size=2,
+                    dcp_size=2,
+                    dcp_rank=0,
+                    decode_prefix_len=prefix,
+                )
 
 
 if __name__ == "__main__":
