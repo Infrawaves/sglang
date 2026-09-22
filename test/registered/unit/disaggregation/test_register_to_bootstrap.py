@@ -240,7 +240,6 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = MagicMock(status_code=200)
         for layout, backend, speculative, dcp_size, supported in (
             ("token", "mooncake", None, 1, True),
-            ("page", "mooncake", None, 1, True),
             ("token", "nixl", None, 1, False),
             ("token", "mooncake", "EAGLE", 1, True),
             ("token", "mooncake", None, 2, False),

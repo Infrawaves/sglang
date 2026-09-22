@@ -68,7 +68,7 @@ class Parallel:
         Arg(
             help="KV layout for decode-context parallelism. 'token' keeps the "
             "existing token-stripe layout; 'page' enables the DCP page "
-            "interleave layout on supported decode servers. DCP1 prefill "
+            "interleave layout on supported decode servers only. DCP1 prefill "
             "servers send according to the decode layout without this option.",
             choices=["token", "page"],
         ),

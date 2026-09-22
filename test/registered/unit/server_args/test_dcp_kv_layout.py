@@ -38,6 +38,7 @@ class TestDcpKvLayout(CustomTestCase):
         for overrides in (
             {},
             {"disaggregation_mode": "null", "enable_unified_memory": True},
+            {"disaggregation_mode": "prefill", "dcp_size": 1},
             {"disaggregation_mode": "prefill", "dcp_size": 2},
         ):
             with self.subTest(overrides=overrides):
@@ -54,15 +55,6 @@ class TestDcpKvLayout(CustomTestCase):
     def test_page_accepts_final_supported_contract(self):
         validate_dcp_kv_layout(_page_args())
 
-    def test_page_prefill_does_not_require_cutedsl(self):
-        validate_dcp_kv_layout(
-            _page_args(
-                disaggregation_mode="prefill",
-                dcp_size=1,
-                decode_attention_backend="trtllm_mla",
-            )
-        )
-
     def test_page_reads_the_resolved_decode_backend(self):
         server_args = _page_args(decode_attention_backend="aiter")
         server_args._resolved_overrides = [
@@ -71,15 +63,16 @@ class TestDcpKvLayout(CustomTestCase):
 
         validate_dcp_kv_layout(server_args)
 
-    def test_page_rejects_token_indexed_execution_paths(self):
-        """Page KV must not reach standalone/unified or sharded-prefill writers."""
+    def test_page_rejects_non_decode_execution_paths(self):
+        """The page option is decode-only, including when prefill uses DCP1."""
         for overrides in (
             {"disaggregation_mode": "null", "enable_unified_memory": True},
+            {"disaggregation_mode": "prefill", "dcp_size": 1},
             {"disaggregation_mode": "prefill", "dcp_size": 2},
         ):
             with (
                 self.subTest(overrides=overrides),
-                self.assertRaisesRegex(ValueError, "PD decode.*DCP1 prefill"),
+                self.assertRaisesRegex(ValueError, "PD decode"),
             ):
                 validate_dcp_kv_layout(_page_args(**overrides))
 

@@ -27,14 +27,11 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
     if cfg.dcp_kv_layout != "page":
         return
 
-    if not (
-        cfg.disaggregation_mode == "decode"
-        or (cfg.disaggregation_mode == "prefill" and cfg.dcp_size == 1)
-    ):
+    if cfg.disaggregation_mode != "decode":
         raise ValueError(
-            "--dcp-kv-layout page requires a PD decode server or a DCP1 prefill "
-            "server; standalone and DCP-sharded prefill paths still use "
-            "token-layout KV indexing."
+            "--dcp-kv-layout page requires a PD decode server. "
+            "Prefill servers do not need this option; they send KV "
+            "according to the decode layout."
         )
     if cfg.disaggregation_transfer_backend != "mooncake":
         raise ValueError(
@@ -47,7 +44,7 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
         )
 
     _, decode_backend = attention_backends_of(cfg)
-    if cfg.disaggregation_mode == "decode" and decode_backend != "cutedsl_mla":
+    if decode_backend != "cutedsl_mla":
         raise ValueError(
             "--dcp-kv-layout page requires the resolved decode attention "
             "backend to be 'cutedsl_mla', got "
