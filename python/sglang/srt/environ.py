@@ -1673,6 +1673,21 @@ class Envs:
     # already passed SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES on its own. Set to
     # 0 (or any value <= 0) to disable (unbounded concurrency).
     SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES = EnvInt(256)
+    # Cap on how many Kimi-K3 video requests may be queued at once waiting
+    # for SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES's GPU-preprocess frame budget
+    # to free up, on this worker. The current queue depth (requests waiting
+    # at this gate, not counting the ones already admitted) is logged at
+    # INFO level on every video request that reaches the gate. Frame
+    # decoding itself (the CPU/IO-thread-pool step that runs before this
+    # gate) is not bounded by this cap -- a request that arrives once the
+    # queue is already at this depth has already paid its own decode cost
+    # by the time it gets here, but rejecting it with 400 (Bad Request)
+    # before it joins the wait queue stops that queue, and the decoded
+    # frame tensors already resident in host memory behind it, from growing
+    # without bound under a sustained burst of video requests. Set to 0 (or
+    # any value <= 0) to disable (unbounded queueing, the previous
+    # behavior).
+    SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH = EnvInt(8)
     # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
     # events (current in-flight count) at INFO level, on top of the
     # always-on per-request duration/frame-count/token-count logs. Off by
