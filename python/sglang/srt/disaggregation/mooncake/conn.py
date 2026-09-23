@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_page_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -156,6 +157,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dcp_kv_layout: str = "token"
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -200,6 +202,9 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dcp_kv_layout=(
+                msg[19].decode("ascii") if len(msg) > 19 and msg[19] != b"" else "token"
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -978,6 +983,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         *,
         dcp_token_item_lens: List[int],
+        dst_dcp_kv_layout: str,
         dst_dcp_size: int,
         dst_dcp_rank: int,
         src_page_offset: int,
@@ -990,6 +996,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
+        if dst_dcp_kv_layout == "page":
+            page_plan = build_dcp_page_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=physical_page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+            )
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=page_plan.src_page_indices,
+                dst_data_indices=page_plan.dst_page_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
 
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
@@ -1986,6 +2013,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 dcp_token_item_lens=dcp_token_item_lens,
+                                dst_dcp_kv_layout=target_rank_registration_info.dcp_kv_layout,
                                 dst_dcp_size=target_rank_registration_info.dst_dcp_size,
                                 dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
                                 src_page_offset=kv_chunk.index_slice.start or 0,
@@ -2276,7 +2304,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 decode_kv_args.dst_dcp_size,
                             )
                         )
-                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+                        if decode_kv_args.dcp_kv_layout == "token":
+                            self._init_dcp_pack_buffers_once(
+                                decode_kv_args.dst_dcp_size
+                            )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
@@ -2654,6 +2685,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
+            dst_dcp_kv_layout = self.kv_mgr.dcp_kv_layout.encode("ascii")
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -2679,6 +2711,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            dst_dcp_kv_layout,
                         ]
                     )
             except zmq.ZMQError:
