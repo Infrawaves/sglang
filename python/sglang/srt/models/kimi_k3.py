@@ -3248,23 +3248,36 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         # Expert-distribution recording is also the data source consumed by
         # EPLBManager.  Keep the recorder on the same physical layout that the
-        # model uses: MegaMoE's standard dispatcher, stat accumulation, and PP=1
-        # are required, while EPLB/redundant/non-trivial placements are valid
-        # because the recorder counts the post-remap physical expert ids and
-        # the metadata is updated together with the weights.
+        # model uses.  MegaMoE and DeepEP both dispatch the post-TopK physical
+        # expert ids, but they use different recorder hooks:
+        #
+        #   * MegaMoE / DeepEP normal: TopK's post-remap ids are counted.
+        #   * DeepEP low_latency: the dispatcher reports masked_m, which is
+        #     converted to local physical counts by the DeepEP gatherer.
+        #
+        # K3 currently validates only the stable `stat` contract here.  This is
+        # intentionally narrower than the generic recorder's `stat_approx`
+        # support: stat_approx is not valid for DeepEP low_latency, while
+        # deepep_mode=auto may select low_latency at decode time.
         moe = get_exec().moe
         recorder_mode = getattr(moe, "expert_distribution_recorder_mode", None)
         if recorder_mode is not None:
-            if (
-                recorder_mode != "stat"
-                or getattr(moe, "moe_a2a_backend", None) != "megamoe"
-                or getattr(moe, "elastic_ep_backend", None) is not None
-                or get_parallel().pp_size != 1
-            ):
+            a2a_backend = getattr(moe, "moe_a2a_backend", None)
+            unsupported = []
+            if recorder_mode != "stat":
+                unsupported.append("recorder mode must be stat")
+            if a2a_backend not in ("megamoe", "deepep"):
+                unsupported.append("moe_a2a_backend must be megamoe or deepep")
+            if getattr(moe, "elastic_ep_backend", None) is not None:
+                unsupported.append("elastic EP is not supported")
+            if get_parallel().pp_size != 1:
+                unsupported.append("PP must be 1")
+            if unsupported:
                 raise ValueError(
                     "Kimi-K3 expert distribution metrics with EPLB require "
-                    "--moe-a2a-backend megamoe, recorder mode stat, PP=1 "
-                    "and no elastic EP."
+                    "--moe-a2a-backend megamoe or deepep, recorder mode stat, "
+                    "PP=1 and no elastic EP; "
+                    + "; ".join(unsupported)
                 )
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
