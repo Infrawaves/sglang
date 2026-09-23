@@ -766,6 +766,11 @@ class KimiK3ImageProcessor(
         )
         self._video_gpu_inflight_frames = 0
         self._video_gpu_condition = asyncio.Condition()
+        max_queue_depth = envs.SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH.get()
+        self._video_gpu_queue_depth_limit = (
+            max_queue_depth if max_queue_depth > 0 else None
+        )
+        self._video_gpu_queue_depth = 0
 
     @asynccontextmanager
     async def _video_gpu_preprocess_slot(self, sampled_frames: int):
@@ -784,13 +789,49 @@ class KimiK3ImageProcessor(
         rather than blocked forever. A no-op for non-video requests
         (``sampled_frames <= 0``; images are cheap enough not to need this)
         or when the budget is disabled.
+
+        ``SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH`` bounds how many requests may be
+        waiting at this gate at once, on top of the frame budget itself. A
+        sustained burst of video requests each individually within
+        ``SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES`` still pays its own decode
+        cost (on the IO thread pool, before this gate is ever reached)
+        regardless of how long the queue here already is -- an unbounded
+        queue means an unbounded amount of already-decoded frame tensors
+        sitting in host memory behind it. A request that would push the
+        queue past this depth is rejected with 400 (Bad Request) before it
+        joins the queue, instead of queueing indefinitely; the current
+        queue depth (not counting this rejected request) is logged at INFO
+        level whenever a request has to queue.
         """
         if sampled_frames <= 0 or self._video_gpu_frame_budget is None:
             yield
             return
         debug = envs.SGLANG_K3_VIDEO_DEBUG_LOG.get()
         budget = self._video_gpu_frame_budget
+        queue_depth_limit = self._video_gpu_queue_depth_limit
         async with self._video_gpu_condition:
+            must_queue = (
+                self._video_gpu_inflight_frames > 0
+                and self._video_gpu_inflight_frames + sampled_frames > budget
+            )
+            if must_queue:
+                if (
+                    queue_depth_limit is not None
+                    and self._video_gpu_queue_depth >= queue_depth_limit
+                ):
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        detail="Internal video format error",
+                    )
+                self._video_gpu_queue_depth += 1
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: queueing for %d frames of "
+                    "budget (%d/%d in use); %d request(s) now queued",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                    self._video_gpu_queue_depth,
+                )
             if debug:
                 logger.info(
                     "Kimi-K3 video GPU-preprocess: waiting for %d frames of "
@@ -799,11 +840,15 @@ class KimiK3ImageProcessor(
                     self._video_gpu_inflight_frames,
                     budget,
                 )
-            while (
-                self._video_gpu_inflight_frames > 0
-                and self._video_gpu_inflight_frames + sampled_frames > budget
-            ):
-                await self._video_gpu_condition.wait()
+            try:
+                while (
+                    self._video_gpu_inflight_frames > 0
+                    and self._video_gpu_inflight_frames + sampled_frames > budget
+                ):
+                    await self._video_gpu_condition.wait()
+            finally:
+                if must_queue:
+                    self._video_gpu_queue_depth -= 1
             self._video_gpu_inflight_frames += sampled_frames
             if debug:
                 logger.info(
