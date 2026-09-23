@@ -3259,7 +3259,14 @@ class KimiK3LinearForCausalLM(nn.Module):
         # intentionally narrower than the generic recorder's `stat_approx`
         # support: stat_approx is not valid for DeepEP low_latency, while
         # deepep_mode=auto may select low_latency at decode time.
-        moe = get_exec().moe
+        # Model metadata can be queried before the execution config namespace
+        # is published (for example during CPU/unit-test discovery).  In that
+        # phase there is no recorder contract to validate yet; defer the
+        # backend checks until the runtime namespace is available.
+        try:
+            moe = get_exec().moe
+        except ValueError:
+            moe = None
         recorder_mode = getattr(moe, "expert_distribution_recorder_mode", None)
         if recorder_mode is not None:
             a2a_backend = getattr(moe, "moe_a2a_backend", None)
