@@ -2,7 +2,9 @@ import argparse
 import asyncio
 import sys
 import unittest
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
@@ -14,7 +16,15 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
-from utils import StreamFixture, engine_chunk, event_payloads, make_serving
+from utils import (
+    StreamFixture,
+    collect_stream_events,
+    engine_chunk,
+    event_payloads,
+    make_serving,
+)
+from xgrammar import Grammar, GrammarCompiler, GrammarMatcher, TokenizerInfo
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
@@ -32,7 +42,9 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
     _should_emit_normal_text_as_message,
 )
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -502,6 +514,592 @@ class ChatToolForwardingTestCase(CustomTestCase):
         )
         self.assertEqual(output_items[0].content[0].text, "work")
         self.assertEqual(output_items[1].content[0].text, "\nanswer")
+
+
+class AllowedToolsResponsesTestCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        self.serving = make_serving()
+        self.serving.chat_encoding_spec = "kimi_k3"
+        self.serving.tool_call_parser = "kimi_k3"
+        self.serving.default_chat_template_kwargs = {}
+        self.serving.template_manager.chat_template_name = None
+        self.serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [
+            1,
+            2,
+        ]
+        self.internal_request = None
+
+    @staticmethod
+    def _request(mode="auto", names=("B",), **kwargs):
+        return ResponsesRequest(
+            model="x",
+            input="Choose a tool.",
+            store=False,
+            tools=[
+                {"type": "function", "name": name, "parameters": {"type": "object"}}
+                for name in ("A", "B", "C")
+            ],
+            tool_choice={
+                "type": "allowed_tools",
+                "mode": mode,
+                "tools": [{"type": "function", "name": name} for name in names],
+            },
+            **kwargs,
+        )
+
+    @staticmethod
+    def _call(name="B", *, arguments="", count=1):
+        return (
+            "<|open|>tools<|sep|>"
+            + "".join(
+                f'<|open|>call tool="{name}" index="{index}"<|sep|>'
+                f"{arguments}<|close|>call<|sep|>"
+                for index in range(1, count + 1)
+            )
+            + "<|close|>tools<|sep|>"
+        )
+
+    def _complete(
+        self, request, text="No tool needed.", *, chunk_size=1, finish_type="stop"
+    ):
+        self.internal_request = None
+
+        async def generate(internal_request, raw_request):
+            self.internal_request = internal_request
+            ends = (
+                [*range(chunk_size, len(text), chunk_size), len(text)]
+                if request.stream
+                else [len(text)]
+            )
+            for end in ends:
+                chunk = engine_chunk(text[:end])
+                chunk["meta_info"]["finish_reason"] = (
+                    {"type": finish_type} if end == len(text) else None
+                )
+                yield chunk
+
+        async def complete():
+            self.serving.tokenizer_manager.generate_request = generate
+            response = await self.serving.create_responses(request)
+            if isinstance(response, AsyncIterator):
+                return event_payloads(await collect_stream_events(response))
+            return response
+
+        return asyncio.run(complete())
+
+    def test_subset_preserves_declarations_and_round_trips_wire_choice(self):
+        """Restrict calls without trimming the prompt's tools or echoing auto."""
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                with self.subTest(stream=stream, mode=mode):
+                    request = self._request(mode=mode, stream=stream)
+                    result = self._complete(request, self._call())
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.completed")
+                        response = result[-1]["response"]
+                        self.assertTrue(
+                            all(
+                                event["response"]["tool_choice"] == request.tool_choice
+                                for event in result
+                                if "response" in event
+                            )
+                        )
+                    else:
+                        self.assertIsInstance(result, ResponsesResponse)
+                        response = result.model_dump()
+                    self.assertEqual(response["tool_choice"], request.tool_choice)
+                    self.assertEqual(
+                        [
+                            item["name"]
+                            for item in response["output"]
+                            if item["type"] == "function_call"
+                        ],
+                        ["B"],
+                    )
+                    rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                    self.assertEqual(
+                        [tool["function"]["name"] for tool in rendered.kwargs["tools"]],
+                        ["A", "B", "C"],
+                    )
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
+                    self.assertFalse(
+                        _is_grammar_accept_string(grammar, self._call("C"))
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, "No tool needed."),
+                        mode == "auto",
+                    )
+
+    def test_allowlist_preserves_reasoning_parallel_and_strict_options(self):
+        self.serving.reasoning_parser = "kimi_k3"
+        self.serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        arguments = (
+            '<|open|>argument key="count" type="number"<|sep|>2<|close|>argument<|sep|>'
+        )
+        single = self._call(arguments=arguments)
+        multiple = self._call(arguments=arguments, count=2)
+        for stream in (False, True):
+            for mode, thinking, parallel, strict in (
+                ("auto", False, False, False),
+                ("auto", True, True, True),
+                ("required", False, True, False),
+                ("required", True, False, True),
+                ("auto", False, True, True),
+                ("required", True, True, False),
+            ):
+                with (
+                    self.subTest(
+                        stream=stream,
+                        mode=mode,
+                        thinking=thinking,
+                        parallel=parallel,
+                        strict=strict,
+                    ),
+                    envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF),
+                ):
+                    request = self._request(
+                        mode=mode,
+                        stream=stream,
+                        parallel_tool_calls=parallel,
+                        chat_template_kwargs={"thinking": thinking},
+                    )
+                    request.tools[1].strict = strict
+                    request.tools[1].parameters = {
+                        "type": "object",
+                        "properties": {"count": {"type": "integer", "minimum": 1}},
+                        "required": ["count"],
+                        "additionalProperties": False,
+                    }
+                    text = ("Thinking." + THINK_CLOSE if thinking else "") + (
+                        multiple if parallel else single
+                    )
+                    result = self._complete(request, text)
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.completed")
+                        output = result[-1]["response"]["output"]
+                    else:
+                        self.assertIsInstance(result, ResponsesResponse)
+                        output = result.model_dump()["output"]
+                    calls = [item for item in output if item["type"] == "function_call"]
+                    self.assertEqual(
+                        [
+                            (call["name"], orjson.loads(call["arguments"]))
+                            for call in calls
+                        ],
+                        [("B", {"count": 2})] * (2 if parallel else 1),
+                    )
+                    reasoning = "".join(
+                        part["text"]
+                        for item in output
+                        if item["type"] == "reasoning"
+                        for part in item["content"]
+                    )
+                    self.assertEqual(reasoning, "Thinking." if thinking else "")
+                    self.assertEqual(self.internal_request.require_reasoning, thinking)
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, single))
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, multiple), parallel
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, self._call()), not strict
+                    )
+
+    def test_allowed_call_arguments_and_ids_agree_across_stream_events(self):
+        text = (
+            '<|open|>tools<|sep|><|open|>call tool="A" index="1"<|sep|>'
+            '<|open|>argument key="city" type="string"<|sep|>'
+            'Paris "rive"\\Seine\n雪<|close|>argument<|sep|>'
+            '<|open|>argument key="days" type="number"<|sep|>2<|close|>argument<|sep|>'
+            '<|open|>argument key="metadata" type="object"<|sep|>'
+            '{"tags":["windy"],"enabled":true}<|close|>argument<|sep|>'
+            '<|close|>call<|sep|><|open|>call tool="B" index="2"<|sep|>'
+            '<|open|>argument key="ok" type="boolean"<|sep|>true<|close|>argument<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|>"
+        )
+        expected = [
+            (
+                "A",
+                {
+                    "city": 'Paris "rive"\\Seine\n雪',
+                    "days": 2,
+                    "metadata": {"tags": ["windy"], "enabled": True},
+                },
+            ),
+            ("B", {"ok": True}),
+        ]
+        for mode in ("auto", "required"):
+            with self.subTest(mode=mode, stream=False):
+                full = self._complete(self._request(mode=mode, names=("A", "B")), text)
+                self.assertIsInstance(full, ResponsesResponse)
+                self.assertTrue(all(item.call_id for item in full.output))
+                self.assertEqual(len({item.call_id for item in full.output}), 2)
+                self.assertEqual(
+                    [(item.name, orjson.loads(item.arguments)) for item in full.output],
+                    expected,
+                )
+            for chunk_size in (1, len(text)):
+                with self.subTest(mode=mode, chunk_size=chunk_size):
+                    events = self._complete(
+                        self._request(mode=mode, names=("A", "B"), stream=True),
+                        text,
+                        chunk_size=chunk_size,
+                    )
+                    self.assertEqual(events[-1]["type"], "response.completed")
+                    output = events[-1]["response"]["output"]
+                    self.assertEqual(
+                        [
+                            (item["name"], orjson.loads(item["arguments"]))
+                            for item in output
+                        ],
+                        expected,
+                    )
+                    self.assertEqual(
+                        {item["type"] for item in output}, {"function_call"}
+                    )
+                    for key in ("id", "call_id"):
+                        self.assertTrue(all(item[key] for item in output))
+                        self.assertEqual(len({item[key] for item in output}), 2)
+                    added = [
+                        e for e in events if e["type"] == "response.output_item.added"
+                    ]
+                    done = [
+                        e for e in events if e["type"] == "response.output_item.done"
+                    ]
+                    self.assertEqual([e["item"] for e in done], output)
+                    self.assertEqual(len(added), len(output))
+                    argument_events = [
+                        e
+                        for e in events
+                        if e["type"]
+                        in (
+                            "response.function_call_arguments.delta",
+                            "response.function_call_arguments.done",
+                        )
+                    ]
+                    self.assertEqual(
+                        {e["item_id"] for e in argument_events},
+                        {item["id"] for item in output},
+                    )
+                    for index, item in enumerate(output):
+                        for key in ("type", "id", "call_id", "name"):
+                            self.assertEqual(added[index]["item"][key], item[key])
+                        for event in (added[index], done[index]):
+                            self.assertEqual(event["output_index"], index)
+                        parts = [
+                            e for e in argument_events if e["item_id"] == item["id"]
+                        ]
+                        self.assertEqual({e["output_index"] for e in parts}, {index})
+                        self.assertEqual(
+                            "".join(
+                                e["delta"]
+                                for e in parts
+                                if e["type"].endswith(".delta")
+                            ),
+                            item["arguments"],
+                        )
+                        self.assertEqual(
+                            [
+                                e["arguments"]
+                                for e in parts
+                                if e["type"].endswith(".done")
+                            ],
+                            [item["arguments"]],
+                        )
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
+
+    def test_allowlist_preserves_schema_admission_and_rendering(self):
+        """Selecting a subset must not rewrite or reject previously accepted schemas."""
+        for schema in (
+            {"type": "object", "properties": {"n": {"type": "int"}}},
+            {"type": "not_a_json_schema_type"},
+        ):
+            for allowed in (False, True):
+                with self.subTest(schema=schema, allowed=allowed):
+                    request = self._request()
+                    request.tools[2].parameters = deepcopy(schema)
+                    if not allowed:
+                        request.tool_choice = "auto"
+                    result = self._complete(request)
+                    self.assertIsInstance(result, ResponsesResponse)
+                    self.assertEqual(request.tools[2].parameters, schema)
+                    rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                    self.assertEqual(
+                        rendered.kwargs["tools"][2]["function"]["parameters"], schema
+                    )
+
+    def test_empty_auto_allowlist_still_installs_grammar_without_declarations(self):
+        for stream in (False, True):
+            for declared in (False, True):
+                with self.subTest(stream=stream, declared=declared):
+                    request = self._request(names=(), stream=stream)
+                    if not declared:
+                        request.tools = []
+                    result = self._complete(request)
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.completed")
+                        output = result[-1]["response"]["output"]
+                    else:
+                        self.assertIsInstance(result, ResponsesResponse)
+                        output = result.model_dump()["output"]
+                    self.assertEqual([item["type"] for item in output], ["message"])
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(
+                        _is_grammar_accept_string(grammar, "No tool needed.")
+                    )
+                    self.assertFalse(_is_grammar_accept_string(grammar, self._call()))
+
+    def test_invalid_references_and_empty_required_fail_before_generation(self):
+        for stream in (False, True):
+            for mode, names in (("auto", ("missing",)), ("required", ())):
+                with self.subTest(stream=stream, mode=mode, names=names):
+                    response = self._complete(self._request(mode, names, stream=stream))
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIsNone(self.internal_request)
+            for collision in (False, True):
+                with self.subTest(stream=stream, custom_name_collision=collision):
+                    request = self._request(stream=stream)
+                    if collision:
+                        request.tools.append(
+                            request.tools[1].model_copy(update={"type": "custom"})
+                        )
+                    else:
+                        request.tools[1].type = "custom"
+                    response = self._complete(request, self._call())
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIsNone(self.internal_request)
+
+    def test_tool_result_continuation_uses_new_allowlist_without_rewriting_history(
+        self,
+    ):
+        self.serving.enable_response_store = True
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                first = self._request(names=("A",), stream=stream)
+                first.store = True
+                result = self._complete(first, self._call("A"))
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.completed")
+                    previous = result[-1]["response"]
+                else:
+                    self.assertIsInstance(result, ResponsesResponse)
+                    previous = result.model_dump()
+                previous_id = previous["id"]
+                call_id = previous["output"][0]["call_id"]
+                history = deepcopy(self.serving.msg_store[previous_id])
+                stored_response = self.serving.response_store[previous_id].model_dump()
+                self.assertEqual(stored_response["tool_choice"], first.tool_choice)
+
+                request = self._request(previous_response_id=previous_id, stream=stream)
+                request.input = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "answer 42",
+                    }
+                ]
+                result = self._complete(request, self._call())
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.completed")
+                    response = result[-1]["response"]
+                else:
+                    self.assertIsInstance(result, ResponsesResponse)
+                    response = result.model_dump()
+                self.assertEqual(response["output"][0]["name"], "B")
+                self.assertEqual(response["tool_choice"], request.tool_choice)
+                self.assertEqual(
+                    self.serving.response_store[previous_id].model_dump(),
+                    stored_response,
+                )
+                self.assertEqual(self.serving.msg_store[previous_id], history)
+
+                rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                messages = rendered.args[0]
+                self.assertEqual(
+                    [m["role"] for m in messages], ["user", "assistant", "tool"]
+                )
+                self.assertEqual(messages[0]["content"], "Choose a tool.")
+                historical_call = messages[1]["tool_calls"][0]
+                self.assertEqual(historical_call["id"], call_id)
+                self.assertEqual(historical_call["function"]["name"], "A")
+                self.assertEqual(messages[2]["tool_call_id"], call_id)
+                self.assertEqual(messages[2]["content"], "answer 42")
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in rendered.kwargs["tools"]],
+                    ["A", "B", "C"],
+                )
+                grammar = Grammar.from_structural_tag(
+                    self.internal_request.sampling_params["structural_tag"]
+                )
+                self.assertFalse(_is_grammar_accept_string(grammar, self._call("A")))
+                self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
+
+    def test_unsupported_encoder_or_parser_does_not_fall_back_to_auto(self):
+        for encoder, parser, harmony in (
+            (None, None, False),
+            ("kimi_k3", "hermes", False),
+            (None, "kimi_k3", False),
+            (None, None, True),
+        ):
+            with self.subTest(encoder=encoder, parser=parser, harmony=harmony):
+                self.serving.chat_encoding_spec = encoder
+                self.serving.tool_call_parser = parser
+                self.serving.use_harmony = harmony
+                response = self._complete(self._request())
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(b"allowed_tools", response.body)
+                self.assertIsNone(self.internal_request)
+
+    def test_text_format_conflicts_but_plain_text_does_not(self):
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                for fmt in (
+                    {"type": "json_object"},
+                    *[
+                        {
+                            "type": "json_schema",
+                            "name": "answer",
+                            "schema": {"type": "object"},
+                            "strict": strict,
+                        }
+                        for strict in (None, False, True)
+                    ],
+                ):
+                    with self.subTest(stream=stream, mode=mode, fmt=fmt):
+                        response = self._complete(
+                            self._request(
+                                mode=mode, stream=stream, text={"format": fmt}
+                            )
+                        )
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(b"text.format", response.body)
+                        self.assertIsNone(self.internal_request)
+        result = self._complete(
+            self._request(text={"format": {"type": "text"}}), self._call()
+        )
+        self.assertIsInstance(result, ResponsesResponse)
+
+    def test_constraint_failure_is_not_silently_ignored(self):
+        request = self._request()
+        request.tools[1].strict = True
+        request.tools[1].parameters = {"type": "array"}
+        response = self._complete(request)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"Cannot enforce allowed_tools", response.body)
+        self.assertIsNone(self.internal_request)
+
+    def test_parser_visible_disallowed_call_is_rejected_before_emission(self):
+        """A call marker inside loose arguments must not leak an excluded tool."""
+        text = (
+            '<|open|>tools<|sep|><|open|>call tool="A" index="1"<|sep|>'
+            '<|open|>argument key="body" type="string"<|sep|><|close|>call<|sep|>'
+            '<|open|>call tool="C" index="2"<|sep|><|close|>call<|sep|>'
+            "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                result = self._complete(
+                    self._request(names=("A", "B"), stream=stream), text
+                )
+                grammar = Grammar.from_structural_tag(
+                    self.internal_request.sampling_params["structural_tag"]
+                )
+                self.assertTrue(_is_grammar_accept_string(grammar, text))
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.failed")
+                    self.assertNotIn(
+                        "C", [event.get("item", {}).get("name") for event in result]
+                    )
+                    self.assertNotIn(
+                        "response.completed", [event["type"] for event in result]
+                    )
+                else:
+                    self.assertEqual(result.status_code, 400)
+                    self.assertIn(b"outside allowed_tools", result.body)
+
+    def test_disallowed_call_before_thinking_ends_cannot_leak(self):
+        # Grammar is deferred during thinking, but K3 tool channels still reach the parser.
+        self.serving.reasoning_parser = "kimi_k3"
+        self.serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        text = "Thinking." + self._call("C") + THINK_CLOSE
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                with self.subTest(stream=stream, mode=mode):
+                    result = self._complete(
+                        self._request(
+                            mode=mode,
+                            stream=stream,
+                            chat_template_kwargs={"thinking": True},
+                        ),
+                        text,
+                    )
+                    self.assertTrue(self.internal_request.require_reasoning)
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.failed")
+                        self.assertIn(
+                            "outside allowed_tools",
+                            result[-1]["response"]["error"]["message"],
+                        )
+                        self.assertNotIn(
+                            "C", [event.get("item", {}).get("name") for event in result]
+                        )
+                        self.assertFalse(
+                            any(
+                                event["type"].startswith(
+                                    "response.function_call_arguments."
+                                )
+                                for event in result
+                            )
+                        )
+                    else:
+                        self.assertEqual(result.status_code, 400)
+                        self.assertIn(b"outside allowed_tools", result.body)
+
+    def test_required_fails_on_length_truncation_before_a_call(self):
+        """A length limit can stop a grammar-valid prefix before a call completes."""
+        prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                result = self._complete(
+                    self._request(mode="required", stream=stream),
+                    prefix,
+                    finish_type="length",
+                )
+                compiler = GrammarCompiler(
+                    TokenizerInfo([bytes([i]) for i in range(256)])
+                )
+                matcher = GrammarMatcher(
+                    compiler.compile_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                )
+                self.assertTrue(matcher.accept_string(prefix))
+                self.assertFalse(matcher.is_completed())
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.failed")
+                    self.assertIn(
+                        "required", result[-1]["response"]["error"]["message"]
+                    )
+                else:
+                    self.assertEqual(result.status_code, 400)
+                    self.assertIn(b"required", result.body)
 
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
