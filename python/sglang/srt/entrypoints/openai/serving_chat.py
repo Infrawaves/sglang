@@ -47,6 +47,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv41,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -1048,7 +1049,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+        if isinstance(request.tool_choice, ToolChoice):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -1057,6 +1058,26 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
+
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            if (
+                self.chat_encoding_spec != "kimi_k3"
+                or self.tool_call_parser != "kimi_k3"
+            ):
+                return (
+                    "allowed_tools requires the Kimi K3 chat encoder and tool parser."
+                )
+            allowed_tools = request.tool_choice.allowed_tools
+            if allowed_tools.mode == "required" and not allowed_tools.tools:
+                return "allowed_tools cannot be empty in required mode."
+            declared_names = {
+                tool.function.name
+                for tool in effective_tools
+                if tool.type == "function"
+            }
+            for tool in allowed_tools.tools:
+                if tool.function.name not in declared_names:
+                    return f"allowed_tools references undeclared function {tool.function.name!r}."
 
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
@@ -1345,9 +1366,11 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
-        if effective_tools and request.tool_choice != "none":
+        if (
+            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
+        ) and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
+            if isinstance(request.tool_choice, ToolChoice):
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
@@ -2077,6 +2100,15 @@ class OpenAIServingChat(OpenAIServingBase):
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
 
+                if (
+                    isinstance(request.tool_choice, AllowedToolChoice)
+                    and request.tool_choice.allowed_tools.mode == "required"
+                    and not has_tool_calls.get(idx, False)
+                ):
+                    raise ValueError(
+                        "allowed_tools required mode produced no tool call."
+                    )
+
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
@@ -2380,6 +2412,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     history_tool_calls_cnt,
                 )
 
+            if isinstance(request.tool_choice, AllowedToolChoice):
+                allowed_names = {
+                    tool.function.name
+                    for tool in request.tool_choice.allowed_tools.tools
+                }
+                if any(
+                    call.function.name not in allowed_names for call in tool_calls or []
+                ):
+                    raise ValueError("Generated tool call is outside allowed_tools.")
+                if (
+                    request.tool_choice.allowed_tools.mode == "required"
+                    and not tool_calls
+                ):
+                    raise ValueError(
+                        "allowed_tools required mode produced no tool call."
+                    )
+
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
                 ret_item.get("prompt_token_ids")
@@ -2555,7 +2604,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: list[Any],
         finish_reason: dict[str, Any],
-        tool_choice: str | ToolChoice | None = None,
+        tool_choice: str | ToolChoice | AllowedToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
@@ -3050,6 +3099,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 end_text, end_calls = parser.parse_stream_end()
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
+
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            allowed_names = {
+                tool.function.name for tool in request.tool_choice.allowed_tools.tools
+            }
+            # Loose argument text can contain tags the parser reads as extra calls.
+            if any(call.name not in allowed_names for call in calls):
+                raise ValueError("Generated tool call is outside allowed_tools.")
 
         # Yield normal text
         if normal_text:
