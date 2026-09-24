@@ -90,7 +90,6 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -3663,12 +3662,8 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
+            self.queue_aborted_prefill_transfer(req)
+            return
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -5210,6 +5205,18 @@ class Scheduler(
         if not ignore_waiting:
             idle &= len(self.waiting_queue) == 0
 
+        # A terminal request can still own buffers used by a remote transfer.
+        # In particular, administrative flush/offload must not mistake those
+        # quarantined pages for an idle, reclaimable cache.
+        if (
+            not for_health_check
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_transfer_queue is not None
+        ):
+            idle &= (
+                not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+            )
+
         if (
             for_health_check
             and not self._engine_paused
@@ -5687,6 +5694,21 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # A yielded/chunked request may already have sent KV. Retain
+                # KV, recurrent state and metadata until every source read ends.
+                prepare_abort(
+                    req,
+                    recv_req.abort_message or "Aborted by AbortReq.",
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if recv_req.abort_message
+                        else None
+                    ),
+                )
+                self.beam_coordinator.retire_group(req)
+                self.queue_aborted_prefill_transfer(req)
+                continue
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5699,9 +5721,6 @@ class Scheduler(
                 if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 release_kv_cache(req, self.tree_cache)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.release_aborted_prefill_waiting_req(req)
-
             # For mamba radix cache
             if req.kv.holds_mamba and self.disaggregation_mode not in (
                 DisaggregationMode.PREFILL,
@@ -5764,7 +5783,6 @@ class Scheduler(
                     if decode_req.host_staged:
                         # Keep the host destination alive until prefill stops writing.
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
                     # The receiver arms drain-ack accounting before sending the
                     # ABORT (see CommonKVReceiver._send_abort_notification), so
                     # an ack racing back is never dropped.

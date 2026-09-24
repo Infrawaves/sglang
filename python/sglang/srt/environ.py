@@ -734,11 +734,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
-    # Deferred decode-side KV release: on abort, hold an in-flight request's KV
-    # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Only applies to backends that ack the drain
-    # (supports_deferred_decode_kv_release).
-    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
+    # Mooncake always waits for transfer-drained ACKs before reusing aborted
+    # requests' buffers. This flag retains the opt-in behavior for other
+    # backends. The timeout below controls warnings/retries, never unsafe reuse.
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================

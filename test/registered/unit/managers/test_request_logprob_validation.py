@@ -604,6 +604,7 @@ class TestRequestValidation(CustomTestCase):
             buffers = MetadataBuffers(1, 1, torch.float32, max_sampling_mask_tokens=2)
         sender = Mock()
         sender.poll.return_value = KVPoll.Transferring
+        sender.is_source_release_safe.return_value = True
         sender.abort.side_effect = lambda: setattr(
             sender.poll, "return_value", KVPoll.Failed
         )
@@ -621,19 +622,23 @@ class TestRequestValidation(CustomTestCase):
             extend_range=SimpleNamespace(end=2),
             disagg_kv_sender=sender,
             finished_reason=None,
+            to_finish=None,
             bootstrap_room=7,
             pending_bootstrap=False,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
         )
         good_sender = Mock()
         good_sender.poll.return_value = KVPoll.Success
+        good_sender.is_source_release_safe.return_value = True
         good = SimpleNamespace(
             rid="good",
             return_logprob=False,
             disagg_kv_sender=good_sender,
             pending_bootstrap=False,
             finished_reason=None,
+            to_finish=None,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
             metadata_buffer_index=1,
@@ -652,6 +657,8 @@ class TestRequestValidation(CustomTestCase):
         scheduler.req_to_metadata_buffer_idx_allocator = Mock()
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.output_streamer = Mock()
+        scheduler.enable_overlap = False
+        scheduler._release_aborted_request = Mock()
 
         scheduler.send_kv_chunk(req, last_chunk=True)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
@@ -666,6 +673,7 @@ class TestRequestValidation(CustomTestCase):
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
                 side_effect=lambda senders, *groups: [s.poll() for s in senders],
             ),
+            patch("sglang.srt.disaggregation.prefill.dist.all_reduce"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
         ):
             done = scheduler.process_disagg_prefill_inflight_queue()
