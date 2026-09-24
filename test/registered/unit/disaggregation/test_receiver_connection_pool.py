@@ -28,6 +28,7 @@ def _receiver(connection_pool, entries):
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
         connection_lock=threading.Lock(),
+        enable_deferred_decode_kv_release=False,
     )
     receiver._connection_pool_entries = entries
     return receiver
@@ -54,6 +55,7 @@ def _fetching_receiver(connection_pool):
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
     receiver.prefill_dp_rank = 0
+    receiver.prefill_info = SimpleNamespace(pp_size=1, attn_cp_size=1)
     receiver.target_cp_ranks = [0]
     receiver.target_tp_rank = 0
     receiver.target_tp_ranks = [0]
@@ -134,6 +136,7 @@ class TestReceiverConnectionPool(CustomTestCase):
         receiver.kv_mgr.waiting_timeout = 1.0
         receiver.kv_mgr.record_failure = Mock()
         receiver.kv_mgr.update_status = Mock()
+        receiver._send_abort_notification = Mock()
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})

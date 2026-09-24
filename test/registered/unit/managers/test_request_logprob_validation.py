@@ -12,7 +12,12 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -275,6 +280,9 @@ class TestRequestValidation(CustomTestCase):
                 serving.use_harmony = False
                 serving.tool_server = None
                 serving.default_sampling_params = {}
+                # Background requests need the in-memory response store.
+                serving.enable_response_store = True
+                serving._validate_model = Mock(return_value=None)
                 processed = SimpleNamespace(
                     require_reasoning=False,
                     reasoning_end_token_ids=None,
@@ -297,6 +305,7 @@ class TestRequestValidation(CustomTestCase):
                     tools=None,
                     stream=False,
                     background=background,
+                    store=True,
                     previous_response_id=None,
                     top_logprobs=top_logprobs,
                     stop=None,
@@ -304,6 +313,13 @@ class TestRequestValidation(CustomTestCase):
                     extra_key=None,
                     cache_salt=None,
                     is_include_output_logprobs=lambda: True,
+                    effective_tool_choice=lambda: "auto",
+                    routed_dp_rank=None,
+                    bootstrap_host=None,
+                    bootstrap_port=None,
+                    bootstrap_room=None,
+                    disagg_prefill_dp_rank=None,
+                    priority=None,
                     to_sampling_params=Mock(return_value=params),
                 )
                 response = asyncio.run(serving.create_responses(request))
@@ -596,6 +612,7 @@ class TestRequestValidation(CustomTestCase):
                     self.assertEqual(response.status_code, 400)
 
     def test_metadata_overflow_aborts_one_request_and_releases_prefill_state(self):
+        enter_scope(self, published_topology())
         import torch
 
         from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
@@ -604,6 +621,7 @@ class TestRequestValidation(CustomTestCase):
             buffers = MetadataBuffers(1, 1, torch.float32, max_sampling_mask_tokens=2)
         sender = Mock()
         sender.poll.return_value = KVPoll.Transferring
+        sender.is_source_release_safe.return_value = True
         sender.abort.side_effect = lambda: setattr(
             sender.poll, "return_value", KVPoll.Failed
         )
@@ -611,6 +629,8 @@ class TestRequestValidation(CustomTestCase):
         req = SimpleNamespace(
             rid="bad-mask",
             return_logprob=False,
+            return_routed_experts=False,
+            cache_request_handle=None,
             return_sampling_mask=True,
             sampling_mask_rows=make_mask_rows([1, 2, 3]),
             sampling_logprobs_mode="selected",
@@ -621,19 +641,25 @@ class TestRequestValidation(CustomTestCase):
             extend_end=2,
             disagg_kv_sender=sender,
             finished_reason=None,
+            to_finish=None,
             bootstrap_room=7,
             pending_bootstrap=False,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
         )
         good_sender = Mock()
         good_sender.poll.return_value = KVPoll.Success
+        good_sender.is_source_release_safe.return_value = True
         good = SimpleNamespace(
             rid="good",
             return_logprob=False,
+            return_routed_experts=False,
+            cache_request_handle=None,
             disagg_kv_sender=good_sender,
             pending_bootstrap=False,
             finished_reason=None,
+            to_finish=None,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
             metadata_buffer_index=1,
@@ -647,11 +673,12 @@ class TestRequestValidation(CustomTestCase):
         scheduler.disagg_prefill_pending_chunk_rids = {req.rid}
         scheduler.disagg_prefill_inflight_queue = [req, good]
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
-        scheduler.ps = SimpleNamespace(tp_rank=0)
         scheduler.tree_cache = Mock()
         scheduler.req_to_metadata_buffer_idx_allocator = Mock()
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.output_streamer = Mock()
+        scheduler.enable_overlap = False
+        scheduler._release_aborted_request = Mock()
 
         scheduler.send_kv_chunk(req, last_chunk=True)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
@@ -666,6 +693,7 @@ class TestRequestValidation(CustomTestCase):
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
                 side_effect=lambda senders, *groups: [s.poll() for s in senders],
             ),
+            patch("sglang.srt.disaggregation.prefill.dist.all_reduce"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
         ):
             done = scheduler.process_disagg_prefill_inflight_queue()

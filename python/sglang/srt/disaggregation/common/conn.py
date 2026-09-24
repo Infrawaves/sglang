@@ -274,6 +274,7 @@ class CommonKVManager(BaseKVManager):
     # ``[room, status, prefill_rank]``; backends whose control socket also
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
+    requires_transfer_drain = False
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
@@ -559,6 +560,9 @@ class CommonKVManager(BaseKVManager):
         return min(statuses)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        lifetime = getattr(self, "_transfer_lifetime", None)
+        if status == KVPoll.Failed and lifetime is not None:
+            lifetime.close(bootstrap_room)
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -849,6 +853,16 @@ class CommonKVManager(BaseKVManager):
             prefill_ranks=set(),
         )
         return generation
+
+    def is_deferred_abort_generation_armed(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> bool:
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        return (
+            generation is not None
+            and state is not None
+            and state.generation == generation
+        )
 
     def note_abort_ack(
         self, bootstrap_room: int, prefill_rank: int, generation: int
@@ -2515,13 +2529,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.retry_abort()
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -2559,7 +2567,10 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        self.ensure_abort_notified()
+        if self.kv_mgr.requires_transfer_drain:
+            self.retry_abort()
+        else:
+            self.ensure_abort_notified()
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
         """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
@@ -2573,6 +2584,13 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification(force_arm=force_arm)
             self.abort_notified = True
 
+    def retry_abort(self):
+        """Retry the same cancellation; never reset an already received ACK."""
+        if getattr(self, "bootstrap_infos", None) is None:
+            return
+        self._send_abort_notification(force_arm=True)
+        self.abort_notified = True
+
     def _send_abort_notification(self, *, force_arm: bool = False):
         # Both abort() and the waiting timeout reach here. Once metadata is
         # published (init_time set) prefill may be writing, so arm the ACK
@@ -2583,11 +2601,18 @@ class CommonKVReceiver(BaseKVReceiver):
         # but earlier ranks already hold destinations; those callers defer and
         # pass force_arm.
         if self.kv_mgr.enable_deferred_decode_kv_release and (
-            force_arm or self.init_time is not None
+            force_arm
+            or self.init_time is not None
+            or self.kv_mgr.requires_transfer_drain
         ):
-            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
-                self.bootstrap_room
-            )
+            # A retry re-sends the armed generation so ACKs already received
+            # for this receiver are kept; only a new arm starts a generation.
+            if not self.kv_mgr.is_deferred_abort_generation_armed(
+                self.bootstrap_room, self._abort_generation
+            ):
+                self._abort_generation = self.kv_mgr.register_deferred_abort_room(
+                    self.bootstrap_room
+                )
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

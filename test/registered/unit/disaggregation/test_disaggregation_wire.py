@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -590,6 +591,9 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.deferred_bootstrap = None
+        manager.enable_staging = False
+        manager._transfer_lifetime = TransferLifetimeTracker()
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         target = AckTarget("127.0.0.1", 1234, 7)
@@ -775,7 +779,9 @@ class TestPollCollectives(CustomTestCase):
         pollers = [Mock(poll=Mock(return_value=KVPoll.Success)) for _ in range(2)]
         requests = [
             SimpleNamespace(
-                req=SimpleNamespace(bootstrap_host="127.0.0.1"),
+                req=SimpleNamespace(
+                    bootstrap_host="127.0.0.1", bootstrap_room=42, rid=f"r{index}"
+                ),
                 metadata_buffer_index=index,
             )
             for index in range(2)

@@ -4,15 +4,15 @@ When a decode request is aborted while its prefill->decode KV transfer may still
 be in flight, the decode side holds its KV pages / req-slot instead of freeing
 them immediately (which could let the still-in-flight write land on pages already
 reused by another request). The pages are released once every prefill rank acks
-that its transfer drained (CommonKVManager.is_abort_release_safe). Device
-destinations may also release on timeout; host destinations require the ack.
+that its transfer drained (CommonKVManager.is_abort_release_safe). A timeout
+must never permit reuse of a destination whose writers have not drained.
 """
 
 import threading
 import unittest
 from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
@@ -557,7 +557,8 @@ class TestAbortAckAggregation(CustomTestCase):
         mgr.note_abort_ack(room, 0, generation)
         mgr.note_abort_ack(room, 1, generation)
         self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
-        # Re-registering (a later reuse) wipes the prior acks.
+        # A new arm starts a new generation; a retried cancellation instead
+        # re-sends the armed one (see CommonKVReceiver._send_abort_notification).
         mgr.register_deferred_abort_room(room)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
@@ -660,15 +661,20 @@ class _FakeIdxAllocator:
 
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    q.queue = []
+    q._release_tp_size = 1
+    q._deferred_release_error = None
     q._deferred_releases = []
+    q._failed_deferred_releases = []
     q.deferred_kv_release_timeout = timeout
     q.enable_host_receive = False
     q.enable_staging = False
     q.staging_handler = None
-    q.tree_cache = object()
+    q.tree_cache = SimpleNamespace(unlock=Mock(), finish=Mock())
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
+        enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
             observe_decode_deferred_kv_release=MagicMock()
@@ -685,20 +691,24 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
         is_abort_release_safe=lambda: mgr.is_abort_release_safe(room, n_prefill_ranks),
         clear=lambda: None,
+        retry_abort=Mock(),
     )
     return SimpleNamespace(
-        req=SimpleNamespace(bootstrap_room=room),
+        req=SimpleNamespace(rid=f"req-{room}", bootstrap_room=room),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        prefix_match=None,
+        hicache_restore_lock=None,
+        hicache_load_consumer_index=-1,
+        _chunk_events=[],
     )
 
 
 class TestResolveDeferredReleases(CustomTestCase):
-    def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
+    def test_host_release_requires_drain_even_after_timeout(self):
         mgr = _make_manager()
         q = _make_queue(timeout=-1)
         q.enable_host_receive = True
-        q.gloo_group = object()
         entries = [_make_decode_req(room, room, mgr) for room in (1, 2)]
         generations = {}
         for entry in entries:
@@ -709,16 +719,10 @@ class TestResolveDeferredReleases(CustomTestCase):
         with (
             patch.object(decode_mod, "discard_kv_cache_backup") as discard,
             patch.object(decode_mod, "release_kv_cache") as device_release,
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.all_reduce") as reduce,
         ):
             q.resolve_deferred_releases()
             discard.assert_not_called()
             mgr.note_abort_ack(2, 0, generations[2])
-            reduce.side_effect = lambda ready, **_: ready.zero_()
-            q.resolve_deferred_releases()
-            discard.assert_not_called()
-            reduce.side_effect = None
             q.resolve_deferred_releases()
             discard.assert_called_once_with(entries[1].req, q.tree_cache, "host_pool")
             self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [2])
@@ -727,6 +731,33 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(discard.call_count, 2)
             self.assertEqual(q._deferred_releases, [])
             device_release.assert_not_called()
+
+    def test_cleanup_failure_keeps_pool_held_without_retrying_partial_free(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        failed = _make_decode_req(805, 5, mgr, n_prefill_ranks=1)
+        healthy = _make_decode_req(806, 6, mgr, n_prefill_ranks=1)
+        for req in (failed, healthy):
+            room = req.req.bootstrap_room
+            gen_room = mgr.register_deferred_abort_room(room)
+            mgr.note_abort_ack(room, 0, gen_room)
+            q._defer_release(req)
+        q.enable_staging = True
+        q.staging_handler = SimpleNamespace(
+            is_staging_room=lambda room: room == 805,
+            unregister_decode_req=Mock(side_effect=RuntimeError("scatter not drained")),
+        )
+        with patch.object(decode_mod, "release_kv_cache") as release:
+            with self.assertRaisesRegex(RuntimeError, "failed buffer cleanup"):
+                q.resolve_deferred_releases()
+            with self.assertRaisesRegex(RuntimeError, "prior cleanup failure"):
+                q.resolve_deferred_releases()
+        release.assert_called_once_with(healthy.req, q.tree_cache, checkpoint=False)
+        q.staging_handler.unregister_decode_req.assert_called_once_with(805)
+        self.assertEqual(q._failed_deferred_releases, [failed])
+        self.assertTrue(q.has_pending_deferred_releases())
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            q.release_memory_occupation()
 
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
@@ -777,7 +808,9 @@ class TestResolveDeferredReleases(CustomTestCase):
             outcome="drained",
         )
 
-    def test_releases_on_timeout_without_ack(self):
+    def test_timeout_keeps_all_destinations_reserved_and_retries_abort(self):
+        # Fail closed: a timeout cannot prove that a remote write has stopped,
+        # so the buffers stay reserved and the cancellation is retried.
         mgr = _make_manager()
         room, idx = 300, 3
         q = _make_queue(timeout=30.0, enable_metrics=True)
@@ -785,26 +818,23 @@ class TestResolveDeferredReleases(CustomTestCase):
         # Force an already-expired deadline (no ack will ever arrive).
         q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
 
-        with (
-            patch.object(decode_mod.time, "monotonic", return_value=42.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
-        ):
+        with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
+            rel.assert_not_called()
 
-        self.assertEqual(q._deferred_releases, [])
-        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
-        self.assertIsNone(dreq.kv_receiver)
-        q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
-            duration_seconds=32.0,
-            outcome="timeout",
-        )
+        self.assertEqual(len(q._deferred_releases), 1)
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+        self.assertIsNotNone(dreq.kv_receiver)
+        dreq.kv_receiver.retry_abort.assert_called_once()
+        q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
     def test_metrics_disabled_does_not_observe_release(self):
         mgr = _make_manager()
         room, idx = 301, 4
         q = _make_queue(enable_metrics=False)
         dreq = _make_decode_req(room, idx, mgr)
+        generation = mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0, generation)
         q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
 
         with (
@@ -817,14 +847,17 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q.num_pending_deferred_releases(), 0)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
-    def test_failed_release_is_isolated_and_not_retried(self):
-        # A raising _do_release must drop the entry (no double-free on retry) and
-        # not brick resolve for the remaining entries or subsequent calls.
+    def test_partial_cleanup_stops_reentry_without_retrying_frees(self):
+        # Finish this common release plan, then stop scheduling if any free
+        # failed. Re-entering must not retry a potentially partial free.
         mgr = _make_manager()
         q = _make_queue(enable_metrics=True)
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
-        # Both already past deadline -> both selected for release.
+        # Both remotely drained -> both selected for release.
+        for room in (700, 701):
+            generation = mgr.register_deferred_abort_room(room)
+            mgr.note_abort_ack(room, 0, generation)
         q._deferred_releases.append((bad, 10.0, float("-inf"), 2, 1))
         q._deferred_releases.append((good, 10.0, float("-inf"), 1, 1))
 
@@ -839,16 +872,19 @@ class TestResolveDeferredReleases(CustomTestCase):
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
             patch.object(decode_mod, "release_kv_cache", side_effect=fake_release),
         ):
-            q.resolve_deferred_releases()  # must not raise
-            # The good one still released despite the bad one throwing.
-            self.assertIn(good.req, calls)
-            # Nothing left held, and a second call is a clean no-op (no retry).
+            with self.assertRaisesRegex(RuntimeError, "failed buffer cleanup"):
+                q.resolve_deferred_releases()
+            self.assertEqual(calls, [good.req, bad.req])
             self.assertEqual(q._deferred_releases, [])
-            q.resolve_deferred_releases()
+            self.assertEqual(q._failed_deferred_releases, [bad])
+            self.assertTrue(q.has_pending_deferred_releases())
+            with self.assertRaisesRegex(RuntimeError, "prior cleanup failure"):
+                q.resolve_deferred_releases()
+            self.assertEqual(calls, [good.req, bad.req])
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
+                call(duration_seconds=30.0, outcome="drained"),
                 call(duration_seconds=30.0, outcome="error"),
-                call(duration_seconds=30.0, outcome="timeout"),
             ]
         )
 
@@ -865,6 +901,98 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(deadline, 17.5)
         self.assertEqual(held_idx, 9)
         self.assertEqual(required, 1)
+
+    def test_unknown_writer_set_never_counts_as_zero_writers(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        dreq = _make_decode_req(800, 4, mgr, n_prefill_ranks=0)
+        q._defer_release(dreq)
+        self.assertIsNone(q._deferred_releases[0][4])
+        with patch.object(decode_mod, "release_kv_cache") as rel:
+            q.resolve_deferred_releases()
+        rel.assert_not_called()
+        self.assertIsNotNone(dreq.kv_receiver)
+
+    def test_repeated_defer_does_not_duplicate_release(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        dreq = _make_decode_req(801, 4, mgr)
+        q._defer_release(dreq)
+        q._defer_release(dreq)
+        self.assertEqual(len(q._deferred_releases), 1)
+
+    def test_local_restore_must_drain_before_cache_lock_and_kv_release(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        dreq = _make_decode_req(802, 4, mgr)
+        restore_lock = object()
+        dreq.hicache_restore_lock = restore_lock
+        dreq.hicache_load_consumer_index = 3
+        q.tree_cache = SimpleNamespace(
+            is_load_back_event_done=Mock(return_value=False),
+            unlock=Mock(),
+        )
+        gen_802 = mgr.register_deferred_abort_room(802)
+        mgr.note_abort_ack(802, 0, gen_802)
+        q._defer_release(dreq)
+        with patch.object(decode_mod, "release_kv_cache") as rel:
+            q.resolve_deferred_releases()
+            rel.assert_not_called()
+            q.tree_cache.unlock.assert_not_called()
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+            q.tree_cache.is_load_back_event_done.return_value = True
+            q.resolve_deferred_releases()
+            rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
+        q.tree_cache.unlock.assert_called_once_with(restore_lock)
+        self.assertIsNone(dreq.hicache_restore_lock)
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
+
+    def test_staging_and_hisparse_buffers_release_only_after_all_writers_ack(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        dreq = _make_decode_req(803, 4, mgr, n_prefill_ranks=2)
+        events = []
+        q.enable_staging = True
+        q.staging_handler = SimpleNamespace(
+            is_staging_room=lambda room: True,
+            unregister_decode_req=lambda room: events.append("staging-drained"),
+        )
+        q.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=SimpleNamespace(
+                request_finished=lambda req: events.append("hisparse-released")
+            ),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+        )
+        gen_803 = mgr.register_deferred_abort_room(803)
+        mgr.note_abort_ack(803, 0, gen_803)
+        q._defer_release(dreq)
+        with patch.object(
+            decode_mod,
+            "release_kv_cache",
+            side_effect=lambda *a, **kw: events.append("kv-released"),
+        ):
+            q.resolve_deferred_releases()
+            self.assertEqual(events, [])
+            mgr.note_abort_ack(803, 1, gen_803)
+            q.resolve_deferred_releases()
+        self.assertEqual(
+            events, ["staging-drained", "hisparse-released", "kv-released"]
+        )
+
+    def test_memory_offload_cannot_drop_quarantined_or_active_transfers(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        dreq = _make_decode_req(804, 4, mgr)
+        q._defer_release(dreq)
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            q.release_memory_occupation()
+        self.assertEqual(len(q._deferred_releases), 1)
+        q._deferred_releases.clear()
+        q.queue.append(dreq)
+        with self.assertRaisesRegex(RuntimeError, "KV transfers"):
+            q.release_memory_occupation()
+        self.assertEqual(q.queue, [dreq])
 
 
 def _make_pop_queue(mgr):

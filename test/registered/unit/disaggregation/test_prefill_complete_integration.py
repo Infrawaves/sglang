@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -138,6 +139,10 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.enable_staging = False
         mgr.is_dummy_cp_rank = False
         mgr._staging_outstanding = {}
+        # Source-buffer leases: production __init__ creates these on prefill.
+        mgr._abort_drain_lock = threading.RLock()
+        if ip == "prefill":
+            mgr._transfer_lifetime = TransferLifetimeTracker()
         mgr._prefill_unique_rank = Mock(return_value=0)
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
@@ -616,6 +621,8 @@ class TestAllocationIntegration(CustomTestCase):
             pending_bootstrap=True,
             prefill_attempt_count=1,
             skip_radix_cache_insert=False,
+            to_finish=None,
+            finished_reason=None,
         )
         scheduler = self.inflight_scheduler([req])
         scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 0)
