@@ -38,7 +38,7 @@ def extract(path, class_name, names, namespace, extra=()):
     extras = [
         n
         for n in tree.body
-        if (isinstance(n, ast.ClassDef) and n.name in extra)
+        if (isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in extra)
         or (
             isinstance(n, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id in extra for t in n.targets)
@@ -224,6 +224,7 @@ Prefill = extract(
     process_batch_result_disagg_prefill handle_bootstrap_failure optimistic_release_and_requeue
     _retire_aborted_prefill_result""",
     GLOBALS,
+    extra=("is_round_robin_eligible",),
 )
 
 
@@ -241,6 +242,7 @@ class Req:
         self.extend_range = None
         self.rid = name
         self.prefill_ready_seq = None
+        self.round_robin_eligible = None
         self.inflight_middle_chunks = 0
         self.kv.holds_kv = prefix > 0
         self.kv.holds_mamba = False
@@ -280,8 +282,9 @@ class Req:
 
 
 class Harness(Scheduler, Prefill):
-    def __init__(self, free=4096, rows=32, chunk=128, enabled=True):
+    def __init__(self, free=4096, rows=32, chunk=128, enabled=True, min_chunks=1):
         self.enable_chunked_prefill_round_robin = enabled
+        self.chunked_prefill_round_robin_min_chunks = min_chunks
         self.waiting_queue = []
         self.suspended_prefill_queue = []
         self.chunked_req = None
@@ -620,6 +623,73 @@ class RoundRobinTests(unittest.TestCase):
         self.assertEqual(a.cleanup, ["pending_send", "sender", "metadata", "kv"])
         self.assertEqual(s.outputs, [a])
         self.assertFalse(s.suspended_prefill_queue)
+
+    def test_min_chunks_gate_boundary(self):
+        """A request needing exactly min_chunks chunks yields; one chunk short does not.
+
+        chunk=128, min_chunks=3 -> the gate admits uncached > 256. Guards an
+        operator flip (>= vs >) and an off-by-one in the chunk-count algebra.
+        """
+        for length, expected in ((256, False), (257, True)):
+            with self.subTest(length=length):
+                s = Harness(min_chunks=3)
+                a, b = Req("a", length), Req("b", 64)
+                s.enqueue_prefill_ready([a])
+                batch = s.batch()
+                self.assertIs(batch.chunked_req, a)
+                self.assertIs(a.round_robin_eligible, expected)
+                s.complete(batch)
+                s.enqueue_prefill_ready([b])
+                s.process_prefill_chunk(batch, s.running_batch)
+                if expected:
+                    self.assertEqual(s.suspended_prefill_queue, [a])
+                    self.assertIsNone(s.chunked_req)
+                else:
+                    self.assertEqual(s.suspended_prefill_queue, [])
+                    self.assertIs(s.chunked_req, a)
+
+    def test_verdict_frozen_across_rounds(self):
+        """An eligible request keeps yielding after its remaining chunks drop below min_chunks.
+
+        Each finished chunk is written back into prefix_indices, so the uncached
+        length shrinks every round. Recomputing the verdict per round instead of
+        freezing it at first truncation would stop the rotation once the tail got
+        short and silently drop the trailing yields.
+        """
+        s = Harness(chunk=256, min_chunks=3)
+        threshold = (3 - 1) * 256
+        a = Req("a", 1024)
+        s.enqueue_prefill_ready([a])
+        reached_divergence = False
+        for round_idx in range(3):
+            batch = s.batch()
+            self.assertIs(batch.chunked_req, a, f"round {round_idx}")
+            s.complete(batch)
+            s.enqueue_prefill_ready([Req(f"short{round_idx}", 64)])
+            s.process_prefill_chunk(batch, s.running_batch)
+            self.assertIs(a.round_robin_eligible, True, f"round {round_idx}")
+            self.assertEqual(s.suspended_prefill_queue, [a], f"round {round_idx}")
+            if len(a.full_untruncated_fill_ids) - len(a.prefix_indices) < threshold:
+                reached_divergence = True
+        # Without this the case can pass vacuously: if no round ever drops below
+        # the gate, a per-round recompute would agree with the frozen verdict.
+        self.assertTrue(reached_divergence, "never reached the divergence point")
+
+    def test_verdict_rejudged_at_fresh_admission(self):
+        """Fresh admission overwrites a stale verdict instead of trusting the old one.
+
+        The optimistic-prefill retry path calls reset_for_retract and requeues,
+        so a request can reach truncation again with a different uncached length.
+        Nothing clears the verdict on that path; it is self-healing only because
+        every fresh truncation recomputes it.
+        """
+        s = Harness(min_chunks=3)
+        a = Req("a", 200)
+        a.round_robin_eligible = True  # stale verdict from a previous incarnation
+        s.enqueue_prefill_ready([a])
+        batch = s.batch()
+        self.assertIs(batch.chunked_req, a)
+        self.assertIs(a.round_robin_eligible, False)
 
     def test_disabled_preserves_current_first(self):
         s = Harness(enabled=False)
