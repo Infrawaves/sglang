@@ -110,6 +110,20 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def is_round_robin_eligible(
+    *, req: Req, chunked_prefill_size: Optional[int], min_chunks: int
+) -> bool:
+    # Call only at first truncation: prefix_indices must still hold the original
+    # prefix, which stops being true once the first chunk is cached.
+    if min_chunks <= 1:
+        return True
+    if not chunked_prefill_size:
+        return True
+    uncached = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+    # ceil(uncached / size) >= min_chunks, without the division.
+    return uncached > (min_chunks - 1) * chunked_prefill_size
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # Hybrid pools count all layers in start_layer, but peer KV lists contain only
     # full-attention layers, so translate to a full-attention-relative offset.
@@ -1294,6 +1308,9 @@ class SchedulerDisaggregationPrefillMixin:
             and self.chunked_req is req
             and not req.pending_bootstrap
             and (self.waiting_queue or self.suspended_prefill_queue)
+            # None (never judged) keeps the pre-gate behavior; only an explicit
+            # False pins the request to the baseline resume path.
+            and req.round_robin_eligible is not False
         ):
             req.prefill_ready_seq = self._prefill_ready_seq
             self._prefill_ready_seq += 1

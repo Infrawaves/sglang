@@ -86,6 +86,7 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    is_round_robin_eligible,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
@@ -1316,6 +1317,9 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         self.enable_chunked_prefill_round_robin = (
             get_schedule().enable_chunked_prefill_round_robin
+        )
+        self.chunked_prefill_round_robin_min_chunks = (
+            get_schedule().chunked_prefill_round_robin_min_chunks
         )
         self._validate_prefill_round_robin()
         self.suspended_prefill_queue: List[Req] = []
@@ -4114,6 +4118,12 @@ class Scheduler(
                 r for r in self.suspended_prefill_queue if r not in can_run_set
             ]
             assert round_robin_chunked_req is None or adder.new_chunked_req is None
+            if adder.new_chunked_req is not None:
+                adder.new_chunked_req.round_robin_eligible = is_round_robin_eligible(
+                    req=adder.new_chunked_req,
+                    chunked_prefill_size=self.chunked_prefill_size,
+                    min_chunks=self.chunked_prefill_round_robin_min_chunks,
+                )
             self.chunked_req = round_robin_chunked_req or adder.new_chunked_req
         elif adder.new_chunked_req is not None:
             # Update chunked prefill
