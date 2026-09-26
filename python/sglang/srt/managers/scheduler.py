@@ -1332,6 +1332,12 @@ class Scheduler(
 
     def _validate_prefill_round_robin(self) -> None:
         if not self.enable_chunked_prefill_round_robin:
+            if self.chunked_prefill_round_robin_min_chunks > 1 and self.ps.tp_rank == 0:
+                logger.warning(
+                    "--chunked-prefill-round-robin-min-chunks=%d has no effect "
+                    "without --enable-chunked-prefill-round-robin.",
+                    self.chunked_prefill_round_robin_min_chunks,
+                )
             return
         if (
             get_disagg().disaggregation_mode != "prefill"

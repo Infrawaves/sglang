@@ -472,6 +472,7 @@ class RoundRobinTests(unittest.TestCase):
     def test_round_robin_configuration_limits(self):
         valid = dict(
             enable_chunked_prefill_round_robin=True,
+            chunked_prefill_round_robin_min_chunks=1,
             ps=NS(pp_size=1),
             enable_pdmux=False,
             is_hybrid_swa=False,
