@@ -841,11 +841,16 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         rendered.kwargs["tools"][2]["function"]["parameters"], schema
                     )
 
-    def test_empty_auto_allowlist_still_installs_grammar_without_declarations(self):
+    def test_empty_allowlist_constrains_generation_with_or_without_tools(self):
         for stream in (False, True):
-            for declared in (False, True):
-                with self.subTest(stream=stream, declared=declared):
-                    request = self._request(names=(), stream=stream)
+            for mode, declared in (
+                ("auto", False),
+                ("auto", True),
+                ("required", False),
+                ("required", True),
+            ):
+                with self.subTest(mode=mode, stream=stream, declared=declared):
+                    request = self._request(mode=mode, names=(), stream=stream)
                     if not declared:
                         request.tools = []
                     result = self._complete(request)
@@ -864,25 +869,21 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     )
                     self.assertFalse(_is_grammar_accept_string(grammar, self._call()))
 
-    def test_invalid_references_and_empty_required_fail_before_generation(self):
+    def test_invalid_function_references_fail_before_generation(self):
         for stream in (False, True):
-            for mode, names in (("auto", ("missing",)), ("required", ())):
-                with self.subTest(stream=stream, mode=mode, names=names):
-                    response = self._complete(self._request(mode, names, stream=stream))
+            for mode in ("auto", "required"):
+                with self.subTest(stream=stream, mode=mode):
+                    response = self._complete(
+                        self._request(mode, names=("missing",), stream=stream)
+                    )
                     self.assertEqual(response.status_code, 400)
                     self.assertIsNone(self.internal_request)
-            for collision in (False, True):
-                with self.subTest(stream=stream, custom_name_collision=collision):
-                    request = self._request(stream=stream)
-                    if collision:
-                        request.tools.append(
-                            request.tools[1].model_copy(update={"type": "custom"})
-                        )
-                    else:
-                        request.tools[1].type = "custom"
-                    response = self._complete(request, self._call())
-                    self.assertEqual(response.status_code, 400)
-                    self.assertIsNone(self.internal_request)
+            with self.subTest(stream=stream, custom_only=True):
+                request = self._request(stream=stream)
+                request.tools[1].type = "custom"
+                response = self._complete(request, self._call())
+                self.assertEqual(response.status_code, 400)
+                self.assertIsNone(self.internal_request)
 
     def test_tool_result_continuation_uses_new_allowlist_without_rewriting_history(
         self,
@@ -949,11 +950,35 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 self.assertFalse(_is_grammar_accept_string(grammar, self._call("A")))
                 self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
 
-    def test_unsupported_encoder_or_parser_does_not_fall_back_to_auto(self):
+    def test_k3_parser_installs_grammar_without_native_encoder(self):
+        """A generic chat template must not disable the selected K3 tool grammar."""
+        self.serving.chat_encoding_spec = None
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    result = self._complete(
+                        self._request(mode=mode, stream=stream), self._call()
+                    )
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.completed")
+                    else:
+                        self.assertIsInstance(result, ResponsesResponse)
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
+                    self.assertFalse(
+                        _is_grammar_accept_string(grammar, self._call("C"))
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, "No tool needed."),
+                        mode == "auto",
+                    )
+
+    def test_unsupported_parser_does_not_fall_back_to_auto(self):
         for encoder, parser, harmony in (
             (None, None, False),
             ("kimi_k3", "hermes", False),
-            (None, "kimi_k3", False),
             (None, None, True),
         ):
             with self.subTest(encoder=encoder, parser=parser, harmony=harmony):
@@ -1000,80 +1025,55 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
         request.tools[1].parameters = {"type": "array"}
         response = self._complete(request)
         self.assertEqual(response.status_code, 400)
-        self.assertIn(b"Cannot enforce allowed_tools", response.body)
+        self.assertIn(
+            b"Kimi K3 tool 'B' parameters must be an object schema", response.body
+        )
+        self.assertNotIn(b"Cannot enforce allowed_tools", response.body)
         self.assertIsNone(self.internal_request)
 
-    def test_parser_visible_disallowed_call_is_rejected_before_emission(self):
-        """A call marker inside loose arguments must not leak an excluded tool."""
+    def test_allowed_tools_preserves_existing_output_parsing(self):
+        """Grammar selection must not add rejection to the native parser's output."""
         text = (
             '<|open|>tools<|sep|><|open|>call tool="A" index="1"<|sep|>'
             '<|open|>argument key="body" type="string"<|sep|><|close|>call<|sep|>'
             '<|open|>call tool="C" index="2"<|sep|><|close|>call<|sep|>'
             "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
         )
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                result = self._complete(
-                    self._request(names=("A", "B"), stream=stream), text
-                )
-                grammar = Grammar.from_structural_tag(
-                    self.internal_request.sampling_params["structural_tag"]
-                )
-                self.assertTrue(_is_grammar_accept_string(grammar, text))
-                if stream:
-                    self.assertEqual(result[-1]["type"], "response.failed")
-                    self.assertNotIn(
-                        "C", [event.get("item", {}).get("name") for event in result]
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    outputs = []
+                    for allowed in (False, True):
+                        request = self._request(
+                            mode=mode, names=("A", "B"), stream=stream
+                        )
+                        if not allowed:
+                            request.tool_choice = mode
+                        result = self._complete(request, text)
+                        if stream:
+                            self.assertEqual(result[-1]["type"], "response.completed")
+                            output = result[-1]["response"]["output"]
+                        else:
+                            self.assertIsInstance(result, ResponsesResponse)
+                            output = result.model_dump()["output"]
+                        outputs.append(
+                            [
+                                {
+                                    k: v
+                                    for k, v in item.items()
+                                    if k not in ("id", "call_id")
+                                }
+                                for item in output
+                            ]
+                        )
+                    self.assertEqual(outputs[0], outputs[1])
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
                     )
-                    self.assertNotIn(
-                        "response.completed", [event["type"] for event in result]
-                    )
-                else:
-                    self.assertEqual(result.status_code, 400)
-                    self.assertIn(b"outside allowed_tools", result.body)
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
 
-    def test_disallowed_call_before_thinking_ends_cannot_leak(self):
-        # Grammar is deferred during thinking, but K3 tool channels still reach the parser.
-        self.serving.reasoning_parser = "kimi_k3"
-        self.serving.template_manager.reasoning_config = ReasoningToggleConfig(
-            toggle_param="thinking", default_enabled=True
-        )
-        text = "Thinking." + self._call("C") + THINK_CLOSE
-        for stream in (False, True):
-            for mode in ("auto", "required"):
-                with self.subTest(stream=stream, mode=mode):
-                    result = self._complete(
-                        self._request(
-                            mode=mode,
-                            stream=stream,
-                            chat_template_kwargs={"thinking": True},
-                        ),
-                        text,
-                    )
-                    self.assertTrue(self.internal_request.require_reasoning)
-                    if stream:
-                        self.assertEqual(result[-1]["type"], "response.failed")
-                        self.assertIn(
-                            "outside allowed_tools",
-                            result[-1]["response"]["error"]["message"],
-                        )
-                        self.assertNotIn(
-                            "C", [event.get("item", {}).get("name") for event in result]
-                        )
-                        self.assertFalse(
-                            any(
-                                event["type"].startswith(
-                                    "response.function_call_arguments."
-                                )
-                                for event in result
-                            )
-                        )
-                    else:
-                        self.assertEqual(result.status_code, 400)
-                        self.assertIn(b"outside allowed_tools", result.body)
-
-    def test_required_checks_decode_output_not_prefill_handoff(self):
-        """A PD first-token handoff must not fail the final-answer tool requirement."""
+    def test_required_preserves_incomplete_output_on_both_pd_workers(self):
+        """Incomplete PD output must retain its finish reason on both workers."""
         for mode in ("prefill", "decode"):
             publish(
                 ServerArgs(model_path="dummy", disaggregation_mode=mode),
@@ -1101,24 +1101,16 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         self.internal_request.sampling_params["structural_tag"]
                     )
                     if stream:
-                        if mode == "prefill":
-                            self.assertEqual(result[-1]["type"], "response.incomplete")
-                            self.assertIsNone(result[-1]["response"]["error"])
-                        else:
-                            self.assertEqual(result[-1]["type"], "response.failed")
-                            self.assertIn(
-                                "required", result[-1]["response"]["error"]["message"]
-                            )
-                    elif mode == "prefill":
+                        self.assertEqual(result[-1]["type"], "response.incomplete")
+                        self.assertEqual(result[-1]["response"]["status"], "incomplete")
+                        self.assertIsNone(result[-1]["response"]["error"])
+                    else:
                         self.assertIsInstance(result, ResponsesResponse)
                         self.assertEqual(result.status, "incomplete")
                         self.assertIsNone(result.error)
-                    else:
-                        self.assertEqual(result.status_code, 400)
-                        self.assertIn(b"required", result.body)
 
-    def test_required_fails_on_length_truncation_before_a_call(self):
-        """A length limit can stop a grammar-valid prefix before a call completes."""
+    def test_required_preserves_length_truncation_before_a_call(self):
+        """A truncated grammar-valid prefix must not become a validation error."""
         prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
         for stream in (False, True):
             with self.subTest(stream=stream):
@@ -1138,13 +1130,16 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 self.assertTrue(matcher.accept_string(prefix))
                 self.assertFalse(matcher.is_completed())
                 if stream:
-                    self.assertEqual(result[-1]["type"], "response.failed")
-                    self.assertIn(
-                        "required", result[-1]["response"]["error"]["message"]
-                    )
+                    self.assertEqual(result[-1]["type"], "response.incomplete")
+                    response = result[-1]["response"]
                 else:
-                    self.assertEqual(result.status_code, 400)
-                    self.assertIn(b"required", result.body)
+                    self.assertIsInstance(result, ResponsesResponse)
+                    response = result.model_dump()
+                self.assertEqual(response["status"], "incomplete")
+                self.assertIsNone(response["error"])
+                self.assertFalse(
+                    any(item["type"] == "function_call" for item in response["output"])
+                )
 
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):

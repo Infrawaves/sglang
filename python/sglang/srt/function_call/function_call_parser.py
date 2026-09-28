@@ -335,6 +335,6 @@ class FunctionCallParser:
                 return ("json_schema", json_schema)
         except Exception as e:
             if isinstance(tool_choice, AllowedToolChoice):
-                raise ValueError(f"Cannot enforce allowed_tools: {e}") from e
+                raise
             logger.error(f"Error getting structure constraint: {e}")
             return None

@@ -613,7 +613,8 @@ def get_kimik3_structural_tag(
 ) -> StructuralTag:
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
-        if isinstance(tool_choice, AllowedToolChoice) and not at_least_one:
+        if isinstance(tool_choice, AllowedToolChoice):
+            # Empty allowlists disable calls, including in required mode.
             return StructuralTag(
                 format=_with_reasoning(
                     AnyTextFormat(
