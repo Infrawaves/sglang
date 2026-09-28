@@ -624,6 +624,10 @@ class BaseRunner(ABC):
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            # The autotune dummy batch has no live scheduler metadata.  Its
+            # static count is unsharded, so expose it as both scopes; graph
+            # runners use a separate global slot when localizing SP rows.
+            global_num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )

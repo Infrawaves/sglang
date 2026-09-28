@@ -379,6 +379,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 enable_num_token_non_padded()
                 or self.prefill_backend_name == Backend.FULL
             ),
+            enable_global_num_token_non_padded=(
+                get_exec().moe.expert_distribution_recorder_mode is not None
+            ),
             require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
@@ -643,15 +646,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _capture_num_token_non_padded(self, num_tokens: int) -> Optional[torch.Tensor]:
+        global_buf = None
+        if self.buffer_registry.has_slot("global_num_token_non_padded"):
+            global_buf = self.buffer_registry.get_slot(
+                "global_num_token_non_padded"
+            ).buffer
+            global_buf.fill_(num_tokens)
         if not self.buffer_registry.has_slot("num_token_non_padded"):
             return None
 
         buf = self.buffer_registry.get_slot("num_token_non_padded").buffer
         buf.fill_(num_tokens)
+        if global_buf is None:
+            global_buf = buf
         # Localize the count when this bucket is attn-TP sharded (SP on).
         if self.model_runner.attn_tp_sequence_sharded(num_tokens):
             local = compute_local_num_token_non_padded(
-                global_num_token_non_padded=buf,
+                global_num_token_non_padded=global_buf,
                 num_tokens_per_dp=num_tokens,
                 sharded=True,
             )
@@ -1397,6 +1408,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
+                global_num_token_non_padded=(
+                    _slot("global_num_token_non_padded")
+                    if registry.has_slot("global_num_token_non_padded")
+                    else None
+                ),
                 global_num_token_non_padded_cpu=num_tokens,
                 attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
                     num_tokens
@@ -1598,6 +1614,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if registry.has_slot("num_token_non_padded")
             else forward_batch.num_token_non_padded
         )
+        global_num_token_non_padded = (
+            _slot("global_num_token_non_padded")
+            if registry.has_slot("global_num_token_non_padded")
+            else forward_batch.global_num_token_non_padded
+        )
 
         # MIXED replays the EXTEND-captured graphs.
         pcg_forward_mode = (
@@ -1670,6 +1691,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
+            global_num_token_non_padded=global_num_token_non_padded,
             global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
             attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
                 static_num_tokens
