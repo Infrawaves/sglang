@@ -454,6 +454,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
             enable_num_token_non_padded=enable_num_token_non_padded(),
+            enable_global_num_token_non_padded=(
+                get_exec().moe.expert_distribution_recorder_mode is not None
+            ),
             require_gathered_buffer=self.require_gathered_buffer,
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
@@ -915,6 +918,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
+        global_num_token_non_padded = None
+        if registry.has_slot("global_num_token_non_padded"):
+            global_num_token_non_padded = _slot("global_num_token_non_padded")
+            global_num_token_non_padded.fill_(num_tokens)
         if buffers.num_token_non_padded is not None:
             buffers.num_token_non_padded[...] = num_tokens
             if not self.enable_prefill_cp and attn_tp_sharded:
@@ -1005,6 +1012,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=(
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
+            global_num_token_non_padded=global_num_token_non_padded,
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
