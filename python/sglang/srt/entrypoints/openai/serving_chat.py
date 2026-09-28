@@ -11,7 +11,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_disagg, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -269,6 +269,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        # Prefill returns the first token after KV transfer, not a final answer.
+        self._is_disagg_prefill = get_disagg().disaggregation_mode == "prefill"
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
@@ -1941,6 +1943,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if (
                     isinstance(request.tool_choice, AllowedToolChoice)
                     and request.tool_choice.allowed_tools.mode == "required"
+                    and not self._is_disagg_prefill
                     and not has_tool_calls.get(idx, False)
                 ):
                     raise ValueError(
@@ -2261,6 +2264,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     raise ValueError("Generated tool call is outside allowed_tools.")
                 if (
                     request.tool_choice.allowed_tools.mode == "required"
+                    and not self._is_disagg_prefill
                     and not tool_calls
                 ):
                     raise ValueError(
