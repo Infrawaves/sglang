@@ -201,14 +201,16 @@ class GraphSlot:
         if self.axis == "tokens":
             return padded_num_tokens
         # axis == "none": no slicing
-        return self.buffer.shape[0] if self.buffer is not None else 0
+        # Scalar graph slots use a zero-dimensional tensor.  Treat them as
+        # one logical element for reset/copy bookkeeping.
+        return (self.buffer.shape or (1,))[0] if self.buffer is not None else 0
 
     def _raw_n(self, raw_bs: int, raw_num_tokens: int) -> int:
         if self.axis == "bs":
             return raw_bs
         if self.axis == "tokens":
             return raw_num_tokens
-        return self.buffer.shape[0] if self.buffer is not None else 0
+        return (self.buffer.shape or (1,))[0] if self.buffer is not None else 0
 
     def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
         """Return the ``[:padded_n]`` slice of the buffer consumed by callers.
@@ -518,6 +520,7 @@ def build_decode_registry(
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
     enable_num_token_non_padded: bool = False,
+    enable_global_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
@@ -641,6 +644,17 @@ def build_decode_registry(
                 axis="bs",
                 padding_policy=PaddingPolicy.FILL_ONCE,
                 pad_value=encoder_len_fill_value,
+            )
+        )
+    if enable_global_num_token_non_padded:
+        # Keep the unsharded count in a distinct, graph-stable scalar. The
+        # local count may change when a layer's hidden states are SP-sharded.
+        reg.register_slot(
+            GraphSlot(
+                "global_num_token_non_padded",
+                lambda _bs, _mt: (),
+                torch.int32,
+                axis="none",
             )
         )
     if enable_num_token_non_padded:
@@ -823,6 +837,7 @@ def build_prefill_registry(
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
     enable_num_token_non_padded: bool = False,
+    enable_global_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
@@ -915,6 +930,17 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+    if enable_global_num_token_non_padded:
+        # Keep the unsharded count in a distinct, graph-stable scalar. The
+        # local count may change when a layer's hidden states are SP-sharded.
+        reg.register_slot(
+            GraphSlot(
+                "global_num_token_non_padded",
+                lambda _bs, _mt: (),
+                torch.int32,
+                axis="none",
+            )
+        )
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
             compute_local_num_token_non_padded_cpu,
