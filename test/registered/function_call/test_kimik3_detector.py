@@ -8,6 +8,8 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -56,7 +58,12 @@ def _stream(
     for chunk in chunks:
         result = detector.parse_streaming_increment(chunk, tools)
         text += result.normal_text
-        calls.extend(result.calls)
+        for call in result.calls:
+            if call.name is not None:
+                assert call.tool_index == len(calls)
+                calls.append(call.model_copy())
+            else:
+                calls[call.tool_index].parameters += call.parameters
     return text, calls
 
 
@@ -151,37 +158,123 @@ def test_non_string_arg_json_decoding() -> None:
     }
 
 
-@pytest.mark.parametrize("chunk_size", [1, 7, 23])
+@pytest.mark.parametrize("chunk_size", [1, 7, 23, 4096])
 def test_streaming_split_markers(chunk_size: int) -> None:
+    """Chunking must not change escaping, value types, or literal marker prefixes."""
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
+    code = 'print("雪")\\path\n\r\t\b\f\x00\x1f<|close|>argumenX &quot;'
     text = (
         f"{RESPONSE_OPEN}Hello!{RESPONSE_CLOSE}{TOOLS_OPEN}"
-        + _call_block("python", 1, {"code": ("string", "print(2)")})
+        + _call_block(
+            "python",
+            27,
+            {
+                "code": ("string", code),
+                "empty": ("string", ""),
+                "literal": ("string", "null"),
+                "q&amp;&quot;": ("string", "raw &amp;"),
+                "number": ("number", "1e2"),
+                "null": ("null", "null"),
+                "flag": ("boolean", "false"),
+                "opts": ("object", '{"a":[true,null,"x"]}'),
+                "array": ("array", '[1,"two"]'),
+                "bad": ("number", "1e"),
+            },
+        )
         + TOOLS_CLOSE
     )
     normal_text, calls = _stream(detector, _chunks(text, chunk_size), tools)
     assert normal_text == "Hello!"
     assert len(calls) == 1
     assert calls[0].name == "python"
-    assert json.loads(calls[0].parameters) == {"code": "print(2)"}
+    expected = {
+        "code": code,
+        "empty": "",
+        "literal": "null",
+        'q&"': "raw &amp;",
+        "number": 100.0,
+        "null": None,
+        "flag": False,
+        "opts": {"a": [True, None, "x"]},
+        "array": [1, "two"],
+        "bad": "1e",
+    }
+    assert json.loads(calls[0].parameters) == expected
+    assert detector.detect_and_parse(text, tools).calls == calls
 
 
-def test_streaming_two_calls() -> None:
+@pytest.mark.parametrize("chunk_size", [7, 4096])
+def test_streaming_multiple_calls(chunk_size: int) -> None:
     detector = KimiK3Detector()
-    tools = [_make_tool("python")]
+    tools = [_make_tool("python"), _make_tool("finish")]
     text = (
         TOOLS_OPEN
-        + _call_block("python", 1, {"code": ("string", "a")})
-        + _call_block("python", 2, {"code": ("string", "b")})
+        + _call_block("python", 27, {"code": ("string", "a")})
+        + _call_block("python", 28, {"code": ("string", "b")})
+        + _call_block("finish", 29, {})
         + TOOLS_CLOSE
     )
-    _, calls = _stream(detector, _chunks(text, 7), tools)
-    assert [call.tool_index for call in calls] == [0, 1]
+    _, calls = _stream(detector, _chunks(text, chunk_size), tools)
+    assert [call.tool_index for call in calls] == [0, 1, 2]
+    assert [call.name for call in calls] == ["python", "python", "finish"]
     assert [json.loads(call.parameters) for call in calls] == [
         {"code": "a"},
         {"code": "b"},
+        {},
     ]
+
+
+def test_streaming_emits_name_and_string_before_closing_markers() -> None:
+    """Long tool arguments must reach clients while the model is still writing them."""
+    parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
+    _, calls = parser.parse_stream_chunk(
+        TOOLS_OPEN + '<|open|>call tool="python" index="27"<|sep|>'
+    )
+    assert [(call.name, call.tool_index) for call in calls] == [("python", 0)]
+    _, header = parser.parse_stream_chunk(
+        '<|open|>argument key="code" type="string"<|sep|>'
+    )
+    calls.extend(header)
+    value = 'line("雪")\\\n' * 128
+    for part in _chunks(value, 16):
+        normal_text, deltas = parser.parse_stream_chunk(part)
+        assert normal_text == ""
+        assert deltas
+        assert all(call.name is None and call.tool_index == 0 for call in deltas)
+        calls.extend(deltas)
+    assert "".join(call.parameters for call in calls) == (
+        '{"code": ' + json.dumps(value, ensure_ascii=False)[:-1]
+    )
+    _, end = parser.parse_stream_chunk(ARGUMENT_CLOSE + CALL_CLOSE + TOOLS_CLOSE)
+    calls.extend(end)
+    assert json.loads("".join(call.parameters for call in calls)) == {"code": value}
+    assert parser.parse_stream_end() == ("", [])
+
+
+@pytest.mark.parametrize(
+    "arg_type, parts, expected",
+    [
+        ("number", ["1", "e", "2"], 100.0),
+        ("null", ["n", "ul", "l"], None),
+        ("boolean", ["tr", "ue"], True),
+        ("array", ["[1", ",2]"], [1, 2]),
+        ("object", ['{"a":', "false}"], {"a": False}),
+        ("number", ["1", "e"], "1e"),
+    ],
+)
+def test_streaming_non_string_waits_for_complete_value(arg_type, parts, expected):
+    """Partial numbers/JSON cannot be emitted before type conversion or fallback."""
+    parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
+    _, calls = parser.parse_stream_chunk(
+        TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+        f'<|open|>argument key="value" type="{arg_type}"<|sep|>'
+    )
+    for part in parts:
+        assert parser.parse_stream_chunk(part) == ("", [])
+    _, end = parser.parse_stream_chunk(ARGUMENT_CLOSE + CALL_CLOSE)
+    calls.extend(end)
+    assert json.loads("".join(call.parameters for call in calls)) == {"value": expected}
 
 
 def test_streaming_plain_text_only() -> None:
@@ -208,14 +301,19 @@ def test_streaming_bookkeeping_for_serving_layer() -> None:
     assert json.loads(detector.streamed_args_for_tool[0]) == {"code": "a"}
 
 
-def test_stream_end_reports_truncated_tools_section(caplog) -> None:
-    """A tools section cut off before its closing tag used to vanish at
-    end-of-stream: no call, no text, no log. It must at least be reported."""
+@pytest.mark.parametrize(
+    "argument", ["", '<|open|>argument key="code" type="string"<|sep|>partial<|cl']
+)
+def test_stream_end_reports_truncated_tools_section(caplog, argument) -> None:
+    """Truncated calls are reported without fabricating closing JSON or leaking markers."""
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
-    truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+    truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>' + argument
     text, calls = _stream(detector, _chunks(truncated, 7), tools)
-    assert calls == []
+    assert text == ""
+    assert calls[0].name == "python"
+    assert calls[0].parameters == ('{"code": "partial' if argument else "{")
+    assert detector.prev_tool_call_arr == []
     with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
         result = detector.finish(tools)
     assert result.calls == []

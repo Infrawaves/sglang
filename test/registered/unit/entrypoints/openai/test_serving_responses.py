@@ -799,6 +799,10 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         parts = [
                             e for e in argument_events if e["item_id"] == item["id"]
                         ]
+                        if chunk_size == 1:
+                            self.assertGreater(
+                                sum(e["type"].endswith(".delta") for e in parts), 1
+                            )
                         self.assertEqual({e["output_index"] for e in parts}, {index})
                         self.assertEqual(
                             "".join(
@@ -1179,6 +1183,28 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         self.assertEqual(result.status, "incomplete")
                         self.assertIsNone(result.error)
 
+    def test_length_truncation_keeps_streamed_arguments_incomplete(self):
+        """Partial arguments must survive a length stop without synthetic closing JSON."""
+        events = self._complete(
+            self._request(names=("B",), stream=True),
+            '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
+            '<|open|>argument key="code" type="string"<|sep|>partial',
+            finish_type="length",
+        )
+        self.assertEqual(events[-1]["type"], "response.incomplete")
+        output = events[-1]["response"]["output"]
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["name"], "B")
+        self.assertEqual(output[0]["arguments"], '{"code": "partial')
+        self.assertEqual(
+            "".join(
+                event["delta"]
+                for event in events
+                if event["type"] == "response.function_call_arguments.delta"
+            ),
+            output[0]["arguments"],
+        )
+
     def test_required_preserves_length_truncation_before_a_call(self):
         """A truncated grammar-valid prefix must not become a validation error."""
         prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
@@ -1207,8 +1233,13 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     response = result.model_dump()
                 self.assertEqual(response["status"], "incomplete")
                 self.assertIsNone(response["error"])
-                self.assertFalse(
-                    any(item["type"] == "function_call" for item in response["output"])
+                self.assertEqual(
+                    [
+                        (item["name"], item["arguments"])
+                        for item in response["output"]
+                        if item["type"] == "function_call"
+                    ],
+                    [("B", "{")] if stream else [],
                 )
 
 
