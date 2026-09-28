@@ -4469,19 +4469,28 @@ class TestAllowedToolsServing(CustomTestCase):
         self.assertIn("schema", json.loads(response.body)["message"])
         self.assertIsNone(self.internal_request)
 
-    def test_constraint_construction_failure_is_not_ignored(self):
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                request = self._request(stream=stream)
-                request.tools[0].function.strict = True
-                request.tools[0].function.parameters = {"type": "array"}
-                response = self._complete(request)
-                self.assertEqual(response.status_code, 400)
-                self.assertEqual(
-                    json.loads(response.body)["message"],
-                    "Kimi K3 tool 'A' parameters must be an object schema",
-                )
-                self.assertIsNone(self.internal_request)
+    def test_constraint_construction_failure_uses_existing_fallback(self):
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    request = self._request(mode=mode, stream=stream)
+                    request.tools[0].function.strict = True
+                    request.tools[0].function.parameters = {"type": "array"}
+                    response = self._complete(request)
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                    else:
+                        self.assertIsInstance(response, ChatCompletionResponse)
+                        self.assertEqual(
+                            response.choices[0].message.content, "No tool needed."
+                        )
+                    self.assertIsNotNone(self.internal_request)
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("structural_tag")
+                    )
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("json_schema")
+                    )
 
     def test_empty_allowlist_without_declarations_still_constrains_generation(self):
         for mode, tools in (

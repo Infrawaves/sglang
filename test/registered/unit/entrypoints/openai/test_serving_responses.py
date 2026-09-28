@@ -1019,17 +1019,26 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
         )
         self.assertIsInstance(result, ResponsesResponse)
 
-    def test_constraint_failure_is_not_silently_ignored(self):
-        request = self._request()
-        request.tools[1].strict = True
-        request.tools[1].parameters = {"type": "array"}
-        response = self._complete(request)
-        self.assertEqual(response.status_code, 400)
-        self.assertIn(
-            b"Kimi K3 tool 'B' parameters must be an object schema", response.body
-        )
-        self.assertNotIn(b"Cannot enforce allowed_tools", response.body)
-        self.assertIsNone(self.internal_request)
+    def test_constraint_failure_uses_existing_fallback(self):
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    request = self._request(mode=mode, stream=stream)
+                    request.tools[1].strict = True
+                    request.tools[1].parameters = {"type": "array"}
+                    response = self._complete(request)
+                    if stream:
+                        self.assertEqual(response[-1]["type"], "response.completed")
+                    else:
+                        self.assertIsInstance(response, ResponsesResponse)
+                        self.assertEqual(response.status, "completed")
+                    self.assertIsNotNone(self.internal_request)
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("structural_tag")
+                    )
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("json_schema")
+                    )
 
     def test_allowed_tools_preserves_existing_output_parsing(self):
         """Grammar selection must not add rejection to the native parser's output."""
