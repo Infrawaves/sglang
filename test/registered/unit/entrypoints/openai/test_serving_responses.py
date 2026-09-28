@@ -841,6 +841,55 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         rendered.kwargs["tools"][2]["function"]["parameters"], schema
                     )
 
+    def test_empty_allowlist_only_changes_k3_template_hint(self):
+        """Responses must forward the empty allowlist's no-tool prompt;
+        its wire choice and decoding grammar must not become plain none.
+        """
+        fields = {"tool_choice", "tools", "chat_template_kwargs"}
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                for names, template_choice in (((), "none"), (("B",), None)):
+                    with self.subTest(mode=mode, stream=stream, names=names):
+                        request = self._request(
+                            mode=mode,
+                            names=names,
+                            stream=stream,
+                            chat_template_kwargs={"thinking": False},
+                        )
+                        original_choice = request.tool_choice
+                        original_fields = request.model_dump(include=fields)
+                        text = self._call() if names else "No tool needed."
+                        result = self._complete(request, text)
+                        if stream:
+                            self.assertEqual(result[-1]["type"], "response.completed")
+                            response = result[-1]["response"]
+                        else:
+                            self.assertIsInstance(result, ResponsesResponse)
+                            response = result.model_dump()
+                        rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                        self.assertEqual(
+                            rendered.kwargs.get("tool_choice"), template_choice
+                        )
+                        self.assertEqual(
+                            [
+                                tool["function"]["name"]
+                                for tool in rendered.kwargs["tools"]
+                            ],
+                            [tool["name"] for tool in original_fields["tools"]],
+                        )
+                        self.assertIs(request.tool_choice, original_choice)
+                        self.assertEqual(
+                            request.model_dump(include=fields), original_fields
+                        )
+                        self.assertEqual(response["tool_choice"], original_choice)
+                        grammar = Grammar.from_structural_tag(
+                            self.internal_request.sampling_params["structural_tag"]
+                        )
+                        self.assertTrue(_is_grammar_accept_string(grammar, text))
+                        self.assertFalse(
+                            _is_grammar_accept_string(grammar, self._call("C"))
+                        )
+
     def test_empty_allowlist_constrains_generation_with_or_without_tools(self):
         for stream in (False, True):
             for mode, declared in (

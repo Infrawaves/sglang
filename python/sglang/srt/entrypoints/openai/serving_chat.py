@@ -598,6 +598,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tool_choice in ("required", "none")
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",

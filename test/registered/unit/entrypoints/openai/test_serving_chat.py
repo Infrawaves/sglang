@@ -4347,6 +4347,57 @@ class TestAllowedToolsServing(CustomTestCase):
                 self.assertNotIn("strict", rendered_tools[0]["function"])
                 self.assertTrue(self.internal_request.sampling_params["structural_tag"])
 
+    def test_empty_allowlist_only_changes_k3_template_hint(self):
+        """Empty allowlists need a no-tool prompt;
+        a grammar-only ban can leak malformed tool markers as text.
+        """
+        call = (
+            TOOLS_OPEN
+            + '<|open|>call tool="B" index="1"<|sep|><|close|>call<|sep|>'
+            + TOOLS_CLOSE
+        )
+        fields = {"tool_choice", "tools", "chat_template_kwargs"}
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                for names, template_choice in (((), "none"), (("B",), None)):
+                    with self.subTest(mode=mode, stream=stream, names=names):
+                        request = self._request(
+                            mode=mode,
+                            names=names,
+                            stream=stream,
+                            chat_template_kwargs={"thinking": False},
+                        )
+                        original_choice = request.tool_choice
+                        original_fields = request.model_dump(include=fields)
+                        original_tools = [
+                            tool.model_dump(exclude_unset=True)
+                            for tool in request.tools
+                        ]
+                        text = call if names else "No tool needed."
+                        result = self._complete(request, text)
+                        if stream:
+                            self.assertFalse(any("error" in event for event in result))
+                        else:
+                            self.assertIsInstance(result, ChatCompletionResponse)
+                        rendered = self.tm.tokenizer.apply_chat_template.call_args
+                        self.assertEqual(
+                            rendered.kwargs.get("tool_choice"), template_choice
+                        )
+                        self.assertEqual(rendered.kwargs["tools"], original_tools)
+                        self.assertIs(request.tool_choice, original_choice)
+                        self.assertEqual(
+                            request.model_dump(include=fields), original_fields
+                        )
+                        grammar = xgr.Grammar.from_structural_tag(
+                            self.internal_request.sampling_params["structural_tag"]
+                        )
+                        self.assertTrue(_is_grammar_accept_string(grammar, text))
+                        self.assertFalse(
+                            _is_grammar_accept_string(
+                                grammar, call.replace('tool="B"', 'tool="C"')
+                            )
+                        )
+
     def test_auto_stream_can_reply_without_calls_even_with_an_empty_allowlist(self):
         for names in (("A",), ()):
             with self.subTest(names=names):
