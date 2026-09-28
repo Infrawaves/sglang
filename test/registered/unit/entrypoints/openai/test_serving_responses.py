@@ -841,20 +841,32 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         rendered.kwargs["tools"][2]["function"]["parameters"], schema
                     )
 
-    def test_empty_allowlist_only_changes_k3_template_hint(self):
-        """Responses must forward the empty allowlist's no-tool prompt;
-        its wire choice and decoding grammar must not become plain none.
+    def test_allowed_tools_k3_template_hints_preserve_choice_and_grammar(self):
+        """Responses must forward required/empty allowlist tool-use hints;
+        its wire choice and grammar must retain the original allowlist.
         """
         fields = {"tool_choice", "tools", "chat_template_kwargs"}
-        for mode in ("auto", "required"):
+        for mode, names, template_choice in (
+            ("auto", (), "none"),
+            ("required", (), "none"),
+            ("auto", ("B",), None),
+            ("required", ("B",), "required"),
+            ("auto", ("A", "B"), None),
+            ("required", ("A", "B"), "required"),
+        ):
             for stream in (False, True):
-                for names, template_choice in (((), "none"), (("B",), None)):
-                    with self.subTest(mode=mode, stream=stream, names=names):
+                for template_kwargs, expected_hint in (
+                    ({"thinking": False}, template_choice),
+                    ({"thinking": False, "tool_choice": "auto"}, "auto"),
+                ):
+                    with self.subTest(
+                        mode=mode, stream=stream, names=names, kwargs=template_kwargs
+                    ):
                         request = self._request(
                             mode=mode,
                             names=names,
                             stream=stream,
-                            chat_template_kwargs={"thinking": False},
+                            chat_template_kwargs=template_kwargs,
                         )
                         original_choice = request.tool_choice
                         original_fields = request.model_dump(include=fields)
@@ -868,7 +880,7 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                             response = result.model_dump()
                         rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
                         self.assertEqual(
-                            rendered.kwargs.get("tool_choice"), template_choice
+                            rendered.kwargs.get("tool_choice"), expected_hint
                         )
                         self.assertEqual(
                             [

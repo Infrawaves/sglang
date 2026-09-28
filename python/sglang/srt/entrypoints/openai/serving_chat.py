@@ -604,6 +604,11 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 # The text-only grammar can still admit malformed tool markers.
                 template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
