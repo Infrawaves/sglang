@@ -2,14 +2,19 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation import utils as disagg_utils
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodePrefixMatch,
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -106,6 +111,112 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         self.assertFalse(prefix_match.prefetch_registered)
         tree_cache.get_prefix_hash_values.assert_not_called()
         tree_cache.prefetch_from_storage.assert_not_called()
+
+
+class TestHiCacheRestoreConsensus(CustomTestCase):
+    @staticmethod
+    def _request(restore, transport=KVPoll.Success, *, require_staging=False):
+        return SimpleNamespace(
+            hicache_restore_status=restore,
+            kv_receiver=SimpleNamespace(
+                poll=lambda: transport, require_staging=require_staging
+            ),
+            metadata_buffer_index=0,
+            req=SimpleNamespace(
+                rid="req-123", bootstrap_host="127.0.0.1", bootstrap_room=123
+            ),
+        )
+
+    def test_restore_failure_precedes_every_transport_state(self):
+        for transport in (
+            KVPoll.Bootstrapping,
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+            KVPoll.Success,
+            KVPoll.Failed,
+        ):
+            with self.subTest(transport=transport):
+                request = self._request(HiCacheRestoreResult.FAILED, transport)
+                self.assertEqual(
+                    HiCacheRestoreGatedKVReceiver(request).poll(), KVPoll.Failed
+                )
+
+    def test_pending_restore_preserves_transport_failure(self):
+        for restore in (HiCacheRestoreResult.PENDING, HiCacheRestoreResult.READY):
+            with self.subTest(restore=restore):
+                request = self._request(restore, KVPoll.Failed)
+                self.assertEqual(
+                    HiCacheRestoreGatedKVReceiver(request).poll(), KVPoll.Failed
+                )
+                request = self._request(restore)
+                self.assertEqual(
+                    HiCacheRestoreGatedKVReceiver(request).poll(),
+                    KVPoll.Transferring
+                    if restore == HiCacheRestoreResult.PENDING
+                    else KVPoll.Success,
+                )
+
+    def test_staging_restore_state_is_included_before_all_reduce(self):
+        for require_staging in (False, True):
+            for restore, enabled, metadata_room, expected in (
+                (HiCacheRestoreResult.FAILED, True, 123, KVPoll.Failed),
+                (HiCacheRestoreResult.FAILED, True, 0, KVPoll.Failed),
+                (HiCacheRestoreResult.PENDING, True, 123, KVPoll.Transferring),
+                (HiCacheRestoreResult.READY, True, 123, KVPoll.Success),
+                (HiCacheRestoreResult.READY, True, 0, KVPoll.Transferring),
+                # Without HiCache, DecodeRequest's default PENDING is inert.
+                (HiCacheRestoreResult.PENDING, False, 123, KVPoll.Success),
+            ):
+                with self.subTest(
+                    staging=require_staging,
+                    restore=restore,
+                    enabled=enabled,
+                    metadata_room=metadata_room,
+                ):
+                    request = self._request(restore, require_staging=require_staging)
+                    handler = SimpleNamespace(
+                        is_done=lambda _: True,
+                        is_failed=lambda _: False,
+                        advance_scatter=Mock(),
+                    )
+                    metadata = SimpleNamespace(
+                        bootstrap_room=torch.tensor([[metadata_room]])
+                    )
+                    with (
+                        envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0),
+                        patch.object(
+                            disagg_utils,
+                            "_all_reduce_polls",
+                            side_effect=lambda polls, _: polls,
+                        ) as reduce,
+                    ):
+                        result = disagg_utils.poll_and_all_reduce_with_staging(
+                            [request],
+                            handler,
+                            object(),
+                            metadata_buffers=metadata,
+                            enable_decode_hicache=enabled,
+                        )
+                    self.assertEqual(result, [int(expected)])
+                    self.assertEqual(reduce.call_args.args[0], [int(expected)])
+
+    def test_staging_failure_is_not_hidden_by_pending_restore(self):
+        request = self._request(HiCacheRestoreResult.PENDING, require_staging=True)
+        handler = SimpleNamespace(
+            is_done=lambda _: False,
+            is_failed=lambda _: True,
+            advance_scatter=Mock(),
+        )
+        with (
+            envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0),
+            patch.object(
+                disagg_utils, "_all_reduce_polls", side_effect=lambda polls, _: polls
+            ),
+        ):
+            result = disagg_utils.poll_and_all_reduce_with_staging(
+                [request], handler, object(), enable_decode_hicache=True
+            )
+        self.assertEqual(result, [int(KVPoll.Failed)])
 
 
 if __name__ == "__main__":

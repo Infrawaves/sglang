@@ -86,7 +86,6 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -3547,12 +3546,8 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
+            self.queue_aborted_prefill_transfer(req)
+            return
         self._release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -4976,6 +4971,18 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
 
+        # A terminal request can still own buffers used by a remote transfer.
+        # In particular, administrative flush/offload must not mistake those
+        # quarantined pages for an idle, reclaimable cache.
+        if (
+            not for_health_check
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_transfer_queue is not None
+        ):
+            idle &= (
+                not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+            )
+
         if (
             for_health_check
             and not self._engine_paused
@@ -5427,6 +5434,21 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # A yielded/chunked request may already have sent KV. Retain
+                # KV, recurrent state and metadata until every source read ends.
+                prepare_abort(
+                    req,
+                    recv_req.abort_message or "Aborted by AbortReq.",
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if recv_req.abort_message
+                        else None
+                    ),
+                )
+                self.beam_coordinator.retire_group(req)
+                self.queue_aborted_prefill_transfer(req)
+                continue
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5437,20 +5459,6 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
             # For mamba radix cache
             if (
                 req.kv.holds_mamba
@@ -5512,19 +5520,6 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
