@@ -320,6 +320,11 @@ class TestCommonAbortAckDispatch(CustomTestCase):
         receiver.abort_notified = False
         receiver.conclude_state = None
         receiver._abort_generation = None
+        # Own the room the way CommonKVReceiver.__init__ registers it (#39).
+        receiver._room_generation = object()
+        receiver._setup_cancelled = False
+        receiver._setup_parts = None
+        mgr.room_generations = {room: receiver._room_generation}
         mgr.local_ip = "10.0.0.1"
         mgr.rank_port = 5000
         mgr.failure_lock = threading.Lock()
@@ -359,7 +364,7 @@ class TestCommonAbortAckDispatch(CustomTestCase):
         mgr = _make_manager()
         mgr.waiting_timeout = 0
         receiver, sent = self._make_notifying_receiver(mgr, 105, init_time=1.0)
-        receiver.invalidate_cached_bootstrap_infos = lambda *args: None
+        receiver.invalidate_cached_bootstrap_infos = lambda: None
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
 
@@ -583,6 +588,9 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         recv = _BareReceiver.__new__(_BareReceiver)
         recv.kv_mgr = mgr
         recv.bootstrap_room = 500
+        recv._room_generation = object()
+        mgr.connection_lock = threading.Lock()
+        mgr.room_generations = {500: recv._room_generation}
         recv.init_time = init_time
         recv.abort_notified = False
         recv._abort_generation = None

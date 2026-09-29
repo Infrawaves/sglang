@@ -3407,8 +3407,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
-    def _register_kv_args(self) -> bool:
-        for bootstrap_info in self.bootstrap_infos:
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
+        for bootstrap_info in bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
