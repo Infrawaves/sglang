@@ -31,6 +31,7 @@ def _receiver(connection_pool, entries):
         enable_deferred_decode_kv_release=False,
     )
     receiver._connection_pool_entries = entries
+    receiver._connection_pool_entries_lock = threading.RLock()
     return receiver
 
 
@@ -61,6 +62,7 @@ def _fetching_receiver(connection_pool):
     receiver.target_tp_ranks = [0]
     receiver.target_pp_ranks = [0]
     receiver._connection_pool_entries = {}
+    receiver._connection_pool_entries_lock = threading.RLock()
     receiver.fetch_count = 0
     return receiver
 
@@ -140,6 +142,28 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
+
+    def test_abort_retry_drops_undrained_room_conflict(self):
+        receiver = object.__new__(_ConcreteReceiver)
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_infos = [{}]
+        receiver._abort_token = "new-token"
+        register = Mock(side_effect=RuntimeError("undrained room"))
+        connection_lock = threading.Lock()
+        receiver.kv_mgr = SimpleNamespace(
+            connection_lock=connection_lock,
+            enable_deferred_decode_kv_release=True,
+            requires_transfer_drain=True,
+            register_deferred_abort_room=register,
+        )
+        receiver._send_abort_notification = Mock()
+
+        receiver.retry_abort()
+
+        register.assert_called_once_with(7, token="new-token")
+        receiver._send_abort_notification.assert_not_called()
+        self.assertTrue(connection_lock.acquire(blocking=False))
+        connection_lock.release()
 
 
 if __name__ == "__main__":

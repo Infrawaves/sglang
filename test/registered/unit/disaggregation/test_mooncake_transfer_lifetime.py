@@ -39,6 +39,7 @@ def _manager():
     mgr._deferred_abort_ack_tracker = {}
     mgr._deferred_abort_tokens = {}
     mgr._deferred_abort_expected = {}
+    mgr.connection_lock = threading.Lock()
     mgr.request_status = {}
     mgr.failure_lock = threading.Lock()
     mgr.failure_records = {}
