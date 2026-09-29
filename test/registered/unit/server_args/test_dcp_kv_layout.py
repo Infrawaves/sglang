@@ -65,19 +65,22 @@ class TestDcpKvLayout(CustomTestCase):
 
     def test_page_rejects_non_decode_execution_paths(self):
         """The page option is decode-only, including when prefill uses DCP1."""
-        for overrides in (
-            {"disaggregation_mode": "null", "enable_unified_memory": True},
-            {"disaggregation_mode": "prefill", "dcp_size": 1},
-            {"disaggregation_mode": "prefill", "dcp_size": 2},
+        for overrides, message in (
+            (
+                {"disaggregation_mode": "null", "enable_unified_memory": True},
+                "PD decode",
+            ),
+            ({"disaggregation_mode": "prefill", "dcp_size": 1}, "dcp-size > 1"),
+            ({"disaggregation_mode": "prefill", "dcp_size": 2}, "PD decode"),
         ):
             with (
                 self.subTest(overrides=overrides),
-                self.assertRaisesRegex(ValueError, "PD decode"),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 validate_dcp_kv_layout(_page_args(**overrides))
 
     def test_resolution_rejects_page_on_prefill(self):
-        """The real resolution entry must enforce the decode-only page option."""
+        """Resolution accepts token layout but rejects page layout on DCP1 prefill."""
         with tempfile.TemporaryDirectory() as model_path:
             LlamaConfig(
                 architectures=["LlamaForCausalLM"],
@@ -104,13 +107,14 @@ class TestDcpKvLayout(CustomTestCase):
                         random_seed=42,
                     )
                     if layout == "page":
-                        with self.assertRaisesRegex(ValueError, "PD decode"):
+                        with self.assertRaisesRegex(ValueError, "dcp-size > 1"):
                             args.resolve_once()
                     else:
                         args.resolve_once()
 
     def test_page_rejects_unsupported_static_combinations(self):
         cases = (
+            ({"dcp_size": 1}, "dcp-size > 1"),
             ({"disaggregation_transfer_backend": "nixl"}, "backend mooncake"),
             ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
             ({"decode_attention_backend": "aiter"}, "'cutedsl_mla'"),
