@@ -27,6 +27,9 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
     if cfg.dcp_kv_layout != "page":
         return
 
+    if cfg.dcp_size <= 1:
+        raise ValueError("--dcp-kv-layout page requires --dcp-size > 1.")
+
     if cfg.disaggregation_mode != "decode":
         raise ValueError(
             "--dcp-kv-layout page requires a PD decode server. "
