@@ -866,7 +866,8 @@ class CommonKVManager(BaseKVManager):
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}"
+                f"target_tp_rank={-1}&target_pp_rank={-1}&"
+                "include_dcp_page_support=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -2099,8 +2100,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 prefill_http_port=self.prefill_http_port,
                 supports_dcp_page=self.supports_dcp_page,
             )
-            # Not backward compatible with decode servers predating the page DCP changes.
-            return web.json_response(dataclasses.asdict(info), status=200)
+            data = dataclasses.asdict(info)
+            # Older decode servers reject unknown PrefillServerInfo fields.
+            if request.query.get("include_dcp_page_support") != "1":
+                del data["supports_dcp_page"]
+            return web.json_response(data, status=200)
 
         if not self._is_ready():
             return web.Response(

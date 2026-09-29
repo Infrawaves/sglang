@@ -8,6 +8,7 @@ import unittest
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 import test_register_to_bootstrap as bootstrap_tests
@@ -144,8 +145,26 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
             "target_pp_rank": "-1",
         }
 
-    def test_route_returns_page_support(self):
-        for supported in (False, True):
+    def test_route_only_returns_page_support_when_requested(self):
+        """Preserve the legacy response schema unless page support is requested."""
+        legacy_info = {
+            "attn_tp_size": 2,
+            "attn_cp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "page_size": 16,
+            "kv_cache_dtype": "auto",
+            "follow_bootstrap_room": True,
+            "enable_dsa_cache_layer_split": False,
+            "prefill_http_port": None,
+            "target_tp_rank": None,
+            "target_tp_ranks": None,
+            "target_cp_ranks": None,
+            "target_pp_ranks": None,
+            "required_dst_info_num": None,
+            "required_prefill_response_num": None,
+        }
+        for supported in (None, False, True):
             with self.subTest(supported=supported):
                 server = self._make_server(tp_size=2)
                 for rank in range(2):
@@ -159,11 +178,27 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                         )
                     )
 
-                response = asyncio.run(
-                    server._handle_route_get(_RouteRequest(query=self._static_query()))
-                )
-                self.assertEqual(response.status, 200)
-                self.assertIs(json.loads(response.text)["supports_dcp_page"], supported)
+                for query_fields, support_fields in (
+                    ({}, {}),
+                    ({"include_dcp_page_support": "0"}, {}),
+                    (
+                        {"include_dcp_page_support": "1"},
+                        {"supports_dcp_page": supported},
+                    ),
+                ):
+                    with self.subTest(query_fields=query_fields):
+                        response = asyncio.run(
+                            server._handle_route_get(
+                                _RouteRequest(
+                                    query={**self._static_query(), **query_fields}
+                                )
+                            )
+                        )
+                        self.assertEqual(response.status, 200)
+                        data = json.loads(response.text)
+                        self.assertEqual(data, {**legacy_info, **support_fields})
+                        if support_fields:
+                            self.assertIs(data["supports_dcp_page"], supported)
 
     @patch("sglang.srt.disaggregation.common.conn.requests.get")
     def test_decode_checks_page_support_before_caching_prefill_info(self, mock_get):
@@ -217,6 +252,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     manager._resolve_rank_mapping.assert_not_called()
 
                 mock_get.assert_called_once()
+                query = parse_qs(urlsplit(mock_get.call_args.args[0]).query)
+                self.assertEqual(query.get("include_dcp_page_support"), ["1"])
 
     def test_token_and_page_share_cached_registration_and_room_metadata(self):
         bootstrap_addr = "127.0.0.1:30000"
