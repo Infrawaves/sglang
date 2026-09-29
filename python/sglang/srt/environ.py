@@ -366,6 +366,13 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    # Where the HTTP frontend runs OpenAI request preprocessing (chat template
+    # rendering + tokenization): "thread" keeps it on a helper thread of the
+    # tokenizer worker; "process" moves it into child processes so it stops
+    # contending for the GIL with the loop that streams every request's output.
+    SGLANG_REQUEST_PREPROCESSOR_MODE = EnvStr("thread")
+    # Child processes per tokenizer worker when the mode is "process".
+    SGLANG_REQUEST_PREPROCESSOR_PROCESSES = EnvInt(1)
 
     # ===================================================================
     # Logging
