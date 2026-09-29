@@ -3494,12 +3494,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                logger.error(
+                    "_register_kv_args to prefill %s:%s failed",
+                    bootstrap_info.get("rank_ip"),
+                    bootstrap_info.get("rank_port"),
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
 

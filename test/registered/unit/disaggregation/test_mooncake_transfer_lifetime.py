@@ -41,6 +41,7 @@ def _manager():
     mgr._staging_outstanding = defaultdict(int)
     mgr.deferred_bootstrap = None
     mgr.defer_decode_allocation = False
+    mgr.connection_lock = threading.Lock()
     mgr.request_status = {}
     mgr.state_layout_rejections = {}
     mgr.bootstrap_port = 7000

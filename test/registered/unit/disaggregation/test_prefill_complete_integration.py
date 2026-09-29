@@ -1,5 +1,6 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
+import concurrent.futures
 import threading
 import time
 import unittest
@@ -102,6 +103,16 @@ class TestAllocationConfiguration(CustomTestCase):
                     handle_pd_disaggregation(ServerArgs(**values))
 
 
+class _InlineExecutor:
+    def submit(self, fn, *args, **kwargs):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as e:  # noqa: BLE001 - mirrored onto the future
+            future.set_exception(e)
+        return future
+
+
 class TestAllocationIntegration(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -144,6 +155,9 @@ class TestAllocationIntegration(CustomTestCase):
         if ip == "prefill":
             mgr._transfer_lifetime = TransferLifetimeTracker()
         mgr._prefill_unique_rank = Mock(return_value=0)
+        # Run the (normally executor-backed) bootstrap setup inline so the
+        # handshake is deterministic; production runs it off the scheduler.
+        mgr._ensure_bootstrap_executor = lambda: _InlineExecutor()
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)

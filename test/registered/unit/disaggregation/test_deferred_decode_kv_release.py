@@ -359,7 +359,7 @@ class TestCommonAbortAckDispatch(CustomTestCase):
         mgr = _make_manager()
         mgr.waiting_timeout = 0
         receiver, sent = self._make_notifying_receiver(mgr, 105, init_time=1.0)
-        receiver.invalidate_cached_bootstrap_infos = lambda: None
+        receiver.invalidate_cached_bootstrap_infos = lambda *args: None
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
 
