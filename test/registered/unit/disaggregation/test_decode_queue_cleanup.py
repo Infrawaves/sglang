@@ -1,13 +1,14 @@
 import threading
 import time
 import unittest
-from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from disagg_test_utils import make_decode_kv_manager
+
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, ParallelInfoState
+from sglang.srt.disaggregation.common.conn import ParallelInfoState
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -294,7 +295,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._ensure_retry_count = {"127.0.0.1:11500": 0}
         queue._ensure_last_attempt_time = {}
         queue.kv_manager = MagicMock()
-        queue.kv_manager.try_ensure_parallel_info.return_value = False
+        queue.kv_manager.try_ensure_parallel_info.return_value = (
+            ParallelInfoState.FAILED
+        )
         queue.kv_manager.has_parallel_info.return_value = False
 
         cleared_req = SimpleNamespace(
@@ -307,50 +310,60 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
 
-    def test_prefetches_prefill_dp_rank_query(self):
-        addr = "127.0.0.1:11500"
-        executor = MagicMock()
-        future_first = Future()
-        future_first.set_result({"7": 1})
-        future_tail = Future()
-        future_tail.set_result({"8": 2})
-        executor.submit.side_effect = [future_first, future_tail]
-
-        def decode_req(room):
-            return SimpleNamespace(
-                req=SimpleNamespace(
-                    bootstrap_host="127.0.0.1",
-                    bootstrap_port=11500,
-                    bootstrap_room=room,
-                ),
-                kv_receiver=MagicMock(),
-            )
-
-        first = decode_req(7)
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.pending_reqs = [first]
-        queue._prefill_dp_rank_queries = {}
-        queue.kv_manager = SimpleNamespace(
-            prefill_info_table={addr: object()},
-            _ensure_bootstrap_executor=lambda: executor,
+    @staticmethod
+    def _pending_decode_req(room):
+        return SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_host="127.0.0.1",
+                bootstrap_port=11500,
+                bootstrap_room=room,
+                finished_reason=None,
+            ),
+            kv_receiver=MagicMock(),
         )
+
+    @staticmethod
+    def _dp_rank_queue(pending_reqs, lookups):
+        """Topology is ready; DP-rank lookups return ``lookups`` in order."""
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = list(pending_reqs)
+        queue._prefill_dp_rank_queries = {}
         queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
         queue._ensure_prefill_info = lambda groups: (groups, [])
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.has_parallel_info.return_value = True
+        queue.kv_manager.parallel_info_epoch.return_value = 0
+        queue.kv_manager.submit_dp_rank_query.side_effect = lookups
+        return queue
+
+    @staticmethod
+    def _answered(room_to_rank):
+        future = Future()
+        future.set_result(room_to_rank)
+        return future
+
+    def test_prefetches_prefill_dp_rank_query(self):
+        addr = "127.0.0.1:11500"
+        first = self._pending_decode_req(7)
+        tail = self._pending_decode_req(8)
+        queue = self._dp_rank_queue(
+            [first], [self._answered({"7": 1}), self._answered({"8": 2})]
+        )
 
         queue.prefetch_prefill_dp_rank_queries()
-        tail = decode_req(8)
         queue.pending_reqs.append(tail)
-        with patch(
-            "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks",
-            return_value={"8": 2},
-        ) as query:
-            queue._resolve_pending_reqs()
+        queue._resolve_pending_reqs()
 
-        _, called_addr, called_rooms = executor.submit.call_args_list[0].args
-        self.assertEqual((called_addr, called_rooms), (addr, [7]))
-        _, called_addr, called_rooms = executor.submit.call_args_list[1].args
-        self.assertEqual((called_addr, called_rooms), (addr, [8]))
-        query.assert_not_called()
+        submitted = [
+            call.kwargs for call in queue.kv_manager.submit_dp_rank_query.call_args_list
+        ]
+        self.assertEqual(
+            submitted,
+            [
+                {"bootstrap_addr": addr, "bootstrap_rooms": [7]},
+                {"bootstrap_addr": addr, "bootstrap_rooms": [8]},
+            ],
+        )
         first.kv_receiver.init.assert_called_once_with(1)
         tail.kv_receiver.init.assert_not_called()
         self.assertEqual(queue.pending_reqs, [tail])
@@ -358,6 +371,82 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._resolve_pending_reqs()
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
+
+    def test_unresolved_dp_rank_query_defers_instead_of_blocking(self):
+        req = self._pending_decode_req(7)
+        pending_future = Future()  # deliberately never resolved
+        queue = self._dp_rank_queue([req], [pending_future])
+
+        queue._resolve_pending_reqs()
+        queue._resolve_pending_reqs()
+
+        queue.kv_manager.submit_dp_rank_query.assert_called_once()
+        req.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [req])
+        self.assertFalse(pending_future.cancelled())
+
+    def test_dp_rank_answer_does_not_cover_a_later_request_reusing_the_room(self):
+        """An answer is bound to the request that asked, not to its room: a new
+        request that reuses the room is asked about again."""
+        old = self._pending_decode_req(7)
+        lookup = Future()
+        queue = self._dp_rank_queue([old], [lookup, Future()])
+        queue._resolve_pending_reqs()
+
+        new = self._pending_decode_req(7)
+        queue.pending_reqs = [new]
+        lookup.set_result({"7": 1})
+        queue._resolve_pending_reqs()
+
+        new.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [new])
+        self.assertEqual(queue.kv_manager.submit_dp_rank_query.call_count, 2)
+
+    def test_dp_rank_answer_from_before_eviction_is_discarded(self):
+        req = self._pending_decode_req(7)
+        queue = self._dp_rank_queue([req], [self._answered({"7": 1}), Future()])
+        queue.kv_manager.parallel_info_epoch.side_effect = [0, 1, 1]
+
+        queue._resolve_pending_reqs()
+        queue._resolve_pending_reqs()
+
+        req.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [req])
+
+    def test_steady_arrivals_are_never_aborted_by_the_dp_rank_lookup(self):
+        """With requests arriving every cycle, some request is always waiting for
+        its room to be registered on the prefill; that must not count as one
+        lookup stuck for the whole handshake timeout and abort fresh arrivals."""
+        queue = self._dp_rank_queue([], [])
+        registered = set()
+        in_flight = []
+
+        def submit_dp_rank_query(*, bootstrap_addr, bootstrap_rooms):
+            future = Future()
+            in_flight.append((future, list(bootstrap_rooms)))
+            return future
+
+        queue.kv_manager.submit_dp_rank_query.side_effect = submit_dp_rank_query
+        arrived = []
+        now = 1000.0
+        for room in range(1, 801):
+            now += 1.0
+            with patch(
+                "sglang.srt.disaggregation.decode.time.monotonic", return_value=now
+            ):
+                registered.update(range(1, room))  # prefill lags by one cycle
+                decode_req = self._pending_decode_req(room)
+                arrived.append(decode_req)
+                queue.pending_reqs.append(decode_req)
+                queue.prefetch_prefill_dp_rank_queries()
+                queue._resolve_pending_reqs()
+            for future, rooms in in_flight:
+                future.set_result({str(r): 0 for r in rooms if r in registered})
+            in_flight.clear()
+
+        for decode_req in arrived:
+            decode_req.kv_receiver.abort.assert_not_called()
+        self.assertTrue(all(r.kv_receiver.init.called for r in arrived[:-2]))
 
     def _ensure_info_queue(self, addr, state, cached=False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -464,54 +553,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertNotIn(addr, queue._ensure_retry_count)
         self.assertNotIn(addr, queue._ensure_last_attempt_time)
 
-    def test_unresolved_dp_rank_query_defers_instead_of_blocking(self):
-        addr = "127.0.0.1:11500"
-        pending_future = Future()  # deliberately never resolved
-        req = SimpleNamespace(
-            req=SimpleNamespace(
-                bootstrap_host="127.0.0.1", bootstrap_port=11500, bootstrap_room=7
-            ),
-            kv_receiver=MagicMock(),
-        )
-
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.pending_reqs = [req]
-        queue._prefill_dp_rank_queries = {addr: ((7,), pending_future)}
-        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
-        queue._ensure_prefill_info = lambda groups: (groups, [])
-
-        with patch(
-            "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks"
-        ) as query:
-            queue._resolve_pending_reqs()
-
-        query.assert_not_called()
-        req.kv_receiver.init.assert_not_called()
-        self.assertEqual(queue.pending_reqs, [req])
-        self.assertIs(queue._prefill_dp_rank_queries[addr][1], pending_future)
-        self.assertFalse(pending_future.cancelled())
-
     def test_missing_dp_rank_future_is_submitted_async(self):
         """A newly ingested request must not use the synchronous query fallback."""
-        addr = "127.0.0.1:11500"
-        req = SimpleNamespace(
-            req=SimpleNamespace(
-                bootstrap_host="127.0.0.1", bootstrap_port=11500, bootstrap_room=7
-            ),
-            kv_receiver=MagicMock(),
-        )
-
-        executor = MagicMock()
-        submitted_future = Future()
-        executor.submit.return_value = submitted_future
-
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.pending_reqs = [req]
-        queue._prefill_dp_rank_queries = {}
-        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
-        queue._ensure_prefill_info = lambda groups: (groups, [])
-        queue.kv_manager = MagicMock()
-        queue.kv_manager._ensure_bootstrap_executor.return_value = executor
+        req = self._pending_decode_req(7)
+        queue = self._dp_rank_queue([req], [Future()])
 
         with patch(
             "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks"
@@ -519,10 +564,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             queue._resolve_pending_reqs()
 
         query.assert_not_called()
-        executor.submit.assert_called_once_with(
-            query,
-            addr,
-            [7],
+        queue.kv_manager.submit_dp_rank_query.assert_called_once_with(
+            bootstrap_addr="127.0.0.1:11500", bootstrap_rooms=[7]
         )
         req.kv_receiver.init.assert_not_called()
         self.assertEqual(queue.pending_reqs, [req])
@@ -794,33 +837,8 @@ class TestParallelInfoFetchEpoch(CustomTestCase):
     ADDR = "prefill:8998"
 
     def _manager(self, payload=None, fetch=None):
-        # CommonKVManager implements both of BaseKVManager's abstract methods, so
-        # it can be built without running __init__ (which needs torch.distributed,
-        # ZMQ sockets and a live bootstrap server).
-        mgr = CommonKVManager.__new__(CommonKVManager)
-        mgr.prefill_info_table = {}
-        mgr.connection_lock = threading.Lock()
-        mgr.connection_pool = {}
-        mgr._parallel_info_futures = {}
-        mgr._parallel_info_epochs = defaultdict(int)
-        mgr.addr_to_rooms_tracker = defaultdict(set)
-        mgr.request_status = {}
-        mgr.kv_args = SimpleNamespace(page_size=64)
-        mgr.kv_cache_dtype_str = "bfloat16"
-        mgr.dcp_size = 1
-        mgr.is_mla_backend = False
-        mgr.is_hybrid_mla_backend = False
-        mgr.record_failure = MagicMock()
-        mgr.update_status = MagicMock()
-        mgr.check_status = MagicMock(return_value=KVPoll.Bootstrapping)
+        mgr = make_decode_kv_manager(self)
         mgr._resolve_rank_mapping = MagicMock()
-
-        executor = ThreadPoolExecutor(max_workers=2)
-        self.addCleanup(executor.shutdown, wait=True)
-        mgr._ensure_prefill_recompute_executor = lambda: executor
-        mgr._ensure_parallel_info_executor = lambda: executor
-        mgr._ensure_bootstrap_executor = lambda: executor
-
         if fetch is None:
             row = payload if payload is not None else self._payload()
             fetch = MagicMock(return_value=row)

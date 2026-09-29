@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import msgspec
 import numpy as np
@@ -1702,9 +1702,7 @@ class MoriKVReceiver(CommonKVReceiver):
     ):
         super().init(prefill_dp_rank)
 
-    def _register_kv_args(self) -> bool:
-        if self.bootstrap_infos is None:
-            return False
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
@@ -1720,7 +1718,7 @@ class MoriKVReceiver(CommonKVReceiver):
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
 
-        for bootstrap_info in self.bootstrap_infos:
+        for bootstrap_info in bootstrap_infos:
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -1821,10 +1819,7 @@ class MoriKVReceiver(CommonKVReceiver):
             if timeout_result is not None:
                 return timeout_result
         elif status == KVPoll.Bootstrapping:
-            timeout_result = self._check_bootstrap_timeout()
-            if timeout_result is not None:
-                self.conclude_state = timeout_result
-                return timeout_result
+            return self._poll_bootstrapping()
 
         return status
 

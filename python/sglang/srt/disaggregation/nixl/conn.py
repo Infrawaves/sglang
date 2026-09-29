@@ -3316,10 +3316,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
         if status == KVPoll.Bootstrapping:
-            timeout_result = self._check_bootstrap_timeout()
-            if timeout_result is not None:
-                self.conclude_state = timeout_result
-                return timeout_result
+            return self._poll_bootstrapping()
         if not self.started_transfer:
             return status
 
@@ -3339,8 +3336,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
         return KVPoll.WaitingForInput  # type: ignore
 
-    def _register_kv_args(self) -> bool:
-        for bootstrap_info in self.bootstrap_infos:
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
+        for bootstrap_info in bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -3433,8 +3430,8 @@ class NixlKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
-
+        # No clear() here: a deferred release must still abort() this room, and
+        # clear() gives up the room ownership that abort() needs to arm ACKs.
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         is_propagated = failure_reason is None

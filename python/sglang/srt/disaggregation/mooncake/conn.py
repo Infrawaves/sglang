@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -2897,8 +2897,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
-    def _register_kv_args(self) -> bool:
-        for bootstrap_info in self.bootstrap_infos:
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
+        for bootstrap_info in bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -3060,13 +3060,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return self.conclude_state
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            return self._poll_bootstrapping()
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
-        elif status == KVPoll.Bootstrapping:
-            timeout_result = self._check_bootstrap_timeout()
-            if timeout_result is not None:
-                self.conclude_state = timeout_result
-                return timeout_result
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
