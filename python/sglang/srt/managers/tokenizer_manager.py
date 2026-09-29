@@ -219,6 +219,64 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
         )
 
 
+def _recent_image_keep_count(
+    image_count: int, max_count: int, keep_ratio: float
+) -> int:
+    """Return how many of the most recent images a request should keep."""
+    if image_count <= max_count:
+        return image_count
+    return min(max_count, int(image_count * keep_ratio))
+
+
+def _remove_image_placeholders_from_ids(
+    input_ids, image_token_id: Optional[int], count: int
+) -> Tuple[Any, int]:
+    """Remove the first ``count`` image placeholder IDs from a prompt."""
+    if input_ids is None or image_token_id is None or count <= 0:
+        return input_ids, 0
+
+    if isinstance(input_ids, torch.Tensor):
+        ids = input_ids.flatten().tolist()
+    elif isinstance(input_ids, np.ndarray):
+        ids = input_ids.reshape(-1).tolist()
+    else:
+        ids = list(input_ids)
+
+    removed = 0
+    kept = []
+    for token_id in ids:
+        if token_id == image_token_id and removed < count:
+            removed += 1
+        else:
+            kept.append(token_id)
+    return kept, removed
+
+
+def _remove_image_placeholders_from_text(
+    text: Optional[str], image_token, count: int
+) -> Tuple[Optional[str], int]:
+    """Remove the first image placeholder strings from a raw prompt."""
+    if not isinstance(text, str) or not image_token or count <= 0:
+        return text, 0
+
+    tokens = image_token if isinstance(image_token, (list, tuple)) else [image_token]
+    tokens = [token for token in tokens if isinstance(token, str) and token]
+    if not tokens:
+        return text, 0
+
+    removed = 0
+    while removed < count:
+        matches = [
+            (text.find(token), token) for token in tokens if text.find(token) >= 0
+        ]
+        if not matches:
+            break
+        start, token = min(matches, key=lambda match: match[0])
+        text = text[:start] + text[start + len(token) :]
+        removed += 1
+    return text, removed
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -509,6 +567,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
+        mm_config = get_mm()
+        self.recent_image_max_count = getattr(mm_config, "recent_image_max_count", 50)
+        self.recent_image_keep_ratio = getattr(
+            mm_config, "recent_image_keep_ratio", 0.8
+        )
 
         # Init model config
         self.init_model_config()
@@ -1028,6 +1091,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if isinstance(obj, GenerateReqInput):
+            # This must happen before EPD dispatch below.  The same normalized
+            # request is then used by local prefill/decode preprocessing and by
+            # the encoder-side request payload.
+            self._truncate_recent_images(obj)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1089,6 +1157,190 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_rids)
             raise
+
+    def _image_placeholder_spec(self) -> Tuple[Optional[int], Any]:
+        """Return the multimodal processor's image placeholder ID and text."""
+        mm_tokens = getattr(getattr(self, "mm_processor", None), "mm_tokens", None)
+        token = None
+        if mm_tokens is not None:
+            token_id = getattr(mm_tokens, "image_token_id", None)
+            token = getattr(mm_tokens, "image_token", None)
+            if token_id is not None:
+                return token_id, token
+
+        # Language-only EPD workers do not construct an MM processor, but K3
+        # still carries a media placeholder token in its HF config.  Resolve
+        # both names here so the decode side can trim the same prompt as the
+        # prefill side.
+        token_id = getattr(self, "image_token_id", None)
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        if token_id is None and hf_config is not None:
+            for name in (
+                "image_token_id",
+                "image_token_index",
+                "media_placeholder_token_id",
+            ):
+                token_id = getattr(hf_config, name, None)
+                if token_id is not None:
+                    break
+
+        tokenizer = getattr(self, "tokenizer", None)
+        if token is None and token_id is not None and tokenizer is not None:
+            try:
+                token = tokenizer.convert_ids_to_tokens([token_id])[0]
+            except (AttributeError, IndexError, TypeError, ValueError):
+                pass
+        return token_id, token
+
+    def _truncate_recent_images(self, obj: GenerateReqInput) -> None:
+        """Keep only the most recent images when a request contains too many.
+
+        This mutates the normalized request before EPD dispatch.  Image hashes
+        and prompt placeholders are trimmed in the same order as ``image_data``
+        so multimodal processors receive aligned inputs.
+        """
+        image_token_id, image_token = self._image_placeholder_spec()
+
+        if obj.is_single:
+            image_data = obj.image_data
+            mm_hashes = obj.mm_hashes
+            mm_content_hashes = obj.mm_content_hashes
+            input_ids = obj.input_ids
+            text = obj.text
+            (
+                image_data,
+                mm_hashes,
+                mm_content_hashes,
+                input_ids,
+                text,
+            ) = self._truncate_recent_images_for_fields(
+                obj.rid,
+                image_data,
+                mm_hashes,
+                mm_content_hashes,
+                input_ids,
+                text,
+                image_token_id,
+                image_token,
+                self.recent_image_max_count,
+                self.recent_image_keep_ratio,
+            )
+            obj.image_data = image_data
+            obj.mm_hashes = mm_hashes
+            obj.mm_content_hashes = mm_content_hashes
+            obj.input_ids = input_ids
+            obj.text = text
+            return
+
+        for index in range(obj.batch_size):
+            image_data = obj.image_data[index] if obj.image_data is not None else None
+            mm_hashes = obj.mm_hashes[index] if obj.mm_hashes is not None else None
+            mm_content_hashes = (
+                obj.mm_content_hashes[index]
+                if obj.mm_content_hashes is not None
+                else None
+            )
+            input_ids = obj.input_ids[index] if obj.input_ids is not None else None
+            text = obj.text[index] if obj.text is not None else None
+            (
+                image_data,
+                mm_hashes,
+                mm_content_hashes,
+                input_ids,
+                text,
+            ) = self._truncate_recent_images_for_fields(
+                obj.rid[index],
+                image_data,
+                mm_hashes,
+                mm_content_hashes,
+                input_ids,
+                text,
+                image_token_id,
+                image_token,
+                self.recent_image_max_count,
+                self.recent_image_keep_ratio,
+            )
+            obj.image_data[index] = image_data
+            if obj.mm_hashes is not None:
+                obj.mm_hashes[index] = mm_hashes
+            if obj.mm_content_hashes is not None:
+                obj.mm_content_hashes[index] = mm_content_hashes
+            if obj.input_ids is not None:
+                obj.input_ids[index] = input_ids
+            if obj.text is not None:
+                obj.text[index] = text
+
+    @staticmethod
+    def _truncate_recent_images_for_fields(
+        rid,
+        image_data,
+        mm_hashes,
+        mm_content_hashes,
+        input_ids,
+        text,
+        image_token_id,
+        image_token,
+        max_count,
+        keep_ratio,
+    ):
+        if image_data is None:
+            return image_data, mm_hashes, mm_content_hashes, input_ids, text
+
+        images = image_data if isinstance(image_data, list) else [image_data]
+        image_count = len(images)
+        keep_count = _recent_image_keep_count(image_count, max_count, keep_ratio)
+        if keep_count >= image_count:
+            return image_data, mm_hashes, mm_content_hashes, input_ids, text
+
+        dropped_count = image_count - keep_count
+        image_data = images[-keep_count:] if keep_count else []
+        if isinstance(mm_hashes, (list, tuple)):
+            mm_hashes = list(mm_hashes[-keep_count:]) if keep_count else []
+        if isinstance(mm_content_hashes, (list, tuple)):
+            mm_content_hashes = (
+                list(mm_content_hashes[-keep_count:]) if keep_count else []
+            )
+
+        input_ids, removed_id_count = _remove_image_placeholders_from_ids(
+            input_ids, image_token_id, dropped_count
+        )
+        text, removed_text_count = _remove_image_placeholders_from_text(
+            text, image_token, dropped_count
+        )
+        if input_ids is not None and image_token_id is not None:
+            if removed_id_count != dropped_count:
+                logger.warning(
+                    "Request %s dropped %d old image(s), but found only %d "
+                    "matching image placeholder ID(s) in input_ids.",
+                    rid,
+                    dropped_count,
+                    removed_id_count,
+                )
+        elif text is not None and image_token:
+            if removed_text_count != dropped_count:
+                logger.warning(
+                    "Request %s dropped %d old image(s), but found only %d "
+                    "matching image placeholder(s) in text.",
+                    rid,
+                    dropped_count,
+                    removed_text_count,
+                )
+        else:
+            logger.warning(
+                "Request %s dropped %d old image(s), but no image placeholder "
+                "representation was available to trim.",
+                rid,
+                dropped_count,
+            )
+
+        logger.warning(
+            "Recent-image sampling reduced request %s from %d image(s) to %d; "
+            "processing the latest images only.",
+            rid,
+            image_count,
+            keep_count,
+        )
+        return image_data, mm_hashes, mm_content_hashes, input_ids, text
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

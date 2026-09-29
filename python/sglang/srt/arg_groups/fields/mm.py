@@ -115,6 +115,17 @@ class Mm(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    recent_image_max_count: A[
+        int,
+        "Keep all images up to this count. For larger requests, keep only the "
+        "most recent images, capped at this count.",
+    ] = 50
+    recent_image_keep_ratio: A[
+        float,
+        "For requests exceeding --recent-image-max-count, keep this fraction "
+        "of the most recent images, rounded down and capped at the max count. "
+        "Must be in (0, 1].",
+    ] = 0.8
     enable_mm_global_cache: A[
         bool,
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
