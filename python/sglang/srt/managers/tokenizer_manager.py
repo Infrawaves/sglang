@@ -504,6 +504,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.recent_image_keep_ratio = getattr(
             mm_config, "recent_image_keep_ratio", 0.8
         )
+        self.enable_recent_image_sampling_log = getattr(
+            mm_config, "enable_recent_image_sampling_log", False
+        )
 
         # Init model config
         self.init_model_config()
@@ -1138,6 +1141,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 image_token,
                 self.recent_image_max_count,
                 self.recent_image_keep_ratio,
+                self.enable_recent_image_sampling_log,
             )
             obj.image_data = image_data
             obj.mm_hashes = mm_hashes
@@ -1173,6 +1177,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 image_token,
                 self.recent_image_max_count,
                 self.recent_image_keep_ratio,
+                self.enable_recent_image_sampling_log,
             )
             obj.image_data[index] = image_data
             if obj.mm_hashes is not None:
@@ -1196,12 +1201,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         image_token,
         max_count,
         keep_ratio,
+        enable_log=False,
     ):
         if image_data is None:
             return image_data, mm_hashes, mm_content_hashes, input_ids, text
 
         images = image_data if isinstance(image_data, list) else [image_data]
         image_count = len(images)
+
+        if enable_log:
+            logger.info(
+                "Recent-image sampling received request %s with %d image(s).",
+                rid,
+                image_count,
+            )
+
         keep_count = _recent_image_keep_count(image_count, max_count, keep_ratio)
         if keep_count >= image_count:
             return image_data, mm_hashes, mm_content_hashes, input_ids, text
@@ -1247,13 +1261,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 dropped_count,
             )
 
-        logger.warning(
-            "Recent-image sampling reduced request %s from %d image(s) to %d; "
-            "processing the latest images only.",
-            rid,
-            image_count,
-            keep_count,
-        )
+        if enable_log:
+            logger.info(
+                "Recent-image sampling truncated request %s from %d to %d "
+                "image(s); processing the latest images only.",
+                rid,
+                image_count,
+                keep_count,
+            )
         return image_data, mm_hashes, mm_content_hashes, input_ids, text
 
     def _detect_input_format(
