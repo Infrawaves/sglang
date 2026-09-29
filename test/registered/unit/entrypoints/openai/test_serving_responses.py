@@ -799,6 +799,10 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         parts = [
                             e for e in argument_events if e["item_id"] == item["id"]
                         ]
+                        if chunk_size == 1:
+                            self.assertGreater(
+                                sum(e["type"].endswith(".delta") for e in parts), 1
+                            )
                         self.assertEqual({e["output_index"] for e in parts}, {index})
                         self.assertEqual(
                             "".join(
@@ -1179,6 +1183,70 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         self.assertEqual(result.status, "incomplete")
                         self.assertIsNone(result.error)
 
+    def test_k3_call_status_tracks_completion_on_length_stop(self):
+        """A length stop must mark only unfinished calls incomplete, including done events."""
+        partial = (
+            '<|open|>call tool="B" index="2"<|sep|>'
+            '<|open|>argument key="code" type="string"<|sep|>partial'
+        )
+        complete = (
+            '<|open|>call tool="B" index="1"<|sep|>'
+            '<|open|>argument key="code" type="string"<|sep|>done'
+            "<|close|>argument<|sep|><|close|>call<|sep|>"
+        )
+        cases = [
+            (partial, [("incomplete", '{"code": "partial')]),
+            (
+                complete + partial,
+                [
+                    ("completed", '{"code": "done"}'),
+                    ("incomplete", '{"code": "partial'),
+                ],
+            ),
+            (complete, [("completed", '{"code": "done"}')]),
+            (
+                complete.removesuffix("<|close|>call<|sep|>"),
+                [("incomplete", '{"code": "done"')],
+            ),
+        ]
+        for body, expected in cases:
+            text = "<|open|>tools<|sep|>" + body
+            for chunk_size in (1, len(text)):
+                with self.subTest(expected=expected, chunk_size=chunk_size):
+                    events = self._complete(
+                        self._request(names=("B",), stream=True),
+                        text,
+                        chunk_size=chunk_size,
+                        finish_type="length",
+                    )
+                    self.assertEqual(events[-1]["type"], "response.incomplete")
+                    output = events[-1]["response"]["output"]
+                    self.assertEqual(
+                        [(item["status"], item["arguments"]) for item in output],
+                        expected,
+                    )
+                    self.assertEqual(
+                        [item["name"] for item in output], ["B"] * len(expected)
+                    )
+                    self.assertEqual(
+                        [
+                            e["item"]
+                            for e in events
+                            if e["type"] == "response.output_item.done"
+                        ],
+                        output,
+                    )
+                    for item in output:
+                        self.assertEqual(
+                            "".join(
+                                e["delta"]
+                                for e in events
+                                if e["type"] == "response.function_call_arguments.delta"
+                                and e["item_id"] == item["id"]
+                            ),
+                            item["arguments"],
+                        )
+
     def test_required_preserves_length_truncation_before_a_call(self):
         """A truncated grammar-valid prefix must not become a validation error."""
         prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
@@ -1207,8 +1275,13 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     response = result.model_dump()
                 self.assertEqual(response["status"], "incomplete")
                 self.assertIsNone(response["error"])
-                self.assertFalse(
-                    any(item["type"] == "function_call" for item in response["output"])
+                self.assertEqual(
+                    [
+                        (item["name"], item["arguments"])
+                        for item in response["output"]
+                        if item["type"] == "function_call"
+                    ],
+                    [("B", "{")] if stream else [],
                 )
 
 
