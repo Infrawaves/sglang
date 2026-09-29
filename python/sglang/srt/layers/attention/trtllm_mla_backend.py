@@ -55,7 +55,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, get_dcp_page_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -291,6 +291,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
+        self.dcp_kv_layout = get_parallel().dcp_kv_layout
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
         self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
@@ -382,7 +383,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
-            and can_use_set_mla_kv_concat_q_fp8()
+            and can_use_set_mla_kv_concat_q_fp8(
+                get_parallel().attn_dcp_size,
+                self.page_size if self.dcp_kv_layout == "page" else 0,
+            )
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -416,17 +420,34 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
+        if self.dcp_kv_layout == "page":
+            local_seq_lens = get_dcp_page_lens(
+                seq_lens,
+                dcp_size=parallel.dcp_size,
+                dcp_rank=parallel.dcp_rank,
+                page_size=self.page_size,
+            )
+        else:
+            local_seq_lens = get_dcp_lens(
+                seq_lens, parallel.dcp_size, parallel.dcp_rank
+            )
+        return local_seq_lens.to(torch.int32)
 
     def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
-        )
+        if self.dcp_kv_layout == "page":
+            tokens_per_round = parallel.dcp_size * self.page_size
+            full_rounds, remainder = divmod(max_seq_len, tokens_per_round)
+            local_max = full_rounds * self.page_size + min(
+                max(remainder - parallel.dcp_rank * self.page_size, 0),
+                self.page_size,
+            )
+        else:
+            local_max = max_seq_len // parallel.dcp_size + int(
+                parallel.dcp_rank < max_seq_len % parallel.dcp_size
+            )
         # A positive scheduling bound is required even when every sequence in a
         # padded graph row is empty on this rank.
         return max(local_max, 1)
@@ -460,6 +481,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
+            PAGE_LAYOUT=self.dcp_kv_layout == "page",
             PAGES_PER_BLOCK=pages_per_block,
             HAS_V2P=v2p is not None,
         )
@@ -1377,8 +1399,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k: torch.Tensor,
         k_rope: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """fp8-KV decode: quantize + scatter the KV row at ``loc`` (already
-        physical) and build the fp8 [q_nope | q_rope] query in one launch.
+        """fp8-KV decode: quantize + scatter the KV row at ``loc`` (DCP-widened
+        under DCP) and build the fp8 [q_nope | q_rope] query in one launch.
 
         Returns the fp8 query, or None when the fused kernel does not cover
         the inputs (caller falls back to the aten quantize chain).
@@ -1393,6 +1415,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # reads below.
         kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        parallel = get_parallel()
+        dcp_page_size = self.page_size if self.dcp_kv_layout == "page" else 0
         if not set_mla_kv_concat_q_fp8_covered(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1400,12 +1424,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_page_size=dcp_page_size,
         ):
             return None
-        parallel = get_parallel()
         # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
-        # is also its only skip. A DCP-resolved loc never reaches here -- see
-        # the `_fused_set_kv_concat_q_fp8` gate.
+        # is also its only skip in token mode. A DCP-resolved loc never reaches
+        # here -- see `_resolve_fused_write_loc`.
         assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
             "fused fp8 KV write reached with a DCP-resolved loc"
         )
@@ -1418,6 +1443,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
+            dcp_page_size=dcp_page_size,
         )
 
     def _dummy_dcp_decode_for_autotune(
