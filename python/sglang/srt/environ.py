@@ -376,6 +376,14 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    # Request-log fields (any nesting depth) logged as their length plus a hash
+    # at --log-requests-level 1 and 2: grammar constraints such as a tool-call
+    # structural_tag can be hundreds of KB per request. Empty logs them verbatim.
+    SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS = EnvTuple(
+        ("structural_tag", "json_schema", "ebnf", "regex")
+    )
+    # Only string values longer than this many characters are abbreviated.
+    SGLANG_LOG_REQUEST_ABBREVIATE_MIN_CHARS = EnvInt(256)
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
