@@ -396,6 +396,19 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
+    # SGLANG_REQUEST_PREPROCESSOR_MODE=process: move chat-template rendering and
+    # tokenization of chat requests out of this worker's event loop process.
+    start_request_preprocessor = getattr(
+        _global_state.tokenizer_manager,
+        "maybe_start_process_request_preprocessor",
+        None,
+    )
+    if start_request_preprocessor is not None:
+        start_request_preprocessor(
+            _global_state.template_manager,
+            handler_classes=(type(fast_api_app.state.openai_serving_chat),),
+        )
+
     # Execute custom warmups
     if get_serving().warmups is not None:
         await execute_warmups(
@@ -437,6 +450,11 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        request_preprocessor = getattr(
+            _global_state.tokenizer_manager, "process_request_preprocessor", None
+        )
+        if request_preprocessor is not None:
+            request_preprocessor.shutdown()
         if sidecar is not None:
             try:
                 sidecar.stop()

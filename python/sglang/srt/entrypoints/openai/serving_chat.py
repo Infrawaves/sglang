@@ -293,6 +293,7 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    supports_process_preprocessing = True
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 

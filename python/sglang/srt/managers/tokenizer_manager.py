@@ -601,13 +601,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
+                self.tokenizer = _load_text_tokenizer()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -621,6 +615,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    @classmethod
+    def create_for_request_preprocessing(cls, server_args: ServerArgs):
+        """A tokenizer-only manager for a process-mode request preprocessor child.
+
+        Runs the same model-config and tokenizer setup as ``__init__`` but none
+        of the IPC, multimodal processor executors, metrics or request state;
+        the serving handlers built on it in the child only read ``server_args``,
+        ``model_config``, ``model_path``, ``served_model_name``, ``tokenizer``
+        and ``config_value``.
+        """
+        manager = cls.__new__(cls)
+        manager.server_args = server_args
+        manager.init_model_config()
+        manager.init_tokenizer_for_request_preprocessing()
+        return manager
+
+    def init_tokenizer_for_request_preprocessing(self):
+        """The tokenizer part of ``init_tokenizer_and_processor``, without the
+        multimodal processor and the dynamic batch tokenizer."""
+        self.mm_processor = None
+        self.async_dynamic_batch_tokenizer = None
+        if get_serving().skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        elif self.model_config.is_multimodal and not get_disagg().language_model_only:
+            import_processors("sglang.srt.multimodal.processors")
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
+            self.processor = get_processor_wrapper()
+            self.tokenizer = get_tokenizer_from_processor(self.processor)
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        else:
+            self.processor = None
+            self.tokenizer = _load_text_tokenizer()
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
@@ -637,6 +665,51 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_request_preprocessor(self):
         self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+        # Set by maybe_start_process_request_preprocessor() in process mode.
+        self.process_request_preprocessor = None
+
+    def maybe_start_process_request_preprocessor(
+        self, template_manager, handler_classes=()
+    ) -> None:
+        """Start child processes for OpenAI request conversion when
+        SGLANG_REQUEST_PREPROCESSOR_MODE=process.
+
+        Call once the chat template and any template-derived config overrides
+        are in place: the children replay the config as it is now.
+        """
+        mode = envs.SGLANG_REQUEST_PREPROCESSOR_MODE.get()
+        if mode == "thread":
+            return
+        if mode != "process":
+            raise ValueError(
+                f"Invalid SGLANG_REQUEST_PREPROCESSOR_MODE={mode!r}; expected "
+                "'thread' or 'process'."
+            )
+        if getattr(self, "process_request_preprocessor", None) is not None:
+            return
+        if getattr(self, "tokenizer", None) is None:
+            logger.warning(
+                "SGLANG_REQUEST_PREPROCESSOR_MODE=process ignored: no tokenizer is "
+                "loaded (skip_tokenizer_init)."
+            )
+            return
+
+        from sglang.srt.managers.process_request_preprocessor import (
+            ProcessRequestPreprocessor,
+        )
+
+        try:
+            self.process_request_preprocessor = ProcessRequestPreprocessor(
+                tokenizer_manager=self,
+                template_manager=template_manager,
+                handler_classes=handler_classes,
+                num_processes=envs.SGLANG_REQUEST_PREPROCESSOR_PROCESSES.get(),
+            )
+        except Exception:
+            logger.exception(
+                "Could not start the process request preprocessor; request "
+                "preprocessing stays on the in-process thread."
+            )
 
     async def run_in_request_preprocessor(self, func, *args, **kwargs):
         func_call = partial(copy_context().run, func, *args, **kwargs)
@@ -3918,6 +3991,16 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+def _load_text_tokenizer():
+    return get_tokenizer(
+        get_serving().tokenizer_path,
+        tokenizer_mode=get_serving().tokenizer_mode,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_model().revision,
+        tokenizer_backend=get_serving().tokenizer_backend,
+    )
 
 
 def get_processor_wrapper():
