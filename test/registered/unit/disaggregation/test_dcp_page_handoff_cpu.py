@@ -3,7 +3,6 @@
 import concurrent.futures
 import threading
 import unittest
-from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,10 +11,12 @@ import torch
 from disagg_test_utils import CopyTransport
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.managers.schedule_batch import Req
@@ -256,7 +257,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 manager.enable_staging = False
                 manager.enable_custom_mem_pool = False
                 manager.max_transfer_batch_indices = 0
-                manager.enable_deferred_decode_kv_release = False
+                manager.enable_deferred_decode_kv_release = True
                 manager.is_mla_backend = True
                 manager.is_hybrid_mla_backend = False
                 manager.pp_size = 1
@@ -265,7 +266,10 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 manager.attn_tp_rank = 0
                 manager.attn_cp_size = 1
                 manager.attn_cp_rank = 0
-                manager._staging_outstanding = defaultdict(int)
+                manager._transfer_lifetime = TransferLifetimeTracker()
+                manager._abort_drain_lock = threading.RLock()
+                manager._drain_ack_targets = {}
+                manager.is_dummy_cp_rank = False
                 manager.request_status = {room: KVPoll.WaitingForInput}
                 manager.failed_sessions = set()
                 manager.session_lock = threading.Lock()
@@ -345,6 +349,17 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                     state_indices=[[0]],
                     num_kv_tokens=num_tokens,
                 )
+                with get_context().override_server_args(dp_size=1):
+                    sender = MooncakeKVSender(
+                        mgr=manager,
+                        bootstrap_addr="127.0.0.1:30000",
+                        bootstrap_room=room,
+                        dest_tp_ranks=[0],
+                        pp_rank=0,
+                    )
+                manager.update_status(room, KVPoll.WaitingForInput)
+                self.assertTrue(manager._transfer_lifetime.try_acquire(room))
+                chunk.staging_counted = True
                 queue = MagicMock()
                 queue.get.side_effect = [chunk, SystemExit]
                 with self.assertRaises(SystemExit):
@@ -373,8 +388,10 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                         b"0",
                     ],
                 )
+                self.assertIn(room, manager.transfer_infos)
+                self.assertTrue(sender.is_source_release_safe())
+                sender.clear()
                 self.assertNotIn(room, manager.transfer_infos)
-                self.assertNotIn(room, manager._staging_outstanding)
                 self.assertNotIn(room, manager.req_to_decode_prefix_len)
 
 

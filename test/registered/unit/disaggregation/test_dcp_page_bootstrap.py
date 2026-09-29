@@ -288,6 +288,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     required_prefill_response_num_table={},
                     prefill_info_table={
                         bootstrap_addr: SimpleNamespace(
+                            pp_size=1,
+                            attn_cp_size=1,
                             target_tp_rank=0,
                             target_tp_ranks=[0],
                             target_cp_ranks=[0],
