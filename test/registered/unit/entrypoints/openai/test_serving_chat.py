@@ -4687,6 +4687,7 @@ class TestAllowedToolsServing(CustomTestCase):
                                 call["function"]["name"]
                                 for message in messages
                                 for call in message.get("tool_calls", [])
+                                if call["function"]["name"] is not None
                             ]
                             reasoning = "".join(
                                 message.get("reasoning_content") or ""
@@ -4704,6 +4705,86 @@ class TestAllowedToolsServing(CustomTestCase):
                         self.assertEqual(
                             self.internal_request.require_reasoning, thinking
                         )
+
+    def test_k3_argument_deltas_reach_sse_before_call_closes(self):
+        """Tool names and argument deltas must reach SSE before the call closes."""
+        for choice in ("allowed_tools", "auto", "required"):
+            with self.subTest(choice=choice):
+                request = self._request(names=("B",), stream=True)
+                if choice != "allowed_tools":
+                    request.tool_choice = choice
+                parser_dict = {}
+                has_tool_calls = {}
+                content = _spec_result(0)
+                deltas = [
+                    TOOLS_OPEN + '<|open|>call tool="B" index="27"<|sep|>',
+                    '<|open|>argument key="code" type="string"<|sep|>line("',
+                    '雪")\\\n',
+                    "<|close|>argument<|sep|><|close|>call<|sep|>" + TOOLS_CLOSE,
+                ]
+
+                async def stream():
+                    calls = []
+                    for delta in deltas:
+                        events = [
+                            json.loads(chunk.removeprefix("data: "))
+                            async for chunk in self.chat._process_tool_call_stream(
+                                index=0,
+                                delta=delta,
+                                parser_dict=parser_dict,
+                                content=content,
+                                request=request,
+                                has_tool_calls=has_tool_calls,
+                            )
+                        ]
+                        self.assertTrue(events)
+                        calls.extend(
+                            call
+                            for event in events
+                            for call in event["choices"][0]["delta"]["tool_calls"]
+                        )
+                        self.assertIsNone(
+                            self.chat._check_for_unstreamed_tool_args(
+                                parser_dict[0], content, request, 0
+                            )
+                        )
+                    return calls
+
+                calls = asyncio.run(stream())
+                self.assertEqual(calls[0]["id"], "B:0")
+                self.assertEqual(calls[0]["function"]["name"], "B")
+                self.assertEqual({call["index"] for call in calls}, {0})
+                self.assertTrue(all(call["id"] is None for call in calls[1:]))
+                self.assertTrue(
+                    all(call["function"]["name"] is None for call in calls[1:])
+                )
+                self.assertEqual(
+                    json.loads(
+                        "".join(call["function"]["arguments"] for call in calls)
+                    ),
+                    {"code": 'line("雪")\\\n'},
+                )
+
+    def test_k3_length_truncation_does_not_close_streamed_arguments(self):
+        """A length limit must retain partial JSON and length, not fabricate a finished call."""
+        response = self._complete(
+            self._request(names=("B",), stream=True),
+            TOOLS_OPEN + '<|open|>call tool="B" index="27"<|sep|>'
+            '<|open|>argument key="code" type="string"<|sep|>partial',
+            finish_type="length",
+        )
+        self.assertFalse(any("error" in event for event in response))
+        choices = [choice for event in response for choice in event.get("choices", [])]
+        arguments = "".join(
+            call["function"]["arguments"]
+            for choice in choices
+            for call in choice["delta"].get("tool_calls", [])
+        )
+        self.assertEqual(arguments, '{"code": "partial')
+        self.assertEqual(
+            [choice["finish_reason"] for choice in choices if choice["finish_reason"]],
+            ["length"],
+        )
 
     def test_non_strict_response_schema_is_not_an_active_constraint(self):
         response = self._complete(
@@ -4954,6 +5035,7 @@ class TestAllowedToolsServing(CustomTestCase):
                                     for call in choice.get("delta", {}).get(
                                         "tool_calls", []
                                     )
+                                    if call["function"]["name"] is not None
                                 )
                     else:
                         calls_by_choice = {
@@ -5030,11 +5112,17 @@ class TestAllowedToolsServing(CustomTestCase):
                         for choice in event.get("choices", [])
                     ]
                     self.assertEqual(choices[-1]["finish_reason"], "length")
-                    self.assertFalse(
-                        any(
-                            choice.get("delta", {}).get("tool_calls")
+                    self.assertEqual(
+                        [
+                            (
+                                call["index"],
+                                call["function"]["name"],
+                                call["function"]["arguments"],
+                            )
                             for choice in choices
-                        )
+                            for call in choice.get("delta", {}).get("tool_calls", [])
+                        ],
+                        [(0, "B", "{")],
                     )
                 else:
                     self.assertIsInstance(response, ChatCompletionResponse)
