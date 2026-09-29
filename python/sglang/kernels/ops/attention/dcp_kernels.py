@@ -89,9 +89,9 @@ def create_mla_kv_page_table_for_dcp(
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
-    PAGE_LAYOUT: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     HAS_V2P: tl.constexpr,
+    PAGE_LAYOUT: tl.constexpr = False,
 ):
     """This rank's cyclic slice of each request, as a page table.
 

@@ -382,7 +382,7 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
     if constexpr (kDcpPageSize > 0) {
       const int64_t page_id = vloc / kDcpPageSize;
       const int64_t page_offset = vloc % kDcpPageSize;
-      is_owner = page_id % kDcpWorldSize == params.dcp_rank;
+      is_owner = vloc >= 0 && page_id % kDcpWorldSize == params.dcp_rank;
       loc = (page_id / kDcpWorldSize) * kDcpPageSize + page_offset;
     } else {
       is_owner = vloc % kDcpWorldSize == params.dcp_rank;
