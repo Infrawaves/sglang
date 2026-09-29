@@ -193,6 +193,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             # With q_len=1 every valid local KV is visible. For multiple queries,
             # cp_world=1 would incorrectly subtract the query suffix on every rank;
             # page shards need per-query local bounds, not a shared local tail.
+            q_len = query.shape[1] if query.dim() == 4 else 1
+            if q_len != 1:
+                raise NotImplementedError(
+                    f"dcp_kv_layout='page' supports single-token decode only, got q_len={q_len}"
+                )
             causal_seqs = seq_lens
             cp_world, cp_rank = 1, 0
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
