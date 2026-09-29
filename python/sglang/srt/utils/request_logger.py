@@ -14,8 +14,19 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.log_utils import create_log_targets, log_json
@@ -26,6 +37,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
+
+# (field names, min chars): string values of these fields, at any depth, are
+# logged as their length plus a hash instead of verbatim.
+_Abbreviation = Tuple[FrozenSet[str], int]
 
 _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
@@ -57,6 +72,7 @@ class RequestLogger:
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
+        self.abbreviation = self._compute_abbreviation()
         self.targets = self._setup_targets()
 
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
@@ -83,6 +99,7 @@ class RequestLogger:
             self.log_requests_target = log_requests_target
 
         self.metadata = self._compute_metadata()
+        self.abbreviation = self._compute_abbreviation()
         self.targets = self._setup_targets()
 
     def log_received_request(
@@ -99,16 +116,19 @@ class RequestLogger:
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(
+                    obj, max_length, skip_names, self.abbreviation
+                ),
             }
             if headers:
                 log_data["headers"] = headers
             log_json(self.targets, "request.received", log_data)
         else:
             headers_str = f", headers={headers}" if headers else ""
-            self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
+            obj_str = _dataclass_to_string_truncated(
+                obj, max_length, skip_names=skip_names, abbreviation=self.abbreviation
             )
+            self._log(f"Receive: obj={obj_str}{headers_str}")
 
         # FIXME: This is a temporary fix to get the text from the input ids.
         # We should remove this once we have a proper way.
@@ -174,19 +194,21 @@ class RequestLogger:
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(
+                    obj, max_length, skip_names, self.abbreviation
+                ),
             }
             if headers:
                 log_data["headers"] = headers
             log_data["out"] = _transform_data_for_logging(
-                out, max_length, out_skip_names
+                out, max_length, out_skip_names, self.abbreviation
             )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
-                obj, max_length, skip_names=skip_names
+                obj, max_length, skip_names=skip_names, abbreviation=self.abbreviation
             )
-            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names, abbreviation=self.abbreviation)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
@@ -232,14 +254,39 @@ class RequestLogger:
                 )
         return max_length, skip_names, out_skip_names
 
+    def _compute_abbreviation(self) -> Optional[_Abbreviation]:
+        # Level 0 drops sampling_params altogether; level 3 is verbatim by definition.
+        if not self.log_requests or self.log_requests_level not in (1, 2):
+            return None
+        fields = frozenset(envs.SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS.get())
+        if not fields:
+            return None
+        return fields, max(0, envs.SGLANG_LOG_REQUEST_ABBREVIATE_MIN_CHARS.get())
+
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
 
 
+def _abbreviated(key: Any, value: Any, abbreviation: Optional[_Abbreviation]):
+    """The short form of ``value`` if ``key`` is to be abbreviated, else None."""
+    if abbreviation is None or not isinstance(value, str):
+        return None
+    fields, min_chars = abbreviation
+    if key not in fields or len(value) <= min_chars:
+        return None
+    digest = hashlib.blake2b(
+        value.encode("utf-8", "surrogatepass"), digest_size=8
+    ).hexdigest()
+    return f"<{key}: {len(value)} chars, blake2b={digest}>"
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
-    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
+    data: Any,
+    max_length: int = 2048,
+    skip_names: Optional[Set[str]] = None,
+    abbreviation: Optional[_Abbreviation] = None,
 ) -> str:
     if skip_names is None:
         skip_names = set()
@@ -259,7 +306,7 @@ def _dataclass_to_string_truncated(
         return (
             "{"
             + ", ".join(
-                f"'{k}': {_dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {_abbreviated(k, v, abbreviation) or _dataclass_to_string_truncated(v, max_length, abbreviation=abbreviation)}"
                 for k, v in data.items()
                 if k not in skip_names
             )
@@ -270,7 +317,7 @@ def _dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                f"{f.name}={_abbreviated(f.name, getattr(data, f.name), abbreviation) or _dataclass_to_string_truncated(getattr(data, f.name), max_length, abbreviation=abbreviation)}"
                 for f in fields
                 if f.name not in skip_names
             )
@@ -281,7 +328,10 @@ def _dataclass_to_string_truncated(
 
 
 def _transform_data_for_logging(
-    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
+    data: Any,
+    max_length: int = 2048,
+    skip_names: Optional[Set[str]] = None,
+    abbreviation: Optional[_Abbreviation] = None,
 ) -> Any:
     if skip_names is None:
         skip_names = set()
@@ -294,17 +344,24 @@ def _transform_data_for_logging(
         if len(data) > max_length:
             half_length = max_length // 2
             return list(data[:half_length]) + ["..."] + list(data[-half_length:])
-        return [_transform_data_for_logging(v, max_length) for v in data]
+        return [
+            _transform_data_for_logging(v, max_length, abbreviation=abbreviation)
+            for v in data
+        ]
     elif isinstance(data, dict):
         return {
-            k: _transform_data_for_logging(v, max_length)
+            k: _abbreviated(k, v, abbreviation)
+            or _transform_data_for_logging(v, max_length, abbreviation=abbreviation)
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         return {
-            f.name: _transform_data_for_logging(getattr(data, f.name), max_length)
+            f.name: _abbreviated(f.name, getattr(data, f.name), abbreviation)
+            or _transform_data_for_logging(
+                getattr(data, f.name), max_length, abbreviation=abbreviation
+            )
             for f in fields
             if f.name not in skip_names
         }

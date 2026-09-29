@@ -126,6 +126,30 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
+# reasoning_effort values Kimi K3 ignores that were already warned about; the
+# value is client-controlled, so the set is capped.
+_K3_WARNED_REASONING_EFFORTS: set = set()
+_K3_WARNED_REASONING_EFFORTS_MAX = 64
+
+
+def _warn_k3_unsupported_reasoning_effort(value: Any) -> None:
+    key = repr(value)
+    if (
+        key in _K3_WARNED_REASONING_EFFORTS
+        or len(_K3_WARNED_REASONING_EFFORTS) >= _K3_WARNED_REASONING_EFFORTS_MAX
+    ):
+        logger.debug(
+            "Kimi K3 does not support reasoning_effort=%s; using the encoder default.",
+            key,
+        )
+        return
+    _K3_WARNED_REASONING_EFFORTS.add(key)
+    logger.warning(
+        "Kimi K3 does not support reasoning_effort=%s; using the encoder default. "
+        "Logged once per value.",
+        key,
+    )
+
 
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
@@ -635,11 +659,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 "high",
                 "max",
             ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
-                )
+                _warn_k3_unsupported_reasoning_effort(request.reasoning_effort)
 
             effective_tools = self._effective_tools(request)
             if (
