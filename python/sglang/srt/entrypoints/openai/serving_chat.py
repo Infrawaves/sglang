@@ -12,7 +12,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_disagg, get_model, get_serving
+from sglang.srt.runtime_context import get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -279,8 +279,6 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        # Prefill returns the first token after KV transfer, not a final answer.
-        self._is_disagg_prefill = get_disagg().disaggregation_mode == "prefill"
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
@@ -650,6 +648,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tool_choice in ("required", "none")
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -1062,16 +1071,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 return f"Tool '{tool_name}' not found in tools list."
 
         if isinstance(request.tool_choice, AllowedToolChoice):
-            if (
-                self.chat_encoding_spec != "kimi_k3"
-                or self.tool_call_parser != "kimi_k3"
-            ):
-                return (
-                    "allowed_tools requires the Kimi K3 chat encoder and tool parser."
-                )
+            if self.tool_call_parser != "kimi_k3":
+                return "allowed_tools requires the Kimi K3 tool parser."
             allowed_tools = request.tool_choice.allowed_tools
-            if allowed_tools.mode == "required" and not allowed_tools.tools:
-                return "allowed_tools cannot be empty in required mode."
             declared_names = {
                 tool.function.name
                 for tool in effective_tools
@@ -2102,16 +2104,6 @@ class OpenAIServingChat(OpenAIServingBase):
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
 
-                if (
-                    isinstance(request.tool_choice, AllowedToolChoice)
-                    and request.tool_choice.allowed_tools.mode == "required"
-                    and not self._is_disagg_prefill
-                    and not has_tool_calls.get(idx, False)
-                ):
-                    raise ValueError(
-                        "allowed_tools required mode produced no tool call."
-                    )
-
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
@@ -2414,24 +2406,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
-
-            if isinstance(request.tool_choice, AllowedToolChoice):
-                allowed_names = {
-                    tool.function.name
-                    for tool in request.tool_choice.allowed_tools.tools
-                }
-                if any(
-                    call.function.name not in allowed_names for call in tool_calls or []
-                ):
-                    raise ValueError("Generated tool call is outside allowed_tools.")
-                if (
-                    request.tool_choice.allowed_tools.mode == "required"
-                    and not self._is_disagg_prefill
-                    and not tool_calls
-                ):
-                    raise ValueError(
-                        "allowed_tools required mode produced no tool call."
-                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -3103,14 +3077,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 end_text, end_calls = parser.parse_stream_end()
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
-
-        if isinstance(request.tool_choice, AllowedToolChoice):
-            allowed_names = {
-                tool.function.name for tool in request.tool_choice.allowed_tools.tools
-            }
-            # Loose argument text can contain tags the parser reads as extra calls.
-            if any(call.name not in allowed_names for call in calls):
-                raise ValueError("Generated tool call is outside allowed_tools.")
 
         # Yield normal text
         if normal_text:

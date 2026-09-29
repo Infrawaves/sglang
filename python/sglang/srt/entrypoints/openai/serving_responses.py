@@ -320,17 +320,9 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         tool_choice = request.effective_tool_choice()
         if isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools":
-            if (
-                self.chat_encoding_spec != "kimi_k3"
-                or self.tool_call_parser != "kimi_k3"
-            ):
+            if self.tool_call_parser != "kimi_k3":
                 return self.create_error_response(
-                    "allowed_tools requires the Kimi K3 chat encoder and tool parser.",
-                    param="tool_choice",
-                )
-            if tool_choice["mode"] == "required" and not tool_choice["tools"]:
-                return self.create_error_response(
-                    "allowed_tools cannot be empty in required mode.",
+                    "allowed_tools requires the Kimi K3 tool parser.",
                     param="tool_choice",
                 )
             declared_functions = {
@@ -342,14 +334,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         f"allowed_tools references undeclared function {tool['name']!r}.",
                         param="tool_choice",
                     )
-            # Custom tool shims cannot satisfy a function-only allowlist.
-            if custom_tool_names(request.tools).intersection(
-                tool["name"] for tool in tool_choice["tools"]
-            ):
-                return self.create_error_response(
-                    "allowed_tools cannot select custom tools or ambiguous function/custom names.",
-                    param="tool_choice",
-                )
         elif isinstance(tool_choice, dict) and not any(
             tool.type in ("function", "custom") and tool.name == tool_choice["name"]
             for tool in request.tools or []
@@ -1105,11 +1089,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         tool_choice = request.effective_tool_choice()
-        allowed_tools = (
-            tool_choice
-            if isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools"
-            else None
-        )
         is_required = tool_choice == "required" or (
             isinstance(tool_choice, dict) and tool_choice["type"] == "function"
         )
@@ -1174,17 +1153,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     content = ""
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
-
-        if allowed_tools is not None:
-            allowed_names = {tool["name"] for tool in allowed_tools["tools"]}
-            if any(call.name not in allowed_names for call in tool_call_items):
-                raise ValueError("Generated tool call is outside allowed_tools.")
-            if (
-                allowed_tools["mode"] == "required"
-                and not self._is_disagg_prefill
-                and not tool_call_items
-            ):
-                raise ValueError("allowed_tools required mode produced no tool call.")
 
         if content:
             output_text = ResponseOutputText(
@@ -2069,16 +2037,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         tool_choice = request.effective_tool_choice()
-        allowed_tools = (
-            tool_choice
-            if isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools"
-            else None
-        )
-        allowed_names = (
-            {tool["name"] for tool in allowed_tools["tools"]}
-            if allowed_tools is not None
-            else None
-        )
         is_required = tool_choice == "required" or (
             isinstance(tool_choice, dict) and tool_choice["type"] == "function"
         )
@@ -2483,11 +2441,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                if allowed_names is not None and any(
-                    call.name not in allowed_names for call in tool_calls
-                ):
-                    raise ValueError("Generated tool call is outside allowed_tools.")
-
                 def _emit_tool_calls(calls):
                     nonlocal current_output_index
                     if calls:
@@ -2668,13 +2621,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     yield ev
                 for ev in _emit_tool_calls(opening):
                     yield ev
-            if (
-                allowed_tools is not None
-                and allowed_tools["mode"] == "required"
-                and not self._is_disagg_prefill
-                and not tool_call_states
-            ):
-                raise ValueError("allowed_tools required mode produced no tool call.")
         except Exception as e:
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id

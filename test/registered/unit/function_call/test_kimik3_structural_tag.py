@@ -296,11 +296,12 @@ def test_allowed_tools_constrains_names_without_making_parameters_strict(mode):
     assert all(not tool.function.strict for tool in tools)
 
 
+@pytest.mark.parametrize("mode", ["auto", "required"])
 @pytest.mark.parametrize("thinking_mode", [False, True])
-def test_empty_allowed_tools_only_accepts_text(thinking_mode):
+def test_empty_allowed_tools_only_accepts_text(mode, thinking_mode):
     parser = FunctionCallParser(tools=[_tool()], tool_call_parser="kimi_k3")
     constraint = parser.get_structure_constraint(
-        _allowed_choice(names=()), thinking_mode=thinking_mode
+        _allowed_choice(mode=mode, names=()), thinking_mode=thinking_mode
     )
     grammar = xgr.Grammar.from_structural_tag(constraint[1])
     prefix = "Thinking." + THINK_CLOSE if thinking_mode else ""
