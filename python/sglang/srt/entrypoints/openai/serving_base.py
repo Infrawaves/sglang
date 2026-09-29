@@ -13,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.process_request_preprocessor import ProcessRequestPreprocessor
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
     """Abstract base class for OpenAI endpoint handlers"""
+
+    # Whether _convert_to_internal_request may run in a process-mode request
+    # preprocessor child (SGLANG_REQUEST_PREPROCESSOR_MODE=process). Opt in only
+    # if the conversion reads no handler state beyond what the constructor builds
+    # from (tokenizer_manager, template_manager), reads only the headers of
+    # raw_request, and returns picklable results.
+    supports_process_preprocessing = False
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
@@ -89,11 +97,8 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Chat template rendering and tokenization can block the event loop.
-            (
-                adapted_request,
-                processed_request,
-            ) = await self.tokenizer_manager.run_in_request_preprocessor(
-                self._convert_to_internal_request, request, raw_request
+            adapted_request, processed_request = await self._run_request_conversion(
+                request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
@@ -133,6 +138,21 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+
+    async def _run_request_conversion(self, request, raw_request):
+        """_convert_to_internal_request off the event loop: in a preprocessor
+        child process when one is running and this handler opted in, otherwise
+        on the tokenizer manager's preprocessing thread."""
+        preprocessor = getattr(
+            self.tokenizer_manager, "process_request_preprocessor", None
+        )
+        if isinstance(preprocessor, ProcessRequestPreprocessor):
+            converted = await preprocessor.convert(self, request, raw_request)
+            if converted is not None:
+                return converted
+        return await self.tokenizer_manager.run_in_request_preprocessor(
+            self._convert_to_internal_request, request, raw_request
+        )
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
