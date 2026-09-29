@@ -1,9 +1,13 @@
+import threading
+import time
 import unittest
-from concurrent.futures import Future
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, ParallelInfoState
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -284,7 +288,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
-        # A req whose kv_receiver was already cleared must not crash on .abort().
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
@@ -292,6 +295,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._ensure_last_attempt_time = {}
         queue.kv_manager = MagicMock()
         queue.kv_manager.try_ensure_parallel_info.return_value = False
+        queue.kv_manager.has_parallel_info.return_value = False
 
         cleared_req = SimpleNamespace(
             req=SimpleNamespace(rid="cleared"), kv_receiver=None
@@ -306,9 +310,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_prefetches_prefill_dp_rank_query(self):
         addr = "127.0.0.1:11500"
         executor = MagicMock()
-        future = Future()
-        future.set_result({"7": 1})
-        executor.submit.return_value = future
+        future_first = Future()
+        future_first.set_result({"7": 1})
+        future_tail = Future()
+        future_tail.set_result({"8": 2})
+        executor.submit.side_effect = [future_first, future_tail]
 
         def decode_req(room):
             return SimpleNamespace(
@@ -326,7 +332,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._prefill_dp_rank_queries = {}
         queue.kv_manager = SimpleNamespace(
             prefill_info_table={addr: object()},
-            _ensure_prefill_recompute_executor=lambda: executor,
+            _ensure_bootstrap_executor=lambda: executor,
         )
         queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
         queue._ensure_prefill_info = lambda groups: (groups, [])
@@ -340,12 +346,186 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ) as query:
             queue._resolve_pending_reqs()
 
-        _, called_addr, called_rooms = executor.submit.call_args.args
+        _, called_addr, called_rooms = executor.submit.call_args_list[0].args
         self.assertEqual((called_addr, called_rooms), (addr, [7]))
-        query.assert_called_once_with(addr, [8])
+        _, called_addr, called_rooms = executor.submit.call_args_list[1].args
+        self.assertEqual((called_addr, called_rooms), (addr, [8]))
+        query.assert_not_called()
         first.kv_receiver.init.assert_called_once_with(1)
+        tail.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [tail])
+
+        queue._resolve_pending_reqs()
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
+
+    def _ensure_info_queue(self, addr, state, cached=False):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._max_ensure_retries = 15
+        queue._ensure_retry_interval = 1.0
+        queue._ensure_retry_interval_max = 4.0
+        queue._ensure_retry_count = {}
+        queue._ensure_last_attempt_time = {}
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.try_ensure_parallel_info.return_value = state
+        queue.kv_manager.has_parallel_info.return_value = cached
+        return queue
+
+    def test_pending_topology_fetch_does_not_consume_retry_budget(self):
+        addr = "127.0.0.1:11500"
+        queue = self._ensure_info_queue(addr, ParallelInfoState.PENDING)
+        req = SimpleNamespace(
+            req=SimpleNamespace(rid="pending"), kv_receiver=MagicMock()
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.time.monotonic", return_value=100.0
+        ):
+            for _ in range(50):
+                ready, remaining = queue._ensure_prefill_info({addr: [req]})
+
+        self.assertEqual(ready, {})
+        self.assertEqual(remaining, [req])
+        self.assertEqual(queue._ensure_retry_count, {})
+        self.assertEqual(queue._ensure_last_attempt_time, {})
+        self.assertEqual(
+            queue.kv_manager.try_ensure_parallel_info.call_count,
+            50,
+        )
+        req.kv_receiver.abort.assert_not_called()
+
+    def test_completed_pending_fetch_is_consumed_without_retry_delay(self):
+        addr = "127.0.0.1:11500"
+        queue = self._ensure_info_queue(addr, ParallelInfoState.PENDING)
+        queue.kv_manager.try_ensure_parallel_info.side_effect = [
+            ParallelInfoState.PENDING,
+            ParallelInfoState.READY,
+        ]
+        req = SimpleNamespace(
+            req=SimpleNamespace(rid="pending-ready"), kv_receiver=MagicMock()
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.time.monotonic", return_value=100.0
+        ):
+            first_ready, first_remaining = queue._ensure_prefill_info({addr: [req]})
+            second_ready, second_remaining = queue._ensure_prefill_info({addr: [req]})
+
+        self.assertEqual((first_ready, first_remaining), ({}, [req]))
+        self.assertEqual((second_ready, second_remaining), ({addr: [req]}, []))
+        self.assertEqual(
+            queue.kv_manager.try_ensure_parallel_info.call_count,
+            2,
+        )
+
+    def test_failed_topology_fetch_still_consumes_retry_budget(self):
+        addr = "127.0.0.1:11500"
+        queue = self._ensure_info_queue(addr, ParallelInfoState.FAILED)
+        queue._max_ensure_retries = 2
+        req = SimpleNamespace(
+            req=SimpleNamespace(rid="failed"), kv_receiver=MagicMock()
+        )
+
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+        self.assertEqual((ready, remaining), ({}, [req]))
+        self.assertEqual(queue._ensure_retry_count[addr], 1)
+
+        queue._ensure_last_attempt_time = {}
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+        self.assertEqual((ready, remaining), ({}, []))
+        req.kv_receiver.abort.assert_called_once()
+        self.assertNotIn(addr, queue._ensure_retry_count)
+
+    def test_topology_retry_delay_backs_off_and_caps(self):
+        addr = "127.0.0.1:11500"
+        queue = self._ensure_info_queue(addr, ParallelInfoState.FAILED)
+
+        delays = []
+        for count in range(7):
+            queue._ensure_retry_count = {addr: count}
+            delays.append(queue._retry_delay_for(addr))
+
+        self.assertEqual(delays, [1.0, 1.0, 2.0, 4.0, 4.0, 4.0, 4.0])
+
+    def test_cached_topology_is_consumed_before_the_pacing_gate(self):
+        addr = "127.0.0.1:11500"
+        queue = self._ensure_info_queue(addr, ParallelInfoState.FAILED, cached=True)
+        queue._ensure_retry_count = {addr: 3}
+        queue._ensure_last_attempt_time = {addr: time.monotonic()}
+        req = SimpleNamespace(
+            req=SimpleNamespace(rid="cached"), kv_receiver=MagicMock()
+        )
+
+        ready, remaining = queue._ensure_prefill_info({addr: [req]})
+
+        self.assertEqual(ready, {addr: [req]})
+        self.assertEqual(remaining, [])
+        queue.kv_manager.try_ensure_parallel_info.assert_not_called()
+        self.assertNotIn(addr, queue._ensure_retry_count)
+        self.assertNotIn(addr, queue._ensure_last_attempt_time)
+
+    def test_unresolved_dp_rank_query_defers_instead_of_blocking(self):
+        addr = "127.0.0.1:11500"
+        pending_future = Future()  # deliberately never resolved
+        req = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_host="127.0.0.1", bootstrap_port=11500, bootstrap_room=7
+            ),
+            kv_receiver=MagicMock(),
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [req]
+        queue._prefill_dp_rank_queries = {addr: ((7,), pending_future)}
+        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
+        queue._ensure_prefill_info = lambda groups: (groups, [])
+
+        with patch(
+            "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks"
+        ) as query:
+            queue._resolve_pending_reqs()
+
+        query.assert_not_called()
+        req.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [req])
+        self.assertIs(queue._prefill_dp_rank_queries[addr][1], pending_future)
+        self.assertFalse(pending_future.cancelled())
+
+    def test_missing_dp_rank_future_is_submitted_async(self):
+        """A newly ingested request must not use the synchronous query fallback."""
+        addr = "127.0.0.1:11500"
+        req = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_host="127.0.0.1", bootstrap_port=11500, bootstrap_room=7
+            ),
+            kv_receiver=MagicMock(),
+        )
+
+        executor = MagicMock()
+        submitted_future = Future()
+        executor.submit.return_value = submitted_future
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [req]
+        queue._prefill_dp_rank_queries = {}
+        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
+        queue._ensure_prefill_info = lambda groups: (groups, [])
+        queue.kv_manager = MagicMock()
+        queue.kv_manager._ensure_bootstrap_executor.return_value = executor
+
+        with patch(
+            "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks"
+        ) as query:
+            queue._resolve_pending_reqs()
+
+        query.assert_not_called()
+        executor.submit.assert_called_once_with(
+            query,
+            addr,
+            [7],
+        )
+        req.kv_receiver.init.assert_not_called()
+        self.assertEqual(queue.pending_reqs, [req])
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
@@ -605,6 +785,218 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # Quarantined buffers have no GPU forward to carry a health response;
         # permit a fresh health request while still blocking cache flush/offload.
         self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
+
+
+class TestParallelInfoFetchEpoch(CustomTestCase):
+    """The topology fetch runs on an executor, so it can outlive the heartbeat's
+    decision that the prefill it was querying is dead."""
+
+    ADDR = "prefill:8998"
+
+    def _manager(self, payload=None, fetch=None):
+        # CommonKVManager implements both of BaseKVManager's abstract methods, so
+        # it can be built without running __init__ (which needs torch.distributed,
+        # ZMQ sockets and a live bootstrap server).
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr.prefill_info_table = {}
+        mgr.connection_lock = threading.Lock()
+        mgr.connection_pool = {}
+        mgr._parallel_info_futures = {}
+        mgr._parallel_info_epochs = defaultdict(int)
+        mgr.addr_to_rooms_tracker = defaultdict(set)
+        mgr.request_status = {}
+        mgr.kv_args = SimpleNamespace(page_size=64)
+        mgr.kv_cache_dtype_str = "bfloat16"
+        mgr.dcp_size = 1
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.record_failure = MagicMock()
+        mgr.update_status = MagicMock()
+        mgr.check_status = MagicMock(return_value=KVPoll.Bootstrapping)
+        mgr._resolve_rank_mapping = MagicMock()
+
+        executor = ThreadPoolExecutor(max_workers=2)
+        self.addCleanup(executor.shutdown, wait=True)
+        mgr._ensure_prefill_recompute_executor = lambda: executor
+        mgr._ensure_parallel_info_executor = lambda: executor
+        mgr._ensure_bootstrap_executor = lambda: executor
+
+        if fetch is None:
+            row = payload if payload is not None else self._payload()
+            fetch = MagicMock(return_value=row)
+        mgr._fetch_parallel_info_payload = fetch
+        return mgr, fetch
+
+    @staticmethod
+    def _payload(**overrides):
+        row = {
+            "attn_tp_size": 8,
+            "attn_cp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "page_size": 64,
+            "kv_cache_dtype": "bfloat16",
+            "follow_bootstrap_room": True,
+        }
+        row.update(overrides)
+        return row
+
+    def _drain(self, mgr):
+        """Advance the state machine until it leaves PENDING."""
+        for _ in range(200):
+            state = mgr.try_ensure_parallel_info(self.ADDR)
+            if state != ParallelInfoState.PENDING:
+                return state
+            time.sleep(0.005)
+        self.fail("fetch never left PENDING")
+
+    def test_fetch_is_not_awaited_on_the_calling_thread(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_fetch(addr):
+            entered.set()
+            release.wait(5)
+            return self._payload()
+
+        mgr, _ = self._manager(fetch=blocking_fetch)
+
+        state = mgr.try_ensure_parallel_info(self.ADDR)
+        self.assertEqual(state, ParallelInfoState.PENDING)
+        self.assertTrue(entered.wait(5), "fetch never started")
+        self.assertEqual(
+            mgr.try_ensure_parallel_info(self.ADDR), ParallelInfoState.PENDING
+        )
+        self.assertNotIn(self.ADDR, mgr.prefill_info_table)
+
+        release.set()
+        self.assertEqual(self._drain(mgr), ParallelInfoState.READY)
+        self.assertIn(self.ADDR, mgr.prefill_info_table)
+
+    def test_in_flight_fetch_is_not_duplicated(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def blocking_fetch(addr):
+            calls.append(addr)
+            entered.set()
+            release.wait(5)
+            return self._payload()
+
+        mgr, _ = self._manager(fetch=blocking_fetch)
+
+        mgr.try_ensure_parallel_info(self.ADDR)
+        self.assertTrue(entered.wait(5))
+        for _ in range(20):
+            mgr.try_ensure_parallel_info(self.ADDR)
+
+        release.set()
+        self._drain(mgr)
+        self.assertEqual(calls, [self.ADDR], "one GET per addr while in flight")
+
+    def test_eviction_pops_the_in_flight_fetch(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_fetch(addr):
+            entered.set()
+            release.wait(5)
+            return self._payload()
+
+        mgr, _ = self._manager(fetch=blocking_fetch)
+
+        self.assertEqual(
+            mgr.try_ensure_parallel_info(self.ADDR), ParallelInfoState.PENDING
+        )
+        self.assertTrue(entered.wait(5), "fetch never started")
+
+        with patch(
+            "sglang.srt.disaggregation.common.conn.CommonKVReceiver.disconnect_endpoint"
+        ):
+            mgr._handle_node_failure(self.ADDR)
+
+        self.assertNotIn(self.ADDR, mgr._parallel_info_futures)
+        self.assertEqual(mgr._parallel_info_epochs[self.ADDR], 1)
+        release.set()
+
+    def test_eviction_between_fetch_and_publish_does_not_resurrect_address(self):
+        mgr, _ = self._manager()
+        evicted = []
+
+        def evict_mid_publish(info):
+            if evicted:
+                return
+            evicted.append(True)
+            with patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.disconnect_endpoint"
+            ):
+                mgr._handle_node_failure(self.ADDR)
+
+        mgr._resolve_rank_mapping = evict_mid_publish
+
+        state = self._drain(mgr)
+
+        self.assertTrue(evicted, "injection point never ran")
+        self.assertEqual(state, ParallelInfoState.FAILED)
+        self.assertNotIn(
+            self.ADDR,
+            mgr.prefill_info_table,
+            "a fetch that resolved before eviction republished a dead prefill",
+        )
+
+    def test_fetch_after_eviction_publishes_again(self):
+        mgr, _ = self._manager()
+
+        with patch(
+            "sglang.srt.disaggregation.common.conn.CommonKVReceiver.disconnect_endpoint"
+        ):
+            mgr._handle_node_failure(self.ADDR)
+        self.assertEqual(mgr._parallel_info_epochs[self.ADDR], 1)
+
+        self.assertEqual(self._drain(mgr), ParallelInfoState.READY)
+        self.assertIn(self.ADDR, mgr.prefill_info_table)
+
+    def test_cancelled_fetch_is_reported_as_a_failed_attempt(self):
+        mgr, _ = self._manager()
+        cancelled = Future()
+        self.assertTrue(cancelled.cancel())
+        mgr._parallel_info_futures[self.ADDR] = (0, cancelled)
+
+        self.assertEqual(
+            mgr.try_ensure_parallel_info(self.ADDR), ParallelInfoState.FAILED
+        )
+        self.assertNotIn(self.ADDR, mgr._parallel_info_futures)
+
+    def test_cache_hit_needs_no_executor(self):
+        mgr, fetch = self._manager()
+        mgr.prefill_info_table[self.ADDR] = object()
+
+        self.assertTrue(mgr.has_parallel_info(self.ADDR))
+        self.assertEqual(
+            mgr.try_ensure_parallel_info(self.ADDR), ParallelInfoState.READY
+        )
+        fetch.assert_not_called()
+
+    def test_failed_fetch_is_retried_by_the_next_call(self):
+        mgr, fetch = self._manager(fetch=MagicMock(return_value=None))
+
+        self.assertEqual(self._drain(mgr), ParallelInfoState.FAILED)
+        self.assertNotIn(self.ADDR, mgr._parallel_info_futures)
+
+        fetch.return_value = self._payload()
+        self.assertEqual(self._drain(mgr), ParallelInfoState.READY)
+        self.assertIn(self.ADDR, mgr.prefill_info_table)
+
+    def test_page_size_mismatch_raises_on_the_calling_thread(self):
+        mgr, _ = self._manager(payload=self._payload(page_size=32))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._drain(mgr)
+        self.assertIn("Page size mismatch", str(ctx.exception))
 
 
 if __name__ == "__main__":

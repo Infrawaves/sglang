@@ -44,7 +44,11 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    ParallelInfoState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -436,10 +440,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
         ] = {}
+        self._prefill_dp_rank_query_since: Dict[str, float] = {}
+        self._prefill_dp_rank_query_epochs: Dict[str, Optional[int]] = {}
+        self._prefill_dp_rank_query_tokens: Dict[str, Optional[Tuple[object, ...]]] = {}
         self._ensure_retry_count: Dict[str, int] = {}
+        self._ensure_pending_since: Dict[str, float] = {}
+        self._ensure_pending_epochs: Dict[str, Optional[int]] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
-        self._ensure_retry_interval: float = 1.0  # seconds
+        self._ensure_retry_interval: float = 1.0  # seconds, first retry
+        self._ensure_retry_interval_max: float = 4.0  # seconds
+        self._ensure_pending_timeout: float = (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        )
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1279,6 +1292,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _retry_delay_for(self, bootstrap_addr: str) -> float:
+        """Exponential backoff for the topology fetch, capped at the ceiling."""
+        count = self._ensure_retry_count.get(bootstrap_addr, 0)
+        if count <= 0:
+            return self._ensure_retry_interval
+        return min(
+            self._ensure_retry_interval * (2 ** (count - 1)),
+            self._ensure_retry_interval_max,
+        )
+
+    def _parallel_info_epoch(self, bootstrap_addr: str) -> Optional[int]:
+        epochs = getattr(self.kv_manager, "_parallel_info_epochs", None)
+        if isinstance(epochs, dict):
+            return epochs.get(bootstrap_addr, 0)
+        return None
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -1286,19 +1315,73 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Returns (ready_addrs, remaining_reqs)."""
         ready: Dict[str, List[DecodeRequest]] = {}
         remaining: List[DecodeRequest] = []
+        if not hasattr(self, "_ensure_pending_since"):
+            self._ensure_pending_since = {}
+        if not hasattr(self, "_ensure_pending_epochs"):
+            self._ensure_pending_epochs = {}
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            current_epoch = self._parallel_info_epoch(bootstrap_addr)
+            previous_epoch = self._ensure_pending_epochs.get(bootstrap_addr)
+            if (
+                current_epoch is not None
+                and previous_epoch is not None
+                and current_epoch != previous_epoch
+            ):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                self._ensure_pending_since.pop(bootstrap_addr, None)
+            self._ensure_pending_epochs[bootstrap_addr] = current_epoch
+            if self.kv_manager.has_parallel_info(bootstrap_addr):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                self._ensure_pending_since.pop(bootstrap_addr, None)
+                ready[bootstrap_addr] = reqs
+                continue
+
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
-            if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
+            pending_fetch = bootstrap_addr in self._ensure_pending_since
+            if (
+                not pending_fetch
+                and last_attempt is not None
+                and (now - last_attempt < self._retry_delay_for(bootstrap_addr))
             ):
                 remaining.extend(reqs)
                 continue
 
+            state = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+
+            if state == ParallelInfoState.PENDING:
+                pending_since = self._ensure_pending_since.setdefault(
+                    bootstrap_addr, now
+                )
+                pending_timeout = getattr(
+                    self,
+                    "_ensure_pending_timeout",
+                    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get(),
+                )
+                pending_elapsed = now - pending_since
+                if pending_elapsed >= pending_timeout:
+                    error_msg = (
+                        f"Timed out waiting for prefill parallel info from "
+                        f"{bootstrap_addr} after {pending_elapsed:.1f}s"
+                    )
+                    logger.error(error_msg)
+                    for decode_req in reqs:
+                        if decode_req.kv_receiver is not None:
+                            decode_req.kv_receiver.abort()
+                    self._ensure_pending_since.pop(bootstrap_addr, None)
+                    self._ensure_retry_count.pop(bootstrap_addr, None)
+                    self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                else:
+                    remaining.extend(reqs)
+                continue
+
+            self._ensure_pending_since.pop(bootstrap_addr, None)
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            if state:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1325,6 +1408,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def prefetch_prefill_dp_rank_queries(self) -> None:
         """Start DP-rank lookups before their normal consume point."""
+        self._ensure_prefill_dp_rank_query_state()
         if not self.pending_reqs:
             return
 
@@ -1332,12 +1416,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
+            if getattr(decode_req, "kv_receiver", None) is None or isinstance(
+                getattr(decode_req.req, "finished_reason", None), FINISH_ABORT
+            ):
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         for bootstrap_addr in set(queries) - set(addr_to_reqs):
             _, stale_future = queries.pop(bootstrap_addr)
             stale_future.cancel()
+            self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         for bootstrap_addr, decode_reqs in addr_to_reqs.items():
             if bootstrap_addr in queries:
@@ -1353,20 +1444,109 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not rooms:
                 continue
 
-            future = self.kv_manager._ensure_prefill_recompute_executor().submit(
-                CommonKVReceiver.query_prefill_dp_ranks,
-                bootstrap_addr,
-                list(rooms),
-            )
-            queries[bootstrap_addr] = (rooms, future)
+            self._submit_prefill_dp_rank_query(bootstrap_addr, list(rooms))
 
     def _cancel_prefill_dp_rank_queries(self) -> None:
+        self._ensure_prefill_dp_rank_query_state()
         for _, future in self._prefill_dp_rank_queries.values():
             future.cancel()
         self._prefill_dp_rank_queries.clear()
+        self._prefill_dp_rank_query_since.clear()
+        self._prefill_dp_rank_query_epochs.clear()
+        self._prefill_dp_rank_query_tokens.clear()
+
+    def _ensure_prefill_dp_rank_query_state(self) -> None:
+        if not hasattr(self, "_prefill_dp_rank_query_since"):
+            self._prefill_dp_rank_query_since = {}
+        if not hasattr(self, "_prefill_dp_rank_query_epochs"):
+            self._prefill_dp_rank_query_epochs = {}
+        if not hasattr(self, "_prefill_dp_rank_query_tokens"):
+            self._prefill_dp_rank_query_tokens = {}
+
+    def _prefill_dp_rank_epoch(self, bootstrap_addr: str) -> Optional[int]:
+        epochs = getattr(self.kv_manager, "_parallel_info_epochs", None)
+        if isinstance(epochs, dict):
+            return epochs.get(bootstrap_addr, 0)
+        return None
+
+    def _prefill_dp_rank_query_expired(self, bootstrap_addr: str) -> bool:
+        since = self._prefill_dp_rank_query_since.get(bootstrap_addr)
+        if since is None:
+            return False
+        timeout = getattr(
+            self,
+            "_ensure_pending_timeout",
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get(),
+        )
+        return time.monotonic() - since >= timeout
+
+    def _prefill_dp_rank_tokens(
+        self, bootstrap_addr: str, bootstrap_rooms: Tuple[int, ...]
+    ) -> Optional[Tuple[object, ...]]:
+        room_tokens = getattr(self.kv_manager, "_bootstrap_room_tokens", None)
+        if not isinstance(room_tokens, dict):
+            return None
+        return tuple(room_tokens.get(room) for room in bootstrap_rooms)
+
+    def _prefill_dp_rank_tokens_match(
+        self,
+        bootstrap_addr: str,
+        bootstrap_rooms: Tuple[int, ...],
+        expected: Optional[Tuple[object, ...]],
+    ) -> bool:
+        if expected is None:
+            return True
+        current = self._prefill_dp_rank_tokens(bootstrap_addr, bootstrap_rooms)
+        return (
+            current is not None
+            and len(current) == len(expected)
+            and all(old is new for old, new in zip(expected, current))
+        )
+
+    @staticmethod
+    def _abort_pending_dp_rank_requests(
+        decode_reqs: List[DecodeRequest],
+    ) -> None:
+        for decode_req in decode_reqs:
+            receiver = getattr(decode_req, "kv_receiver", None)
+            if receiver is not None:
+                receiver.abort()
+
+    def _submit_prefill_dp_rank_query(
+        self, bootstrap_addr: str, bootstrap_rooms: List[int]
+    ) -> None:
+        """Submit a DP-rank lookup without waiting on the scheduler thread."""
+        self._ensure_prefill_dp_rank_query_state()
+        if not bootstrap_rooms:
+            return
+        future = self.kv_manager._ensure_bootstrap_executor().submit(
+            CommonKVReceiver.query_prefill_dp_ranks,
+            bootstrap_addr,
+            list(bootstrap_rooms),
+        )
+        self._prefill_dp_rank_queries[bootstrap_addr] = (
+            tuple(bootstrap_rooms),
+            future,
+        )
+        self._prefill_dp_rank_query_since.setdefault(bootstrap_addr, time.monotonic())
+        self._prefill_dp_rank_query_epochs[bootstrap_addr] = (
+            self._prefill_dp_rank_epoch(bootstrap_addr)
+        )
+        self._prefill_dp_rank_query_tokens[bootstrap_addr] = (
+            self._prefill_dp_rank_tokens(bootstrap_addr, tuple(bootstrap_rooms))
+        )
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
+        self._ensure_prefill_dp_rank_query_state()
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if getattr(decode_req, "kv_receiver", None) is not None
+            and not isinstance(
+                getattr(decode_req.req, "finished_reason", None), FINISH_ABORT
+            )
+        ]
         if not self.pending_reqs:
             self._cancel_prefill_dp_rank_queries()
             return
@@ -1376,6 +1556,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
+
+        for bootstrap_addr in set(self._prefill_dp_rank_queries) - set(addr_to_reqs):
+            _, stale_future = self._prefill_dp_rank_queries.pop(bootstrap_addr)
+            stale_future.cancel()
+            self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
@@ -1395,24 +1582,69 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 prefetched_rooms = prefetched[0] if prefetched is not None else ()
-                if (
+                prefetched_epoch = self._prefill_dp_rank_query_epochs.pop(
+                    bootstrap_addr, None
+                )
+                prefetched_tokens = self._prefill_dp_rank_query_tokens.pop(
+                    bootstrap_addr, None
+                )
+                has_matching_prefix = (
                     prefetched is not None
                     and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
+                )
+
+                if (
+                    prefetched is not None
+                    and prefetched_epoch is not None
+                    and prefetched_epoch != self._prefill_dp_rank_epoch(bootstrap_addr)
                 ):
-                    room_to_rank = prefetched[1].result()
-                    remaining_rooms = rooms[len(prefetched_rooms) :]
-                    if remaining_rooms:
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
-                            )
-                        )
-                else:
-                    if prefetched is not None:
-                        prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
+                    has_matching_prefix = False
+                if prefetched is not None and not self._prefill_dp_rank_tokens_match(
+                    bootstrap_addr, tuple(prefetched_rooms), prefetched_tokens
+                ):
+                    has_matching_prefix = False
+
+                if prefetched is not None and not has_matching_prefix:
+                    prefetched[1].cancel()
+                    prefetched = None
+                    self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+
+                if prefetched is None:
+                    self._submit_prefill_dp_rank_query(bootstrap_addr, rooms)
+                    remaining.extend(need_query)
+                    continue
+
+                # Never wait for a Future on the scheduler thread.
+                if not prefetched[1].done():
+                    self._prefill_dp_rank_queries[bootstrap_addr] = prefetched
+                    self._prefill_dp_rank_query_epochs[bootstrap_addr] = (
+                        prefetched_epoch
                     )
+                    self._prefill_dp_rank_query_tokens[bootstrap_addr] = (
+                        prefetched_tokens
+                    )
+                    if self._prefill_dp_rank_query_expired(bootstrap_addr):
+                        prefetched[1].cancel()
+                        self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
+                        self._abort_pending_dp_rank_requests(need_query)
+                        continue
+                    remaining.extend(need_query)
+                    continue
+
+                try:
+                    room_to_rank = prefetched[1].result()
+                except Exception as e:
+                    logger.warning(
+                        "Prefill DP-rank query failed for %s: %s",
+                        bootstrap_addr,
+                        e,
+                    )
+                    room_to_rank = {}
+
+                unresolved: List[DecodeRequest] = []
                 for decode_req in need_query:
                     prefill_dp_rank = room_to_rank.get(
                         str(decode_req.req.bootstrap_room)
@@ -1420,11 +1652,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefill_dp_rank is not None:
                         resolved.append((decode_req, int(prefill_dp_rank)))
                     else:
-                        remaining.append(decode_req)
+                        unresolved.append(decode_req)
+
+                if unresolved:
+                    if self._prefill_dp_rank_query_expired(bootstrap_addr):
+                        self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                        self._abort_pending_dp_rank_requests(unresolved)
+                    else:
+                        self._submit_prefill_dp_rank_query(
+                            bootstrap_addr,
+                            [req.req.bootstrap_room for req in unresolved],
+                        )
+                        remaining.extend(unresolved)
+                else:
+                    self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
             else:
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 if prefetched is not None:
                     prefetched[1].cancel()
+                self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+                self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         self.pending_reqs = remaining
 
