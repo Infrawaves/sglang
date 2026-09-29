@@ -25,8 +25,8 @@ def set_mla_kv_buffer_kernel(
     BLOCK: tl.constexpr,
     DCP_RANK: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
-    DCP_PAGE_SIZE: tl.constexpr,
-    PAGE_LAYOUT: tl.constexpr,
+    DCP_PAGE_SIZE: tl.constexpr = 1,
+    PAGE_LAYOUT: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
