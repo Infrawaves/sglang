@@ -2,6 +2,7 @@
 
 import argparse
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.serving_hook import handle_multimodal
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -26,6 +27,7 @@ class TestRecentImageSampling(CustomTestCase):
         manager.image_token_id = 99
         manager.recent_image_max_count = 50
         manager.recent_image_keep_ratio = 0.8
+        manager.enable_recent_image_sampling_log = False
         return manager
 
     def test_keep_count_uses_configured_tail_cap_and_floor(self):
@@ -62,6 +64,48 @@ class TestRecentImageSampling(CustomTestCase):
         # cap; the default 50/.8 values would have retained all 12 images.
         self.assertEqual(req.image_data, image_data[-6:])
         self.assertEqual(req.input_ids, [7, *([99] * 6), 8])
+
+    def test_sampling_log_is_emitted_only_when_enabled(self):
+        image_data = [f"image-{index}" for index in range(51)]
+        req = GenerateReqInput(
+            rid="logging-config",
+            input_ids=[7, *([99] * 51), 8],
+            image_data=image_data,
+        )
+        req.normalize_batch_and_arguments()
+
+        manager = self._manager()
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.logger"
+        ) as logger_mock:
+            manager._truncate_recent_images(req)
+            logger_mock.info.assert_not_called()
+
+        manager.enable_recent_image_sampling_log = True
+        req = GenerateReqInput(
+            rid="logging-enabled",
+            input_ids=[7, *([99] * 51), 8],
+            image_data=image_data,
+        )
+        req.normalize_batch_and_arguments()
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.logger"
+        ) as logger_mock:
+            manager._truncate_recent_images(req)
+            self.assertEqual(logger_mock.info.call_count, 2)
+            logger_mock.info.assert_any_call(
+                "Recent-image sampling received request %s with %d image(s).",
+                "logging-enabled",
+                51,
+            )
+            logger_mock.info.assert_any_call(
+                "Recent-image sampling truncated request %s from %d to %d "
+                "image(s); processing the latest images only.",
+                "logging-enabled",
+                51,
+                40,
+            )
 
     def test_single_request_trims_images_hashes_and_input_ids(self):
         image_data = [f"image-{index}" for index in range(106)]
@@ -135,6 +179,7 @@ class TestRecentImageSampling(CustomTestCase):
         defaults = self._parse_server_args([])
         self.assertEqual(defaults.recent_image_max_count, 50)
         self.assertEqual(defaults.recent_image_keep_ratio, 0.8)
+        self.assertFalse(defaults.enable_recent_image_sampling_log)
 
         custom = self._parse_server_args(
             [
@@ -142,10 +187,12 @@ class TestRecentImageSampling(CustomTestCase):
                 "12",
                 "--recent-image-keep-ratio",
                 "0.5",
+                "--enable-recent-image-sampling-log",
             ]
         )
         self.assertEqual(custom.recent_image_max_count, 12)
         self.assertEqual(custom.recent_image_keep_ratio, 0.5)
+        self.assertTrue(custom.enable_recent_image_sampling_log)
 
     def test_sampling_startup_args_validate_bounds(self):
         with self.assertRaisesRegex(ValueError, "recent-image-max-count"):

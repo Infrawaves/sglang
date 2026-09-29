@@ -126,6 +126,11 @@ class Mm(msgspec.Struct):
         "of the most recent images, rounded down and capped at the max count. "
         "Must be in (0, 1].",
     ] = 0.8
+    enable_recent_image_sampling_log: A[
+        bool,
+        "Log the image count for each image request and log recent-image "
+        "sampling truncation details.",
+    ] = False
     enable_mm_global_cache: A[
         bool,
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
