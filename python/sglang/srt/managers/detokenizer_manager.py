@@ -409,9 +409,40 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if rid in self.decode_status:
                 del self.decode_status[rid]
 
+            reasoning_text_len = 0
+            if recv_obj.reasoning_tokens[i] and isinstance(
+                recv_obj.finished_reasons[i].get("matched"), str
+            ):
+                # Scheduler read_offsets retain the prompt context length;
+                # reasoning_tokens includes the complete thinking terminator.
+                prompt_len = recv_obj.read_offsets[i]
+                prefix_ids = [
+                    s.decode_ids[:prompt_len],
+                    s.decode_ids[: prompt_len + recv_obj.reasoning_tokens[i]],
+                ]
+                if self.disable_tokenizer_batch_decode:
+                    prefix_texts = [
+                        self.tokenizer.decode(
+                            ids,
+                            skip_special_tokens=recv_obj.skip_special_tokens[i],
+                            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                                i
+                            ],
+                        )
+                        for ids in prefix_ids
+                    ]
+                else:
+                    prefix_texts = self._grouped_batch_decode(
+                        prefix_ids,
+                        [recv_obj.skip_special_tokens[i]] * 2,
+                        [recv_obj.spaces_between_special_tokens[i]] * 2,
+                    )
+                reasoning_text_len = len(prefix_texts[1]) - len(prefix_texts[0])
+
             # Finished: materialize once, trim the matched stop, emit the tail.
-            output_str = self.trim_matched_stop(
-                s.get_decoded_text() + new_text,
+            output_str = s.get_decoded_text() + new_text
+            output_str = output_str[:reasoning_text_len] + self.trim_matched_stop(
+                output_str[reasoning_text_len:],
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
