@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
+import itertools
 import json
 import re
 import tempfile
@@ -1493,6 +1494,48 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertEqual(
                     self.chat._validate_request(duplicate),
                     "Tool names must be unique across request and message tools.",
+                )
+
+    def test_slow_tool_schema_validation_is_reported(self):
+        # Unique property names keep the schemas out of other tests' cache hits.
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {uuid.uuid4().hex: {"type": "string"}},
+                    },
+                },
+            }
+
+        messages = [
+            {"role": "system", "content": "", "tools": [tool("from_message")]},
+            {"role": "user", "content": "hi"},
+        ]
+        tools = [tool("from_request")]
+        # Every clock read advances 0.5 s, so the validation looks slow.
+        clock = patch(
+            "sglang.srt.entrypoints.openai.serving_chat.monotonic_time",
+            side_effect=itertools.count(step=0.5),
+        )
+        with clock, envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100):
+            for expected_checked in (2, 0):  # the second request hits the cache
+                request = ChatCompletionRequest(
+                    model="x", messages=messages, tools=tools, rid="rid-7"
+                )
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.serving_base", level="WARNING"
+                ) as logs:
+                    self.assertIsNone(self.chat._validate_request(request))
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(
+                    "tool schema validation on the event loop", logs.output[0]
+                )
+                self.assertIn(
+                    f"rid=rid-7, tools=2, schemas_checked={expected_checked}",
+                    logs.output[0],
                 )
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
