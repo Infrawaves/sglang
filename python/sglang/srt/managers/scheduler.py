@@ -940,6 +940,12 @@ class Scheduler(
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
+                if get_serving().reasoning_parser == "kimi_k3":
+                    # K3's parser also leaves reasoning when the tools channel opens.
+                    self.model_config.reasoning_tool_start_ids = self.tokenizer.encode(
+                        reasoning_parser.detector.tool_start_token,
+                        add_special_tokens=False,
+                    )
             else:
                 logger.warning(
                     "Reasoning parser think_end_token %r could not be encoded; "
