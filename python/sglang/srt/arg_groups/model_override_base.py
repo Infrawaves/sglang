@@ -259,9 +259,15 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
-    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
-        "extra_buffer",
-        "extra_buffer_lazy",
+    strategy = cfg.mamba_radix_cache_strategy
+    if strategy == "extra_buffer_lazy":
+        return cfg.disable_radix_cache is False
+    if strategy != "extra_buffer":
+        return False
+
+    return cfg.disable_radix_cache is False or (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
     )
 
 
