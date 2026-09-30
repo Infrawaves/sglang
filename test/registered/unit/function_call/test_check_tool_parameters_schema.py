@@ -37,16 +37,34 @@ def _load_validation_from_utils():
         "_JSON_SCALAR_TYPES",
         "_MAX_RUST_SCHEMA_DEPTH",
         "_TOOL_SCHEMA_VALIDATOR",
+        "_RUST_FALLBACK_WARNING_LOCK",
+        "_rust_fallback_warning_logged",
         "_is_rust_compatible_json",
+        "_warn_rust_fallback",
         "check_tool_parameters_schema",
+        "logger",
     }
     for node in tree.body:
         if isinstance(node, ast.Import):
-            if any(alias.name in {"math", "jsonschema_rs"} for alias in node.names):
+            if any(
+                alias.name in {"logging", "math", "threading", "jsonschema_rs"}
+                for alias in node.names
+            ):
                 selected.append(node)
         elif isinstance(node, ast.ImportFrom):
             if node.module in {"typing", "jsonschema", "jsonschema_specifications"}:
                 selected.append(node)
+        elif isinstance(node, ast.Try):
+            # jsonschema_rs is optional in production. Keep its guarded
+            # import/initialization so the extracted module follows the same
+            # fallback path as the application when the binding is absent.
+            if any(
+                isinstance(child, ast.Import)
+                and any(alias.name == "jsonschema_rs" for alias in child.names)
+                for child in node.body
+            ):
+                selected.append(node)
+                found.add("_TOOL_SCHEMA_VALIDATOR")
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             matched = {
@@ -82,7 +100,7 @@ class TestCheckToolParametersSchema(unittest.TestCase):
     def setUp(self):
         self.python_check = Draft202012Validator.check_schema
 
-    def assert_matches_python(self, schema):
+    def assert_matches_python(self, schema, expected_fallback=None):
         """Compare both acceptance and the public Python error details."""
         try:
             self.python_check(schema)
@@ -100,8 +118,15 @@ class TestCheckToolParametersSchema(unittest.TestCase):
                 list(actual.absolute_schema_path), list(expected.absolute_schema_path)
             )
         else:
-            self.assertIsNone(validation.check_tool_parameters_schema(schema))
+            actual = validation.check_tool_parameters_schema(schema)
+            self.assertIsInstance(actual, bool)
+            if expected_fallback is not None:
+                self.assertEqual(actual, expected_fallback)
 
+    @unittest.skipUnless(
+        validation._TOOL_SCHEMA_VALIDATOR is not None,
+        "jsonschema_rs is not installed",
+    )
     def test_valid_and_repeated_schemas_use_real_rust_without_python(self):
         schema = _schema(a={"type": "string"}, b={"type": "integer"})
         with (
@@ -116,11 +141,15 @@ class TestCheckToolParametersSchema(unittest.TestCase):
                 wraps=self.python_check,
             ) as python,
         ):
-            self.assertIsNone(validation.check_tool_parameters_schema(schema))
-            self.assertIsNone(validation.check_tool_parameters_schema(schema))
+            self.assertFalse(validation.check_tool_parameters_schema(schema))
+            self.assertFalse(validation.check_tool_parameters_schema(schema))
         self.assertEqual(rust.is_valid.call_count, 2)
         python.assert_not_called()
 
+    @unittest.skipUnless(
+        validation._TOOL_SCHEMA_VALIDATOR is not None,
+        "jsonschema_rs is not installed",
+    )
     def test_mutated_schema_is_checked_again(self):
         schema = _schema(a={"type": "string"})
         with (
@@ -177,7 +206,7 @@ class TestCheckToolParametersSchema(unittest.TestCase):
             ) as python,
         ):
             rust.is_valid.return_value = False
-            self.assertIsNone(validation.check_tool_parameters_schema(schema))
+            self.assertTrue(validation.check_tool_parameters_schema(schema))
         rust.is_valid.assert_called_once_with(schema)
         python.assert_called_once_with(schema)
 
@@ -203,6 +232,50 @@ class TestCheckToolParametersSchema(unittest.TestCase):
                     self.assert_matches_python(schema)
                     python.assert_called_once_with(schema)
 
+    def test_rust_conversion_exception_warns_once(self):
+        schema = _schema(a={"type": "string"})
+        previous = validation._rust_fallback_warning_logged
+        validation._rust_fallback_warning_logged = False
+        self.addCleanup(
+            setattr,
+            validation,
+            "_rust_fallback_warning_logged",
+            previous,
+        )
+        with (
+            mock.patch.object(validation, "_TOOL_SCHEMA_VALIDATOR") as rust,
+            mock.patch.object(
+                validation.Draft202012Validator,
+                "check_schema",
+                wraps=self.python_check,
+            ),
+            self.assertLogs(validation.logger, level="WARNING") as logs,
+        ):
+            rust.is_valid.side_effect = RuntimeError("conversion failed")
+            self.assertTrue(validation.check_tool_parameters_schema(schema))
+            self.assertTrue(validation.check_tool_parameters_schema(schema))
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertIn("falling back to Python", logs.output[0])
+
+    def test_unavailable_rust_validator_uses_python(self):
+        schema = _schema(a={"type": "string"})
+        with (
+            mock.patch.object(validation, "_TOOL_SCHEMA_VALIDATOR", None),
+            mock.patch.object(
+                validation.Draft202012Validator,
+                "check_schema",
+                wraps=self.python_check,
+            ) as python,
+        ):
+            self.assertTrue(validation.check_tool_parameters_schema(schema))
+        python.assert_called_once_with(schema)
+
+    @unittest.skipUnless(
+        validation._TOOL_SCHEMA_VALIDATOR is not None,
+        "jsonschema_rs is not installed",
+    )
     def test_newline_anchor_keeps_python_acceptance(self):
         # Python's regex "$" also matches before a trailing newline; Rust's
         # anchor check is stricter. Exercise the real false-negative fallback.

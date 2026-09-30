@@ -46,6 +46,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -1521,8 +1522,15 @@ class ServingChatTestCase(unittest.TestCase):
             "sglang.srt.entrypoints.openai.serving_chat.monotonic_time",
             side_effect=itertools.count(step=0.5),
         )
-        with clock, envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100):
-            for expected_checked in (2, 2):  # repeated schemas also use the Rust check
+        with (
+            clock,
+            envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+                return_value=False,
+            ),
+        ):
+            for expected_fallbacks in (0, 0):  # valid schemas use the Rust check
                 request = ChatCompletionRequest(
                     model="x", messages=messages, tools=tools, rid="rid-7"
                 )
@@ -1535,7 +1543,7 @@ class ServingChatTestCase(unittest.TestCase):
                     "tool schema validation on the event loop", logs.output[0]
                 )
                 self.assertIn(
-                    f"rid=rid-7, tools=2, schemas_checked={expected_checked}",
+                    f"rid=rid-7, tools=2, python_fallbacks={expected_fallbacks}",
                     logs.output[0],
                 )
 
@@ -1552,19 +1560,47 @@ class ServingChatTestCase(unittest.TestCase):
         invalid = {"type": "object", "required": uuid.uuid4().hex}  # not an array
         cyclic = {"type": "object", "properties": {}}
         cyclic["properties"]["self"] = cyclic
+        valid_fallbacks = int(check_tool_parameters_schema(valid))
 
         error, checked = self.chat._validate_tool_schemas(tools(invalid))
         self.assertIn("Tool 0 function has invalid 'parameters' schema", error)
         self.assertEqual(checked, 1)
-        self.assertEqual(self.chat._validate_tool_schemas(tools(valid)), (None, 1))
+        self.assertEqual(
+            self.chat._validate_tool_schemas(tools(valid)), (None, valid_fallbacks)
+        )
         # A successful check followed by a failed check.
         error, checked = self.chat._validate_tool_schemas(tools(valid, invalid))
         self.assertIn("Tool 1 function has invalid 'parameters' schema", error)
-        self.assertEqual(checked, 2)
+        self.assertEqual(checked, valid_fallbacks + 1)
         # The cycle stops normalization before any check runs.
         error, checked = self.chat._validate_tool_schemas(tools(cyclic))
         self.assertIn("too deeply nested or contains a cycle", error)
         self.assertEqual(checked, 0)
+
+    def test_tool_schema_validation_counts_only_python_fallbacks(self):
+        def tool(name, parameters):
+            payload = {
+                "type": "function",
+                "function": {"name": name},
+            }
+            if parameters is not None:
+                payload["function"]["parameters"] = parameters
+            return Tool.model_validate(payload)
+
+        schemas = [
+            tool("rust", {"type": "object"}),
+            tool("python", {"type": "object"}),
+            tool("none", None),
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+            side_effect=[False, True],
+        ) as check_schema:
+            error, python_fallbacks = self.chat._validate_tool_schemas(schemas)
+
+        self.assertIsNone(error)
+        self.assertEqual(python_fallbacks, 1)
+        self.assertEqual(check_schema.call_count, 2)
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""

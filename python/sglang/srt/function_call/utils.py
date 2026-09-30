@@ -1,4 +1,5 @@
 import ast
+import logging
 import math
 import threading
 import warnings
@@ -6,7 +7,6 @@ from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-import jsonschema_rs
 import orjson
 import partial_json_parser
 from jsonschema import Draft202012Validator
@@ -15,26 +15,56 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
+logger = logging.getLogger(__name__)
+
 # Compile the *meta-schema*, not each tool's parameters. Fix the draft instead
 # of using rs.meta.is_valid(), which selects a draft from the input's $schema.
 # Keep Python's format policy (including whichever format extras are installed)
 # rather than changing acceptance of regex/URI values when switching engines.
-_TOOL_SCHEMA_VALIDATOR = jsonschema_rs.Draft202012Validator(
-    Draft202012Validator.META_SCHEMA,
-    registry=jsonschema_rs.Registry(
-        [(uri, resource.contents) for uri, resource in REGISTRY.items()]
-    ),
-    validate_formats=True,
-    formats={
-        name: (
-            lambda value, name=name: Draft202012Validator.FORMAT_CHECKER.conforms(
-                value, name
+try:
+    import jsonschema_rs
+
+    _TOOL_SCHEMA_VALIDATOR = jsonschema_rs.Draft202012Validator(
+        Draft202012Validator.META_SCHEMA,
+        registry=jsonschema_rs.Registry(
+            [(uri, resource.contents) for uri, resource in REGISTRY.items()]
+        ),
+        validate_formats=True,
+        formats={
+            name: (
+                lambda value, name=name: Draft202012Validator.FORMAT_CHECKER.conforms(
+                    value, name
+                )
             )
-        )
-        for name in ("regex", "uri", "uri-reference")
-    },
-    offline=True,
-)
+            for name in ("regex", "uri", "uri-reference")
+        },
+        offline=True,
+    )
+except Exception:
+    logger.warning(
+        "jsonschema_rs unavailable or failed to initialize; using the Python validator",
+        exc_info=True,
+    )
+    _TOOL_SCHEMA_VALIDATOR = None
+
+
+_RUST_FALLBACK_WARNING_LOCK = threading.Lock()
+_rust_fallback_warning_logged = False
+
+
+def _warn_rust_fallback(exc: Exception) -> None:
+    """Log the first Rust validator failure without spamming request logs."""
+    global _rust_fallback_warning_logged
+    with _RUST_FALLBACK_WARNING_LOCK:
+        if _rust_fallback_warning_logged:
+            return
+        _rust_fallback_warning_logged = True
+    logger.warning(
+        "jsonschema_rs validation raised %s; falling back to Python validation",
+        type(exc).__name__,
+        exc_info=True,
+    )
+
 
 # Deep schemas can pass Rust but hit Python's recursion limit. Keep those on
 # the original path, along with Python-only values the binding may coerce.
@@ -58,26 +88,29 @@ def _is_rust_compatible_json(value: Any, depth: int = 0) -> bool:
     return kind in _JSON_SCALAR_TYPES
 
 
-def check_tool_parameters_schema(schema: Any) -> None:
+def check_tool_parameters_schema(schema: Any) -> bool:
     """Check tool parameters, preserving Python SchemaError messages.
 
     Valid JSON schemas use a shared Rust meta-validator without a digest/LRU.
     If Rust rejects an input (or cannot convert it), Python makes the final
     decision. In particular, a Rust rejection is not itself a request error:
     Python may accept it due to differences in regex or numeric semantics.
+
+    Returns whether the Python validator ran, so callers can report fallback
+    usage separately from the number of schemas in a request.
     """
-    try:
-        if _is_rust_compatible_json(schema) and _TOOL_SCHEMA_VALIDATOR.is_valid(schema):
-            return
-    except Exception:
-        # Rust is an optimization; Python is the compatibility authority.
-        # Includes conversion errors, UnicodeEncodeError, and future binding
-        # exception types. Do not expose Rust-side failures as HTTP 500s.
-        pass
+    if _TOOL_SCHEMA_VALIDATOR is not None:
+        if _is_rust_compatible_json(schema):
+            try:
+                if _TOOL_SCHEMA_VALIDATOR.is_valid(schema):
+                    return False
+            except Exception as exc:
+                _warn_rust_fallback(exc)
 
     # Use the exact existing implementation to preserve both acceptance and
     # the first error, its paths and str(SchemaError) in the HTTP 400 response.
     Draft202012Validator.check_schema(schema)
+    return True
 
 
 _STANDARD_JSON_SCHEMA_TYPES = {
