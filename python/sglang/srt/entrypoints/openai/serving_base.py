@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.process_request_preprocessor import ProcessRequestPreprocessor
 from sglang.srt.observability.req_time_stats import monotonic_time
@@ -22,6 +23,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_if_slow(request: Any, what: str, elapsed_s: float) -> None:
+    """WARNING when a preprocessing step that competes with the tokenizer
+    worker's event loop took at least SGLANG_LOG_SLOW_PREPROCESSING_MS: while it
+    runs, every stream served by this worker waits for its next token."""
+    threshold_ms = envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.get()
+    elapsed_ms = elapsed_s * 1000
+    if threshold_ms <= 0 or elapsed_ms < threshold_ms:
+        return
+    logger.warning(
+        "Slow request %s: %.0f ms (rid=%s, tools=%d)",
+        what,
+        elapsed_ms,
+        getattr(request, "rid", None),
+        len(getattr(request, "tools", None) or ()),
+    )
 
 
 # Base class for specific endpoint handlers
@@ -86,8 +104,13 @@ class OpenAIServingBase(ABC):
         received_time = monotonic_time()
 
         try:
-            # Validate request
+            # Validate request. Runs on the event loop.
             error_msg = self._validate_request(request)
+            _warn_if_slow(
+                request,
+                "validation on the event loop",
+                monotonic_time() - received_time,
+            )
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -150,9 +173,15 @@ class OpenAIServingBase(ABC):
             converted = await preprocessor.convert(self, request, raw_request)
             if converted is not None:
                 return converted
-        return await self.tokenizer_manager.run_in_request_preprocessor(
+        started = monotonic_time()
+        converted = await self.tokenizer_manager.run_in_request_preprocessor(
             self._convert_to_internal_request, request, raw_request
         )
+        # The thread holds the GIL for most of this, starving the event loop.
+        _warn_if_slow(
+            request, "conversion on the in-process thread", monotonic_time() - started
+        )
+        return converted
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
