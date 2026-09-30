@@ -1086,9 +1086,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                schemas_checked += check_tool_parameters_schema(
-                    tool.function.parameters
-                )
+                # Counted before the check so a full check that raises counts too.
+                schemas_checked += 1
+                if not check_tool_parameters_schema(tool.function.parameters):
+                    schemas_checked -= 1  # cache hit
             except SchemaError as e:
                 return (
                     f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
