@@ -202,6 +202,10 @@ class TestAllocationIntegration(CustomTestCase):
         receiver._connect_to_bootstrap_server = Mock(
             return_value=(sock, threading.Lock())
         )
+        # Mooncake ABORTs ride the shared cached metadata socket (non-blocking).
+        receiver._try_send_cached_abort = lambda info, frames: (
+            sock.send_multipart(frames) or True
+        )
         # A cached connection makes init() finish the handshake inline (#39).
         self.decode.connection_pool[f"{receiver.bootstrap_addr}_0_0_0"] = [
             {"rank_ip": "prefill", "rank_port": 1}

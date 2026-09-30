@@ -360,6 +360,10 @@ class DecodeRequest:
     is_rebootstrap: bool = False
     host_staged: bool = False
 
+    # Cancellation retries are independent of the quarantine warning interval.
+    _abort_retry_deadline: float = 0.0
+    _abort_retry_interval: float = 0.05
+
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -2989,6 +2993,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
+        receiver = decode_req.kv_receiver
+        if getattr(receiver.kv_mgr, "requires_transfer_drain", False):
+            # A skipped nonblocking send should not wait for a 30s warning.
+            # Once accepted, allow the normal ACK wait before retrying.
+            delay = (
+                min(max(self.deferred_kv_release_timeout, 0.05), 60.0)
+                if getattr(receiver, "abort_notified", False)
+                else 0.05
+            )
+        else:
+            delay = max(self.deferred_kv_release_timeout, 1.0)
+        decode_req._abort_retry_deadline = start_time + delay
+        decode_req._abort_retry_interval = min(delay * 2, 60.0)
         if self.enable_host_receive and decode_req.host_staged:
             # Host-capable receivers own their drain tracking.
             required_acks = 0
@@ -2996,7 +3013,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # Require an ack from every notified prefill rank (dummy-proof).
             # Snapshot now -- the receiver may be cleared by resolve time.
             # Unknown writer set (None) fails closed.
-            bootstrap_infos = getattr(decode_req.kv_receiver, "bootstrap_infos", None)
+            bootstrap_infos = getattr(receiver, "bootstrap_infos", None)
             required_acks = len(bootstrap_infos) if bootstrap_infos else None
         self._deferred_releases.append(
             (
@@ -3007,6 +3024,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 required_acks,
             )
         )
+
+    def _retry_deferred_abort(
+        self, decode_req: DecodeRequest, now: float, warning_deadline: float
+    ) -> None:
+        if now < getattr(decode_req, "_abort_retry_deadline", warning_deadline):
+            return
+        receiver = decode_req.kv_receiver
+        retry_abort = getattr(receiver, "retry_abort", None)
+        if retry_abort is None:
+            return
+        sent = retry_abort()
+        if getattr(receiver.kv_mgr, "requires_transfer_drain", False):
+            delay = getattr(decode_req, "_abort_retry_interval", 0.05)
+            if sent is not False:
+                # Accepted by ZMQ is not a drain ACK. Keep holding the buffers.
+                delay = max(
+                    delay, min(max(self.deferred_kv_release_timeout, 0.05), 60.0)
+                )
+            delay = min(delay, 60.0)
+            decode_req._abort_retry_interval = min(delay * 2, 60.0)
+        else:
+            delay = max(self.deferred_kv_release_timeout, 1.0)
+        decode_req._abort_retry_deadline = time.monotonic() + delay
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
         room = decode_req.req.bootstrap_room
@@ -3128,17 +3168,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             try:
                 ready = self._local_deferred_release_ready(decode_req, required_acks)
-                if not ready and now >= deadline:
-                    logger.warning(
-                        "Deferred KV release for room %s still lacks a complete "
-                        "transfer drain after %ss; keeping its buffers quarantined.",
-                        room,
-                        self.deferred_kv_release_timeout,
-                    )
-                    retry_abort = getattr(decode_req.kv_receiver, "retry_abort", None)
-                    if retry_abort is not None:
-                        retry_abort()
-                    deadline = now + max(self.deferred_kv_release_timeout, 1.0)
+                if not ready:
+                    self._retry_deferred_abort(decode_req, now, deadline)
+                    if now >= deadline:
+                        logger.warning(
+                            "Deferred KV release for room %s still lacks a complete "
+                            "transfer drain after %ss; keeping its buffers quarantined "
+                            "and retrying ABORT with backoff.",
+                            room,
+                            self.deferred_kv_release_timeout,
+                        )
+                        deadline = time.monotonic() + max(
+                            self.deferred_kv_release_timeout, 1.0
+                        )
                 readiness.append(int(ready))
             except Exception:
                 logger.exception("Failed to check deferred release for room %s", room)

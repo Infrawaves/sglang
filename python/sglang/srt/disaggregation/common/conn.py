@@ -2960,8 +2960,7 @@ class CommonKVReceiver(BaseKVReceiver):
             and self.bootstrap_infos is not None
         ):
             # Preserve the recorded root cause; this is cleanup, not a new abort.
-            if self._send_abort_notification():
-                self.abort_notified = True
+            self.ensure_abort_notified()
         # Deferred-abort ACK state is dropped by the decode release path
         # (_do_release), so a newer owner's armed generation is never cleared.
         self.kv_mgr.release_receiver_room(
@@ -2979,33 +2978,37 @@ class CommonKVReceiver(BaseKVReceiver):
         self._abort_room("Aborted by AbortReq.", invalidate=False)
         self.conclude_state = KVPoll.Failed
 
-    def retry_abort(self):
-        """Retry the same cancellation; never reset an already received ACK."""
-        if self.bootstrap_infos is None:
-            return
-        if self._send_abort_notification(force_arm=True):
-            self.abort_notified = True
-
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
         """Notify once without overwriting the request's recorded failure."""
-        if not self.abort_notified and self.bootstrap_infos is not None:
-            if self._send_abort_notification(force_arm=force_arm):
-                self.abort_notified = True
+        if not self.abort_notified:
+            self.retry_abort(force_arm=force_arm)
 
-    def _send_abort_notification(self, *, force_arm: bool = False):
-        infos = list(self.bootstrap_infos)
-        # Once metadata is published (init_time set) prefill may already be
-        # writing; arm the drain-ack tracker BEFORE the ABORT goes out, so an
-        # ack racing back -- or fanned out by a peer rank's earlier abort of
-        # the same room -- is counted instead of dropped. Prealloc-queue
-        # receivers (init_time None) never enter the deferred-release flow
-        # that would clean the tracker up, so they stay unarmed -- except on a
-        # partial publish, where init_time is still None but earlier ranks
-        # already hold destinations; those callers defer and pass force_arm.
-        with self.kv_mgr.connection_lock:
+    def retry_abort(self, *, force_arm: bool = True) -> bool:
+        """Retry cancellation, returning whether every target accepted this attempt.
+
+        Acceptance is local ZMQ queueing, not a drain ACK. A failed attempt must
+        retain the ACK state and destination buffers for a later retry.
+        """
+        infos = self.bootstrap_infos
+        if infos is None:
+            return False
+        if not self.kv_mgr.connection_lock.acquire(
+            blocking=not self.kv_mgr.requires_transfer_drain
+        ):
+            return False
+        try:
             # An ABORT for a reused room would cancel the new request's transfer.
             if not self._owns_room_locked():
                 return False
+            # Fence this attempt against an eviction that races its send. A
+            # later retry captures the new epoch instead of staying suppressed.
+            expected_epoch = (
+                self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+                if self.kv_mgr.requires_transfer_drain
+                else None
+            )
+            # Arm before sending. Legacy prealloc cancellation has no held
+            # buffers; partial publication callers explicitly force arming.
             if self.kv_mgr.enable_deferred_decode_kv_release and (
                 force_arm
                 or self.init_time is not None
@@ -3019,13 +3022,110 @@ class CommonKVReceiver(BaseKVReceiver):
                     self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                         self.bootstrap_room
                     )
-            notification = AbortNotification(
+            frames = AbortNotification(
                 room=self.bootstrap_room,
                 decode_ip=self.kv_mgr.local_ip,
                 decode_port=self.kv_mgr.rank_port,
                 generation=self._abort_generation,
             ).to_zmq()
-        for bootstrap_info in infos:
+        finally:
+            self.kv_mgr.connection_lock.release()
+        accepted = self._send_abort_notification(
+            infos, frames, expected_epoch=expected_epoch
+        )
+        if accepted:
+            self.abort_notified = True
+        return accepted
+
+    @classmethod
+    def _try_send_cached_abort(cls, bootstrap_info: Dict, frames: List[bytes]) -> bool:
+        """Try ABORT on the shared metadata channel without waiting for a peer.
+
+        Recreate a missing cached socket, as the original ABORT path did:
+        heartbeat eviction does not prove the original writer is gone. Future
+        metadata shares this connection and its FIFO ordering. This does not
+        establish ordering across connections or fence a restarted writer.
+        """
+        address = NetworkAddress(
+            bootstrap_info["rank_ip"], int(bootstrap_info["rank_port"])
+        )
+        endpoint = address.to_tcp()
+        if not cls._global_lock.acquire(blocking=False):
+            return False
+        try:
+            sock = cls._socket_cache.get(endpoint)
+            lock = cls._socket_locks.get(endpoint)
+            if sock is None:
+                try:
+                    sock = cls._ctx.socket(zmq.PUSH)
+                    if address.is_ipv6:
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Match the bounded libzmq default used by metadata sockets.
+                    sock.setsockopt(zmq.SNDHWM, 1000)
+                    sock.setsockopt(
+                        zmq.SNDTIMEO,
+                        envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                    )
+                    # libzmq starts the connection asynchronously; do not poll
+                    # for a handshake or call the blocking _connect helper.
+                    sock.connect(endpoint)
+                except Exception:
+                    if sock is not None:
+                        try:
+                            sock.close(linger=0)
+                        except zmq.ZMQError:
+                            pass
+                    return False
+                lock = threading.Lock()
+                # Publish only a fully configured socket and its matching lock.
+                cls._socket_cache[endpoint] = sock
+                cls._socket_locks[endpoint] = lock
+            if lock is None or not lock.acquire(blocking=False):
+                return False
+        finally:
+            cls._global_lock.release()
+        try:
+            sock.send_multipart(frames, flags=zmq.DONTWAIT)
+            return True
+        except zmq.ZMQError:
+            return False
+        finally:
+            lock.release()
+
+    def _send_abort_notification(
+        self,
+        bootstrap_infos: List[Dict],
+        frames: List[bytes],
+        *,
+        expected_epoch: Optional[int] = None,
+    ) -> bool:
+        if self.kv_mgr.requires_transfer_drain:
+            all_sent = True
+            for bootstrap_info in bootstrap_infos:
+                # Validate atomically with the nonblocking send. The manager
+                # lock is never held while waiting on another lock or the peer.
+                if not self.kv_mgr.connection_lock.acquire(blocking=False):
+                    return False
+                try:
+                    if (
+                        not self._owns_room_locked()
+                        or expected_epoch
+                        != self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+                    ):
+                        return False
+                    # These local fences cannot retract an already queued ABORT.
+                    # The frame's generation makes prefill ACK only this
+                    # receiver's attempt, so a late one cannot release a reuse.
+                    sent = self._try_send_cached_abort(bootstrap_info, frames)
+                finally:
+                    self.kv_mgr.connection_lock.release()
+                all_sent = sent and all_sent
+            return all_sent
+
+        # Other backends do not always retain aborted buffers and schedule
+        # retries. Keep their existing delivery behavior on the same channel.
+        for bootstrap_info in bootstrap_infos:
             with self.kv_mgr.connection_lock:
                 if not self._owns_room_locked():
                     return False
@@ -3033,7 +3133,7 @@ class CommonKVReceiver(BaseKVReceiver):
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(notification)
+                    sock.send_multipart(frames)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"

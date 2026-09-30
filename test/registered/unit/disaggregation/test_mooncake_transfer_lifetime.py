@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+import zmq
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common import conn as common_mod
@@ -440,7 +441,8 @@ class TestMooncakeTransferLifetime(CustomTestCase):
         def connect(info):
             rank = info["rank_port"] - 8000
 
-            def send(parts):
+            def send(parts, *, flags):
+                self.assertEqual(flags, zmq.DONTWAIT)
                 sends.append(parts)
                 state = mgr._deferred_abort_ack_tracker[7]
                 self.assertEqual(state.generation, receiver._abort_generation)
@@ -450,13 +452,25 @@ class TestMooncakeTransferLifetime(CustomTestCase):
             return SimpleNamespace(send_multipart=send), threading.Lock()
 
         receiver._connect_to_bootstrap_server = connect
-        receiver.abort()
-        self.assertTrue(mgr.is_abort_release_safe(7, 2))
-        generation = receiver._abort_generation
-        # A retried cancellation re-sends the armed generation and keeps ACKs.
-        receiver.abort()
-        self.assertTrue(mgr.is_abort_release_safe(7, 2))
-        self.assertEqual(receiver._abort_generation, generation)
+        # Pre-existing metadata sockets must carry ABORT as well, preserving
+        # FIFO ordering without reconnecting or waiting for writable capacity.
+        socket_cache = {}
+        socket_locks = {}
+        for info in receiver.bootstrap_infos:
+            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            socket_cache[endpoint], socket_locks[endpoint] = connect(info)
+        with (
+            patch.object(common_mod.CommonKVReceiver, "_socket_cache", socket_cache),
+            patch.object(common_mod.CommonKVReceiver, "_socket_locks", socket_locks),
+            patch.object(common_mod.CommonKVReceiver, "_global_lock", threading.Lock()),
+        ):
+            receiver.abort()
+            self.assertTrue(mgr.is_abort_release_safe(7, 2))
+            generation = receiver._abort_generation
+            # A retried cancellation re-sends the armed generation and keeps ACKs.
+            receiver.abort()
+            self.assertTrue(mgr.is_abort_release_safe(7, 2))
+            self.assertEqual(receiver._abort_generation, generation)
         self.assertEqual(len(sends), 4)
         self.assertTrue(all(parts[4] == str(generation).encode() for parts in sends))
 
