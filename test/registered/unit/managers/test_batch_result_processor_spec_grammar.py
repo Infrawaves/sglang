@@ -70,7 +70,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(think_end_ids=None, reasoning_tool_start_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
@@ -232,6 +232,25 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertEqual(req.reasoning_tokens, 2)
         self.assertTrue(req._is_reasoning_over)
+
+    def test_disagg_handoff_can_start_tools_boundary(self):
+        """A tools opener split across PD handoff must enable stops in the tool turn."""
+        req = _make_req(terminate_after=99)
+        req.require_reasoning = True
+        req.sampling_params.stop_token_ids = {19}
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [7, 8]
+        processor.model_config.reasoning_tool_start_ids = [17, 18]
+
+        _commit_disagg_handoff(req, processor, 17)
+        req.update_finish_state()
+        self.assertFalse(req.finished())
+        for token in (18, 19):
+            req.output_ids.append(token)
+            processor._maybe_update_reasoning_tokens(req, token)
+            req.update_finish_state()
+            self.assertEqual(req.finished(), token == 19)
+        self.assertEqual(req.finished_reason.to_json(), {"type": "stop", "matched": 19})
 
     def test_disagg_rebootstrap_does_not_recount_boundary(self):
         req = _make_req(terminate_after=99)

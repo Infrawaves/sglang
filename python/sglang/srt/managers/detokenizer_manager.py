@@ -414,7 +414,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 recv_obj.finished_reasons[i].get("matched"), str
             ):
                 # Scheduler read_offsets retain the prompt context length;
-                # reasoning_tokens includes the complete thinking terminator.
+                # reasoning_tokens includes the complete reasoning boundary marker.
                 prompt_len = recv_obj.read_offsets[i]
                 prefix_ids = [
                     s.decode_ids[:prompt_len],
