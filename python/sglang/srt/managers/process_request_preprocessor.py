@@ -565,6 +565,12 @@ class ProcessRequestPreprocessor:
         """
         pool = self._pool
         if pool is None or not self.accepts(handler):
+            if pool is not None and type(handler) in self._handler_classes:
+                self._warn_once(
+                    "not-ready",
+                    "Request preprocessor processes are not ready yet; converting "
+                    "on the in-process thread until they are.",
+                )
             return None
         try:
             headers = snapshot_headers(raw_request)
