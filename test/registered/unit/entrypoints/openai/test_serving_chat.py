@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -1559,6 +1560,33 @@ class ServingChatTestCase(CustomTestCase):
                     f"rid=rid-7, tools=2, schemas_checked={expected_checked}",
                     logs.output[0],
                 )
+
+    def test_tool_schema_validation_counts_failed_full_checks(self):
+        def tools(*parameters):
+            return [
+                Tool.model_validate(
+                    {"type": "function", "function": {"name": f"t{i}", "parameters": p}}
+                )
+                for i, p in enumerate(parameters)
+            ]
+
+        valid = {"type": "object", "properties": {uuid.uuid4().hex: {}}}
+        invalid = {"type": "object", "required": uuid.uuid4().hex}  # not an array
+        cyclic = {"type": "object", "properties": {}}
+        cyclic["properties"]["self"] = cyclic
+
+        error, checked = self.chat._validate_tool_schemas(tools(invalid))
+        self.assertIn("Tool 0 function has invalid 'parameters' schema", error)
+        self.assertEqual(checked, 1)
+        self.assertEqual(self.chat._validate_tool_schemas(tools(valid)), (None, 1))
+        # Cache hit, then a failed full check.
+        error, checked = self.chat._validate_tool_schemas(tools(valid, invalid))
+        self.assertIn("Tool 1 function has invalid 'parameters' schema", error)
+        self.assertEqual(checked, 1)
+        # The cycle stops normalization before any check runs.
+        error, checked = self.chat._validate_tool_schemas(tools(cyclic))
+        self.assertIn("too deeply nested or contains a cycle", error)
+        self.assertEqual(checked, 0)
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
