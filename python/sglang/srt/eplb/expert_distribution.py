@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
+import threading
 import time
 from abc import ABC
 from collections import deque
@@ -137,7 +139,12 @@ class ExpertDistributionRecorder(ABC):
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(
+        self,
+        output_mode: _OutputMode = "file",
+        *,
+        aggregate_steps_for_rebalance: bool = False,
+    ):
         self._on_not_implemented()
 
     @property
@@ -289,9 +296,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         self._recording = False
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(
+        self,
+        output_mode: _OutputMode = "file",
+        *,
+        aggregate_steps_for_rebalance: bool = False,
+    ):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(output_mode=output_mode)
+        output = self._accumulator.dump(
+            output_mode=output_mode,
+            aggregate_steps_for_rebalance=aggregate_steps_for_rebalance,
+        )
         self._reset()
         return output
 
@@ -697,7 +712,12 @@ class _Accumulator(ABC):
     def reset(self):
         pass
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        *,
+        aggregate_steps_for_rebalance: bool = False,
+    ):
         pass
 
 
@@ -720,6 +740,16 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 self._expert_location_metadata.ep_size
             )
             self._metric_heatmap_collection_counter = 0
+            self._metric_heatmap_interval = get_int_env_var(
+                "SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0
+            )
+            # Histogram child creation performs label lookup and allocates a
+            # child object.  Do it once per layer instead of once per sample.
+            self._metric_heatmap_children = None
+            self._metric_heatmap_free_buffers = None
+            self._metric_heatmap_pending = None
+            self._metric_heatmap_copy_stream = None
+            self._metric_heatmap_worker = None
 
     def append(
         self,
@@ -781,28 +811,108 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
-        # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
-        interval = get_int_env_var("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
+        # sglang:eplb_gpu_physical_count metric is disabled if
+        # SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0.  The old code read
+        # every CUDA scalar in the nested layer/rank loop.  Each read can
+        # synchronize the scheduler with the GPU, turning a tiny metric into
+        # a latency fence.  Copy the complete (small) matrix once and only
+        # then iterate over ordinary Python integers.
+        interval = self._metric_heatmap_interval
         if interval > 0 and self._metric_heatmap_collection_counter % interval == 0:
-            for layer_idx in range(self._expert_location_metadata.num_layers):
-                count_of_layer = (
-                    self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
-                        layer=str(layer_idx)
+            self._ensure_metric_heatmap_children()
+            if gpu_physical_count.is_cuda:
+                self._submit_async_heatmap_copy(gpu_physical_count)
+            else:
+                self._emit_metric_heatmap(gpu_physical_count.detach().to("cpu"))
+        self._metric_heatmap_collection_counter += 1
+
+    def _ensure_metric_heatmap_children(self):
+        if self._metric_heatmap_children is not None:
+            return
+        histogram = self._expert_dispatch_collector.eplb_gpu_physical_count
+        self._metric_heatmap_children = [
+            histogram.labels(layer=str(layer_idx))
+            for layer_idx in range(self._expert_location_metadata.num_layers)
+        ]
+
+    def _submit_async_heatmap_copy(self, gpu_physical_count: torch.Tensor):
+        """Copy a sampled heatmap without making the forward stream wait.
+
+        The previous implementation converted CUDA scalars in the scheduler
+        thread.  A dedicated copy stream and daemon worker move the tiny
+        matrix and update Prometheus away from the request critical path.  If
+        both bounded slots are busy, dropping one sample is preferable to
+        blocking inference; the metric is cumulative and the next sample
+        still reports the current distribution.
+        """
+        if self._metric_heatmap_free_buffers is None:
+            shape = (
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.ep_size,
+            )
+            self._metric_heatmap_free_buffers = queue.Queue(maxsize=2)
+            self._metric_heatmap_pending = queue.Queue(maxsize=2)
+            for _ in range(2):
+                self._metric_heatmap_free_buffers.put(
+                    torch.empty(
+                        shape,
+                        dtype=gpu_physical_count.dtype,
+                        device="cpu",
+                        pin_memory=True,
                     )
                 )
-                # Exclude the +Inf bucket.
-                assert (
-                    self._expert_location_metadata.ep_size
-                    == len(count_of_layer._buckets) - 1
-                ), (
-                    f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
-                )
-                for gpu_rank in range(self._expert_location_metadata.ep_size):
-                    count = gpu_physical_count[layer_idx, gpu_rank]
-                    if count > 0:
-                        count_of_layer._sum.inc(count * gpu_rank)
-                        count_of_layer._buckets[gpu_rank].inc(count)
-        self._metric_heatmap_collection_counter += 1
+            self._metric_heatmap_copy_stream = torch.cuda.Stream(
+                device=gpu_physical_count.device
+            )
+            self._metric_heatmap_worker = threading.Thread(
+                target=self._metric_heatmap_worker_loop,
+                name="sglang-eplb-heatmap",
+                daemon=True,
+            )
+            self._metric_heatmap_worker.start()
+
+        try:
+            cpu_buffer = self._metric_heatmap_free_buffers.get_nowait()
+        except queue.Empty:
+            return
+
+        current_stream = torch.cuda.current_stream(device=gpu_physical_count.device)
+        self._metric_heatmap_copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._metric_heatmap_copy_stream):
+            cpu_buffer.copy_(gpu_physical_count, non_blocking=True)
+            copy_done = torch.cuda.Event()
+            copy_done.record(self._metric_heatmap_copy_stream)
+        try:
+            self._metric_heatmap_pending.put_nowait((copy_done, cpu_buffer))
+        except queue.Full:
+            self._metric_heatmap_free_buffers.put_nowait(cpu_buffer)
+
+    def _metric_heatmap_worker_loop(self):
+        while True:
+            copy_done, cpu_buffer = self._metric_heatmap_pending.get()
+            try:
+                copy_done.synchronize()
+                self._emit_metric_heatmap(cpu_buffer)
+            except Exception:
+                logger.exception("Failed to emit asynchronous EPLB heatmap sample")
+            finally:
+                self._metric_heatmap_free_buffers.put(cpu_buffer)
+
+    def _emit_metric_heatmap(self, gpu_physical_count_cpu: torch.Tensor):
+        rows = gpu_physical_count_cpu.tolist()
+        for layer_idx in range(self._expert_location_metadata.num_layers):
+            count_of_layer = self._metric_heatmap_children[layer_idx]
+            # Exclude the +Inf bucket.
+            assert (
+                self._expert_location_metadata.ep_size
+                == len(count_of_layer._buckets) - 1
+            ), (
+                f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+            )
+            for gpu_rank, count in enumerate(rows[layer_idx]):
+                if count:
+                    count_of_layer._sum.inc(count * gpu_rank)
+                    count_of_layer._buckets[gpu_rank].inc(count)
 
 
 class _DequeCollection:
@@ -863,7 +973,12 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        *,
+        aggregate_steps_for_rebalance: bool = False,
+    ):
         assert output_mode == "file"
         output = dict(
             records=self._records,
@@ -907,9 +1022,22 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        *,
+        aggregate_steps_for_rebalance: bool = False,
+    ):
+        global_physical_count = self._global_physical_count_of_buffered_step.get_all()
+        if aggregate_steps_for_rebalance:
+            # The default DeepSeek/EPLB solver immediately sums the recorder
+            # window over time.  Summing in physical-expert space first avoids
+            # allocating and all-reducing the full [steps, layers, experts]
+            # logical tensor (hundreds of MB for K3).
+            global_physical_count = global_physical_count.sum(dim=0, keepdim=True)
+
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            global_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,

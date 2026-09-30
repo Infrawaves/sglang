@@ -319,6 +319,12 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
+        # Update only the rows whose weights are being moved.  The previous
+        # masked ``where`` constructed a full [layers, experts, experts]
+        # temporary for every field, even when layers_per_chunk=1.  Keeping
+        # the tensors and their data pointers stable is important for CUDA
+        # graph dispatch, while row-wise copies preserve that contract.
+        update_layer_ids = list(update_layer_ids)
         for field in [
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
@@ -331,12 +337,8 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
-                mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
-                )
-                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
-                self_field[...] = torch.where(mask_update, other_field, self_field)
+                for layer_id in update_layer_ids:
+                    self_field[layer_id].copy_(other_field[layer_id])
 
     # -------------------------------- usage ------------------------------------
 
@@ -634,6 +636,16 @@ def compute_logical_to_rank_dispatch_physical_map(
     )
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
+
+    # With no redundant experts (the common K3 setup), each logical expert has
+    # exactly one physical slot.  The general Python placement loop produces
+    # the same value for every rank, but scans layers*experts*ranks and builds
+    # maps for ranks that this process never uses.  Preserve the exact mapping
+    # and avoid that initialization/rebalance cost.
+    if logical_to_all_physical_map.shape[-1] == 1 and torch.all(
+        logical_to_all_physical_map >= 0
+    ):
+        return logical_to_all_physical_map[..., 0].to(device)
 
     result_list = [
         [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)

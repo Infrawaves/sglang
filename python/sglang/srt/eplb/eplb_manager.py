@@ -11,8 +11,10 @@ from torch import nn
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm, compute_algorithm
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     format_expert_location_layout,
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
@@ -123,7 +125,8 @@ class EPLBManager:
             time_start = time.time()
 
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
+            output_mode="object",
+            aggregate_steps_for_rebalance=self._aggregate_steps_for_rebalance(),
         )
         logical_count = dump_record_output["logical_count"]
         average_utilization_rate_over_window = dump_record_output[
@@ -186,6 +189,28 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def _aggregate_steps_for_rebalance(self) -> bool:
+        """Whether the selected solver consumes only a time aggregate.
+
+        Vector EPLB intentionally needs the per-step tensor.  The scalar
+        DeepSeek and elasticity-aware solvers only call ``sum(dim=0)``; let
+        the recorder perform that reduction before the expensive logical-map
+        expansion and distributed all-reduce.
+        """
+        metadata = ModelConfigForExpertLocation.from_model_config(self._model_config)
+        num_groups = metadata.num_groups if metadata is not None else None
+        algorithm = compute_algorithm(
+            raw_algorithm=get_exec().moe.eplb_algorithm,
+            num_groups=num_groups,
+            num_nodes=get_parallel().nnodes,
+        )
+        return algorithm in {
+            EplbAlgorithm.deepseek,
+            EplbAlgorithm.deepseek_hierarchical,
+            EplbAlgorithm.elasticity_aware,
+            EplbAlgorithm.elasticity_aware_hierarchical,
+        }
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool
