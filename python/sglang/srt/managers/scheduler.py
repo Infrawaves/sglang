@@ -5329,6 +5329,14 @@ class Scheduler(
                     else:
                         remaining_demoted.append(entry)
                 self.disagg_decode_prealloc_queue.demotion_queue = remaining_demoted
+                resume_failure_cnt = getattr(
+                    self.disagg_decode_prealloc_queue, "resume_failure_cnt", {}
+                )
+                self.disagg_decode_prealloc_queue.resume_failure_cnt = {
+                    entry.req.rid: resume_failure_cnt[entry.req.rid]
+                    for entry in remaining_demoted
+                    if entry.req.rid in resume_failure_cnt
+                }
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

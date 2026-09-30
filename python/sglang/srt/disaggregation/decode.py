@@ -392,6 +392,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.demotion_queue: List[DemotedRequest] = []
+        self.resume_failure_cnt: Dict[str, int] = {}
         self.demoted_tokens_total = 0
         self.pending_reqs: List[DecodeRequest] = []
         # In-flight authoritative room -> DP-rank lookups, consumed below.
@@ -827,6 +828,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
         self.demotion_queue.clear()
+        if hasattr(self, "resume_failure_cnt"):
+            self.resume_failure_cnt.clear()
         self.demoted_tokens_total = 0
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -914,6 +917,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> None:
         req.is_demoted = True
         req.last_demote_output_len = len(req.output_ids)
+        if not hasattr(self, "resume_failure_cnt"):
+            self.resume_failure_cnt = {}
+        self.resume_failure_cnt[req.rid] = 0
         demoted_tokens = req.seqlen
         if get_disagg().disaggregation_decode_retraction_backup != "ssd":
             self.scheduler.remain_cpu_demote_tokens -= demoted_tokens
@@ -948,11 +954,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
     def resume_demote_reqs(self, expired_indices: List[int]) -> List[Req]:
+        if not hasattr(self, "resume_failure_cnt"):
+            self.resume_failure_cnt = {}
         if not expired_indices:
             return []
 
         resumed_reqs: List[Req] = []
         indices_to_remove = set()
+        retry_indices = set()
+        original_queue = self.demotion_queue
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         if uses_swa_tail_prealloc:
             full_allocatable_tokens, swa_allocatable_tokens = (
@@ -966,6 +976,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for i in expired_indices:
             entry = self.demotion_queue[i]
             req = entry.req
+            rid = getattr(req, "rid", None)
             if (
                 get_disagg().disaggregation_decode_retraction_backup == "ssd"
                 and not self.tree_cache.retraction_restore_admissible(req)
@@ -995,9 +1006,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             # Need to free allocated L1 cache when restore fails.
             if not restored:
+                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
+                    metrics_reporter = getattr(self.scheduler, "metrics_reporter", None)
+                    if (
+                        metrics_reporter is not None
+                        and metrics_reporter.is_stats_logging_rank
+                        and metrics_reporter.enable_metrics
+                    ):
+                        metrics_reporter.metrics_collector.increment_demotion_resume_failures(
+                            1
+                        )
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+                failure_cnt = (
+                    self.resume_failure_cnt.get(rid, 0) + 1 if rid is not None else 0
+                )
+                if failure_cnt >= 3:
+                    if rid is not None:
+                        self.resume_failure_cnt.pop(rid, None)
+                    retraction_discard(req, self.tree_cache, "ssd")
+                    self.demoted_tokens_total -= entry.demoted_tokens
+                    indices_to_remove.add(i)
+                    from sglang.srt.managers.scheduler import _make_abort_req
+
+                    # Directly abort demoted request since it cannot be resumed
+                    self.scheduler.ipc_channels.send_to_tokenizer.send_output(
+                        _make_abort_req(req), req
+                    )
+                else:
+                    if rid is not None:
+                        self.resume_failure_cnt[rid] = failure_cnt
+                    entry.demoted_start_time = time.monotonic()
+                    retry_indices.add(i)
                 continue
             req.is_demoted = False
+            if rid is not None:
+                self.resume_failure_cnt.pop(rid, None)
             if get_disagg().disaggregation_decode_retraction_backup != "ssd":
                 self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
@@ -1014,11 +1057,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
+        retry_entries = [
+            entry for i, entry in enumerate(original_queue) if i in retry_indices
+        ]
         self.demotion_queue = [
             entry
-            for i, entry in enumerate(self.demotion_queue)
-            if i not in indices_to_remove
-        ]
+            for i, entry in enumerate(original_queue)
+            if i not in indices_to_remove and i not in retry_indices
+        ] + retry_entries
         return resumed_reqs
 
     def _update_handshake_waiters(
