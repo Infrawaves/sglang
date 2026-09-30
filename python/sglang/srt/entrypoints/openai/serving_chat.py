@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -73,7 +73,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    warn_if_slow_preprocessing,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -99,6 +102,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -1110,24 +1114,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if len(names) != len(set(names)):
                 return "Tool names must be unique across request and message tools."
 
-        # Validate tool definitions
-        for i, tool in enumerate(effective_tools):
-            if tool.function.parameters is None:
-                continue
-            try:
-                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
-                # to standard JSON Schema types before validation. RecursionError
-                # guards against hand-crafted cyclic schemas so the request gets
-                # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                check_tool_parameters_schema(tool.function.parameters)
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-            except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
-                )
+        # Validate tool definitions. This runs on the event loop of every entry
+        # point that validates chat requests (chat, Anthropic, tokenize).
+        started = monotonic_time()
+        error_msg, schemas_checked = self._validate_tool_schemas(effective_tools)
+        warn_if_slow_preprocessing(
+            "tool schema validation on the event loop",
+            monotonic_time() - started,
+            request,
+            tools=len(effective_tools),
+            schemas_checked=schemas_checked,
+        )
+        if error_msg:
+            return error_msg
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1147,6 +1146,36 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    @staticmethod
+    def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
+        """The error for the first invalid ``parameters`` schema, if any, and how
+        many schemas needed a full check (the others were cached as valid)."""
+        schemas_checked = 0
+        for i, tool in enumerate(tools):
+            if tool.function.parameters is None:
+                continue
+            try:
+                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
+                # to standard JSON Schema types before validation. RecursionError
+                # guards against hand-crafted cyclic schemas so the request gets
+                # a 400 instead of crashing into a 500.
+                normalize_json_schema_types(tool.function.parameters)
+                schemas_checked += check_tool_parameters_schema(
+                    tool.function.parameters
+                )
+            except SchemaError as e:
+                return (
+                    f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
+                    schemas_checked,
+                )
+            except RecursionError:
+                return (
+                    f"Tool {i} function 'parameters' schema is too deeply nested "
+                    "or contains a cycle.",
+                    schemas_checked,
+                )
+        return None, schemas_checked
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         if self.tokenizer_manager.model_config.is_multimodal:

@@ -31,16 +31,20 @@ class TestCheckToolParametersSchema(CustomTestCase):
         self.addCleanup(utils._valid_tool_schemas.clear)
 
     def test_valid_schema_is_checked_once(self):
-        check_tool_parameters_schema(
-            _schema(a={"type": "string"}, b={"type": "integer"})
+        self.assertTrue(
+            check_tool_parameters_schema(
+                _schema(a={"type": "string"}, b={"type": "integer"})
+            )
         )
         # Equal content, different key order and object identity.
-        check_tool_parameters_schema(
-            {
-                "required": ["a", "b"],
-                "properties": {"b": {"type": "integer"}, "a": {"type": "string"}},
-                "type": "object",
-            }
+        self.assertFalse(
+            check_tool_parameters_schema(
+                {
+                    "required": ["a", "b"],
+                    "properties": {"b": {"type": "integer"}, "a": {"type": "string"}},
+                    "type": "object",
+                }
+            )
         )
         self.assertEqual(self.check.call_count, 1)
 
@@ -64,10 +68,23 @@ class TestCheckToolParametersSchema(CustomTestCase):
 
     def test_non_json_schema_is_checked_without_caching(self):
         schema = {"type": "object", "default": {1, 2}}  # a set: not JSON data
-        check_tool_parameters_schema(schema)
-        check_tool_parameters_schema(schema)
+        self.assertTrue(check_tool_parameters_schema(schema))
+        self.assertTrue(check_tool_parameters_schema(schema))
         self.assertEqual(self.check.call_count, 2)
         self.assertEqual(len(utils._valid_tool_schemas), 0)
+
+    def test_python_only_types_do_not_hit_json_equivalent_entries(self):
+        # json.dumps renders these like their JSON counterparts, so they must
+        # not share cache entries: the metaschema rejects a tuple where it
+        # expects an array, and a non-string key is not JSON at all.
+        check_tool_parameters_schema({"type": "object", "required": ["x"]})
+        with self.assertRaises(SchemaError):
+            check_tool_parameters_schema({"type": "object", "required": ("x",)})
+        check_tool_parameters_schema({"type": "object", "properties": {"1": {}}})
+        self.assertTrue(
+            check_tool_parameters_schema({"type": "object", "properties": {1: {}}})
+        )
+        self.assertEqual(len(utils._valid_tool_schemas), 2)
 
     def test_cyclic_schema_still_raises_recursion_error(self):
         schema = {"type": "object", "properties": {}}

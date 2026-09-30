@@ -1328,7 +1328,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_SLOW_PREPROCESSING_MS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log a warning when OpenAI request validation (on the tokenizer worker's event loop) or request conversion on the in-process preprocessing thread takes at least this many milliseconds; either delays the next token of every stream served by that worker. <code>0</code> or less disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log a warning when chat tool schema validation (on the tokenizer worker's event loop) or request conversion on the in-process preprocessing thread (queueing excluded) takes at least this many milliseconds; either delays the next token of every stream served by that worker. <code>0</code> or less disables.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>200</code></td>
     </tr>
     <tr>

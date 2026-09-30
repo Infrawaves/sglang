@@ -25,7 +25,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _warn_if_slow(request: Any, what: str, elapsed_s: float) -> None:
+def warn_if_slow_preprocessing(
+    what: str, elapsed_s: float, request: Any, **details: Any
+) -> None:
     """WARNING when a preprocessing step that competes with the tokenizer
     worker's event loop took at least SGLANG_LOG_SLOW_PREPROCESSING_MS: while it
     runs, every stream served by this worker waits for its next token."""
@@ -34,11 +36,11 @@ def _warn_if_slow(request: Any, what: str, elapsed_s: float) -> None:
     if threshold_ms <= 0 or elapsed_ms < threshold_ms:
         return
     logger.warning(
-        "Slow request %s: %.0f ms (rid=%s, tools=%d)",
+        "Slow request %s: %.0f ms (rid=%s%s)",
         what,
         elapsed_ms,
         getattr(request, "rid", None),
-        len(getattr(request, "tools", None) or ()),
+        "".join(f", {name}={value}" for name, value in details.items()),
     )
 
 
@@ -104,13 +106,8 @@ class OpenAIServingBase(ABC):
         received_time = monotonic_time()
 
         try:
-            # Validate request. Runs on the event loop.
+            # Validate request
             error_msg = self._validate_request(request)
-            _warn_if_slow(
-                request,
-                "validation on the event loop",
-                monotonic_time() - received_time,
-            )
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -173,13 +170,20 @@ class OpenAIServingBase(ABC):
             converted = await preprocessor.convert(self, request, raw_request)
             if converted is not None:
                 return converted
-        started = monotonic_time()
-        converted = await self.tokenizer_manager.run_in_request_preprocessor(
-            self._convert_to_internal_request, request, raw_request
+
+        def convert_timed():
+            # Timed inside the thread so that queueing behind other requests'
+            # conversions is not counted; while this runs it holds the GIL for
+            # most of the time, starving the event loop.
+            started = monotonic_time()
+            converted = self._convert_to_internal_request(request, raw_request)
+            return converted, monotonic_time() - started
+
+        converted, elapsed_s = await self.tokenizer_manager.run_in_request_preprocessor(
+            convert_timed
         )
-        # The thread holds the GIL for most of this, starving the event loop.
-        _warn_if_slow(
-            request, "conversion on the in-process thread", monotonic_time() - started
+        warn_if_slow_preprocessing(
+            "conversion on the in-process thread", elapsed_s, request
         )
         return converted
 

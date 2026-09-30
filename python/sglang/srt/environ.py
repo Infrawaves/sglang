@@ -382,10 +382,10 @@ class Envs:
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
-    # WARNING when request validation (on the tokenizer worker's event loop) or
-    # conversion on the in-process preprocessing thread takes at least this
-    # many ms; either delays the next token of every stream on that worker.
-    # <= 0 disables.
+    # WARNING when chat tool schema validation (on the tokenizer worker's event
+    # loop) or request conversion on the in-process preprocessing thread
+    # (queueing excluded) takes at least this many ms; either delays the next
+    # token of every stream on that worker. <= 0 disables.
     SGLANG_LOG_SLOW_PREPROCESSING_MS = EnvInt(200)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     # Request-log fields (any nesting depth) logged as their length plus a hash
