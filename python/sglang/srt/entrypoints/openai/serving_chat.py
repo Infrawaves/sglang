@@ -1117,13 +1117,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Validate tool definitions. This runs on the event loop of every entry
         # point that validates chat requests (chat, Anthropic, tokenize).
         started = monotonic_time()
-        error_msg, schemas_checked = self._validate_tool_schemas(effective_tools)
+        error_msg, python_fallbacks = self._validate_tool_schemas(effective_tools)
         warn_if_slow_preprocessing(
             "tool schema validation on the event loop",
             monotonic_time() - started,
             request,
             tools=len(effective_tools),
-            schemas_checked=schemas_checked,
+            python_fallbacks=python_fallbacks,
         )
         if error_msg:
             return error_msg
@@ -1149,9 +1149,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
-        """The error for the first invalid ``parameters`` schema, if any, and how
-        many schemas needed a full check (the others were cached as valid)."""
-        schemas_checked = 0
+        """The first parameters schema error, if any, and Python fallbacks."""
+        python_fallbacks = 0
         for i, tool in enumerate(tools):
             if tool.function.parameters is None:
                 continue
@@ -1161,22 +1160,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                # Counted before the check so a full check that raises counts too.
-                schemas_checked += 1
+                # Count before checking so Python errors are included as well.
+                # A Rust success returns False and removes the provisional count.
+                python_fallbacks += 1
                 if not check_tool_parameters_schema(tool.function.parameters):
-                    schemas_checked -= 1  # cache hit
+                    python_fallbacks -= 1
             except SchemaError as e:
                 return (
                     f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
-                    schemas_checked,
+                    python_fallbacks,
                 )
             except RecursionError:
                 return (
                     f"Tool {i} function 'parameters' schema is too deeply nested "
                     "or contains a cycle.",
-                    schemas_checked,
+                    python_fallbacks,
                 )
-        return None, schemas_checked
+        return None, python_fallbacks
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         if self.tokenizer_manager.model_config.is_multimodal:

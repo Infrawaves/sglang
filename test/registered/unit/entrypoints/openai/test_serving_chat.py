@@ -26,6 +26,7 @@ from unittest.mock import Mock, patch
 import xgrammar as xgr
 from fastapi import Request
 from fastapi.responses import StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai import chat_encoding
@@ -46,6 +47,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -1520,7 +1522,6 @@ class ServingChatTestCase(CustomTestCase):
                 )
 
     def test_slow_tool_schema_validation_is_reported(self):
-        # Unique property names keep the schemas out of other tests' cache hits.
         def tool(name):
             return {
                 "type": "function",
@@ -1543,8 +1544,15 @@ class ServingChatTestCase(CustomTestCase):
             "sglang.srt.entrypoints.openai.serving_chat.monotonic_time",
             side_effect=itertools.count(step=0.5),
         )
-        with clock, envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100):
-            for expected_checked in (2, 0):  # the second request hits the cache
+        with (
+            clock,
+            envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+                return_value=False,
+            ),
+        ):
+            for expected_fallbacks in (0, 0):  # valid schemas use the Rust check
                 request = ChatCompletionRequest(
                     model="x", messages=messages, tools=tools, rid="rid-7"
                 )
@@ -1557,7 +1565,7 @@ class ServingChatTestCase(CustomTestCase):
                     "tool schema validation on the event loop", logs.output[0]
                 )
                 self.assertIn(
-                    f"rid=rid-7, tools=2, schemas_checked={expected_checked}",
+                    f"rid=rid-7, tools=2, python_fallbacks={expected_fallbacks}",
                     logs.output[0],
                 )
 
@@ -1574,19 +1582,47 @@ class ServingChatTestCase(CustomTestCase):
         invalid = {"type": "object", "required": uuid.uuid4().hex}  # not an array
         cyclic = {"type": "object", "properties": {}}
         cyclic["properties"]["self"] = cyclic
+        valid_fallbacks = int(check_tool_parameters_schema(valid))
 
         error, checked = self.chat._validate_tool_schemas(tools(invalid))
         self.assertIn("Tool 0 function has invalid 'parameters' schema", error)
         self.assertEqual(checked, 1)
-        self.assertEqual(self.chat._validate_tool_schemas(tools(valid)), (None, 1))
-        # Cache hit, then a failed full check.
+        self.assertEqual(
+            self.chat._validate_tool_schemas(tools(valid)), (None, valid_fallbacks)
+        )
+        # A successful check followed by a failed check.
         error, checked = self.chat._validate_tool_schemas(tools(valid, invalid))
         self.assertIn("Tool 1 function has invalid 'parameters' schema", error)
-        self.assertEqual(checked, 1)
+        self.assertEqual(checked, valid_fallbacks + 1)
         # The cycle stops normalization before any check runs.
         error, checked = self.chat._validate_tool_schemas(tools(cyclic))
         self.assertIn("too deeply nested or contains a cycle", error)
         self.assertEqual(checked, 0)
+
+    def test_tool_schema_validation_counts_only_python_fallbacks(self):
+        def tool(name, parameters):
+            payload = {
+                "type": "function",
+                "function": {"name": name},
+            }
+            if parameters is not None:
+                payload["function"]["parameters"] = parameters
+            return Tool.model_validate(payload)
+
+        schemas = [
+            tool("rust", {"type": "object"}),
+            tool("python", {"type": "object"}),
+            tool("none", None),
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+            side_effect=[False, True],
+        ) as check_schema:
+            error, python_fallbacks = self.chat._validate_tool_schemas(schemas)
+
+        self.assertIsNone(error)
+        self.assertEqual(python_fallbacks, 1)
+        self.assertEqual(check_schema.call_count, 2)
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
@@ -4909,9 +4945,17 @@ class TestAllowedToolsServing(CustomTestCase):
             "integer",
         )
         request.messages[0].tools[1].function.parameters = {"type": "invalid_type"}
+        with self.assertRaises(SchemaError) as original_error:
+            Draft202012Validator.check_schema(
+                request.messages[0].tools[1].function.parameters
+            )
         response = self._complete(request)
         self.assertEqual(response.status_code, 400)
-        self.assertIn("schema", json.loads(response.body)["message"])
+        self.assertEqual(
+            json.loads(response.body)["message"],
+            "Tool 2 function has invalid 'parameters' schema: "
+            + str(original_error.exception),
+        )
         self.assertIsNone(self.internal_request)
 
     def test_constraint_construction_failure_uses_existing_fallback(self):
