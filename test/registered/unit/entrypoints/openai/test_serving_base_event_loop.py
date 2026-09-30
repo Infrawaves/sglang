@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
@@ -94,6 +96,64 @@ class TestServingBaseEventLoop(CustomTestCase):
             loop_was_starved.is_set(),
             "synchronous request conversion blocked the API event loop",
         )
+
+
+class _SlowStepServing(_BlockingServing):
+    """Validation and conversion each take ``validate_s`` / ``convert_s``."""
+
+    def __init__(self, validate_s=0.0, convert_s=0.0):
+        release = threading.Event()
+        release.set()
+        super().__init__(threading.Event(), release)
+        self.validate_s = validate_s
+        self.convert_s = convert_s
+
+    def _validate_request(self, request):
+        time.sleep(self.validate_s)
+        return None
+
+    def _convert_to_internal_request(self, request, raw_request=None):
+        time.sleep(self.convert_s)
+        return object(), request
+
+
+class TestSlowPreprocessingWarning(CustomTestCase):
+    logger_name = "sglang.srt.entrypoints.openai.serving_base"
+
+    def _run(self, serving):
+        request = SimpleNamespace(stream=False, rid="rid-1", tools=[1, 2, 3])
+        try:
+            return asyncio.run(serving.handle_request(request, object()))
+        finally:
+            executor = getattr(
+                serving.tokenizer_manager, "_request_preprocessor_executor", None
+            )
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+    def test_slow_validation_is_reported(self):
+        with envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(10):
+            with self.assertLogs(self.logger_name, level="WARNING") as logs:
+                self.assertEqual(self._run(_SlowStepServing(validate_s=0.05)), "ok")
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("Slow request validation on the event loop", logs.output[0])
+        self.assertIn("rid=rid-1, tools=3", logs.output[0])
+
+    def test_slow_thread_conversion_is_reported(self):
+        with envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(10):
+            with self.assertLogs(self.logger_name, level="WARNING") as logs:
+                self.assertEqual(self._run(_SlowStepServing(convert_s=0.05)), "ok")
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("conversion on the in-process thread", logs.output[0])
+
+    def test_fast_or_disabled_is_silent(self):
+        for threshold, serving in (
+            (1000, _SlowStepServing(validate_s=0.02, convert_s=0.02)),
+            (0, _SlowStepServing(validate_s=0.02, convert_s=0.02)),
+        ):
+            with envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(threshold):
+                with self.assertNoLogs(self.logger_name, level="WARNING"):
+                    self.assertEqual(self._run(serving), "ok")
 
 
 if __name__ == "__main__":

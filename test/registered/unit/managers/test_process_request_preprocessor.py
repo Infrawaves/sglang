@@ -208,6 +208,31 @@ class TestHelpers(CustomTestCase):
                         (kind, changes), ("changes", {"reasoning_effort": "high"})
                     )
 
+    def test_convert_before_ready_warns_once_and_declines(self):
+        class Opted:
+            pass
+
+        class NotOpted:
+            pass
+
+        pre = prp.ProcessRequestPreprocessor.__new__(prp.ProcessRequestPreprocessor)
+        pre._pool = object()  # started, warmup not finished
+        pre._ready = False
+        pre._disabled_reason = None
+        pre._handler_classes = (Opted,)
+        pre._warned = set()
+
+        async def convert_all():
+            return [
+                await pre.convert(handler, _chat_request(), None)
+                for handler in (Opted(), Opted(), NotOpted())
+            ]
+
+        with self.assertLogs(prp.logger, level="WARNING") as logs:
+            self.assertEqual(asyncio.run(convert_all()), [None, None, None])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("not ready yet", logs.output[0])
+
 
 # ----------------------------------------------------------------------------
 # End to end with spawned children and a tiny local model
