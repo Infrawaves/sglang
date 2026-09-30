@@ -2106,21 +2106,20 @@ class Req(ReqDllmMixin):
         matched = self._think_end_match_len
         for position, token in enumerate(token_id):
             matched = self._think_end_matcher.advance(matched, token)
-            tool_start_matched = False
-            if tool_start_ids and token == tool_start_ids[-1]:
-                # Accepted tokens are already appended by both local and PD callers.
-                end = len(self.output_ids) - len(token_id) + position + 1
-                tool_start_matched = (
-                    list(self.output_ids[end - len(tool_start_ids) : end])
-                    == tool_start_ids
-                )
-            if matched == len(self._think_end_matcher) or tool_start_matched:
+            if matched == len(self._think_end_matcher):
                 self.reasoning_tokens += position + 1
                 self._is_reasoning_over = True
                 return
 
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
+        if (
+            tool_start_ids
+            and token_id
+            and token_id[-1] == tool_start_ids[-1]
+            and list(self.output_ids[-len(tool_start_ids) :]) == tool_start_ids
+        ):
+            self._is_reasoning_over = True
 
     def __repr__(self):
         return (
