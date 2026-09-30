@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 import xgrammar as xgr
 from fastapi import Request
 from fastapi.responses import StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai import chat_encoding
@@ -1498,7 +1499,6 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
     def test_slow_tool_schema_validation_is_reported(self):
-        # Unique property names keep the schemas out of other tests' cache hits.
         def tool(name):
             return {
                 "type": "function",
@@ -1522,7 +1522,7 @@ class ServingChatTestCase(unittest.TestCase):
             side_effect=itertools.count(step=0.5),
         )
         with clock, envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100):
-            for expected_checked in (2, 0):  # the second request hits the cache
+            for expected_checked in (2, 2):  # repeated schemas also use the Rust check
                 request = ChatCompletionRequest(
                     model="x", messages=messages, tools=tools, rid="rid-7"
                 )
@@ -1557,10 +1557,10 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("Tool 0 function has invalid 'parameters' schema", error)
         self.assertEqual(checked, 1)
         self.assertEqual(self.chat._validate_tool_schemas(tools(valid)), (None, 1))
-        # Cache hit, then a failed full check.
+        # A successful check followed by a failed check.
         error, checked = self.chat._validate_tool_schemas(tools(valid, invalid))
         self.assertIn("Tool 1 function has invalid 'parameters' schema", error)
-        self.assertEqual(checked, 1)
+        self.assertEqual(checked, 2)
         # The cycle stops normalization before any check runs.
         error, checked = self.chat._validate_tool_schemas(tools(cyclic))
         self.assertIn("too deeply nested or contains a cycle", error)
@@ -4679,9 +4679,17 @@ class TestAllowedToolsServing(CustomTestCase):
             "integer",
         )
         request.messages[0].tools[1].function.parameters = {"type": "invalid_type"}
+        with self.assertRaises(SchemaError) as original_error:
+            Draft202012Validator.check_schema(
+                request.messages[0].tools[1].function.parameters
+            )
         response = self._complete(request)
         self.assertEqual(response.status_code, 400)
-        self.assertIn("schema", json.loads(response.body)["message"])
+        self.assertEqual(
+            json.loads(response.body)["message"],
+            "Tool 2 function has invalid 'parameters' schema: "
+            + str(original_error.exception),
+        )
         self.assertIsNone(self.internal_request)
 
     def test_constraint_construction_failure_uses_existing_fallback(self):

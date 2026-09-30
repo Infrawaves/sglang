@@ -1074,8 +1074,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
-        """The error for the first invalid ``parameters`` schema, if any, and how
-        many schemas needed a full check (the others were cached as valid)."""
+        """The first parameters schema error, if any, and schemas checked."""
         schemas_checked = 0
         for i, tool in enumerate(tools):
             if tool.function.parameters is None:
@@ -1086,10 +1085,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                # Counted before the check so a full check that raises counts too.
+                # Count before checking so failures are included as well.
                 schemas_checked += 1
-                if not check_tool_parameters_schema(tool.function.parameters):
-                    schemas_checked -= 1  # cache hit
+                check_tool_parameters_schema(tool.function.parameters)
             except SchemaError as e:
                 return (
                     f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
