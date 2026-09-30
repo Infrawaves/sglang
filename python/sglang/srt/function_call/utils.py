@@ -1,12 +1,16 @@
 import ast
+import hashlib
+import json
 import threading
 import warnings
+from collections import OrderedDict
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
+from jsonschema import Draft202012Validator
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
@@ -172,6 +176,48 @@ def normalize_json_schema_types(schema: Any) -> None:
     ):
         if key in schema:
             normalize_json_schema_types(schema[key])
+
+
+# Digests of tool ``parameters`` schemas that already passed
+# ``Draft202012Validator.check_schema`` in this process, most recent last.
+_VALID_TOOL_SCHEMAS_MAX_SIZE = 8192
+_valid_tool_schemas: "OrderedDict[bytes, None]" = OrderedDict()
+_valid_tool_schemas_lock = threading.Lock()
+
+
+def check_tool_parameters_schema(schema: Any) -> None:
+    """``Draft202012Validator.check_schema(schema)``, skipped for schemas seen valid.
+
+    Metaschema validation is pure Python (~1-2 ms per tool) and runs on the
+    tokenizer worker's event loop, so a request carrying a few hundred tools
+    stalls every stream on that worker for most of a second. Agent clients
+    resend the same tool list on every turn, so remembering a digest of each
+    schema that passed reduces that to hashing. Only successes are remembered:
+    an invalid schema is re-validated each time and raises exactly as
+    ``check_schema`` does (``SchemaError``, ``RecursionError``).
+    """
+    try:
+        # json (not orjson) keeps NaN/Infinity distinct from null.
+        key = hashlib.blake2b(
+            json.dumps(schema, sort_keys=True, separators=(",", ":")).encode(),
+            digest_size=16,
+        ).digest()
+    except (TypeError, ValueError, RecursionError):
+        key = None  # not plain JSON data: validate without caching
+
+    if key is not None:
+        with _valid_tool_schemas_lock:
+            if key in _valid_tool_schemas:
+                _valid_tool_schemas.move_to_end(key)
+                return
+
+    Draft202012Validator.check_schema(schema)
+
+    if key is not None:
+        with _valid_tool_schemas_lock:
+            _valid_tool_schemas[key] = None
+            if len(_valid_tool_schemas) > _VALID_TOOL_SCHEMAS_MAX_SIZE:
+                _valid_tool_schemas.popitem(last=False)
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
