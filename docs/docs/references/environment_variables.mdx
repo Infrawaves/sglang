@@ -1520,7 +1520,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send timeout (seconds) for decode's ZMQ sockets to prefill peers. Raise if healthy sends exceed the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send timeout (seconds) for decode's synchronous ZMQ control sockets to prefill peers. Mooncake ABORT notifications use nonblocking sends and do not wait for this timeout on the scheduler.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
     <tr>

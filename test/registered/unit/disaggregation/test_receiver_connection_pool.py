@@ -11,6 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import zmq
 from disagg_test_utils import (
     complete_receiver_setup,
     make_decode_kv_manager,
@@ -68,6 +69,441 @@ class TestReceiverConnectionPool(CustomTestCase):
         mgr = make_decode_kv_manager(self, **overrides)
         mgr.prefill_info_table[ADDR] = prefill_info_stub()
         return mgr
+
+    def _abort_receiver(self, room=7):
+        mgr = self._decode_manager(
+            enable_deferred_decode_kv_release=True,
+            requires_transfer_drain=True,
+        )
+        mgr.connection_pool[f"{ADDR}_0_0_0"] = [
+            {"rank_ip": "127.0.0.1", "rank_port": 2001, "abort_rank": 0},
+        ]
+        receiver = _FetchingReceiver(mgr, ADDR, room)
+        receiver.init(0)
+        return mgr, receiver
+
+    def _cached_abort_socket(self, sock, *, endpoint_lock=None, global_lock=None):
+        endpoint = "tcp://127.0.0.1:2001"
+        patches = [
+            patch.object(CommonKVReceiver, "_socket_cache", {endpoint: sock}),
+            patch.object(
+                CommonKVReceiver,
+                "_socket_locks",
+                {endpoint: endpoint_lock or threading.Lock()},
+            ),
+            patch.object(
+                CommonKVReceiver, "_global_lock", global_lock or threading.Lock()
+            ),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_abort_does_not_wait_for_busy_metadata_socket_locks(self):
+        """Either lock may belong to bootstrap work; the scheduler must return
+        while its owner is still holding the lock, retaining the ACK state."""
+        for busy_lock_name in ("endpoint_lock", "global_lock"):
+            with self.subTest(lock=busy_lock_name):
+                mgr, receiver = self._abort_receiver()
+                sock = Mock()
+                busy_lock = threading.Lock()
+                self._cached_abort_socket(sock, **{busy_lock_name: busy_lock})
+                returned = threading.Event()
+                errors = []
+
+                def abort():
+                    try:
+                        receiver.abort()
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        returned.set()
+
+                busy_lock.acquire()
+                scheduler = threading.Thread(target=abort, daemon=True)
+                scheduler.start()
+                try:
+                    self.assertTrue(returned.wait(5), "abort waited for a socket lock")
+                    self.assertEqual(errors, [])
+                    sock.send_multipart.assert_not_called()
+                    self.assertFalse(receiver.abort_notified)
+                    self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+                    self.assertEqual(
+                        mgr._deferred_abort_tokens[7], receiver._abort_token
+                    )
+                    self.assertTrue(mgr.connection_lock.acquire(blocking=False))
+                    mgr.connection_lock.release()
+                finally:
+                    busy_lock.release()
+                    scheduler.join(5)
+
+                self.assertTrue(receiver.retry_abort())
+                self.assertTrue(receiver.abort_notified)
+                self.assertEqual(
+                    sock.send_multipart.call_args.kwargs["flags"], zmq.DONTWAIT
+                )
+
+    def test_abort_rebuilds_missing_metadata_socket_without_waiting(self):
+        mgr, receiver = self._abort_receiver()
+        sock = Mock()
+        context = Mock()
+        context.socket.return_value = sock
+        seen_ack_state = []
+        sent_under_manager_lock = []
+
+        def send(frames, flags=0):
+            sent_under_manager_lock.append(mgr.connection_lock.locked())
+            seen_ack_state.append(
+                (mgr._deferred_abort_tokens.get(7), mgr._deferred_abort_expected.get(7))
+            )
+
+        sock.send_multipart.side_effect = send
+        sockets = {}
+        locks = {}
+        with (
+            patch.object(CommonKVReceiver, "_ctx", context),
+            patch.object(CommonKVReceiver, "_socket_cache", sockets),
+            patch.object(CommonKVReceiver, "_socket_locks", locks),
+            patch.object(CommonKVReceiver, "_global_lock", threading.Lock()),
+            patch.object(receiver, "_connect_to_bootstrap_server") as blocking_connect,
+        ):
+            self.assertTrue(receiver.retry_abort())
+            self.assertTrue(receiver.retry_abort())
+        blocking_connect.assert_not_called()
+        context.socket.assert_called_once_with(zmq.PUSH)
+        sock.connect.assert_called_once_with("tcp://127.0.0.1:2001")
+        self.assertIs(sockets["tcp://127.0.0.1:2001"], sock)
+        self.assertIn("tcp://127.0.0.1:2001", locks)
+        self.assertEqual(sock.send_multipart.call_args.kwargs["flags"], zmq.DONTWAIT)
+        self.assertEqual(seen_ack_state, [(receiver._abort_token, {0})] * 2)
+        self.assertEqual(sent_under_manager_lock, [True, True])
+        self.assertTrue(receiver.abort_notified)
+
+    def test_socket_failures_leave_consistent_cache_and_allow_retry(self):
+        for failure_step in ("socket", "configure", "connect", "send"):
+            with self.subTest(failure_step=failure_step):
+                mgr, receiver = self._abort_receiver()
+                context = Mock()
+                sock = context.socket.return_value
+                failing = {
+                    "socket": context.socket,
+                    "configure": sock.setsockopt,
+                    "connect": sock.connect,
+                    "send": sock.send_multipart,
+                }[failure_step]
+                failing.side_effect = zmq.ZMQError(zmq.EINVAL)
+                sockets = {}
+                locks = {}
+                with (
+                    patch.object(CommonKVReceiver, "_ctx", context),
+                    patch.object(CommonKVReceiver, "_socket_cache", sockets),
+                    patch.object(CommonKVReceiver, "_socket_locks", locks),
+                    patch.object(CommonKVReceiver, "_global_lock", threading.Lock()),
+                ):
+                    self.assertFalse(receiver.retry_abort())
+                    if failure_step == "send":
+                        endpoint = "tcp://127.0.0.1:2001"
+                        self.assertEqual(sockets, {endpoint: sock})
+                        self.assertEqual(set(locks), {endpoint})
+                        self.assertTrue(locks[endpoint].acquire(blocking=False))
+                        locks[endpoint].release()
+                    else:
+                        self.assertEqual(sockets, {})
+                        self.assertEqual(locks, {})
+                    self.assertFalse(receiver.abort_notified)
+                    self.assertEqual(
+                        mgr._deferred_abort_tokens[7], receiver._abort_token
+                    )
+                    if failure_step in ("configure", "connect"):
+                        sock.close.assert_called_once()
+                    failing.side_effect = None
+                    self.assertTrue(receiver.retry_abort())
+                    self.assertTrue(receiver.abort_notified)
+
+    def test_retry_abort_does_not_wait_for_manager_lock(self):
+        mgr, receiver = self._abort_receiver()
+        sock = Mock()
+        self._cached_abort_socket(sock)
+        returned = threading.Event()
+        results = []
+
+        def retry():
+            try:
+                results.append(receiver.retry_abort())
+            finally:
+                returned.set()
+
+        mgr.connection_lock.acquire()
+        scheduler = threading.Thread(target=retry, daemon=True)
+        scheduler.start()
+        try:
+            self.assertTrue(returned.wait(5), "retry waited for the manager lock")
+            self.assertEqual(results, [False])
+            self.assertNotIn(7, mgr._deferred_abort_tokens)
+            sock.send_multipart.assert_not_called()
+        finally:
+            mgr.connection_lock.release()
+            scheduler.join(5)
+        self.assertTrue(receiver.retry_abort())
+        self.assertEqual(mgr._deferred_abort_tokens[7], receiver._abort_token)
+
+    def test_abort_again_keeps_early_and_late_ack_state(self):
+        mgr, receiver = self._abort_receiver()
+        sock = Mock()
+        observed_ack_state = []
+
+        def backpressure(frames, flags=0):
+            observed_ack_state.append(
+                (
+                    mgr._deferred_abort_tokens.get(7),
+                    mgr._deferred_abort_expected.get(7),
+                )
+            )
+            raise zmq.Again()
+
+        sock.send_multipart.side_effect = backpressure
+        self._cached_abort_socket(sock)
+        self.assertFalse(receiver.retry_abort())
+        self.assertFalse(receiver.abort_notified)
+        self.assertEqual(observed_ack_state, [(receiver._abort_token, {0})])
+        # An ACK from an earlier attempt can arrive while this retry is unwritable.
+        mgr.note_abort_ack(7, 0, token=receiver._abort_token)
+        receiver.retry_abort()
+        self.assertEqual(mgr._deferred_abort_ack_tracker[7], {0})
+        self.assertTrue(mgr.is_abort_release_safe(7, 1))
+        self.assertEqual(sock.send_multipart.call_args.kwargs["flags"], zmq.DONTWAIT)
+        sock.send_multipart.side_effect = None
+        receiver.retry_abort()
+        self.assertTrue(receiver.abort_notified)
+        self.assertEqual(mgr._deferred_abort_ack_tracker[7], {0})
+
+    def test_abort_on_real_zmq_backpressure_uses_dontwait(self):
+        """Exercise real libzmq with both an absent peer and a saturated pipe.
+        SNDTIMEO only prevents a regressed test from hanging forever."""
+        for connected in (False, True):
+            with self.subTest(connected=connected):
+                mgr, receiver = self._abort_receiver()
+                context = zmq.Context()
+                self.addCleanup(context.term)
+                sock = context.socket(zmq.PUSH)
+                self.addCleanup(sock.close, 0)
+                sock.setsockopt(zmq.IMMEDIATE, 1)
+                sock.setsockopt(zmq.SNDHWM, 1)
+                sock.setsockopt(zmq.SNDTIMEO, 1000)
+                if connected:
+                    peer = context.socket(zmq.PULL)
+                    self.addCleanup(peer.close, 0)
+                    peer.setsockopt(zmq.RCVHWM, 1)
+                    sock.bind("inproc://abort-backpressure")
+                    peer.connect("inproc://abort-backpressure")
+                    for _ in range(100):
+                        try:
+                            sock.send_multipart([b"METADATA"], flags=zmq.DONTWAIT)
+                        except zmq.Again:
+                            break
+                    else:
+                        self.fail("test did not fill the bounded ZMQ pipe")
+                flags_seen = []
+
+                class RecordingSocket:
+                    def send_multipart(self, frames, flags=0):
+                        flags_seen.append(flags)
+                        sock.send_multipart(frames, flags=flags)
+
+                self._cached_abort_socket(RecordingSocket())
+                self.assertFalse(receiver.retry_abort())
+                self.assertFalse(receiver.abort_notified)
+                self.assertEqual(flags_seen, [zmq.DONTWAIT])
+                self.assertEqual(mgr._deferred_abort_tokens[7], receiver._abort_token)
+
+    def test_abort_and_metadata_keep_same_socket_fifo(self):
+        mgr, receiver = self._abort_receiver()
+        context = zmq.Context()
+        self.addCleanup(context.term)
+        sender = context.socket(zmq.PUSH)
+        peer = context.socket(zmq.PULL)
+        self.addCleanup(sender.close, 0)
+        self.addCleanup(peer.close, 0)
+        sender.bind("inproc://abort-metadata-fifo")
+        peer.connect("inproc://abort-metadata-fifo")
+        self._cached_abort_socket(sender)
+        metadata = [b"METADATA", b"7"]
+        sender.send_multipart(metadata)
+
+        receiver.retry_abort()
+
+        self.assertTrue(receiver.abort_notified)
+        replacement_metadata = [b"METADATA", b"reused-room"]
+        sender.send_multipart(replacement_metadata)
+        self.assertTrue(peer.poll(timeout=5000, flags=zmq.POLLIN))
+        self.assertEqual(peer.recv_multipart(), metadata)
+        self.assertTrue(peer.poll(timeout=5000, flags=zmq.POLLIN))
+        self.assertEqual(
+            peer.recv_multipart(),
+            [
+                b"ABORT",
+                b"7",
+                b"127.0.0.1",
+                b"17000",
+                receiver._abort_token.encode("ascii"),
+            ],
+        )
+        self.assertTrue(peer.poll(timeout=5000, flags=zmq.POLLIN))
+        self.assertEqual(peer.recv_multipart(), replacement_metadata)
+
+    def test_abort_rechecks_room_and_epoch_before_each_target(self):
+        mgr, old = self._abort_receiver()
+        replacement = _ConcreteReceiver(mgr, ADDR, 7)
+        replacement_status = mgr.request_status[7]
+        sock = Mock()
+        self._cached_abort_socket(sock)
+
+        self.assertFalse(old.retry_abort())
+        self.assertFalse(old._send_abort_notification(old.bootstrap_infos))
+
+        sock.send_multipart.assert_not_called()
+        self.assertNotIn(7, mgr._deferred_abort_tokens)
+        self.assertEqual(mgr.request_status[7], replacement_status)
+        self.assertIs(mgr.room_generations[7], replacement._room_generation)
+
+        # A different epoch invalidates only this attempt. The next attempt must
+        # snapshot the current epoch and contact both original writers again.
+        for direct_send in (False, True):
+            with self.subTest(direct_send=direct_send):
+                mgr, receiver = self._abort_receiver(room=8)
+                receiver.bootstrap_infos.append(
+                    {"rank_ip": "127.0.0.1", "rank_port": 2002, "abort_rank": 1}
+                )
+                first, second = Mock(), Mock()
+                self._cached_abort_socket(first)
+                CommonKVReceiver._socket_cache["tcp://127.0.0.1:2002"] = second
+                CommonKVReceiver._socket_locks["tcp://127.0.0.1:2002"] = (
+                    threading.Lock()
+                )
+                sent_under_manager_lock = []
+                advance_after_send = [False]
+                manager_lock = mgr.connection_lock
+                wrapped_lock = Mock(wraps=manager_lock)
+
+                def release():
+                    manager_lock.release()
+                    if advance_after_send[0]:
+                        advance_after_send[0] = False
+                        # Model the heartbeat taking the same lock after the
+                        # first target's send and before the next target.
+                        with manager_lock:
+                            mgr._parallel_info_epochs[ADDR] += 1
+
+                wrapped_lock.release.side_effect = release
+                mgr.connection_lock = wrapped_lock
+
+                def observe_send(frames, flags=0):
+                    sent_under_manager_lock.append(mgr.connection_lock.locked())
+
+                def advance_epoch(frames, flags=0):
+                    observe_send(frames, flags)
+                    advance_after_send[0] = True
+
+                first.send_multipart.side_effect = advance_epoch
+                second.send_multipart.side_effect = observe_send
+                if direct_send:
+                    mgr.register_deferred_abort_room(
+                        8, token=receiver._abort_token, expected_ranks={0, 1}
+                    )
+                send_attempt = (
+                    (
+                        lambda: receiver._send_abort_notification(
+                            receiver.bootstrap_infos
+                        )
+                    )
+                    if direct_send
+                    else receiver.retry_abort
+                )
+                self.assertFalse(send_attempt())
+                self.assertEqual(first.send_multipart.call_count, 1)
+                second.send_multipart.assert_not_called()
+                first.send_multipart.side_effect = observe_send
+
+                self.assertTrue(receiver.retry_abort())
+
+                self.assertEqual(first.send_multipart.call_count, 2)
+                self.assertEqual(second.send_multipart.call_count, 1)
+                self.assertEqual(sent_under_manager_lock, [True, True, True])
+                self.assertEqual(mgr._deferred_abort_tokens[8], receiver._abort_token)
+                self.assertEqual(mgr._deferred_abort_expected[8], {0, 1})
+                self.assertTrue(receiver.abort_notified)
+
+    def test_false_heartbeat_eviction_still_delivers_first_abort(self):
+        """No ABORT has been sent when a false heartbeat failure evicts the
+        healthy peer. Reconnect on the metadata channel and wait for its ACK."""
+        mgr, receiver = self._abort_receiver()
+        context = zmq.Context()
+        self.addCleanup(context.term)
+        peer = context.socket(zmq.PULL)
+        self.addCleanup(peer.close, 0)
+        port = peer.bind_to_random_port("tcp://127.0.0.1")
+        endpoint = f"tcp://127.0.0.1:{port}"
+        receiver.bootstrap_infos[0]["rank_port"] = port
+        original = context.socket(zmq.PUSH)
+        self.addCleanup(original.close, 0)
+        original.connect(endpoint)
+        sockets = {endpoint: original}
+        locks = {endpoint: threading.Lock()}
+
+        def close_cached_sockets():
+            for sock in sockets.values():
+                sock.close(0)
+
+        self.addCleanup(close_cached_sockets)
+        with (
+            patch.object(CommonKVReceiver, "_ctx", context),
+            patch.object(CommonKVReceiver, "_socket_cache", sockets),
+            patch.object(CommonKVReceiver, "_socket_locks", locks),
+            patch.object(CommonKVReceiver, "_global_lock", threading.Lock()),
+        ):
+            mgr._handle_node_failure(ADDR)
+            self.assertEqual(sockets, {})
+            self.assertTrue(original.closed)
+            self.assertNotIn(7, mgr._deferred_abort_tokens)
+            self.assertNotEqual(mgr.parallel_info_epoch(ADDR), receiver._setup_epoch)
+
+            self.assertTrue(receiver.retry_abort())
+
+            self.assertTrue(receiver.abort_notified)
+            self.assertIsNot(sockets[endpoint], original)
+            self.assertTrue(peer.poll(timeout=5000, flags=zmq.POLLIN))
+            self.assertEqual(
+                peer.recv_multipart(),
+                [
+                    b"ABORT",
+                    b"7",
+                    b"127.0.0.1",
+                    b"17000",
+                    receiver._abort_token.encode("ascii"),
+                ],
+            )
+            self.assertFalse(mgr.is_abort_release_safe(7, 1))
+            mgr.note_abort_ack(7, 0, token="another-generation")
+            self.assertFalse(mgr.is_abort_release_safe(7, 1))
+            mgr.note_abort_ack(7, 0, token=receiver._abort_token)
+            mgr.note_abort_ack(7, 0, token=receiver._abort_token)
+            self.assertTrue(mgr.is_abort_release_safe(7, 1))
+            self.assertTrue(receiver.retry_abort())
+            self.assertEqual(mgr._deferred_abort_ack_tracker[7], {0})
+            self.assertTrue(mgr.is_abort_release_safe(7, 1))
+
+    def test_legacy_abort_keeps_metadata_socket_path(self):
+        mgr = self._decode_manager()
+        receiver = _ConcreteReceiver(mgr, ADDR, 7)
+        receiver.bootstrap_infos = [{"rank_ip": "127.0.0.1", "rank_port": 2001}]
+        sock = Mock()
+        with patch.object(
+            receiver,
+            "_connect_to_bootstrap_server",
+            return_value=(sock, threading.Lock()),
+        ):
+            receiver.retry_abort()
+        self.assertEqual(sock.send_multipart.call_args.args[0][0], b"ABORT")
 
     def test_invalidate_removes_matching_generation(self):
         stale = [
@@ -286,7 +722,7 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         receiver.ensure_abort_notified(force_arm=True)
         receiver.retry_abort()
-        receiver._send_abort_notification(force_arm=True)
+        receiver._send_abort_notification(receiver.bootstrap_infos)
 
         self.assertFalse(receiver.abort_notified)
         receiver.kv_mgr.register_deferred_abort_room.assert_not_called()

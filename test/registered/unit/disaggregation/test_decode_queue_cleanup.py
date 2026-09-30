@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from disagg_test_utils import make_decode_kv_manager
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.common.conn import ParallelInfoState
+from sglang.srt.disaggregation.common.conn import CommonKVManager, ParallelInfoState
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -39,6 +39,134 @@ class FakeReceiver:
 
     def failure_exception(self):
         return None
+
+
+class TestDeferredReleaseRecovery(CustomTestCase):
+    def _queue(self, *, sent=True, already_notified=False):
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager.requires_transfer_drain = True
+        manager._deferred_abort_ack_tracker = {7: set()}
+        manager._deferred_abort_tokens = {7: "old-transfer"}
+        manager._deferred_abort_expected = {7: {0, 1}}
+        receiver = SimpleNamespace(
+            kv_mgr=manager,
+            retry_abort=MagicMock(return_value=sent),
+            abort_notified=already_notified,
+            bootstrap_infos=[{"abort_rank": 0}, {"abort_rank": 1}],
+        )
+        req = SimpleNamespace(
+            req=SimpleNamespace(rid="quarantined", bootstrap_room=7),
+            kv_receiver=receiver,
+            metadata_buffer_index=3,
+            hicache_restored_node=None,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue._release_tp_size = 1
+        queue._deferred_releases = []
+        queue._failed_deferred_releases = []
+        queue._deferred_release_error = None
+        queue.deferred_kv_release_timeout = 30
+        queue.enable_staging = False
+        queue._do_release = MagicMock()
+        with patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=0):
+            queue._defer_release(req)
+        return queue, req, manager
+
+    def test_unsent_abort_retries_before_warning_deadline(self):
+        queue, req, manager = self._queue()
+        with (
+            patch("sglang.srt.disaggregation.decode.time.monotonic") as clock,
+            patch("sglang.srt.disaggregation.decode.logger") as logger,
+        ):
+            clock.return_value = 0.049
+            queue.resolve_deferred_releases()
+            req.kv_receiver.retry_abort.assert_not_called()
+            clock.return_value = 0.05
+            queue.resolve_deferred_releases()
+            req.kv_receiver.retry_abort.assert_called_once_with()
+            logger.warning.assert_not_called()
+        self.assertAlmostEqual(req._abort_retry_deadline, 30.05)
+        self.assertFalse(manager.is_abort_release_safe(7, 2))
+        queue._do_release.assert_not_called()
+
+    def test_backpressure_backs_off_without_releasing_buffers(self):
+        queue, req, manager = self._queue(sent=False)
+        intervals = []
+        with (
+            patch("sglang.srt.disaggregation.decode.time.monotonic") as clock,
+            patch("sglang.srt.disaggregation.decode.logger"),
+        ):
+            for attempt in range(20):
+                now = req._abort_retry_deadline
+                clock.return_value = now
+                queue.resolve_deferred_releases()
+                intervals.append(req._abort_retry_deadline - now)
+                self.assertEqual(req.kv_receiver.retry_abort.call_count, attempt + 1)
+                # A second scheduler step at the same time cannot busy-loop.
+                queue.resolve_deferred_releases()
+                self.assertEqual(req.kv_receiver.retry_abort.call_count, attempt + 1)
+        self.assertAlmostEqual(intervals[0], 0.1)
+        for previous, current in zip(intervals, intervals[1:]):
+            self.assertGreaterEqual(current + 1e-9, previous)
+        self.assertAlmostEqual(max(intervals), 60.0)
+        self.assertTrue(queue.has_pending_deferred_releases())
+        self.assertFalse(manager.is_abort_release_safe(7, 2))
+        queue._do_release.assert_not_called()
+
+    def test_matching_late_acks_release_during_retry_backoff(self):
+        queue, req, manager = self._queue(sent=False)
+        receiver = req.kv_receiver
+        with patch("sglang.srt.disaggregation.decode.time.monotonic") as clock:
+            clock.return_value = 0.05
+            queue.resolve_deferred_releases()
+            manager.note_abort_ack(7, 0, token="wrong-transfer")
+            manager.note_abort_ack(7, 1, token="old-transfer")
+            clock.return_value = 0.06
+            queue.resolve_deferred_releases()
+            queue._do_release.assert_not_called()
+            manager.note_abort_ack(7, 0, token="old-transfer")
+            clock.return_value = 0.07
+            queue.resolve_deferred_releases()
+        receiver.retry_abort.assert_called_once_with()
+        queue._do_release.assert_called_once_with(req, 3)
+        self.assertFalse(queue.has_pending_deferred_releases())
+
+    def test_accepted_abort_waits_for_ack_and_retries_with_backoff(self):
+        queue, req, manager = self._queue(already_notified=True)
+        with (
+            patch("sglang.srt.disaggregation.decode.time.monotonic") as clock,
+            patch("sglang.srt.disaggregation.decode.logger"),
+        ):
+            clock.return_value = 29.99
+            queue.resolve_deferred_releases()
+            req.kv_receiver.retry_abort.assert_not_called()
+            clock.return_value = 30
+            queue.resolve_deferred_releases()
+            self.assertEqual(req._abort_retry_deadline, 90)
+            clock.return_value = 89
+            queue.resolve_deferred_releases()
+            req.kv_receiver.retry_abort.assert_called_once_with()
+            clock.return_value = 90
+            queue.resolve_deferred_releases()
+            self.assertEqual(req.kv_receiver.retry_abort.call_count, 2)
+            self.assertEqual(req._abort_retry_deadline, 150)
+        self.assertFalse(manager.is_abort_release_safe(7, 2))
+        queue._do_release.assert_not_called()
+
+    def test_warning_does_not_override_retry_backoff(self):
+        queue, req, manager = self._queue(sent=False)
+        req._abort_retry_deadline = 120
+        with (
+            patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=30),
+            self.assertLogs(
+                "sglang.srt.disaggregation.decode", level="WARNING"
+            ) as logs,
+        ):
+            queue.resolve_deferred_releases()
+        self.assertIn("retrying ABORT with backoff", logs.output[0])
+        req.kv_receiver.retry_abort.assert_not_called()
+        self.assertEqual(queue._deferred_releases[0][1:], (60, 3, 2))
+        queue._do_release.assert_not_called()
 
 
 class TestDecodeQueueCleanup(CustomTestCase):

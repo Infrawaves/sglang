@@ -179,7 +179,7 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
     def test_tracker_armed_before_the_abort_is_sent(self):
         mgr = self._make_decode_manager()
         recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
-        recv._send_abort_notification()
+        recv.ensure_abort_notified()
         self.assertEqual(armed_at_send, [True])
 
     def test_prealloc_abort_does_not_arm(self):
@@ -188,7 +188,7 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         # it would leak one set per aborted prealloc request.
         mgr = self._make_decode_manager()
         recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
-        recv._send_abort_notification()
+        recv.ensure_abort_notified()
         self.assertEqual(armed_at_send, [False])
         self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
@@ -197,7 +197,7 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         # nothing would ever clean the tracker up.
         mgr = self._make_decode_manager(enabled=False)
         recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
-        recv._send_abort_notification()
+        recv.ensure_abort_notified()
         self.assertEqual(armed_at_send, [False])
         self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
