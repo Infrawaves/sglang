@@ -1045,7 +1045,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._first_dump:
             self._first_dump = False
-            torch.get_device_module().empty_cache()
+            # The scalar DeepSeek solver now aggregates before logical-map
+            # expansion, so it no longer needs the large temporary workspace
+            # that motivated this cache flush.  Keep the old safety behavior
+            # for vector/file dumps, where the full recorder window is still
+            # materialized.
+            if not aggregate_steps_for_rebalance:
+                torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
