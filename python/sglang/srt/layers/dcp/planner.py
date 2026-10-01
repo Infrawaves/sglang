@@ -22,9 +22,9 @@ import torch
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
+    prepare_dcp_local_lens,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -150,9 +150,15 @@ def plan_dcp_decode_metadata(
     prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
     """
     parallel = get_parallel()
-    local_kv_lens = kv_lens.clone()
-    update_local_kv_lens_for_dcp(local_kv_lens)
-    local_kv_lens.clamp_(min=0)
+    local_kv_lens = torch.empty_like(kv_lens)
+    local_kv_lens_cumsum = kv_indptr.new_empty((bs + 1,))
+    prepare_dcp_local_lens(
+        kv_lens,
+        local_kv_lens,
+        local_kv_lens_cumsum,
+        parallel.dcp_rank,
+        parallel.dcp_size,
+    )
 
     if not init_metadata_replay:
         max_local_len = (
@@ -172,8 +178,6 @@ def plan_dcp_decode_metadata(
             if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
             else 0
         )
-    local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
-    local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
     local_kv_indices = kv_indices.new_empty(total_local_len)
     BLOCK_SIZE = 128
     num_blocks = (
