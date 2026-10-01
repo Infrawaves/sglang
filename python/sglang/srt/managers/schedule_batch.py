@@ -1661,7 +1661,8 @@ class Req(ReqDllmMixin):
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         # Reasoning-aware user stops currently target non-speculative decoding only.
         content_len = len(self.output_ids)
-        if self.require_reasoning:
+        # The result processor creates a matcher only for a usable reasoning boundary.
+        if self._think_end_matcher is not None:
             if not self._is_reasoning_over:
                 return 0
             content_len -= self.reasoning_tokens
@@ -1719,7 +1720,7 @@ class Req(ReqDllmMixin):
 
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids and (
-                not self.require_reasoning
+                self._think_end_matcher is None
                 or (
                     self._is_reasoning_over
                     and len(self.output_ids) > self.reasoning_tokens
@@ -1769,7 +1770,7 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
-        if self.require_reasoning and not self._is_reasoning_over:
+        if self._think_end_matcher is not None and not self._is_reasoning_over:
             return False
         if (
             len(self.sampling_params.stop_strs) > 0
@@ -1782,7 +1783,8 @@ class Req(ReqDllmMixin):
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
                     if stop_str_in_tail or (
-                        not self.require_reasoning and stop_str in self.decoded_text
+                        self._think_end_matcher is None
+                        and stop_str in self.decoded_text
                     ):
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         if stop_str_in_tail:
@@ -2091,7 +2093,7 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
 
-    def update_reasoning_tokens(self, token_id, think_end_ids):
+    def update_reasoning_tokens(self, token_id, think_end_ids, *, tool_start_ids=None):
         if self._is_reasoning_over:
             return
 
@@ -2111,6 +2113,13 @@ class Req(ReqDllmMixin):
 
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
+        if (
+            tool_start_ids
+            and token_id
+            and token_id[-1] == tool_start_ids[-1]
+            and list(self.output_ids[-len(tool_start_ids) :]) == tool_start_ids
+        ):
+            self._is_reasoning_over = True
 
     def __repr__(self):
         return (
