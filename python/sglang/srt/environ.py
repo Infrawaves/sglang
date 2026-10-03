@@ -1938,6 +1938,11 @@ class Envs:
     )
     # Whether client media may name local files (paths or file:// URLs).
     SGLANG_MEDIA_ALLOW_LOCAL_FILES = EnvBool(True)
+    # Decoded-pixel budget for one decode+preprocess chunk of cache misses.
+    # A processor whose preprocessing runs on the serving GPU bounds its own
+    # peak that way instead of decoding every image in the request first.
+    # None defers to the processor's own default; 0 disables chunking.
+    SGLANG_MM_PREPROCESS_CHUNK_MB = EnvInt(None)
 
     # ===================================================================
     # Unlimited-OCR v2

@@ -1012,6 +1012,12 @@ class KimiK3ImageProcessor(
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
     uses_wide_image_identity = True
+    # nvJPEG decodes onto the serving GPU, so a request's decoded images and
+    # the preprocessing peak both come out of the tokenizer process's slice of
+    # the device -- about 9 GiB in production, against 512-image requests whose
+    # sources alone can exceed that. Chunk the decode+preprocess loop so
+    # neither scales with the image count.
+    mm_preprocess_chunk_mb = 1024
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
