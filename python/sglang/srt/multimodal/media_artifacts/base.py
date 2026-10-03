@@ -24,6 +24,7 @@ media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -32,6 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
@@ -104,6 +106,12 @@ class MediaArtifactCacheMixin:
 
     artifact_modality: Optional[Modality] = None
     artifact_option_defaults: Mapping[str, Any] = {"detail": "auto"}
+    # Decoded-pixel budget, in MiB, for one decode+preprocess chunk of cache
+    # misses. 0 keeps the whole miss set in one chunk, which is the behaviour
+    # every model had before chunking existed. A processor that decodes onto
+    # the serving GPU overrides this, because there its decoded images and its
+    # preprocessing peak share the tokenizer process's slice of the device.
+    mm_preprocess_chunk_mb: int = 0
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -472,6 +480,76 @@ class MediaArtifactCacheMixin:
             self.validate_artifact(artifact, entry)
         return artifacts
 
+    def decoded_size_hint(self, snapshot: MediaSnapshot) -> int:
+        """Estimate the bytes ``decode_media_snapshot`` will put in memory.
+
+        Used only to place chunk boundaries, so it is allowed to be
+        approximate -- but it has to track *decoded* size, not payload size. A
+        snapshot of encoded bytes carries its compressed length in
+        ``size_bytes``, and JPEG compression ratios vary by more than an order
+        of magnitude, so budgeting on that bounds nothing. PIL reads the header
+        lazily, which gives the real dimensions without decoding any pixels.
+
+        Never returns less than ``size_bytes``: a hint of 0 for every miss
+        would put the whole request in one chunk and silently restore the
+        unbounded behaviour.
+        """
+        data = snapshot.data
+        if isinstance(data, torch.Tensor):
+            return data.numel() * data.element_size()
+        if isinstance(data, np.ndarray):
+            return int(data.nbytes)
+        try:
+            if isinstance(data, Image.Image):
+                width, height, mode = data.width, data.height, data.mode
+            elif isinstance(data, (bytes, bytearray, memoryview)):
+                with Image.open(io.BytesIO(bytes(data))) as header:
+                    width, height, mode = header.width, header.height, header.mode
+            else:
+                return snapshot.size_bytes
+        except Exception:
+            # A corrupt payload fails for real in decode_media_snapshot, which
+            # reports it with the right context. Here it only costs accuracy.
+            return snapshot.size_bytes
+        channels = {"RGB": 3, "RGBA": 4, "L": 1, "P": 1, "CMYK": 4, "I": 4, "F": 4}
+        return max(snapshot.size_bytes, width * height * channels.get(mode, 3))
+
+    def _chunk_misses(
+        self,
+        misses_to_compute: Sequence[CacheMiss[str, MediaArtifact]],
+        first_index_by_key: Mapping[str, int],
+        snapshots: Sequence[Optional[MediaSnapshot]],
+    ) -> list[Sequence[CacheMiss[str, MediaArtifact]]]:
+        """Split claimed misses into decode+preprocess chunks by decoded size.
+
+        The budget is a byte count rather than an image count because one
+        8000px image is worth about twenty 1800px ones: a count-based split
+        still admits an unbounded chunk. Images are never split, so a single
+        image over the budget gets a chunk to itself.
+        """
+        override = envs.SGLANG_MM_PREPROCESS_CHUNK_MB.get()
+        budget_mb = self.mm_preprocess_chunk_mb if override is None else override
+        if budget_mb <= 0 or len(misses_to_compute) <= 1:
+            return [misses_to_compute]
+
+        budget = budget_mb * 1024 * 1024
+        chunks: list[list[CacheMiss[str, MediaArtifact]]] = []
+        current: list[CacheMiss[str, MediaArtifact]] = []
+        current_bytes = 0
+        for missed in misses_to_compute:
+            snapshot = snapshots[first_index_by_key[missed.key]]
+            assert snapshot is not None
+            hint = self.decoded_size_hint(snapshot)
+            if current and current_bytes + hint > budget:
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append(missed)
+            current_bytes += hint
+        if current:
+            chunks.append(current)
+        return chunks
+
     async def _compute_cache_misses(
         self,
         misses_to_compute: Sequence[CacheMiss[str, MediaArtifact]],
@@ -488,56 +566,67 @@ class MediaArtifactCacheMixin:
         CPU cache. The two values differ when a CUDA feature must not be cached.
         """
         try:
-            # 1. decode (load media) each unique miss
-            missed_media = []
-            for missed in misses_to_compute:
-                index = first_index_by_key[missed.key]
-                snapshot = snapshots[index]
-                assert snapshot is not None
-                media = await asyncio.wrap_future(
-                    self.io_executor.submit(
-                        self.decode_media_snapshot, snapshot, modality
-                    )
-                )
-                missed_media.append(
-                    MediaArtifactInput(
-                        content_digest=snapshot.content_digest,
-                        artifact_key=missed.key,
-                        modality=modality,
-                        media=media,
-                    )
-                )
-
-            # 2. preprocess all decoded misses as one model batch
-            missed_artifacts = await self._run_preprocess_and_build_artifact_batch(
-                missed_media
-            )
-            if len(missed_artifacts) != len(misses_to_compute):
-                raise ValueError(
-                    "prepare_artifact_batch must return one artifact per cache miss"
-                )
-            for missed, entry, artifact in zip(
-                misses_to_compute, missed_media, missed_artifacts
+            # Decode and preprocess in chunks so neither stage's peak scales
+            # with the request's image count. Decoded images stay resident
+            # until their chunk's artifacts are built, so the two stages have
+            # to share one loop -- decoding everything first puts the whole
+            # request on the device before preprocessing allocates anything.
+            for chunk in self._chunk_misses(
+                misses_to_compute, first_index_by_key, snapshots
             ):
-                self.validate_artifact(artifact, entry)
-                previous = previous_metadata.get(missed.key)
-                if (
-                    previous is not None
-                    and previous.feature_hash != artifact.feature_hash
-                ):
-                    raise ValueError(
-                        "Cached media artifact feature hash changed for identical "
-                        f"identity {missed.key}"
+                # 1. decode (load media) each unique miss in this chunk
+                missed_media = []
+                for missed in chunk:
+                    index = first_index_by_key[missed.key]
+                    snapshot = snapshots[index]
+                    assert snapshot is not None
+                    media = await asyncio.wrap_future(
+                        self.io_executor.submit(
+                            self.decode_media_snapshot, snapshot, modality
+                        )
                     )
-                cache_value = artifact.cache_value()
-                self.validate_artifact(cache_value, entry)
-                # 3. return full artifacts and retain cache-safe copies
-                self.mm_preprocess_cache.complete_miss(
-                    missed,
-                    artifact,
-                    cache_value=cache_value,
+                    missed_media.append(
+                        MediaArtifactInput(
+                            content_digest=snapshot.content_digest,
+                            artifact_key=missed.key,
+                            modality=modality,
+                            media=media,
+                        )
+                    )
+
+                # 2. preprocess this chunk's decoded misses as one model batch
+                missed_artifacts = await self._run_preprocess_and_build_artifact_batch(
+                    missed_media
                 )
-                resolved_by_key[missed.key] = artifact
+                if len(missed_artifacts) != len(chunk):
+                    raise ValueError(
+                        "prepare_artifact_batch must return one artifact per cache miss"
+                    )
+                for missed, entry, artifact in zip(
+                    chunk, missed_media, missed_artifacts
+                ):
+                    self.validate_artifact(artifact, entry)
+                    previous = previous_metadata.get(missed.key)
+                    if (
+                        previous is not None
+                        and previous.feature_hash != artifact.feature_hash
+                    ):
+                        raise ValueError(
+                            "Cached media artifact feature hash changed for identical "
+                            f"identity {missed.key}"
+                        )
+                    cache_value = artifact.cache_value()
+                    self.validate_artifact(cache_value, entry)
+                    # 3. return full artifacts and retain cache-safe copies
+                    self.mm_preprocess_cache.complete_miss(
+                        missed,
+                        artifact,
+                        cache_value=cache_value,
+                    )
+                    resolved_by_key[missed.key] = artifact
+                # Drop this chunk's decoded media and features before the next
+                # chunk decodes, so only one chunk is ever resident.
+                del missed_media, missed_artifacts
         except BaseException as error:
             for missed in misses_to_compute:
                 if not missed.future.done():
