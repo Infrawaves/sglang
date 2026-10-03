@@ -1,6 +1,7 @@
 import unittest
 from array import array
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -122,6 +123,66 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
+
+
+def _distinct_req(rid, base, n, prefill_arrival=0):
+    # Distinct token ids per request so in-batch prefix sharing does not
+    # deprioritize any of them.
+    r = _make_req(rid, "x", list(range(base, base + n)))
+    r.prefill_arrival_processed_tokens = prefill_arrival
+    return r
+
+
+class TestSchedulePolicyShortestPrefillFirst(CustomTestCase):
+    def _policy(self, policy="shortest-prefill-first"):
+        return SchedulePolicy(
+            policy=policy,
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def test_calc_priority_least_work_first(self):
+        long = _distinct_req("long", 10_000, 3000)
+        short = _distinct_req("short", 20_000, 100)
+        mid = _distinct_req("mid", 30_000, 1000)
+        queue = [long, mid, short]
+        self._policy().calc_priority(queue, processed_tokens=0)
+        self.assertEqual([r.rid for r in queue], ["short", "mid", "long"])
+
+    def test_calc_priority_counts_l3_prefetched_prefix(self):
+        cold = _distinct_req("cold", 10_000, 4000)
+        warm = _distinct_req("warm", 20_000, 4000)
+        policy = self._policy()
+        policy.tree_cache.peek_prefetched_prefix_len = lambda rid: (
+            3_968 if rid == "warm" else 0
+        )
+        queue = [cold, warm]
+        policy.calc_priority(queue, processed_tokens=0)
+        self.assertEqual([r.rid for r in queue], ["warm", "cold"])
+
+    def test_calc_priority_aged_request_goes_first(self):
+        big_old = _distinct_req("big_old", 10_000, 5000, prefill_arrival=0)
+        small_new = _distinct_req("small_new", 20_000, 100, prefill_arrival=900)
+        queue = [small_new, big_old]
+        with envs.SGLANG_SPF_AGING_TOKENS.override(500):
+            self._policy().calc_priority(queue, processed_tokens=1000)
+        self.assertEqual([r.rid for r in queue], ["big_old", "small_new"])
+
+    def test_bootstrap_admission_order(self):
+        reqs = [
+            _distinct_req("a", 10_000, 3000),
+            _distinct_req("b", 20_000, 100),
+            _distinct_req("c", 30_000, 1000),
+        ]
+        self.assertIsNone(
+            self._policy("fcfs").bootstrap_admission_order(reqs, processed_tokens=0)
+        )
+        self.assertEqual(
+            self._policy().bootstrap_admission_order(reqs, processed_tokens=0),
+            [1, 2, 0],
+        )
 
 
 if __name__ == "__main__":

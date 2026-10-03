@@ -496,6 +496,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(req_id), None
 
+    def peek_prefetched_prefix_len(self, req_id: str) -> int:
+        """Prefix length (from the sequence start) that a finished L3 prefetch
+        made host-resident for ``req_id``, or 0 if none or unknown.
+
+        Read-only scheduling hint; ``pop_prefetch_loaded_span`` consumes the
+        same record at admission. Must be rank-consistent where implemented.
+        """
+        return 0
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading

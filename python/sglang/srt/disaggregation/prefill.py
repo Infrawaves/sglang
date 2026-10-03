@@ -493,7 +493,16 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+        # Under shortest-prefill-first, scarce metadata buffers go to the
+        # requests with the least remaining prefill work instead of the oldest.
+        order = self.scheduler.policy.bootstrap_admission_order(
+            self.queue, self.scheduler.processed_tokens_counter
+        )
+        if order is None:
+            order = range(len(self.queue))
+
+        for i in order:
+            req, poll = self.queue[i], polls[i]
             if poll is None:
                 continue
 

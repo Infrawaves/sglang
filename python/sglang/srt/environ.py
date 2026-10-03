@@ -641,6 +641,12 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # shortest-prefill-first aging: once the scheduler has prefilled this many
+    # tokens since a request was queued, the request stops being deferred and
+    # goes ahead of shorter ones (longest-waiting first). Counted in tokens, not
+    # seconds, so every TP rank orders identically; 3M is about 150 s at
+    # 20K prefill tok/s. 0 disables aging.
+    SGLANG_SPF_AGING_TOKENS = EnvInt(3_000_000)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

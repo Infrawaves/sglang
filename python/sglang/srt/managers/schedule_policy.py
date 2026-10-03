@@ -5,6 +5,10 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.managers.prefill_order import (
+    shortest_prefill_order,
+    sort_shortest_prefill_first,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_schedule,
@@ -208,6 +212,9 @@ class CacheAwarePolicy(Enum):
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
+    # Least remaining prefill work first (device/host/L3 hits counted), with
+    # token-based aging; also orders the PD-prefill bootstrap queue.
+    SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -281,6 +288,10 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_hrrn(
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
+            elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                self._sort_by_shortest_prefill(
+                    waiting_queue, temporary_deprioritized, processed_tokens
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -329,6 +340,8 @@ class SchedulePolicy:
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
+                if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                    raise ValueError("shortest-prefill-first requires prefix caching")
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -451,6 +464,44 @@ class SchedulePolicy:
             return (-ratio_delta, rid)
 
         waiting_queue.sort(key=_key)
+
+    def _sort_by_shortest_prefill(
+        self,
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        processed_tokens: int,
+    ) -> None:
+        """Least remaining prefill work first, with token-based aging.
+
+        See ``prefill_order.shortest_prefill_key``. Work subtracts the device
+        and host match refreshed by ``_compute_prefix_matches`` and the prefix
+        a finished L3 prefetch loaded into host memory.
+        """
+        sort_shortest_prefill_first(
+            waiting_queue,
+            processed_tokens=processed_tokens,
+            aging_tokens=envs.SGLANG_SPF_AGING_TOKENS.get(),
+            prefetched_prefix_len=self.tree_cache.peek_prefetched_prefix_len,
+            deprioritized=temporary_deprioritized,
+        )
+
+    def bootstrap_admission_order(
+        self, bootstrap_queue: List[Req], processed_tokens: int
+    ) -> Optional[List[int]]:
+        """Order in which PD-prefill bootstrap requests claim metadata buffers.
+
+        Returns indices into ``bootstrap_queue``, or None to keep arrival
+        order (any policy other than shortest-prefill-first). Uses the
+        arrival-time radix match and the L3 prefetch result; no new match.
+        """
+        if self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            return None
+        return shortest_prefill_order(
+            bootstrap_queue,
+            processed_tokens=processed_tokens,
+            aging_tokens=envs.SGLANG_SPF_AGING_TOKENS.get(),
+            prefetched_prefix_len=self.tree_cache.peek_prefetched_prefix_len,
+        )
 
     @staticmethod
     def _sort_by_dfs_weight(

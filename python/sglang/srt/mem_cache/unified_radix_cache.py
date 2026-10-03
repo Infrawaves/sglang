@@ -2975,6 +2975,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None),
         )
 
+    def peek_prefetched_prefix_len(self, req_id: str) -> int:
+        # Both records are written by _handle_prefetch_result from the
+        # rank-agreed completed length, so every rank reads the same value.
+        loaded = self.prefetch_loaded_tokens_by_reqid.get(req_id, 0)
+        if loaded <= 0:
+            return 0
+        start = self.prefetch_loaded_storage_start_by_reqid.get(req_id)
+        return loaded + (start or 0)
+
     def pop_storage_prefetch_miss(self, req_id: str) -> bool:
         """True once per resolved storage-prefetch miss for a live request;
         the scheduler uses it to arm the paced availability-check retry."""

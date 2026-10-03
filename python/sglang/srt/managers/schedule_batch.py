@@ -1345,6 +1345,9 @@ class Req(ReqDllmMixin):
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
+        # Same counter at the request's first queue entry (the bootstrap queue
+        # under PD prefill); kept across requeues. Used by shortest-prefill-first aging.
+        self.prefill_arrival_processed_tokens: Optional[int] = None
 
     @property
     def seqlen(self) -> int:

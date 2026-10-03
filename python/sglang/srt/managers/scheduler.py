@@ -3235,6 +3235,9 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if req.prefill_arrival_processed_tokens is None:
+            # First queue entry; shortest-prefill-first ages from here.
+            req.prefill_arrival_processed_tokens = self.processed_tokens_counter
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
