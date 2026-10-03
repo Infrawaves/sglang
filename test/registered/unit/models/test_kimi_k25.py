@@ -194,6 +194,66 @@ def test_kimi_gpu_preprocess_group_batching_matches_the_single_image_path():
         offset += count
 
 
+def test_kimi_gpu_preprocess_per_image_matches_the_packed_block_without_copying():
+    # per_image must be a pure repackaging of the same features: equal values in
+    # the same order, and no extra copy. The packed path keeps every group's
+    # patchify output alive while torch.cat builds a full duplicate; the
+    # per-image path hands back tensors that still index into their own group's
+    # output, so same-group images keep sharing one storage.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    resize_configs = [wide, tall, wide, tall]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    call = functools.partial(
+        _gpu_preprocess_images,
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    packed, packed_grids = call()
+    per_image, per_image_grids = call(per_image=True)
+
+    torch.testing.assert_close(packed_grids, per_image_grids)
+    patch_counts = [row[1] * row[2] for row in per_image_grids.tolist()]
+    assert [feature.shape[0] for feature in per_image] == patch_counts
+    offset = 0
+    for feature, count in zip(per_image, patch_counts):
+        torch.testing.assert_close(feature, packed[offset : offset + count])
+        offset += count
+
+    # Indices 0/2 share the `wide` group and 1/3 share `tall`. Same group means
+    # one patchify output, so a reintroduced clone() or cat would break this.
+    storage_of = lambda t: t.untyped_storage().data_ptr()  # noqa: E731
+    assert storage_of(per_image[0]) == storage_of(per_image[2])
+    assert storage_of(per_image[1]) == storage_of(per_image[3])
+    assert storage_of(per_image[0]) != storage_of(per_image[1])
+
+
+def test_kimi_gpu_preprocess_per_image_is_empty_for_no_images():
+    # The packed path returns a zero-row tensor here; the list contract has to
+    # return an empty list instead of that tensor.
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+
+    features, grid_thws = _gpu_preprocess_images(
+        [], [], image_scale, image_bias, 4, per_image=True
+    )
+
+    assert features == []
+    assert grid_thws.shape == (0, 3)
+
+
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
     # Plain F.interpolate skips PIL's implicit antialiasing on downscale and
     # drifts far outside 8-bit rounding; photo-like content, not pure noise.
