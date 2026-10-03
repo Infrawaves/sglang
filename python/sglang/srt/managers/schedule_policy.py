@@ -313,6 +313,13 @@ class SchedulePolicy:
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
+            self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            and len(waiting_queue) <= 1
+        ):
+            # Nothing to reorder: skip the per-request prefix match and act
+            # exactly like FCFS (also for the load snapshot's uncached estimate).
+            return CacheAgnosticPolicy.FCFS
+        if (
             self.policy
             in (
                 CacheAwarePolicy.LPM,
@@ -360,6 +367,12 @@ class SchedulePolicy:
         """
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # shortest-prefill-first skips in-batch prefix deferral: the deferred
+        # request would sort behind every other request, however large, and on
+        # hybrid KDA/Mamba models a shared prefix shorter than a chunk gets no
+        # reusable state anyway. It also saves inserting long prompts into the
+        # simulated tree on every scheduling pass.
+        check_in_batch = policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -376,7 +389,10 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if (
+                check_in_batch
+                and len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+            ):
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(

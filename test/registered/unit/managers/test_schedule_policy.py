@@ -3,7 +3,11 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    CacheAgnosticPolicy,
+    CacheAwarePolicy,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -182,6 +186,31 @@ class TestSchedulePolicyShortestPrefillFirst(CustomTestCase):
         self.assertEqual(
             self._policy().bootstrap_admission_order(reqs, processed_tokens=0),
             [1, 2, 0],
+        )
+
+    def test_calc_priority_ignores_in_batch_prefix_sharing(self):
+        # Both share their first 100 tokens. LPM-style in-batch deferral would
+        # push "small" behind "big"; shortest-prefill-first does not defer.
+        big = _make_req("big", "x", list(range(5000)))
+        small = _make_req("small", "x", list(range(100)))
+        big.prefill_arrival_processed_tokens = 0
+        small.prefill_arrival_processed_tokens = 0
+        queue = [big, small]
+        self._policy().calc_priority(queue, processed_tokens=0)
+        self.assertEqual([r.rid for r in queue], ["small", "big"])
+
+    def test_single_waiting_request_acts_like_fcfs(self):
+        policy = self._policy()
+        r = _distinct_req("only", 10_000, 100)
+        r.num_matched_prefix_tokens = 77
+        self.assertEqual(policy._determine_active_policy([r]), CacheAgnosticPolicy.FCFS)
+        policy.calc_priority([r], processed_tokens=0)
+        # No prefix match ran, so the field is untouched.
+        self.assertEqual(r.num_matched_prefix_tokens, 77)
+        two = [r, _distinct_req("other", 20_000, 100)]
+        self.assertEqual(
+            policy._determine_active_policy(two),
+            CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
         )
 
 
