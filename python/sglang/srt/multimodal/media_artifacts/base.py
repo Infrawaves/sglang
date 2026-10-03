@@ -24,6 +24,7 @@ media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -112,6 +113,13 @@ class MediaArtifactCacheMixin:
     # the serving GPU overrides this, because there its decoded images and its
     # preprocessing peak share the tokenizer process's slice of the device.
     mm_preprocess_chunk_mb: int = 0
+    # How many decode+preprocess chunks may be in flight across all requests.
+    # Chunking bounds one request; concurrent requests still add up, because
+    # decode yields the event loop while it waits on the io executor. 0 leaves
+    # them unbounded, which is the behaviour every model had before the gate.
+    mm_preprocess_concurrency: int = 0
+    _preprocess_gate: Optional[asyncio.Semaphore] = None
+    _preprocess_gate_limit: int = 0
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -550,6 +558,28 @@ class MediaArtifactCacheMixin:
             chunks.append(current)
         return chunks
 
+    def _preprocess_chunk_gate(self):
+        """Bound how many decode+preprocess chunks run at once, process-wide.
+
+        Returns an async context manager; a disabled gate returns a no-op one.
+
+        The gate is taken per chunk rather than for a whole request. Holding it
+        across a request would deadlock: ``prepare_media_artifacts`` waits on
+        keys *another* request claimed, so a gate holder could be waiting for a
+        request that cannot get in. Per chunk also keeps a 500-image request
+        from locking out a 1-image one for its whole duration.
+        """
+        override = envs.SGLANG_MM_PREPROCESS_CONCURRENCY.get()
+        limit = self.mm_preprocess_concurrency if override is None else override
+        if limit <= 0:
+            return contextlib.nullcontext()
+        if self._preprocess_gate is None or self._preprocess_gate_limit != limit:
+            # Built on first use: __init__ can run outside a running loop, and
+            # a Semaphore binds to the loop that first awaits it.
+            self._preprocess_gate = asyncio.Semaphore(limit)
+            self._preprocess_gate_limit = limit
+        return self._preprocess_gate
+
     async def _compute_cache_misses(
         self,
         misses_to_compute: Sequence[CacheMiss[str, MediaArtifact]],
@@ -574,59 +604,69 @@ class MediaArtifactCacheMixin:
             for chunk in self._chunk_misses(
                 misses_to_compute, first_index_by_key, snapshots
             ):
-                # 1. decode (load media) each unique miss in this chunk
-                missed_media = []
-                for missed in chunk:
-                    index = first_index_by_key[missed.key]
-                    snapshot = snapshots[index]
-                    assert snapshot is not None
-                    media = await asyncio.wrap_future(
-                        self.io_executor.submit(
-                            self.decode_media_snapshot, snapshot, modality
+                # Held across decode and preprocess, and released only after
+                # this chunk's decoded images are dropped. Releasing earlier
+                # would let the next chunk decode while these are still
+                # resident, which is the sum the gate exists to bound.
+                async with self._preprocess_chunk_gate():
+                    # 1. decode (load media) each unique miss in this chunk
+                    missed_media = []
+                    for missed in chunk:
+                        index = first_index_by_key[missed.key]
+                        snapshot = snapshots[index]
+                        assert snapshot is not None
+                        media = await asyncio.wrap_future(
+                            self.io_executor.submit(
+                                self.decode_media_snapshot, snapshot, modality
+                            )
                         )
-                    )
-                    missed_media.append(
-                        MediaArtifactInput(
-                            content_digest=snapshot.content_digest,
-                            artifact_key=missed.key,
-                            modality=modality,
-                            media=media,
+                        missed_media.append(
+                            MediaArtifactInput(
+                                content_digest=snapshot.content_digest,
+                                artifact_key=missed.key,
+                                modality=modality,
+                                media=media,
+                            )
                         )
-                    )
 
-                # 2. preprocess this chunk's decoded misses as one model batch
-                missed_artifacts = await self._run_preprocess_and_build_artifact_batch(
-                    missed_media
-                )
-                if len(missed_artifacts) != len(chunk):
-                    raise ValueError(
-                        "prepare_artifact_batch must return one artifact per cache miss"
-                    )
-                for missed, entry, artifact in zip(
-                    chunk, missed_media, missed_artifacts
-                ):
-                    self.validate_artifact(artifact, entry)
-                    previous = previous_metadata.get(missed.key)
-                    if (
-                        previous is not None
-                        and previous.feature_hash != artifact.feature_hash
-                    ):
-                        raise ValueError(
-                            "Cached media artifact feature hash changed for identical "
-                            f"identity {missed.key}"
+                    # 2. preprocess this chunk's decoded misses as one model batch
+                    missed_artifacts = (
+                        await self._run_preprocess_and_build_artifact_batch(
+                            missed_media
                         )
-                    cache_value = artifact.cache_value()
-                    self.validate_artifact(cache_value, entry)
-                    # 3. return full artifacts and retain cache-safe copies
-                    self.mm_preprocess_cache.complete_miss(
-                        missed,
-                        artifact,
-                        cache_value=cache_value,
                     )
-                    resolved_by_key[missed.key] = artifact
-                # Drop this chunk's decoded media and features before the next
-                # chunk decodes, so only one chunk is ever resident.
-                del missed_media, missed_artifacts
+                    if len(missed_artifacts) != len(chunk):
+                        raise ValueError(
+                            "prepare_artifact_batch must return one artifact per cache miss"
+                        )
+                    for missed, entry, artifact in zip(
+                        chunk, missed_media, missed_artifacts
+                    ):
+                        self.validate_artifact(artifact, entry)
+                        previous = previous_metadata.get(missed.key)
+                        if (
+                            previous is not None
+                            and previous.feature_hash != artifact.feature_hash
+                        ):
+                            raise ValueError(
+                                "Cached media artifact feature hash changed for "
+                                f"identical identity {missed.key}"
+                            )
+                        cache_value = artifact.cache_value()
+                        self.validate_artifact(cache_value, entry)
+                        # 3. return full artifacts and retain cache-safe copies
+                        self.mm_preprocess_cache.complete_miss(
+                            missed,
+                            artifact,
+                            cache_value=cache_value,
+                        )
+                        resolved_by_key[missed.key] = artifact
+                    # Drop this chunk's decoded media before the next chunk
+                    # decodes, so only one chunk's inputs are ever resident.
+                    # The features themselves outlive this by design -- the
+                    # request needs them -- so the gate bounds the decode and
+                    # preprocess transient, not the finished output.
+                    del missed_media, missed_artifacts
         except BaseException as error:
             for missed in misses_to_compute:
                 if not missed.future.done():
