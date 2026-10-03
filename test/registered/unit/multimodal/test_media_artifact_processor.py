@@ -8,6 +8,7 @@ from typing import Optional
 
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
 from sglang.srt.multimodal.media_artifacts import (
@@ -17,7 +18,14 @@ from sglang.srt.multimodal.media_artifacts import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+
+def _solid_png(width: int, height: int, color: tuple) -> bytes:
+    """A PNG whose payload is tiny and whose decoded size is width*height*3."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @dataclass(frozen=True)
@@ -273,6 +281,90 @@ class TestMediaArtifactProcessor(CustomTestCase):
         self.assertEqual(len(processor.batches), 1)
         self.assertEqual(len(processor.batches[0]), 2)
         self.assertIs(cached_after[0], cached)
+
+    def test_chunking_splits_the_miss_set_without_changing_its_result(self):
+        # Chunking only moves where decode/preprocess boundaries fall. The
+        # artifacts, and their order, must be what one batch produced. Each
+        # 400x400 RGB image hints 480000 decoded bytes, so a 1 MiB budget
+        # admits two and refuses a third -- a split that proves the budget
+        # accumulates rather than giving every image its own chunk.
+        images = [_solid_png(400, 400, (index * 40, 10, 20)) for index in range(4)]
+        unchunked = _Processor()
+        chunked = _Processor()
+        chunked.mm_preprocess_chunk_mb = 1
+        try:
+            reference = asyncio.run(unchunked.prepare_media_artifacts(images))
+            actual = asyncio.run(chunked.prepare_media_artifacts(images))
+        finally:
+            unchunked.close()
+            chunked.close()
+
+        self.assertEqual(len(unchunked.batches), 1)
+        self.assertEqual([len(batch) for batch in chunked.batches], [2, 2])
+        self.assertEqual(
+            [artifact.artifact_key for artifact in actual],
+            [artifact.artifact_key for artifact in reference],
+        )
+        self.assertEqual(
+            [artifact.feature for artifact in actual],
+            [artifact.feature for artifact in reference],
+        )
+
+    def test_an_image_over_the_whole_budget_gets_its_own_chunk(self):
+        # Images are never split, so one image above the budget has to still
+        # be processed rather than refused or merged into a neighbour's chunk.
+        big = _solid_png(800, 800, (1, 2, 3))
+        small = _solid_png(10, 10, (4, 5, 6))
+        processor = _Processor()
+        processor.mm_preprocess_chunk_mb = 1
+        try:
+            artifacts = asyncio.run(processor.prepare_media_artifacts([big, small]))
+        finally:
+            processor.close()
+
+        self.assertEqual([len(batch) for batch in processor.batches], [1, 1])
+        self.assertEqual([artifact.feature for artifact in artifacts], [big, small])
+
+    def test_chunk_budget_tracks_decoded_size_not_payload_size(self):
+        # A solid-colour PNG compresses to a few hundred bytes, so budgeting on
+        # snapshot.size_bytes would admit an unbounded number of them. The hint
+        # has to come from the header's dimensions instead.
+        payload = _solid_png(512, 512, (7, 8, 9))
+        processor = _Processor()
+        try:
+            hint = processor.decoded_size_hint(snapshot_media(payload))
+        finally:
+            processor.close()
+
+        self.assertEqual(hint, 512 * 512 * 3)
+        self.assertLess(len(payload), 512 * 512 * 3 // 100)
+
+    def test_unreadable_payload_still_hints_its_byte_count(self):
+        # Returning 0 for an unreadable payload would put every miss in one
+        # chunk and silently restore the unbounded behaviour. The real decode
+        # failure is reported by decode_media_snapshot, not here.
+        payload = b"not an image at all"
+        processor = _Processor()
+        try:
+            hint = processor.decoded_size_hint(snapshot_media(payload))
+        finally:
+            processor.close()
+
+        self.assertEqual(hint, len(payload))
+
+    def test_env_override_of_zero_disables_a_processors_own_chunking(self):
+        # The env var is the only production override, and 0 has to mean off
+        # even for a processor that opts into chunking in code.
+        images = [_solid_png(400, 400, (index * 40, 10, 20)) for index in range(4)]
+        processor = _Processor()
+        processor.mm_preprocess_chunk_mb = 1
+        try:
+            with envs.SGLANG_MM_PREPROCESS_CHUNK_MB.override(0):
+                asyncio.run(processor.prepare_media_artifacts(images))
+        finally:
+            processor.close()
+
+        self.assertEqual([len(batch) for batch in processor.batches], [4])
 
     def test_without_cache_still_validates_caller_content_hash(self):
         processor = _Processor()
