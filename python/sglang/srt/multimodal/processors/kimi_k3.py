@@ -434,6 +434,15 @@ class KimiK3ImageProcessor(
     # sources alone can exceed that. Chunk the decode+preprocess loop so
     # neither scales with the image count.
     mm_preprocess_chunk_mb = 1024
+    # Chunking bounds one request; concurrent requests still add up, because
+    # decode yields the event loop while it waits on the io executor. One
+    # chunk at a time makes the device peak independent of how many requests
+    # arrive together, which is the only property that holds for traffic we do
+    # not control. Preprocessing is already serialized here
+    # (_preprocessing_competes_with_the_scheduler forces one worker), so this
+    # only serializes decode; raise SGLANG_MM_PREPROCESS_CONCURRENCY if that
+    # costs more throughput than the bound is worth.
+    mm_preprocess_concurrency = 1
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(

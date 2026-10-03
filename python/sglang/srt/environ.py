@@ -1408,6 +1408,11 @@ class Envs:
     # peak that way instead of decoding every image in the request first.
     # None defers to the processor's own default; 0 disables chunking.
     SGLANG_MM_PREPROCESS_CHUNK_MB = EnvInt(None)
+    # How many decode+preprocess chunks may be in flight across all requests.
+    # Chunking bounds one request; this bounds their sum, which is what a
+    # processor sharing the serving GPU needs. None defers to the processor's
+    # own default; 0 disables the gate.
+    SGLANG_MM_PREPROCESS_CONCURRENCY = EnvInt(None)
 
     # ===================================================================
     # Multimodal CUDA IPC transport
