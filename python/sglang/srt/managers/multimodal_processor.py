@@ -86,4 +86,14 @@ def get_mm_processor(
             f"No processor registered for architecture: {hf_config.architectures}.\n"
             f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
         )
-    return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)
+    # Forwarded, not just used to pick the class: a processor that emits model-
+    # ready features needs the same resolved dtype the weights load with, and
+    # re-deriving it from hf_config would be a second source of truth.
+    return processor_cls(
+        hf_config,
+        server_args,
+        processor,
+        transport_mode,
+        model_config=model_config,
+        **kwargs,
+    )
