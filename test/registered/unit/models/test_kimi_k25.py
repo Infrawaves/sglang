@@ -240,6 +240,50 @@ def test_kimi_gpu_preprocess_per_image_matches_the_packed_block_without_copying(
     assert storage_of(per_image[0]) != storage_of(per_image[1])
 
 
+def test_kimi_gpu_preprocess_output_dtype_applies_to_both_group_branches():
+    # _gpu_preprocess_images has two branches: one image in a target group goes
+    # through _process_single_image, several go through the batched path. A cast
+    # added to only one leaves the other at the wider dtype, and then the packed
+    # torch.cat promotes everything back -- the saving disappears with no error.
+    # `tall` has one member and `wide` has three, so both branches run here.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    resize_configs = [wide, tall, wide, wide]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    call = functools.partial(
+        _gpu_preprocess_images,
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    reference, _ = call(per_image=True)
+    narrow, _ = call(per_image=True, output_dtype=torch.bfloat16)
+    packed, _ = call(output_dtype=torch.bfloat16)
+
+    assert [feature.dtype for feature in reference] == [torch.float32] * 4
+    assert [feature.dtype for feature in narrow] == [torch.bfloat16] * 4
+    # The packed path must not promote, which it would if either branch skipped
+    # the cast.
+    assert packed.dtype == torch.bfloat16
+
+    # Cast after patchify, not before: the normalize affine still runs in the
+    # resize dtype, so the result is bit-identical to casting the fp32 output.
+    # Casting the patchify *input* instead would move the low bits.
+    for feature, expected in zip(narrow, reference):
+        assert torch.equal(feature, expected.to(torch.bfloat16))
+
+
 def test_kimi_gpu_preprocess_per_image_is_empty_for_no_images():
     # The packed path returns a zero-row tensor here; the list contract has to
     # return an empty list instead of that tensor.
@@ -793,11 +837,16 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
             assert isinstance(worker_processor, wrapper_cls)
             assert worker_processor is not processor._processor
             if processor_cls is KimiK3ImageProcessor:
-                fingerprint_config = processor.preprocess_fingerprint_payload()[
+                wrapped = processor.preprocess_fingerprint_payload()[
                     "wrapped_processor"
                 ]
+                fingerprint_config = wrapped["preprocess_config"]
                 assert isinstance(fingerprint_config, KimiK3PreprocessConfig)
                 assert fingerprint_config.patch_size == 14
+                # No model_config was passed, so the wrapper keeps the resize
+                # dtype and says so in its key.
+                assert wrapped["output_dtype"] is None
+                assert "feature_dtype" not in processor.preprocess_fingerprint_payload()
         finally:
             processor.mm_processor_executor.shutdown()
             processor.io_executor.shutdown()

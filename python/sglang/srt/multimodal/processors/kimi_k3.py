@@ -181,7 +181,9 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-    def __init__(self, hf_processor, image_token, image_token_id, config):
+    def __init__(
+        self, hf_processor, image_token, image_token_id, config, output_dtype=None
+    ):
         self.preprocess_config = config
         super().__init__(
             hf_processor,
@@ -196,9 +198,17 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             image_std=config.image_std,
         )
         self._transparent_bg_config = config.transparent_bg_config
+        self._output_dtype = output_dtype
 
     def preprocess_fingerprint_payload(self):
-        return self.preprocess_config
+        # A cached fp32 feature is not interchangeable with a bf16 one, so the
+        # dtype this wrapper emits has to scope its artifact keys. Kept here
+        # rather than on the base processor: only a processor that actually
+        # casts should change its keys.
+        return {
+            "preprocess_config": self.preprocess_config,
+            "output_dtype": self._output_dtype,
+        }
 
     def _prepare_input_ids(
         self, input_text, resize_configs, original_input_ids, image_sizes
@@ -260,6 +270,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            output_dtype=self._output_dtype,
         )
 
         return {
@@ -362,6 +373,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     x, self._transparent_bg_config
                 ),
                 per_image=True,
+                output_dtype=self._output_dtype,
             )
         else:
             # The checkpoint CPU processor couples prompt composition with media
@@ -439,6 +451,11 @@ class KimiK3ImageProcessor(
             image_token=mm_tokens.image_token,
             image_token_id=mm_tokens.image_token_id,
             config=preprocess_config,
+            # ModelConfig.dtype is the resolved dtype the weights load with, so
+            # the encoder receives exactly what it would have cast to itself.
+            # None (the scheduler's M-RoPE fallback processor passes no
+            # model_config) leaves the output in its resize dtype.
+            output_dtype=getattr(kwargs.get("model_config"), "dtype", None),
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
