@@ -217,12 +217,14 @@ def _process_single_image(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Process a single image on GPU: resize -> pad -> normalize -> patchify.
 
     ``to_chw`` converts the input to a CUDA CHW tensor (a model may keep an
     alpha channel here); ``post_resize`` runs on the resized ``(B, C, H, W)``
     batch before patchify (K3 composites transparent backgrounds there).
+    ``output_dtype`` casts the patchified result; see ``_gpu_preprocess_images``.
     """
     image = to_chw(image)
 
@@ -238,9 +240,12 @@ def _process_single_image(
     if post_resize is not None:
         x = post_resize(x)
 
-    return normalize_and_patchify(
+    patches = normalize_and_patchify(
         x, image_scale, image_bias, patch_size, padded_h, padded_w
     ).squeeze(0)
+    if output_dtype is not None and patches.dtype != output_dtype:
+        patches = patches.to(output_dtype)
+    return patches
 
 
 def _resize_images_by_source_shape(
@@ -295,6 +300,7 @@ def _preprocess_group_streamed(
     image_bias: torch.Tensor,
     patch_size: int,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Resize, post_resize and patchify one target-size group chunk by chunk.
 
@@ -306,6 +312,9 @@ def _preprocess_group_streamed(
     ``indexed_images`` is consumed: each uint8 source is dropped once its chunk
     is stacked, so the caller must not read the list afterwards. Returns patches
     in the order of ``indexed_images``.
+
+    ``output_dtype`` is the dtype of the preallocated output; each chunk is
+    cast as it is written, so the wide result exists one chunk at a time.
     """
     by_source_shape = defaultdict(list)
     for position, (_, image) in enumerate(indexed_images):
@@ -341,7 +350,7 @@ def _preprocess_group_streamed(
                 # channel count (K3 turns RGBA into RGB).
                 out = torch.empty(
                     (len(indexed_images), *patches.shape[1:]),
-                    dtype=patches.dtype,
+                    dtype=output_dtype or patches.dtype,
                     device=patches.device,
                 )
             out[part] = patches
@@ -358,6 +367,7 @@ def _gpu_preprocess_images(
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     per_image: bool = False,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> tuple[Union[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
@@ -369,6 +379,14 @@ def _gpu_preprocess_images(
     builds the copy. The per-image tensors index into their own group's
     patchify output, so they share storage exactly the way the block's
     ``split`` views already did -- without the copy in between.
+
+    ``output_dtype`` casts each group's patchified result, which the encoder
+    would otherwise do on arrival. Applied after patchify, so the normalize
+    affine still runs in the resize dtype and the encoder sees bit-identical
+    values; applied per group (per chunk in the streamed path), so the
+    full-precision output never exists for the whole request at once. It must be passed for *both* branches below or
+    not at all -- a mix leaves the single-image groups at the wider dtype, and
+    the packed ``torch.cat`` would promote the narrow ones back to match.
     """
     n = len(images)
     empty_grids = torch.empty(0, 3, dtype=torch.int64)
@@ -403,6 +421,7 @@ def _gpu_preprocess_images(
                 patch_size,
                 to_chw=to_chw,
                 post_resize=post_resize,
+                output_dtype=output_dtype,
             )
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
@@ -422,6 +441,7 @@ def _gpu_preprocess_images(
                 image_bias,
                 patch_size,
                 post_resize=post_resize,
+                output_dtype=output_dtype,
             )
             del indexed_images
 
