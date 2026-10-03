@@ -244,6 +244,10 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        # Present when the caller resolved a ModelConfig (tokenizer process and
+        # the encoder receiver). The scheduler's M-RoPE fallback processor does
+        # not, so every read has to tolerate None.
+        self.model_config = kwargs.get("model_config")
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -455,6 +459,18 @@ class BaseMultimodalProcessor(ABC):
         """Whether feature transport expects processor outputs to stay on GPU."""
         return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
 
+    @property
+    def feature_dtype(self) -> Optional[torch.dtype]:
+        """The dtype the encoder will cast this processor's features to.
+
+        ``ModelConfig.dtype`` is the resolved value the weights load with, so
+        a processor that emits its features in this dtype hands the encoder
+        exactly what it would have produced itself. Returns None when no
+        ModelConfig was forwarded, which keeps such a processor on whatever
+        dtype its preprocessing naturally produces.
+        """
+        return getattr(self.model_config, "dtype", None)
+
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
 
@@ -476,6 +492,9 @@ class BaseMultimodalProcessor(ABC):
             "gpu_image_decode": self.gpu_image_decode,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
+            # A cached fp32 feature is not interchangeable with a bf16 one, so
+            # the dtype a processor emits has to scope its artifact keys.
+            "feature_dtype": self.feature_dtype,
             "image_config": self.image_config,
             "video_config": self.video_config,
             "audio_config": self.audio_config,

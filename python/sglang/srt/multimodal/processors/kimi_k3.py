@@ -163,7 +163,9 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-    def __init__(self, hf_processor, image_token, image_token_id, config):
+    def __init__(
+        self, hf_processor, image_token, image_token_id, config, output_dtype=None
+    ):
         self.preprocess_config = config
         super().__init__(
             hf_processor,
@@ -178,6 +180,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             image_std=config.image_std,
         )
         self._transparent_bg_config = config.transparent_bg_config
+        self._output_dtype = output_dtype
 
     def preprocess_fingerprint_payload(self):
         return self.preprocess_config
@@ -242,6 +245,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            output_dtype=self._output_dtype,
         )
 
         return {
@@ -344,6 +348,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     x, self._transparent_bg_config
                 ),
                 per_image=True,
+                output_dtype=self._output_dtype,
             )
         else:
             # The checkpoint CPU processor couples prompt composition with media
@@ -421,6 +426,10 @@ class KimiK3ImageProcessor(
             image_token=mm_tokens.image_token,
             image_token_id=mm_tokens.image_token_id,
             config=preprocess_config,
+            # Read from kwargs because the wrapper is built before
+            # super().__init__() sets self.model_config. None (the scheduler's
+            # M-RoPE fallback processor) leaves the output in its resize dtype.
+            output_dtype=getattr(kwargs.get("model_config"), "dtype", None),
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
