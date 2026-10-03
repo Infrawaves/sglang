@@ -1403,6 +1403,11 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Decoded-pixel budget for one decode+preprocess chunk of cache misses.
+    # A processor whose preprocessing runs on the serving GPU bounds its own
+    # peak that way instead of decoding every image in the request first.
+    # None defers to the processor's own default; 0 disables chunking.
+    SGLANG_MM_PREPROCESS_CHUNK_MB = EnvInt(None)
 
     # ===================================================================
     # Multimodal CUDA IPC transport
