@@ -574,7 +574,9 @@ def _gpu_preprocess_k3_visual_items(
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-    def __init__(self, hf_processor, image_token, image_token_id, config):
+    def __init__(
+        self, hf_processor, image_token, image_token_id, config, output_dtype=None
+    ):
         self.preprocess_config = config
         super().__init__(
             hf_processor,
@@ -589,6 +591,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             image_std=config.image_std,
         )
         self._transparent_bg_config = config.transparent_bg_config
+        self._output_dtype = output_dtype
         self._image_preprocess_mode = _resolve_image_preprocess_mode()
         self._log_preprocess_backend = envs.SGLANG_K3_IMAGE_PREPROCESS_LOG.get()
         self._oom_fallback = envs.SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK.get()
@@ -681,7 +684,14 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
     def preprocess_fingerprint_payload(self):
-        return self.preprocess_config
+        # A cached fp32 feature is not interchangeable with a bf16 one, so the
+        # dtype this wrapper emits has to scope its artifact keys. Kept here
+        # rather than on the base processor: only a processor that actually
+        # casts should change its keys.
+        return {
+            "preprocess_config": self.preprocess_config,
+            "output_dtype": self._output_dtype,
+        }
 
     def _normalize_visual_items(self, images) -> list[_KimiK3VisualItem]:
         return [
@@ -828,6 +838,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            output_dtype=self._output_dtype,
         )
 
         return {
@@ -936,6 +947,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                         x, self._transparent_bg_config
                     ),
                     per_image=True,
+                    output_dtype=self._output_dtype,
                 )
             except torch.OutOfMemoryError:
                 if not self._can_retry_on_cpu(images):
@@ -1020,6 +1032,11 @@ class KimiK3ImageProcessor(
             image_token=mm_tokens.image_token,
             image_token_id=mm_tokens.image_token_id,
             config=preprocess_config,
+            # ModelConfig.dtype is the resolved dtype the weights load with, so
+            # the encoder receives exactly what it would have cast to itself.
+            # None (the scheduler's M-RoPE fallback processor passes no
+            # model_config) leaves the output in its resize dtype.
+            output_dtype=getattr(kwargs.get("model_config"), "dtype", None),
         )
         self._image_preprocess_mode = _resolve_image_preprocess_mode()
         # `_load_single_item` is a classmethod and reads `cls.gpu_image_decode`,
