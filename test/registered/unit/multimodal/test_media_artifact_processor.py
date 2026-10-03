@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import contextlib
 import io
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -18,7 +20,7 @@ from sglang.srt.multimodal.media_artifacts import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 def _solid_png(width: int, height: int, color: tuple) -> bytes:
@@ -95,6 +97,32 @@ class _Processor(MediaArtifactCacheMixin):
 
     def close(self):
         self.io_executor.shutdown()
+
+
+class _ConcurrencyProbeProcessor(_Processor):
+    """Records how many decodes are inside the gated section at once."""
+
+    def __init__(self, barrier: Optional[threading.Barrier] = None):
+        super().__init__()
+        self._barrier = barrier
+        self._probe_lock = threading.Lock()
+        self.inside = 0
+        self.max_inside = 0
+
+    def decode_media_snapshot(self, snapshot, modality):
+        with self._probe_lock:
+            self.inside += 1
+            self.max_inside = max(self.max_inside, self.inside)
+        try:
+            if self._barrier is not None:
+                # Releases only once a second decode has arrived, so the
+                # ungated case cannot pass just because one request happened
+                # to finish before the other started.
+                self._barrier.wait(timeout=5)
+            return super().decode_media_snapshot(snapshot, modality)
+        finally:
+            with self._probe_lock:
+                self.inside -= 1
 
 
 class TestMediaArtifactProcessor(CustomTestCase):
@@ -365,6 +393,78 @@ class TestMediaArtifactProcessor(CustomTestCase):
             processor.close()
 
         self.assertEqual([len(batch) for batch in processor.batches], [4])
+
+    def test_gate_keeps_one_chunk_in_flight_across_concurrent_requests(self):
+        # Chunking bounds one request; decode yields the event loop while it
+        # waits on the io executor, so concurrent requests still add up. The
+        # gate is what makes the in-flight count independent of how many
+        # requests arrive together.
+        processor = _ConcurrencyProbeProcessor()
+        processor.mm_preprocess_concurrency = 1
+
+        async def drive():
+            return await asyncio.gather(
+                processor.prepare_media_artifacts([b"first"]),
+                processor.prepare_media_artifacts([b"second"]),
+            )
+
+        try:
+            first, second = asyncio.run(asyncio.wait_for(drive(), timeout=30))
+        finally:
+            processor.close()
+
+        self.assertEqual(processor.max_inside, 1)
+        self.assertEqual(first[0].feature, b"first")
+        self.assertEqual(second[0].feature, b"second")
+
+    def test_without_the_gate_concurrent_requests_decode_together(self):
+        # The baseline the gate changes. The barrier makes the overlap a
+        # requirement rather than a coincidence: if a gate were active here,
+        # the second decode would never arrive and the barrier would break.
+        barrier = threading.Barrier(2)
+        processor = _ConcurrencyProbeProcessor(barrier=barrier)
+
+        async def drive():
+            return await asyncio.gather(
+                processor.prepare_media_artifacts([b"first"]),
+                processor.prepare_media_artifacts([b"second"]),
+            )
+
+        try:
+            asyncio.run(asyncio.wait_for(drive(), timeout=30))
+        finally:
+            processor.close()
+
+        self.assertEqual(processor.max_inside, 2)
+
+    def test_gate_resolution_prefers_the_env_override(self):
+        # The gate has to be a no-op when off rather than a semaphore of some
+        # default size, and the env var is the only production override. The
+        # limit change case matters because a stale semaphore would keep
+        # enforcing the old bound.
+        processor = _Processor()
+        try:
+            self.assertIsInstance(
+                processor._preprocess_chunk_gate(), contextlib.nullcontext
+            )
+
+            processor.mm_preprocess_concurrency = 2
+            gate = processor._preprocess_chunk_gate()
+            self.assertIsInstance(gate, asyncio.Semaphore)
+            self.assertEqual(gate._value, 2)
+            self.assertIs(gate, processor._preprocess_chunk_gate())
+
+            processor.mm_preprocess_concurrency = 3
+            self.assertEqual(processor._preprocess_chunk_gate()._value, 3)
+
+            with envs.SGLANG_MM_PREPROCESS_CONCURRENCY.override(0):
+                self.assertIsInstance(
+                    processor._preprocess_chunk_gate(), contextlib.nullcontext
+                )
+            with envs.SGLANG_MM_PREPROCESS_CONCURRENCY.override(5):
+                self.assertEqual(processor._preprocess_chunk_gate()._value, 5)
+        finally:
+            processor.close()
 
     def test_without_cache_still_validates_caller_content_hash(self):
         processor = _Processor()
