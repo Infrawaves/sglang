@@ -314,6 +314,10 @@ def _gpu_preprocess_images(
                 # 3/4-channel sources cannot be concatenated first.
                 resized = [post_resize(part) for part in resized]
             batch = torch.cat(resized, dim=0)
+            # The concat already copied every part. Holding the list alive
+            # keeps a second full-size copy resident across patchify, which is
+            # where this group's peak allocation lands.
+            del resized
 
             T = 1
             gh, gw = padded_h // patch_size, padded_w // patch_size
