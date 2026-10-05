@@ -1471,6 +1471,10 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Currently supported by the Kimi-K2.5 image processor only.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # PD decode only: drop multimodal feature tensors in the tokenizer before
+    # dispatch. Decode gets prompt KV from prefill and never runs the encoder,
+    # so it only needs item metadata (offsets, hash/pad_value, grid info).
+    SGLANG_DISAGG_DECODE_DROP_MM_FEATURES = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
