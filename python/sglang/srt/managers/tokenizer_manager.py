@@ -114,7 +114,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    drop_mm_features_for_decode,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.request_validation import (
@@ -880,6 +883,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self._drop_decode_mm_features = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_DISAGG_DECODE_DROP_MM_FEATURES.get()
+        )
+        if self._drop_decode_mm_features:
+            logger.info(
+                "PD decode: dropping multimodal feature tensors before dispatch "
+                "(SGLANG_DISAGG_DECODE_DROP_MM_FEATURES=1)."
+            )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
             start_disagg_service() if start_pd_bootstrap_service else None
@@ -1435,11 +1447,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 hex_hash,
                             )
             if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                (envs.SGLANG_MM_PRECOMPUTE_HASH.get() or self._drop_decode_mm_features)
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
+                drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
