@@ -93,32 +93,50 @@ def _expand_k3_image_prompt_token_ids(
         input_ids = input_ids.detach().flatten().cpu().numpy()
     input_ids = np.asarray(input_ids, dtype=np.int64)
 
-    placeholder_count = np.count_nonzero(input_ids == image_token_id)
+    if input_ids.ndim != 1:
+        raise ValueError("Expected a flat K3 prompt token sequence.")
+
+    placeholder_positions = np.flatnonzero(input_ids == image_token_id)
+    placeholder_count = len(placeholder_positions)
     if placeholder_count != len(image_token_counts):
         raise ValueError(
             f"Expected {len(image_token_counts)} image placeholder token(s), "
             f"found {placeholder_count}."
         )
 
-    output = []
-    image_index = 0
-    for token_id in input_ids:
-        if token_id != image_token_id:
-            output.append(int(token_id))
-            continue
-
+    # Splice whole segments instead of a per-token Python loop: this runs on the
+    # tokenizer event loop and long prompts (~1M tokens) blocked it for ~0.1 s.
+    segments = []
+    segment_start = 0
+    for image_index, position in enumerate(placeholder_positions):
+        segments.append(input_ids[segment_start:position])
         width, height = image_sizes[image_index]
-        output.extend(
-            _encode_k3_special_tokens(
-                tokenizer,
-                f"<|media_begin|>image {width}x{height}<|media_content|>",
+        segments.append(
+            _as_int64_array(
+                _encode_k3_special_tokens(
+                    tokenizer,
+                    f"<|media_begin|>image {width}x{height}<|media_content|>",
+                )
             )
         )
-        output.extend([image_token_id] * image_token_counts[image_index])
-        output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
-        image_index += 1
+        segments.append(
+            np.full(
+                max(image_token_counts[image_index], 0),
+                image_token_id,
+                dtype=np.int64,
+            )
+        )
+        segments.append(
+            _as_int64_array(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        )
+        segment_start = position + 1
+    segments.append(input_ids[segment_start:])
 
-    return torch.tensor(output, dtype=torch.long).unsqueeze(0)
+    return torch.from_numpy(np.concatenate(segments)).unsqueeze(0)
+
+
+def _as_int64_array(token_ids: list[int]) -> np.ndarray:
+    return np.asarray(token_ids, dtype=np.int64).reshape(-1)
 
 
 def _expand_k3_image_prompt_text(
