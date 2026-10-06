@@ -185,6 +185,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.event_loop_lag import EventLoopLagMonitor
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -2514,6 +2515,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        loop_lag_ms = envs.SGLANG_LOG_EVENT_LOOP_LAG_MS.get()
+        if loop_lag_ms > 0:
+            EventLoopLagMonitor(loop, loop_lag_ms / 1000, "TokenizerManager").start()
 
     async def handle_loop(self):
         """The event loop that handles requests"""
