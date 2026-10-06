@@ -8,6 +8,7 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
@@ -324,6 +325,14 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         return padded_ids
 
 
+def _as_int64_tensor(input_ids):
+    """torch.as_tensor() reads an array.array item by item (~110 ms for 869k
+    tokens); read its buffer directly and copy so the caller's ids stay intact."""
+    if isinstance(input_ids, array) and input_ids.typecode == "q":
+        return torch.frombuffer(input_ids, dtype=torch.int64).clone()
+    return torch.as_tensor(input_ids)
+
+
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
@@ -339,7 +348,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        input_ids_tensor = _as_int64_tensor(input_ids)
 
         # Replace multimodal tokens using per-item offsets
         items_by_modality = defaultdict(list)
