@@ -1963,6 +1963,8 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
+    except Image.DecompressionBombError as e:
+        raise ValueError("image too large, exceeds upper limit.") from e
     except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)

@@ -120,6 +120,19 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "cannot identify image file"):
             _StubProcessor._load_single_item(b"not an image", Modality.IMAGE)
 
+    def test_oversized_image_is_a_client_error(self):
+        with patch.object(
+            common.Image,
+            "open",
+            side_effect=Image.DecompressionBombError(
+                "Image size exceeds the decompression bomb limit"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, r"^image too large, exceeds upper limit\.$"
+            ):
+                common.load_image(b"oversized image", gpu_image_decode=False)
+
     def test_unexpected_loader_bug_remains_a_server_error(self):
         with patch(
             "sglang.srt.multimodal.processors.base_processor.load_image",
