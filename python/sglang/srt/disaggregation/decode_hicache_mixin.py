@@ -163,17 +163,20 @@ class DecodeHiCachePreallocMixin:
 
 
 class HiCacheRestoreGatedKVReceiver:
-    """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
+    """Include local restore state in transfer consensus before the TP MIN."""
 
     def __init__(self, decode_req: DecodeRequest):
         self.decode_req = decode_req
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
-        if (
-            poll == KVPoll.Success
-            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
-        ):
+        restore_status = getattr(self.decode_req, "hicache_restore_status", None)
+        if restore_status == HiCacheRestoreResult.FAILED:
+            # A local restore failure must reach every rank before any rank
+            # commits or retires this request. Transport Success alone is not
+            # sufficient: another rank may still own an incomplete prefix.
+            return KVPoll.Failed
+        if poll == KVPoll.Success and restore_status == HiCacheRestoreResult.PENDING:
             return KVPoll.Transferring
         return poll
 

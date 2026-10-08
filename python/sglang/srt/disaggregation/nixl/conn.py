@@ -3245,6 +3245,11 @@ class NixlKVReceiver(CommonKVReceiver):
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
             return status
+        if status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                self.conclude_state = timeout_result
+                return timeout_result
         if not self.started_transfer:
             return status
 
@@ -3346,12 +3351,11 @@ class NixlKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                logger.error(
+                    "_register_kv_args to prefill %s:%s failed",
+                    bootstrap_info.get("rank_ip"),
+                    bootstrap_info.get("rank_port"),
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
 

@@ -702,6 +702,9 @@ class Envs:
     # Retained only to reject the removed setting during startup.
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Split connect/read budgets so half-dead prefill HTTP calls have a bound.
+    SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT = EnvFloat(5.0)
+    SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_READ_TIMEOUT = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
@@ -715,9 +718,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
-    # Deferred decode-side KV release: on abort, hold an in-flight request's KV
-    # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Off by default (no behavior/perf impact when disabled).
+    # Mooncake always waits for transfer-drained ACKs before reusing aborted
+    # requests' buffers. This flag retains the opt-in behavior for other
+    # backends. The timeout below controls warnings/retries, never unsafe reuse.
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 

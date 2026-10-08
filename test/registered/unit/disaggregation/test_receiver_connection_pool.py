@@ -28,8 +28,10 @@ def _receiver(connection_pool, entries):
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
         connection_lock=threading.Lock(),
+        enable_deferred_decode_kv_release=False,
     )
     receiver._connection_pool_entries = entries
+    receiver._connection_pool_entries_lock = threading.RLock()
     return receiver
 
 
@@ -54,11 +56,13 @@ def _fetching_receiver(connection_pool):
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
     receiver.prefill_dp_rank = 0
+    receiver.prefill_info = SimpleNamespace(pp_size=1, attn_cp_size=1)
     receiver.target_cp_ranks = [0]
     receiver.target_tp_rank = 0
     receiver.target_tp_ranks = [0]
     receiver.target_pp_ranks = [0]
     receiver._connection_pool_entries = {}
+    receiver._connection_pool_entries_lock = threading.RLock()
     receiver.fetch_count = 0
     return receiver
 
@@ -134,9 +138,32 @@ class TestReceiverConnectionPool(CustomTestCase):
         receiver.kv_mgr.waiting_timeout = 1.0
         receiver.kv_mgr.record_failure = Mock()
         receiver.kv_mgr.update_status = Mock()
+        receiver._send_abort_notification = Mock()
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
+
+    def test_abort_retry_drops_undrained_room_conflict(self):
+        receiver = object.__new__(_ConcreteReceiver)
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_infos = [{}]
+        receiver._abort_token = "new-token"
+        register = Mock(side_effect=RuntimeError("undrained room"))
+        connection_lock = threading.Lock()
+        receiver.kv_mgr = SimpleNamespace(
+            connection_lock=connection_lock,
+            enable_deferred_decode_kv_release=True,
+            requires_transfer_drain=True,
+            register_deferred_abort_room=register,
+        )
+        receiver._send_abort_notification = Mock()
+
+        receiver.retry_abort()
+
+        register.assert_called_once_with(7, token="new-token")
+        receiver._send_abort_notification.assert_not_called()
+        self.assertTrue(connection_lock.acquire(blocking=False))
+        connection_lock.release()
 
 
 if __name__ == "__main__":

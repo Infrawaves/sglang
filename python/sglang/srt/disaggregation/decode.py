@@ -31,13 +31,18 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    ParallelInfoState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -73,6 +78,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -103,9 +111,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_QUEUE,
     scheduler_stage_method,
-)
-from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
-    NewTokenRatioTracker,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -410,10 +415,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
         ] = {}
+        self._prefill_dp_rank_query_since: Dict[str, float] = {}
+        self._prefill_dp_rank_query_epochs: Dict[str, Optional[int]] = {}
+        self._prefill_dp_rank_query_tokens: Dict[str, Optional[Tuple[object, ...]]] = {}
         self._ensure_retry_count: Dict[str, int] = {}
+        self._ensure_pending_since: Dict[str, float] = {}
+        self._ensure_pending_epochs: Dict[str, Optional[int]] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
-        self._ensure_retry_interval: float = 1.0  # seconds
+        self._ensure_retry_interval: float = 1.0  # seconds, first retry
+        self._ensure_retry_interval_max: float = 4.0  # seconds
+        self._ensure_pending_timeout: float = (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        )
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1137,6 +1151,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _retry_delay_for(self, bootstrap_addr: str) -> float:
+        """Exponential backoff for the topology fetch, capped at the ceiling."""
+        count = self._ensure_retry_count.get(bootstrap_addr, 0)
+        if count <= 0:
+            return self._ensure_retry_interval
+        return min(
+            self._ensure_retry_interval * (2 ** (count - 1)),
+            self._ensure_retry_interval_max,
+        )
+
+    def _parallel_info_epoch(self, bootstrap_addr: str) -> Optional[int]:
+        epochs = getattr(self.kv_manager, "_parallel_info_epochs", None)
+        if isinstance(epochs, dict):
+            return epochs.get(bootstrap_addr, 0)
+        return None
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -1144,19 +1174,73 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Returns (ready_addrs, remaining_reqs)."""
         ready: Dict[str, List[DecodeRequest]] = {}
         remaining: List[DecodeRequest] = []
+        if not hasattr(self, "_ensure_pending_since"):
+            self._ensure_pending_since = {}
+        if not hasattr(self, "_ensure_pending_epochs"):
+            self._ensure_pending_epochs = {}
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            current_epoch = self._parallel_info_epoch(bootstrap_addr)
+            previous_epoch = self._ensure_pending_epochs.get(bootstrap_addr)
+            if (
+                current_epoch is not None
+                and previous_epoch is not None
+                and current_epoch != previous_epoch
+            ):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                self._ensure_pending_since.pop(bootstrap_addr, None)
+            self._ensure_pending_epochs[bootstrap_addr] = current_epoch
+            if self.kv_manager.has_parallel_info(bootstrap_addr):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                self._ensure_pending_since.pop(bootstrap_addr, None)
+                ready[bootstrap_addr] = reqs
+                continue
+
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
-            if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
+            pending_fetch = bootstrap_addr in self._ensure_pending_since
+            if (
+                not pending_fetch
+                and last_attempt is not None
+                and (now - last_attempt < self._retry_delay_for(bootstrap_addr))
             ):
                 remaining.extend(reqs)
                 continue
 
+            state = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+
+            if state == ParallelInfoState.PENDING:
+                pending_since = self._ensure_pending_since.setdefault(
+                    bootstrap_addr, now
+                )
+                pending_timeout = getattr(
+                    self,
+                    "_ensure_pending_timeout",
+                    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get(),
+                )
+                pending_elapsed = now - pending_since
+                if pending_elapsed >= pending_timeout:
+                    error_msg = (
+                        f"Timed out waiting for prefill parallel info from "
+                        f"{bootstrap_addr} after {pending_elapsed:.1f}s"
+                    )
+                    logger.error(error_msg)
+                    for decode_req in reqs:
+                        if decode_req.kv_receiver is not None:
+                            decode_req.kv_receiver.abort()
+                    self._ensure_pending_since.pop(bootstrap_addr, None)
+                    self._ensure_retry_count.pop(bootstrap_addr, None)
+                    self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                else:
+                    remaining.extend(reqs)
+                continue
+
+            self._ensure_pending_since.pop(bootstrap_addr, None)
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            if state:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1183,6 +1267,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def prefetch_prefill_dp_rank_queries(self) -> None:
         """Start DP-rank lookups before their normal consume point."""
+        self._ensure_prefill_dp_rank_query_state()
         if not self.pending_reqs:
             return
 
@@ -1190,12 +1275,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
+            if getattr(decode_req, "kv_receiver", None) is None or isinstance(
+                getattr(decode_req.req, "finished_reason", None), FINISH_ABORT
+            ):
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         for bootstrap_addr in set(queries) - set(addr_to_reqs):
             _, stale_future = queries.pop(bootstrap_addr)
             stale_future.cancel()
+            self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         for bootstrap_addr, decode_reqs in addr_to_reqs.items():
             if bootstrap_addr in queries:
@@ -1211,20 +1303,109 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not rooms:
                 continue
 
-            future = self.kv_manager._ensure_prefill_recompute_executor().submit(
-                CommonKVReceiver.query_prefill_dp_ranks,
-                bootstrap_addr,
-                list(rooms),
-            )
-            queries[bootstrap_addr] = (rooms, future)
+            self._submit_prefill_dp_rank_query(bootstrap_addr, list(rooms))
 
     def _cancel_prefill_dp_rank_queries(self) -> None:
+        self._ensure_prefill_dp_rank_query_state()
         for _, future in self._prefill_dp_rank_queries.values():
             future.cancel()
         self._prefill_dp_rank_queries.clear()
+        self._prefill_dp_rank_query_since.clear()
+        self._prefill_dp_rank_query_epochs.clear()
+        self._prefill_dp_rank_query_tokens.clear()
+
+    def _ensure_prefill_dp_rank_query_state(self) -> None:
+        if not hasattr(self, "_prefill_dp_rank_query_since"):
+            self._prefill_dp_rank_query_since = {}
+        if not hasattr(self, "_prefill_dp_rank_query_epochs"):
+            self._prefill_dp_rank_query_epochs = {}
+        if not hasattr(self, "_prefill_dp_rank_query_tokens"):
+            self._prefill_dp_rank_query_tokens = {}
+
+    def _prefill_dp_rank_epoch(self, bootstrap_addr: str) -> Optional[int]:
+        epochs = getattr(self.kv_manager, "_parallel_info_epochs", None)
+        if isinstance(epochs, dict):
+            return epochs.get(bootstrap_addr, 0)
+        return None
+
+    def _prefill_dp_rank_query_expired(self, bootstrap_addr: str) -> bool:
+        since = self._prefill_dp_rank_query_since.get(bootstrap_addr)
+        if since is None:
+            return False
+        timeout = getattr(
+            self,
+            "_ensure_pending_timeout",
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get(),
+        )
+        return time.monotonic() - since >= timeout
+
+    def _prefill_dp_rank_tokens(
+        self, bootstrap_addr: str, bootstrap_rooms: Tuple[int, ...]
+    ) -> Optional[Tuple[object, ...]]:
+        room_tokens = getattr(self.kv_manager, "_bootstrap_room_tokens", None)
+        if not isinstance(room_tokens, dict):
+            return None
+        return tuple(room_tokens.get(room) for room in bootstrap_rooms)
+
+    def _prefill_dp_rank_tokens_match(
+        self,
+        bootstrap_addr: str,
+        bootstrap_rooms: Tuple[int, ...],
+        expected: Optional[Tuple[object, ...]],
+    ) -> bool:
+        if expected is None:
+            return True
+        current = self._prefill_dp_rank_tokens(bootstrap_addr, bootstrap_rooms)
+        return (
+            current is not None
+            and len(current) == len(expected)
+            and all(old is new for old, new in zip(expected, current))
+        )
+
+    @staticmethod
+    def _abort_pending_dp_rank_requests(
+        decode_reqs: List[DecodeRequest],
+    ) -> None:
+        for decode_req in decode_reqs:
+            receiver = getattr(decode_req, "kv_receiver", None)
+            if receiver is not None:
+                receiver.abort()
+
+    def _submit_prefill_dp_rank_query(
+        self, bootstrap_addr: str, bootstrap_rooms: List[int]
+    ) -> None:
+        """Submit a DP-rank lookup without waiting on the scheduler thread."""
+        self._ensure_prefill_dp_rank_query_state()
+        if not bootstrap_rooms:
+            return
+        future = self.kv_manager._ensure_bootstrap_executor().submit(
+            CommonKVReceiver.query_prefill_dp_ranks,
+            bootstrap_addr,
+            list(bootstrap_rooms),
+        )
+        self._prefill_dp_rank_queries[bootstrap_addr] = (
+            tuple(bootstrap_rooms),
+            future,
+        )
+        self._prefill_dp_rank_query_since.setdefault(bootstrap_addr, time.monotonic())
+        self._prefill_dp_rank_query_epochs[bootstrap_addr] = (
+            self._prefill_dp_rank_epoch(bootstrap_addr)
+        )
+        self._prefill_dp_rank_query_tokens[bootstrap_addr] = (
+            self._prefill_dp_rank_tokens(bootstrap_addr, tuple(bootstrap_rooms))
+        )
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
+        self._ensure_prefill_dp_rank_query_state()
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if getattr(decode_req, "kv_receiver", None) is not None
+            and not isinstance(
+                getattr(decode_req.req, "finished_reason", None), FINISH_ABORT
+            )
+        ]
         if not self.pending_reqs:
             self._cancel_prefill_dp_rank_queries()
             return
@@ -1234,6 +1415,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
+
+        for bootstrap_addr in set(self._prefill_dp_rank_queries) - set(addr_to_reqs):
+            _, stale_future = self._prefill_dp_rank_queries.pop(bootstrap_addr)
+            stale_future.cancel()
+            self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+            self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
@@ -1253,24 +1441,69 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 prefetched_rooms = prefetched[0] if prefetched is not None else ()
-                if (
+                prefetched_epoch = self._prefill_dp_rank_query_epochs.pop(
+                    bootstrap_addr, None
+                )
+                prefetched_tokens = self._prefill_dp_rank_query_tokens.pop(
+                    bootstrap_addr, None
+                )
+                has_matching_prefix = (
                     prefetched is not None
                     and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
+                )
+
+                if (
+                    prefetched is not None
+                    and prefetched_epoch is not None
+                    and prefetched_epoch != self._prefill_dp_rank_epoch(bootstrap_addr)
                 ):
-                    room_to_rank = prefetched[1].result()
-                    remaining_rooms = rooms[len(prefetched_rooms) :]
-                    if remaining_rooms:
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
-                            )
-                        )
-                else:
-                    if prefetched is not None:
-                        prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
+                    has_matching_prefix = False
+                if prefetched is not None and not self._prefill_dp_rank_tokens_match(
+                    bootstrap_addr, tuple(prefetched_rooms), prefetched_tokens
+                ):
+                    has_matching_prefix = False
+
+                if prefetched is not None and not has_matching_prefix:
+                    prefetched[1].cancel()
+                    prefetched = None
+                    self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+
+                if prefetched is None:
+                    self._submit_prefill_dp_rank_query(bootstrap_addr, rooms)
+                    remaining.extend(need_query)
+                    continue
+
+                # Never wait for a Future on the scheduler thread.
+                if not prefetched[1].done():
+                    self._prefill_dp_rank_queries[bootstrap_addr] = prefetched
+                    self._prefill_dp_rank_query_epochs[bootstrap_addr] = (
+                        prefetched_epoch
                     )
+                    self._prefill_dp_rank_query_tokens[bootstrap_addr] = (
+                        prefetched_tokens
+                    )
+                    if self._prefill_dp_rank_query_expired(bootstrap_addr):
+                        prefetched[1].cancel()
+                        self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+                        self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
+                        self._abort_pending_dp_rank_requests(need_query)
+                        continue
+                    remaining.extend(need_query)
+                    continue
+
+                try:
+                    room_to_rank = prefetched[1].result()
+                except Exception as e:
+                    logger.warning(
+                        "Prefill DP-rank query failed for %s: %s",
+                        bootstrap_addr,
+                        e,
+                    )
+                    room_to_rank = {}
+
+                unresolved: List[DecodeRequest] = []
                 for decode_req in need_query:
                     prefill_dp_rank = room_to_rank.get(
                         str(decode_req.req.bootstrap_room)
@@ -1278,11 +1511,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefill_dp_rank is not None:
                         resolved.append((decode_req, int(prefill_dp_rank)))
                     else:
-                        remaining.append(decode_req)
+                        unresolved.append(decode_req)
+
+                if unresolved:
+                    if self._prefill_dp_rank_query_expired(bootstrap_addr):
+                        self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                        self._abort_pending_dp_rank_requests(unresolved)
+                    else:
+                        self._submit_prefill_dp_rank_query(
+                            bootstrap_addr,
+                            [req.req.bootstrap_room for req in unresolved],
+                        )
+                        remaining.extend(unresolved)
+                else:
+                    self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
             else:
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 if prefetched is not None:
                     prefetched[1].cancel()
+                self._prefill_dp_rank_query_since.pop(bootstrap_addr, None)
+                self._prefill_dp_rank_query_epochs.pop(bootstrap_addr, None)
+                self._prefill_dp_rank_query_tokens.pop(bootstrap_addr, None)
 
         self.pending_reqs = remaining
 
@@ -2290,9 +2539,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        # Failed transfers retain every destination until all writers drain.
+        # The deadline only controls warnings/retries, never memory reclamation.
+        # None required_acks means the writer set is unknown, so fail closed.
+        self._deferred_releases: List[
+            Tuple[DecodeRequest, float, int, Optional[int]]
+        ] = []
+        # A cleanup exception may leave local DMA or partially released state.
+        # Keep administrative/compaction gates closed without retrying a free.
+        self._failed_deferred_releases: List[DecodeRequest] = []
+        self._release_tp_size = dist.get_world_size(gloo_group)
+        self._deferred_release_error: Optional[str] = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2491,6 +2748,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
+            enable_decode_hicache=self.scheduler.enable_decode_hicache,
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -2547,7 +2805,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
-                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2562,21 +2819,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
+                kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
+                if getattr(kv_mgr, "requires_transfer_drain", False) or (
                     self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
+                    and getattr(kv_mgr, "enable_deferred_decode_kv_release", False)
                 ):
-                    # Decode-initiated abort: a prefill write may still target
-                    # these pages, so hold them until the drain ack or timeout.
-                    # (A prefill-initiated failure has already stopped writing ->
-                    # immediate release below.)
+                    # Failed is a request outcome, not a write-completion fence:
+                    # another prefill writer/rank may still target these pages.
+                    # abort() arms ACK accounting before notifying every writer.
+                    decode_req.kv_receiver.abort()
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
+                    self._clean_hicache_prefetch_resources(decode_req)
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
+                        )
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     decode_req.kv_receiver.clear()
@@ -2642,10 +2902,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
+        if any(entry[0] is decode_req for entry in self._deferred_releases):
+            return
         deadline = time.monotonic() + self.deferred_kv_release_timeout
         # Require an ack from every notified prefill rank (dummy-proof). Snapshot
         # now -- the receiver may be cleared by resolve time.
-        required_acks = len(decode_req.kv_receiver.bootstrap_infos)
+        bootstrap_infos = getattr(decode_req.kv_receiver, "bootstrap_infos", None)
+        required_acks = len(bootstrap_infos) if bootstrap_infos else None
         self._deferred_releases.append(
             (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
         )
@@ -2654,6 +2917,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
+        self._clean_hicache_prefetch_resources(decode_req)
+        if self.scheduler.enable_hisparse:
+            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
         self.metadata_buffers.bootstrap_room[idx] = 0
@@ -2663,48 +2929,152 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self._deferred_releases)
+        return bool(
+            self._deferred_releases
+            or self._failed_deferred_releases
+            or self._deferred_release_error
+        )
+
+    def _local_deferred_release_ready(
+        self, decode_req: DecodeRequest, required_acks: Optional[int]
+    ) -> bool:
+        room = decode_req.req.bootstrap_room
+        if (
+            required_acks is None
+            or not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                room, required_acks
+            )
+        ):
+            return False
+        if decode_req.hicache_restored_node is not None:
+            consumer_index = decode_req.hicache_load_consumer_index
+            if consumer_index >= 0 and not self.tree_cache.is_load_back_event_done(
+                consumer_index
+            ):
+                return False
+        if self.enable_staging and self.staging_handler.is_staging_room(room):
+            # Mooncake ACKs follow this room's CHUNK_READY messages on the same
+            # socket. Once all ACKs arrive, its scatter events are registered.
+            if any(not event.query() for event, _ in decode_req._chunk_events):
+                return False
+        return True
+
+    def _fail_deferred_release(self, reason: str) -> None:
+        # A partially completed free cannot be rolled back. Stop every TP rank
+        # before any can admit new work using a different allocator state.
+        self._deferred_release_error = reason
+        raise RuntimeError(f"Decode deferred release stopped: {reason}")
 
     def resolve_deferred_releases(self) -> None:
-        """Release held requests once every prefill rank acks the drain, or the
-        hold times out."""
-        if not self._deferred_releases:
+        """Reclaim the same requests in the same order on every Attention TP rank.
+
+        This is called at a common scheduler point, including on ranks whose
+        local hold list is empty. Never make collective participation depend on
+        rank-local ACK timing, DMA completion, or allocator capacity.
+        """
+        distributed = self._release_tp_size > 1
+        state = torch.tensor(
+            [
+                bool(self._deferred_releases),
+                bool(self._deferred_release_error or self._failed_deferred_releases),
+            ],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        if distributed:
+            dist.all_reduce(state, op=dist.ReduceOp.MAX, group=self.gloo_group)
+        if state[1].item():
+            self._fail_deferred_release(
+                "an Attention TP peer has a prior cleanup failure"
+            )
+        if not state[0].item():
             return
-        now = time.monotonic()
-        still_held = []
-        to_release = []
-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
-            room = decode_req.req.bootstrap_room
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append((decode_req, deadline, idx, required_acks))
-            else:
-                to_release.append((decode_req, idx, room, drained))
-        # Commit the survivors before releasing so a _do_release exception can't
-        # leave a released entry in the list (double-free / None receiver on retry).
-        self._deferred_releases = still_held
-        for decode_req, idx, room, drained in to_release:
-            if not drained:
-                logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
+
+        entries = sorted(
+            self._deferred_releases,
+            key=lambda entry: (entry[0].req.rid, entry[0].req.bootstrap_room, entry[2]),
+        )
+        identities = [
+            (entry[0].req.rid, entry[0].req.bootstrap_room, entry[2])
+            for entry in entries
+        ]
+        if distributed:
+            peer_identities = [None] * self._release_tp_size
+            dist.all_gather_object(peer_identities, identities, group=self.gloo_group)
+            if any(peer != peer_identities[0] for peer in peer_identities):
+                self._fail_deferred_release(
+                    "held request identities differ across Attention TP"
                 )
+        if len({(rid, room) for rid, room, _ in identities}) != len(identities):
+            self._fail_deferred_release("duplicate held request identity")
+
+        now = time.monotonic()
+        refreshed = []
+        readiness = []
+        for decode_req, deadline, idx, required_acks in entries:
+            room = decode_req.req.bootstrap_room
+            try:
+                ready = self._local_deferred_release_ready(decode_req, required_acks)
+                if not ready and now >= deadline:
+                    logger.warning(
+                        "Deferred KV release for room %s still lacks a complete "
+                        "transfer drain after %ss; keeping its buffers quarantined.",
+                        room,
+                        self.deferred_kv_release_timeout,
+                    )
+                    retry_abort = getattr(decode_req.kv_receiver, "retry_abort", None)
+                    if retry_abort is not None:
+                        retry_abort()
+                    deadline = now + max(self.deferred_kv_release_timeout, 1.0)
+                readiness.append(int(ready))
+            except Exception:
+                logger.exception("Failed to check deferred release for room %s", room)
+                readiness.append(-1)
+            refreshed.append((decode_req, deadline, idx, required_acks))
+
+        ready_tensor = torch.tensor(readiness, dtype=torch.int32, device="cpu")
+        if distributed:
+            dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        if (ready_tensor < 0).any().item():
+            self._fail_deferred_release("an Attention TP peer failed its drain check")
+        can_release = ready_tensor.tolist()
+        self._deferred_releases = [
+            entry for entry, ready in zip(refreshed, can_release) if not ready
+        ]
+        if not any(can_release):
+            return
+
+        cleanup_failed = False
+        for (decode_req, _, idx, _), ready in zip(refreshed, can_release):
+            if not ready:
+                continue
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+                cleanup_failed = True
+                self._failed_deferred_releases.append(decode_req)
+                logger.exception(
+                    "Deferred KV release failed for room %s",
+                    decode_req.req.bootstrap_room,
+                )
+        outcome = torch.tensor([cleanup_failed], dtype=torch.int32, device="cpu")
+        if distributed:
+            # This is also the post-free barrier: no rank can allocate new
+            # requests while a peer is still tearing down its local copies.
+            dist.all_reduce(outcome, op=dist.ReduceOp.MAX, group=self.gloo_group)
+        if outcome.item():
+            self._fail_deferred_release("an Attention TP peer failed buffer cleanup")
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        """Reject offload while any remote transfer can still access the pool."""
+        if self.queue or self.has_pending_deferred_releases():
+            raise RuntimeError(
+                "Cannot release decode memory while KV transfers or quarantined "
+                "transfer buffers are pending."
+            )
 
     def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
+        """Release requires empty queues, so new transfers can be accepted."""
         pass
 
 
@@ -3006,8 +3376,7 @@ class SchedulerDisaggregationDecodeMixin:
                 and not req.is_retracted
                 and not req.is_demoted
                 and len(req.origin_input_ids) <= max_input_len
-                and len(req.output_ids) - req.last_demote_output_len
-                >= min_output_len
+                and len(req.output_ids) - req.last_demote_output_len >= min_output_len
             )
 
         ssd_retraction = get_disagg().disaggregation_decode_retraction_backup == "ssd"
@@ -3020,9 +3389,7 @@ class SchedulerDisaggregationDecodeMixin:
                 break
 
             victim = candidates.pop(0)
-            victim_index = next(
-                i for i, r in enumerate(batch.reqs) if r is victim
-            )
+            victim_index = next(i for i, r in enumerate(batch.reqs) if r is victim)
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
@@ -3061,16 +3428,12 @@ class SchedulerDisaggregationDecodeMixin:
 
             batch.filter_batch(
                 keep_indices=[
-                    index
-                    for index, _ in enumerate(batch.reqs)
-                    if index != victim_index
+                    index for index, _ in enumerate(batch.reqs) if index != victim_index
                 ]
             )
             batch.batch_is_full = False
             self.new_token_ratio_tracker.current = (
-                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
-                    batch.reqs
-                )
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(batch.reqs)
             )
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",

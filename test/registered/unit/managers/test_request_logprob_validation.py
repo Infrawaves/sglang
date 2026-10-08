@@ -167,9 +167,12 @@ class TestRequestValidation(CustomTestCase):
     def test_metadata_allocation_and_validation_share_capacity(self):
         import torch
 
-        with patch("sglang.srt.disaggregation.utils.is_npu", return_value=False), patch(
-            "sglang.srt.disaggregation.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get",
-            return_value=None,
+        with (
+            patch("sglang.srt.disaggregation.utils.is_npu", return_value=False),
+            patch(
+                "sglang.srt.disaggregation.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get",
+                return_value=None,
+            ),
         ):
             buffers = MetadataBuffers(
                 size=1,
@@ -201,9 +204,12 @@ class TestRequestValidation(CustomTestCase):
                 GenerateReqInput(**await request.json()), request
             )
 
-        with patch.object(
-            http_server, "_global_state", SimpleNamespace(tokenizer_manager=manager)
-        ), TestClient(app) as client:
+        with (
+            patch.object(
+                http_server, "_global_state", SimpleNamespace(tokenizer_manager=manager)
+            ),
+            TestClient(app) as client,
+        ):
             for stream in (False, True):
                 bad = client.post(
                     "/generate",
@@ -473,9 +479,12 @@ class TestRequestValidation(CustomTestCase):
     def test_metadata_rejection_does_not_partially_write_buffers(self):
         import torch
 
-        with patch("sglang.srt.disaggregation.utils.is_npu", return_value=False), patch(
-            "sglang.srt.disaggregation.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get",
-            return_value=None,
+        with (
+            patch("sglang.srt.disaggregation.utils.is_npu", return_value=False),
+            patch(
+                "sglang.srt.disaggregation.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get",
+                return_value=None,
+            ),
         ):
             buffers = MetadataBuffers(1, 1, torch.float32, max_sampling_mask_tokens=2)
         req = SimpleNamespace(
@@ -499,9 +508,12 @@ class TestRequestValidation(CustomTestCase):
                 GenerateReqInput(**await request.json()), request
             )
 
-        with patch.object(
-            http_server, "_global_state", SimpleNamespace(tokenizer_manager=manager)
-        ), TestClient(app) as client:
+        with (
+            patch.object(
+                http_server, "_global_state", SimpleNamespace(tokenizer_manager=manager)
+            ),
+            TestClient(app) as client,
+        ):
             for stream in (False, True):
                 for payload in (
                     {"text": "hello", "sampling_params": {"n": 129}},
@@ -552,6 +564,7 @@ class TestRequestValidation(CustomTestCase):
         buffers = MetadataBuffers(1, 1, torch.float32, max_sampling_mask_tokens=2)
         sender = Mock()
         sender.poll.return_value = KVPoll.Transferring
+        sender.is_source_release_safe.return_value = True
         sender.abort.side_effect = lambda: setattr(
             sender.poll, "return_value", KVPoll.Failed
         )
@@ -568,19 +581,23 @@ class TestRequestValidation(CustomTestCase):
             extend_range=SimpleNamespace(end=2),
             disagg_kv_sender=sender,
             finished_reason=None,
+            to_finish=None,
             bootstrap_room=7,
             pending_bootstrap=False,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
         )
         good_sender = Mock()
         good_sender.poll.return_value = KVPoll.Success
+        good_sender.is_source_release_safe.return_value = True
         good = SimpleNamespace(
             rid="good",
             return_logprob=False,
             disagg_kv_sender=good_sender,
             pending_bootstrap=False,
             finished_reason=None,
+            to_finish=None,
             time_stats=Mock(),
             bootstrap_host=FAKE_BOOTSTRAP_HOST,
             metadata_buffer_index=1,
@@ -598,6 +615,8 @@ class TestRequestValidation(CustomTestCase):
         scheduler.req_to_metadata_buffer_idx_allocator = Mock()
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.output_streamer = Mock()
+        scheduler.enable_overlap = False
+        scheduler._release_aborted_request = Mock()
 
         scheduler.send_kv_chunk(req, last_chunk=True)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
@@ -607,10 +626,14 @@ class TestRequestValidation(CustomTestCase):
         self.assertNotIn(req.rid, scheduler.disagg_prefill_pending_chunk_rids)
         self.assertEqual(buffers.output_ids[0, 0].item(), 0)
 
-        with patch(
-            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
-            side_effect=lambda senders, *groups: [s.poll() for s in senders],
-        ), patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release:
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=lambda senders, *groups: [s.poll() for s in senders],
+            ),
+            patch("sglang.srt.disaggregation.prefill.dist.all_reduce"),
+            patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
+        ):
             done = scheduler.process_disagg_prefill_inflight_queue()
         self.assertEqual(done, [req, good])
         self.assertEqual(release.call_count, 2)

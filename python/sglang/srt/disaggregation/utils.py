@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -41,6 +42,8 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
         DSV4NPUTokenToKVPool,
     )
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -178,6 +181,7 @@ def unified_memory_disagg_move_gate(scheduler):
         def decode_gate() -> bool:
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
+                or scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
             )
 
@@ -211,10 +215,11 @@ def _is_fake_transfer(req: Req) -> bool:
 
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+    """Gate success on matching metadata before the TP status consensus.
 
-    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
-    ranks naturally prevents any rank from committing before all ranks are ready.
+    Missing metadata remains in flight; metadata from another room fails the
+    request on every TP rank. A local-only failure at commit time would let
+    peers admit a request whose destination is already being released.
     """
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
@@ -226,6 +231,18 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            else:
+                expected_room = decode_req.req.bootstrap_room or 0
+                if actual_room != expected_room:
+                    logger.error(
+                        "Metadata bootstrap room mismatch: request %s, "
+                        "expected=%s, actual=%s, metadata_buffer_index=%s",
+                        decode_req.req.rid,
+                        expected_room,
+                        actual_room,
+                        decode_req.metadata_buffer_index,
+                    )
+                    polls[i] = int(KVPoll.Failed)
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
@@ -244,7 +261,7 @@ def poll_and_all_reduce(
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
 
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    # Missing metadata stays in flight; a mismatched room fails before TP consensus.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
@@ -269,8 +286,10 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    *,
+    enable_decode_hicache: bool = False,
 ):
-    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    """Include staging, local restore and metadata state before TP consensus."""
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -278,8 +297,19 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
+    if enable_decode_hicache:
+        # Keep this import local: the restore mixin's scheduling imports also
+        # depend on disaggregation utilities. Share the ordinary receive gate
+        # so neither a failed nor a pending restore can commit on only one rank.
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            HiCacheRestoreGatedKVReceiver,
+        )
+
+        pollers = [HiCacheRestoreGatedKVReceiver(dr) for dr in decode_reqs]
+    else:
+        # DecodeRequest defaults to restore PENDING even without HiCache.
+        pollers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(pollers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
             decode_req
@@ -293,7 +323,7 @@ def poll_and_all_reduce_with_staging(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    # Missing metadata stays in flight; a mismatched room fails before TP consensus.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(raw_polls, gloo_group)

@@ -4457,7 +4457,11 @@ class MLATokenToKVPool(KVCache):
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
-                dst_buffer, loc, cache_k_nope, cache_k_rope
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                physical_page_size=self.page_size,
             )
 
     def set_kv_buffer(
@@ -4609,7 +4613,29 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _dcp_page_retraction_local_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map page-DCP slots to local KV rows; leave other layouts unchanged."""
+        parallel = get_parallel()
+        if not (parallel.dcp_enabled and parallel.dcp_kv_layout == "page"):
+            # TODO: Token-layout DCP retraction still lacks owner filtering and
+            # local-row mapping in get_cpu_copy/load_cpu_copy, which can access
+            # out-of-bounds or incorrect KV rows.
+            # https://github.com/sgl-project/sglang/issues/38645
+            return indices
+        dcp_size = parallel.dcp_size
+        page_size = self.page_size
+        virtual_page_size = dcp_size * page_size
+
+        local_mask = (indices // page_size) % dcp_size == parallel.dcp_rank
+        local_indices = indices[local_mask]
+
+        page_ids = local_indices // virtual_page_size
+        page_offsets = local_indices % page_size
+        return page_ids * page_size + page_offsets
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        indices = self._dcp_page_retraction_local_rows(indices)
+
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4629,6 +4655,8 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        indices = self._dcp_page_retraction_local_rows(indices)
+
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
