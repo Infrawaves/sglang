@@ -526,31 +526,6 @@ elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
 
-def _anthropic_validation_message(raw_errors) -> str:
-    """Render Pydantic-style errors for an Anthropic /v1/messages route.
-
-    Builds a short ``loc: msg`` digest that names the offending fields without
-    leaking file paths or Python internals (the default ``str(exc)`` includes
-    the dispatcher's ``File "/.../http_server.py"`` line).
-    """
-    parts: list[str] = []
-    for err in raw_errors or []:
-        loc = err.get("loc") or ()
-        if loc:
-            loc_str = ".".join(str(p) for p in loc if p not in ("body",))
-        else:
-            loc_str = ""
-        msg = (err.get("msg") or "").strip()
-        if loc_str and msg:
-            parts.append(f"{loc_str}: {msg}")
-        elif msg:
-            parts.append(msg)
-    text = "; ".join(parts) or "Invalid request"
-    if len(text) > 500:
-        text = text[:500] + "…"
-    return text
-
-
 def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
     """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
     return ORJSONResponse(
@@ -618,6 +593,40 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
+# sgl-model-gateway forwards at most 2 KB of an upstream error body; keep the
+# encoded message well under that so the client still gets valid JSON.
+_MAX_VALIDATION_MESSAGE_BYTES = 1024
+
+
+def _validation_error_message(raw_errors) -> str:
+    """Short ``loc: msg`` digest of request validation errors.
+
+    Never echoes ``input``: for a chat request that is the whole message list,
+    once per Union branch, and stringifying it stalls the HTTP event loop that
+    also streams tokens. Union branch tags are dropped from ``loc`` and the
+    deepest locations come first, since they name the field that failed.
+    """
+    depth_by_text = {}
+    for err in raw_errors or []:
+        loc = [
+            str(p)[:64]
+            for p in err.get("loc") or ()
+            if p != "body" and not str(p).endswith("]")
+        ]
+        msg = (err.get("msg") or "").strip()[:200]
+        text = f"{'.'.join(loc)}: {msg}" if loc else msg
+        if text:
+            depth_by_text.setdefault(text, len(loc))
+    parts = sorted(depth_by_text, key=depth_by_text.get, reverse=True)
+    message = "; ".join(parts) or "Invalid request"
+    if len(orjson.dumps(message)) > _MAX_VALIDATION_MESSAGE_BYTES:
+        message = message[:_MAX_VALIDATION_MESSAGE_BYTES]
+        while len(orjson.dumps(message + "…")) > _MAX_VALIDATION_MESSAGE_BYTES:
+            message = message[: len(message) * 9 // 10]
+        message += "…"
+    return message
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -632,16 +641,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
-            message=_anthropic_validation_message(exc.errors()),
+            message=_validation_error_message(exc.errors()),
         )
 
-    exc_str = str(exc)
-    errors_str = str(exc.errors())
-
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    message = _validation_error_message(exc.errors())
 
     if request.url.path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
