@@ -634,6 +634,43 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
+# Cap on the validation error message. sgl-model-gateway forwards at most 2 KB
+# of an upstream error body; staying under it keeps the client's error valid
+# JSON instead of a truncated prefix.
+_MAX_VALIDATION_ERROR_MESSAGE_CHARS = 1024
+
+
+def _validation_error_message(exc: RequestValidationError) -> str:
+    """Summarize a request validation error without echoing the request.
+
+    Each error carries the offending value as ``input``; for a chat request
+    that can be the whole message list (megabytes of text or base64 images),
+    once per Union branch. Stringifying that runs on the HTTP event loop
+    (a tokenizer worker's, in multi-tokenizer mode), which also delivers
+    tokens for every stream it serves, so it stalls them for hundreds of ms.
+    Drop ``input`` and bound the message, keeping ``loc``/``msg``/``type`` so
+    the client can still find the bad field.
+    """
+    errors = exc.errors()
+    parts = []
+    length = 0
+    for error in errors:
+        if isinstance(error, dict):
+            error = {key: value for key, value in error.items() if key != "input"}
+        part = repr(error)[:_MAX_VALIDATION_ERROR_MESSAGE_CHARS]
+        parts.append(part)
+        length += len(part) + 2
+        if length > _MAX_VALIDATION_ERROR_MESSAGE_CHARS:
+            break
+    count = len(errors)
+    message = (
+        f"{count} validation error{'s' if count != 1 else ''}: [{', '.join(parts)}]"
+    )
+    if len(message) > _MAX_VALIDATION_ERROR_MESSAGE_CHARS or len(parts) < count:
+        message = message[:_MAX_VALIDATION_ERROR_MESSAGE_CHARS] + "... [truncated]"
+    return message
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -665,13 +702,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             content={"detail": jsonable_encoder(detail)},
         )
 
-    exc_str = str(exc)
-    errors_str = str(exc.errors())
-
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    message = _validation_error_message(exc)
 
     if request.url.path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
