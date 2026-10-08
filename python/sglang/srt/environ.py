@@ -763,10 +763,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
-    # Mooncake always waits for transfer-drained ACKs before reusing aborted
-    # requests' buffers. This flag retains the opt-in behavior for other
-    # backends. The timeout below controls warnings/retries, never unsafe reuse.
-    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    # ACK-capable backends retain aborted destinations until remote writes drain.
+    # Mooncake enforces this even when explicitly disabled; unsupported backends
+    # remain opted out. The timeout controls warnings/retries, not unsafe reuse.
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================

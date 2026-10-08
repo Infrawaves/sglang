@@ -623,11 +623,11 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
 
 
-class TestBackendOptIn(CustomTestCase):
+class TestBackendCapability(CustomTestCase):
     """Without a prefill ack, every hold waits out the full release timeout."""
 
-    def test_other_backends_require_opt_in_by_default(self):
-        self.assertFalse(envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get())
+    def test_ack_capable_backends_enabled_by_default(self):
+        self.assertTrue(envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get())
 
     def test_backends_that_ack_opt_in(self):
         # Ascend inherits Mooncake's threads, so it opts in too.
