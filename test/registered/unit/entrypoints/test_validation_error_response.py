@@ -3,13 +3,13 @@
 FastAPI attaches the offending value to every validation error as ``input``;
 for a chat request that is the whole message list, once per Union branch.
 Stringifying it ran on the HTTP event loop and stalled token delivery for
-every stream on that tokenizer worker. These tests pin that the 400 body
-stays small and free of the request content while still naming the bad field.
+every stream on that tokenizer worker. These tests pin that the 400 body stays
+small, valid JSON and free of the request content, while still naming the
+field that failed.
 """
 
 import asyncio
 import json
-import time
 import unittest
 
 from fastapi.exceptions import RequestValidationError
@@ -27,7 +27,7 @@ GATEWAY_ERROR_BODY_CAP = 2048
 MARKER = "QQQQQQQQQQQQQQQQ"
 
 
-def _request(path):
+def _handle(path, errors):
     scope = {
         "type": "http",
         "method": "POST",
@@ -36,48 +36,40 @@ def _request(path):
         "query_string": b"",
         "headers": [],
     }
-    return Request(scope)
-
-
-def _handle(path, errors):
     response = asyncio.run(
         http_server.validation_exception_handler(
-            _request(path), RequestValidationError(errors)
+            Request(scope), RequestValidationError(errors)
         )
     )
     return response.status_code, response.body
 
 
 class TestValidationErrorResponse(CustomTestCase):
-    def test_chat_completions_body_does_not_echo_large_request(self):
-        big_text = MARKER * (4_000_000 // len(MARKER))
+    def test_chat_completions_names_bad_field_without_echoing_request(self):
         body = {
             "model": "m",
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": big_text},
+                        {"type": "text", "text": MARKER * 250_000},
                         {"type": "image_url", "image_url": 123},
                     ],
                 }
             ],
         }
-        client = TestClient(http_server.app)
-        start = time.perf_counter()
-        response = client.post("/v1/chat/completions", json=body)
-        elapsed = time.perf_counter() - start
+        response = TestClient(http_server.app).post("/v1/chat/completions", json=body)
 
         self.assertEqual(response.status_code, 400)
         self.assertLess(len(response.content), GATEWAY_ERROR_BODY_CAP)
         self.assertNotIn(MARKER, response.text)
         message = response.json()["message"]
-        self.assertIn("validation error", message)
-        self.assertIn("messages", message)
-        # Parsing the 4 MB body dominates; the error path itself adds little.
-        self.assertLess(elapsed, 5.0)
+        self.assertIn(
+            "image_url: Input should be a valid dictionary or object", message
+        )
+        self.assertNotIn("function-after[", message)
 
-    def test_responses_endpoint_uses_bounded_message(self):
+    def test_responses_endpoint_uses_digest(self):
         errors = [
             {
                 "type": "string_type",
@@ -88,41 +80,36 @@ class TestValidationErrorResponse(CustomTestCase):
         ]
         status, raw = _handle("/v1/responses", errors)
         self.assertEqual(status, 400)
-        self.assertLess(len(raw), GATEWAY_ERROR_BODY_CAP)
-        body = json.loads(raw)
-        self.assertNotIn(MARKER, body["error"]["message"])
-        self.assertIn("('body', 'input')", body["error"]["message"])
-        self.assertIn("Input should be a valid string", body["error"]["message"])
+        self.assertEqual(
+            json.loads(raw)["error"]["message"], "input: Input should be a valid string"
+        )
 
-    def test_many_errors_are_truncated_with_marker(self):
+    def test_small_error_is_kept_intact_on_every_route(self):
         errors = [
-            {"type": "missing", "loc": ("body", f"field_{i}"), "msg": "Field required"}
-            for i in range(500)
+            {"type": "missing", "loc": ("body", "messages"), "msg": "Field required"}
         ]
-        status, raw = _handle("/v1/chat/completions", errors)
-        self.assertEqual(status, 400)
-        self.assertLess(len(raw), GATEWAY_ERROR_BODY_CAP)
-        message = json.loads(raw)["message"]
-        self.assertTrue(message.startswith("500 validation errors: "))
-        self.assertTrue(message.endswith("... [truncated]"))
+        _, raw = _handle("/v1/chat/completions", errors)
+        self.assertEqual(json.loads(raw)["message"], "messages: Field required")
+        _, raw = _handle("/v1/messages", errors)
+        payload = json.loads(raw)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["message"], "messages: Field required")
 
-    def test_small_error_is_kept_intact(self):
+    def test_body_stays_under_gateway_cap_for_wide_characters(self):
+        # loc can carry client-controlled dict keys (e.g. logit_bias); CJK is
+        # 3 bytes in UTF-8 and control characters are escaped to 6 bytes.
         errors = [
             {
-                "type": "missing",
-                "loc": ("body", "messages"),
-                "msg": "Field required",
-                "input": {"model": "m"},
+                "type": "int_parsing",
+                "loc": ("body", "logit_bias", f"{i}" + "中\x01" * 500),
+                "msg": "Input should be a valid integer",
             }
+            for i in range(50)
         ]
         status, raw = _handle("/v1/chat/completions", errors)
         self.assertEqual(status, 400)
-        message = json.loads(raw)["message"]
-        self.assertEqual(
-            message,
-            "1 validation error: [{'type': 'missing', 'loc': ('body', 'messages'), "
-            "'msg': 'Field required'}]",
-        )
+        self.assertLess(len(raw), GATEWAY_ERROR_BODY_CAP)
+        self.assertTrue(json.loads(raw)["message"].endswith("…"))
 
 
 if __name__ == "__main__":
