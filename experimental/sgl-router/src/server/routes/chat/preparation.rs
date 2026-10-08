@@ -37,6 +37,7 @@ pub(super) struct PreparedChatRequest {
 pub(super) struct OutgoingBodies {
     pub(super) response: Bytes,
     pub(super) prefill: Option<Bytes>,
+    pub(super) caller_rid: Option<String>,
 }
 
 impl PreparedChatRequest {
@@ -90,9 +91,13 @@ impl PreparedChatRequest {
     }
 
     pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs; PD must finish KV transfer.
-        if self.caller_set_rid || self.fans_out || pd_mode {
+        // Fan-out regenerates IDs in the worker. Plain requests retain caller
+        // IDs; single-sample PD requests use a private ID for paired cleanup.
+        if self.fans_out || (self.caller_set_rid && !pd_mode) {
             return None;
+        }
+        if pd_mode {
+            return Some(format!("sgl-router-{}", uuid::Uuid::new_v4()));
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
@@ -133,11 +138,30 @@ impl PreparedChatRequest {
     }
 
     pub(super) fn into_outgoing_bodies(
-        self,
+        mut self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
     ) -> Result<OutgoingBodies, ApiError> {
+        let caller_rid = if bootstrap.is_some() {
+            // PD already needs the parsed body for bootstrap injection. Keep
+            // the caller ID for tracing before a private ID replaces it.
+            if self.parsed_body.is_none() {
+                self.parsed_body = Some(
+                    serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
+                );
+            }
+            self.parsed_body
+                .as_ref()
+                .and_then(|body| body.get("rid"))
+                .filter(|rid| !rid.is_null())
+                .map(|rid| match rid.as_str() {
+                    Some(rid) => rid.to_owned(),
+                    None => rid.to_string(),
+                })
+        } else {
+            None
+        };
         let response = self.into_outgoing_body(ctx, bootstrap, engine_rid)?;
         let prefill = if bootstrap.is_some() {
             let mut value: Value = serde_json::from_slice(&response).map_err(|_| invalid_request())?;
@@ -150,7 +174,11 @@ impl PreparedChatRequest {
         } else {
             None
         };
-        Ok(OutgoingBodies { response, prefill })
+        Ok(OutgoingBodies {
+            response,
+            prefill,
+            caller_rid,
+        })
     }
 }
 
@@ -1671,6 +1699,64 @@ mod tests {
             )
             .unwrap();
             assert_eq!(requests_multiple_samples(&fields, &defaults), fan_out);
+        }
+    }
+
+    #[test]
+    fn private_ids_follow_plain_pd_and_fanout_semantics() {
+        for (raw, pd_mode, has_private_id) in [
+            (r#"{}"#, false, true),
+            (r#"{"rid":"caller"}"#, false, false),
+            (r#"{"rid":"caller"}"#, true, true),
+            (r#"{"n":2}"#, false, false),
+            (r#"{"n":2,"rid":"caller"}"#, true, false),
+        ] {
+            let body = Bytes::copy_from_slice(raw.as_bytes());
+            let request = PreparedChatRequest::prepare(
+                &AppContext::stub(),
+                ModelId("tiny".into()),
+                fields_of(raw),
+                body,
+                false,
+            )
+            .unwrap();
+            let rid = request.engine_rid(pd_mode);
+            assert_eq!(rid.is_some(), has_private_id, "{raw}, pd={pd_mode}");
+            if pd_mode && has_private_id {
+                assert!(rid.as_deref().unwrap().starts_with("sgl-router-"));
+                assert_ne!(rid, request.engine_rid(pd_mode));
+            }
+        }
+    }
+
+    #[test]
+    fn pd_body_preserves_caller_id_for_tracing() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from_static(br#"{"rid":"caller","stream":true}"#);
+        let request = PreparedChatRequest::prepare(
+            &ctx,
+            ModelId("tiny".into()),
+            parse_routing_fields(&body).unwrap(),
+            body,
+            false,
+        )
+        .unwrap();
+        let rid = request.engine_rid(true).unwrap();
+        let bodies = request
+            .into_outgoing_bodies(
+                &ctx,
+                Some(&BootstrapFields {
+                    host: "localhost".into(),
+                    port: Some(1),
+                    room: 7,
+                }),
+                Some(&rid),
+            )
+            .unwrap();
+        assert_eq!(bodies.caller_rid.as_deref(), Some("caller"));
+        for body in [bodies.response, bodies.prefill.unwrap()] {
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["rid"], rid);
         }
     }
 }

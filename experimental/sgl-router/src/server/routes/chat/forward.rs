@@ -82,11 +82,7 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let engine_rid = if pd.is_some() {
-        Some(format!("sgl-router-{}", uuid::Uuid::new_v4()))
-    } else {
-        request.engine_rid(false)
-    };
+    let engine_rid = request.engine_rid(pd.is_some());
     let bodies = request.into_outgoing_bodies(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
@@ -96,6 +92,19 @@ pub(super) async fn forward_chat_request(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let (response_worker, response_load_guards, prefill_result) = if let Some((decode, bootstrap)) = pd {
+        let request_id = ["venus-request-id", "x-request-id"]
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+            .unwrap_or("-");
+        tracing::info!(
+            request_id,
+            engine_rid = ?engine_rid,
+            caller_rid = ?bodies.caller_rid,
+            prefill_url = %prefill.url,
+            decode_url = %decode.url,
+            bootstrap_room = bootstrap.room,
+            "dispatching paired PD request",
+        );
         let prefill_result = spawn_prefill_request(
             ctx,
             prefill,
@@ -137,7 +146,7 @@ pub(super) async fn forward_chat_request(
                         match (&mut prefill_result).await {
                             Ok(Ok(())) => Ok(response),
                             other => {
-                                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref());
                                 Err(prefill_failure(other))
                             }
                         }
@@ -147,7 +156,7 @@ pub(super) async fn forward_chat_request(
                 prefill = &mut prefill_result => match prefill {
                     Ok(Ok(())) => response_future.await,
                     other => {
-                        spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                        spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref());
                         Err(prefill_failure(other))
                     }
                 },
@@ -157,7 +166,7 @@ pub(super) async fn forward_chat_request(
             biased;
             result = paired_response => result,
             _ = expiration_token.cancelled() => {
-                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref().unwrap());
+                spawn_decode_abort(ctx, &response_worker, &headers, engine_rid.as_deref());
                 Err(ApiError::StaleRequestExpired { model: metrics.model.clone() })
             },
         }
@@ -170,7 +179,7 @@ pub(super) async fn forward_chat_request(
             }),
         }
     };
-    let log_context = metrics.record_dispatch_result(&result, engine_rid);
+    let log_context = metrics.record_dispatch_result(&result, engine_rid.clone());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -242,7 +251,12 @@ fn prefill_failure(result: Result<Result<(), ApiError>, oneshot::error::RecvErro
     }
 }
 
-fn spawn_decode_abort(ctx: &AppContext, worker: &Worker, headers: &HeaderMap, rid: &str) {
+fn spawn_decode_abort(ctx: &AppContext, worker: &Worker, headers: &HeaderMap, rid: Option<&str>) {
+    // Worker-generated fan-out IDs cannot be targeted by the router. Dropping
+    // the decode transport leaves their cleanup to the worker's request scope.
+    let Some(rid) = rid else {
+        return;
+    };
     let proxy = Arc::clone(&ctx.proxy);
     let metrics = Arc::clone(&ctx.metrics);
     let url = worker.url.clone();

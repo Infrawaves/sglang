@@ -460,6 +460,61 @@ async fn pd_mode_prefill_5xx_cancels_decode() {
     .await;
 }
 
+#[tokio::test]
+async fn pd_fanout_failure_preserves_caller_rid_without_targeted_abort() {
+    let decode =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let prefill = crate::common::mock_worker::MockWorker::start_error_after_peer(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error":"prefill failed"}),
+        Some(Arc::clone(&decode.captured)),
+    )
+    .await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model":"tiny", "rid":"caller", "n":2,
+                "messages":[{"role":"user","content":"hi"}]})
+            .to_string(),
+        ))
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        build_router(Arc::clone(&ctx)).oneshot(request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    for worker in [&prefill, &decode] {
+        let body = await_captured_body(worker, Duration::from_secs(2), "PD fanout").await;
+        assert_eq!(parse_body(&body)["rid"], "caller");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(decode.captured.lock().unwrap().abort_rids.is_empty());
+    assert!(!ctx
+        .metrics
+        .render()
+        .lines()
+        .any(|line| line.starts_with("sgl_router_pd_decode_abort_requests_total{")));
+}
+
 /// A prefill client rejection keeps its 4xx status and still cancels decode,
 /// because decode cannot complete without a successful prefill.
 #[tokio::test]
