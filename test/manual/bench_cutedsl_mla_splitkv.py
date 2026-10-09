@@ -47,7 +47,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--active-batch-size",
         type=int,
-        help="Pad remaining rows with one query-width of KV (SGLang Q1 sentinel is 1)",
+        help="Pad remaining rows with one query-width of KV (SGLang Q1 sentinel is 1); "
+        "with --dcp-page-layout, pad with 0 local KV as non-first DCP ranks see",
     )
     parser.add_argument("--heads", type=int, default=24)
     parser.add_argument("--q-len", type=int, default=1)
@@ -92,7 +93,8 @@ def parse_args(argv=None):
         "--dcp-page-layout",
         action="store_true",
         help="Call the kernels as a page-layout DCP rank does (enable_dcp, "
-        "cp_world=1, local lengths as the causal bound) and also compare LSE",
+        "cp_world=1, local lengths as the causal bound) and also compare LSE; "
+        "zero local lengths are allowed and excluded from comparisons",
     )
     parser.add_argument("--execution-mode", choices=["graph", "eager"], default="graph")
     parser.add_argument("--check-only", action="store_true", help="Skip timing")
@@ -124,6 +126,10 @@ def parse_args(argv=None):
         parser.error("shape, scale, and timing counts must be positive")
     if any(not 1 <= n <= 32 for n in args.splits):
         parser.error("splits must be in [1, 32]")
+    if args.dcp_page_layout and args.q_len != 1:
+        parser.error("--dcp-page-layout requires --q-len 1, as the backend does")
+    # A page-layout DCP rank owns no KV for short requests and graph padding rows.
+    args.min_kv_len = 0 if args.dcp_page_layout else args.q_len
     if (
         not math.isfinite(args.atol)
         or not math.isfinite(args.rtol)
@@ -164,11 +170,13 @@ def build_cases(args):
             if (
                 not isinstance(lengths, list)
                 or len(lengths) != case_args.active_batch_size
-                or any(type(n) is not int or n < args.q_len for n in lengths)
+                or any(type(n) is not int or n < args.min_kv_len for n in lengths)
+                or max(lengths) < 1
             ):
                 raise ValueError(
                     f"B{batch} {name}: lengths must contain "
-                    f"{case_args.active_batch_size} integers >= q-len"
+                    f"{case_args.active_batch_size} integers >= {args.min_kv_len}, "
+                    "at least one nonzero"
                 )
             if args.max_seq_len is not None and max(lengths) > args.max_seq_len:
                 raise ValueError(
@@ -248,13 +256,19 @@ def result_status(checks, reference_valid):
 
 def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit):
     batch, page, heads, q_len = args.batch_size, args.page_size, args.heads, args.q_len
-    if len(lengths) != args.active_batch_size or any(
-        type(n) is not int or n < q_len for n in lengths
+    if (
+        len(lengths) != args.active_batch_size
+        or any(type(n) is not int or n < args.min_kv_len for n in lengths)
+        or max(lengths) < 1
     ):
-        raise ValueError("lengths must contain active-batch-size integers >= q-len")
+        raise ValueError(
+            "lengths must contain active-batch-size integers >= "
+            f"{args.min_kv_len}, at least one nonzero"
+        )
     # The supported non-DCP reducers do not support K=0. SGLang ordinary
     # decode pads seq_lens with 1, so keep these rows as real minimal KV work.
-    lengths = lengths + [q_len] * (batch - len(lengths))
+    # Under DCP, padding rows (global length 1) are empty on every rank but 0.
+    lengths = lengths + [args.min_kv_len] * (batch - len(lengths))
     bound = args.max_seq_len or max(lengths)
     if bound < max(lengths):
         raise ValueError("max-seq-len is below an actual KV length")
@@ -355,7 +369,12 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
         # DCP merges ranks by LSE, so it is compared together with the output.
         if not lse_kwargs:
             return out
-        return torch.cat((out.float().flatten(), lse_kwargs["lse"].flatten()))
+        # SGLang overwrites zero-KV rows with (0, -inf) after the kernel, so
+        # only nonempty rows carry kernel results.
+        rows = lens_gpu > 0
+        return torch.cat(
+            (out[rows].float().flatten(), lse_kwargs["lse"][rows].flatten())
+        )
 
     candidates = [("stock", stock.cute_dsl_mla_decode, stock_split, stock_ws)]
     for split in dict.fromkeys(args.splits):

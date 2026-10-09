@@ -95,6 +95,19 @@ CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
   --enable-pdl --check-only --output-jsonl splitkv-batch-sweep.jsonl
 ```
 
+Under DCP, check one rank's kernel shape (K3 DCP4: 96 gathered heads, about
+1/4 of the context per rank). `--dcp-page-layout` calls the kernel as a
+page-layout rank does, compares LSE too, and pads unused graph rows with zero
+local KV, as every rank except rank 0 sees for padding. Zero-KV rows are
+excluded from comparisons because SGLang overwrites them with `(0, -inf)`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-size 128 --active-batch-size 120 --heads 96 --splits 1 2 4 8 \
+  --dtype fp8 --max-seq-len 262144 --length-scale 0.25 --dcp-page-layout \
+  --enable-pdl --output-jsonl splitkv-dcp4-b128.jsonl
+```
+
 `--batch-size` and `--batch-sizes` are mutually exclusive. Fixed splits default
 to `1 4 8 16 32`. Within each case, all candidates use identical Q, KV, page
 tables and length arrays; pages are randomly placed and disjoint. Different
