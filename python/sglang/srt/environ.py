@@ -387,6 +387,9 @@ class Envs:
     # (queueing excluded) takes at least this many ms; either delays the next
     # token of every stream on that worker. <= 0 disables.
     SGLANG_LOG_SLOW_PREPROCESSING_MS = EnvInt(200)
+    # WARNING (with the blocking call's stack) when a tokenizer worker's event
+    # loop stops running callbacks for at least this many ms. <= 0 disables.
+    SGLANG_LOG_EVENT_LOOP_LAG_MS = EnvInt(0)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     # Request-log fields (any nesting depth) logged as their length plus a hash
     # at --log-requests-level 1 and 2: grammar constraints such as a tool-call
@@ -1393,6 +1396,10 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # PD decode only: drop multimodal feature tensors in the tokenizer before
+    # dispatch. Decode gets prompt KV from prefill and never runs the encoder,
+    # so it only needs item metadata (offsets, hash/pad_value, grid info).
+    SGLANG_DISAGG_DECODE_DROP_MM_FEATURES = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)

@@ -8,6 +8,7 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +36,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -323,6 +325,14 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         return padded_ids
 
 
+def _as_int64_tensor(input_ids):
+    """torch.as_tensor() reads an array.array item by item (~110 ms for 869k
+    tokens); read its buffer directly and copy so the caller's ids stay intact."""
+    if isinstance(input_ids, array) and input_ids.typecode == "q":
+        return torch.frombuffer(input_ids, dtype=torch.int64).clone()
+    return torch.as_tensor(input_ids)
+
+
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
@@ -338,7 +348,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        input_ids_tensor = _as_int64_tensor(input_ids)
 
         # Replace multimodal tokens using per-item offsets
         items_by_modality = defaultdict(list)
@@ -1464,6 +1474,41 @@ def wrap_shm_features(obj):
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
     return obj
+
+
+def _is_droppable_mm_payload(value) -> bool:
+    """Plain tensors/arrays only; transport proxies own producer-side resources."""
+    if value is None or isinstance(value, (torch.Tensor, np.ndarray)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(isinstance(v, (torch.Tensor, np.ndarray)) for v in value)
+    return False
+
+
+def drop_mm_features_for_decode(mm_items) -> None:
+    """Drop feature tensors from items dispatched to a PD decode scheduler.
+
+    Decode receives prompt KV from prefill and never runs the multimodal
+    encoder; it only reads item metadata (offsets, hash/pad_value and
+    model_specific_data such as grid_thw). Shipping the tensors costs a full
+    copy per IPC hop and, with nnodes > 1, a pickle broadcast inside the
+    attention-TP group that stalls the lockstep decode loop.
+    """
+    for item in mm_items:
+        if not isinstance(item, MultimodalDataItem):
+            continue
+        if item.feature is None and item.precomputed_embeddings is None:
+            continue
+        if not (
+            _is_droppable_mm_payload(item.feature)
+            and _is_droppable_mm_payload(item.precomputed_embeddings)
+        ):
+            # CUDA IPC/VMM proxies (single-node only) keep their normal lifecycle.
+            continue
+        # pad_value must be derived while the payload is still available.
+        item.set_pad_value()
+        item.feature = None
+        item.precomputed_embeddings = None
 
 
 def _feature_has_shm(feat) -> bool:

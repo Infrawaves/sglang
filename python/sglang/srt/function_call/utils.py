@@ -1,9 +1,8 @@
 import ast
-import hashlib
-import json
+import logging
+import math
 import threading
 import warnings
-from collections import OrderedDict
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -11,9 +10,108 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import orjson
 import partial_json_parser
 from jsonschema import Draft202012Validator
+from jsonschema_specifications import REGISTRY
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+logger = logging.getLogger(__name__)
+
+# Compile the *meta-schema*, not each tool's parameters. Fix the draft instead
+# of using rs.meta.is_valid(), which selects a draft from the input's $schema.
+# Keep Python's format policy (including whichever format extras are installed)
+# rather than changing acceptance of regex/URI values when switching engines.
+try:
+    import jsonschema_rs
+
+    _TOOL_SCHEMA_VALIDATOR = jsonschema_rs.Draft202012Validator(
+        Draft202012Validator.META_SCHEMA,
+        registry=jsonschema_rs.Registry(
+            [(uri, resource.contents) for uri, resource in REGISTRY.items()]
+        ),
+        validate_formats=True,
+        formats={
+            name: (
+                lambda value, name=name: Draft202012Validator.FORMAT_CHECKER.conforms(
+                    value, name
+                )
+            )
+            for name in ("regex", "uri", "uri-reference")
+        },
+        offline=True,
+    )
+except Exception:
+    logger.warning(
+        "jsonschema_rs unavailable or failed to initialize; using the Python validator",
+        exc_info=True,
+    )
+    _TOOL_SCHEMA_VALIDATOR = None
+
+
+_RUST_FALLBACK_WARNING_LOCK = threading.Lock()
+_rust_fallback_warning_logged = False
+
+
+def _warn_rust_fallback(exc: Exception) -> None:
+    """Log the first Rust validator failure without spamming request logs."""
+    global _rust_fallback_warning_logged
+    with _RUST_FALLBACK_WARNING_LOCK:
+        if _rust_fallback_warning_logged:
+            return
+        _rust_fallback_warning_logged = True
+    logger.warning(
+        "jsonschema_rs validation raised %s; falling back to Python validation",
+        type(exc).__name__,
+        exc_info=True,
+    )
+
+
+# Deep schemas can pass Rust but hit Python's recursion limit. Keep those on
+# the original path, along with Python-only values the binding may coerce.
+_MAX_RUST_SCHEMA_DEPTH = 32
+_JSON_SCALAR_TYPES = (str, int, bool, type(None))
+
+
+def _is_rust_compatible_json(value: Any, depth: int = 0) -> bool:
+    if depth > _MAX_RUST_SCHEMA_DEPTH:
+        return False
+    kind = type(value)
+    if kind is dict:
+        return all(
+            type(key) is str and _is_rust_compatible_json(item, depth + 1)
+            for key, item in value.items()
+        )
+    if kind is list:
+        return all(_is_rust_compatible_json(item, depth + 1) for item in value)
+    if kind is float:
+        return math.isfinite(value)
+    return kind in _JSON_SCALAR_TYPES
+
+
+def check_tool_parameters_schema(schema: Any) -> bool:
+    """Check tool parameters, preserving Python SchemaError messages.
+
+    Valid JSON schemas use a shared Rust meta-validator without a digest/LRU.
+    If Rust rejects an input (or cannot convert it), Python makes the final
+    decision. In particular, a Rust rejection is not itself a request error:
+    Python may accept it due to differences in regex or numeric semantics.
+
+    Returns whether the Python validator ran, so callers can report fallback
+    usage separately from the number of schemas in a request.
+    """
+    if _TOOL_SCHEMA_VALIDATOR is not None:
+        if _is_rust_compatible_json(schema):
+            try:
+                if _TOOL_SCHEMA_VALIDATOR.is_valid(schema):
+                    return False
+            except Exception as exc:
+                _warn_rust_fallback(exc)
+
+    # Use the exact existing implementation to preserve both acceptance and
+    # the first error, its paths and str(SchemaError) in the HTTP 400 response.
+    Draft202012Validator.check_schema(schema)
+    return True
+
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -176,69 +274,6 @@ def normalize_json_schema_types(schema: Any) -> None:
     ):
         if key in schema:
             normalize_json_schema_types(schema[key])
-
-
-# Digests of tool ``parameters`` schemas that already passed
-# ``Draft202012Validator.check_schema`` in this process, most recent last.
-_VALID_TOOL_SCHEMAS_MAX_SIZE = 8192
-_valid_tool_schemas: "OrderedDict[bytes, None]" = OrderedDict()
-_valid_tool_schemas_lock = threading.Lock()
-
-
-_PLAIN_JSON_SCALARS = (str, int, float, bool, type(None))
-
-
-def _is_plain_json(value: Any) -> bool:
-    """Exactly dict (str keys), list and JSON scalars: the only values whose
-    json.dumps text determines them (it also accepts tuples, non-str keys and
-    subclasses, which the metaschema may judge differently)."""
-    kind = type(value)
-    if kind is dict:
-        return all(type(k) is str and _is_plain_json(v) for k, v in value.items())
-    if kind is list:
-        return all(_is_plain_json(v) for v in value)
-    return kind in _PLAIN_JSON_SCALARS
-
-
-def _tool_schema_key(schema: Any) -> Optional[bytes]:
-    try:
-        if not _is_plain_json(schema):
-            return None
-        # json (not orjson) keeps NaN/Infinity distinct from null.
-        text = json.dumps(schema, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError, RecursionError):
-        return None
-    return hashlib.blake2b(text.encode(), digest_size=16).digest()
-
-
-def check_tool_parameters_schema(schema: Any) -> bool:
-    """``Draft202012Validator.check_schema(schema)``, skipped for schemas seen valid.
-
-    Metaschema validation is pure Python (~1-2 ms per tool) and runs on the
-    tokenizer worker's event loop, so a request carrying a few hundred tools
-    stalls every stream on that worker for most of a second. Agent clients
-    resend the same tool list on every turn, so remembering a digest of each
-    schema that passed reduces that to hashing. Only successes of plain JSON
-    data are remembered: anything else is checked every time and raises exactly
-    as ``check_schema`` does (``SchemaError``, ``RecursionError``).
-
-    Returns whether the full check ran (False on a cache hit).
-    """
-    key = _tool_schema_key(schema)
-    if key is not None:
-        with _valid_tool_schemas_lock:
-            if key in _valid_tool_schemas:
-                _valid_tool_schemas.move_to_end(key)
-                return False
-
-    Draft202012Validator.check_schema(schema)
-
-    if key is not None:
-        with _valid_tool_schemas_lock:
-            _valid_tool_schemas[key] = None
-            if len(_valid_tool_schemas) > _VALID_TOOL_SCHEMAS_MAX_SIZE:
-                _valid_tool_schemas.popitem(last=False)
-    return True
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:

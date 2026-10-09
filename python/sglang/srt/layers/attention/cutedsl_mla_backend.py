@@ -56,7 +56,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism.
 
     SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS optionally overrides the split planner
-    for ordinary non-DCP decode; the default keeps the base cute-dsl path.
+    for single-token decode, with or without DCP; the default keeps the base
+    cute-dsl path.
     """
 
     # This kernel does not support varlen queries.
@@ -77,10 +78,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 create_cutedsl_mla_decode_with_splits,
             )
 
-            if get_parallel().dcp_enabled or not model_runner.spec_algorithm.is_none():
+            if not model_runner.spec_algorithm.is_none():
                 raise ValueError(
                     "SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS currently requires "
-                    "DCP size 1 and speculative decoding disabled"
+                    "speculative decoding disabled"
                 )
             if envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is not None:
                 raise ValueError("Fixed CuTeDSL MLA splits do not support skip-softmax")
@@ -106,8 +107,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 get_cuda_graph_max_batch_size(capacity),
                 get_eager_max_batch_size(capacity),
             )
+            # Under DCP the kernel sees the DCP-gathered query heads.
             _, required = plan_cutedsl_mla_splits(
-                max_bs, 1, self.num_local_heads, self.kv_lora_rank, num_splits
+                max_bs, 1, self.num_decode_q_heads, self.kv_lora_rank, num_splits
             )
             if required > self.workspace_buffer.numel():
                 # Keep the shared upstream buffer intact for other instances.
@@ -117,9 +119,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 )
                 self.workspace_size = required
             logger.info(
-                "CuTeDSL MLA fixed KV splits=%d, max_batch=%d, workspace=%.2f MiB "
+                "CuTeDSL MLA fixed KV splits=%d, decode_heads=%d, dcp_size=%d, "
+                "max_batch=%d, workspace=%.2f MiB "
                 "(short contexts may use fewer nonempty splits)",
                 num_splits,
+                self.num_decode_q_heads,
+                get_parallel().attn_dcp_size,
                 max_bs,
                 self.workspace_buffer.numel() / 1024**2,
             )
@@ -154,23 +159,16 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             if self._decode_with_splits is not None:
                 if query.ndim != 4 or query.shape[1] != 1 or return_lse:
                     raise ValueError(
-                        "Fixed CuTeDSL MLA splits currently support ordinary "
-                        "decode only (Q length 1, no DCP/LSE merge)"
+                        "Fixed CuTeDSL MLA splits support single-token decode "
+                        "only (Q length 1; LSE is returned only under DCP)"
                     )
-                return self._decode_with_splits(
+                return self._run_fixed_split_decode(
                     query=query,
                     kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
-                    kv_lora_rank=self.kv_lora_rank,
-                    qk_rope_head_dim=self.qk_rope_head_dim,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
                     max_seq_len=max_seq_len,
-                    softmax_scale=self._compute_decode_bmm1_scale(layer),
-                    output_scale=1.0,
-                    out_dtype=torch.bfloat16,
-                    is_var_seq=True,
-                    enable_pdl=_ENABLE_PDL,
+                    layer=layer,
                 )
             return super()._run_decode_kernel(
                 query,
@@ -189,6 +187,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "causal_seqs (global per-request KV lengths) is required for DCP "
                 "MLA decode."
             )
+        seq_lens = (
+            seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+        )
         if self.dcp_kv_layout == "page":
             # With q_len=1 every valid local KV is visible. For multiple queries,
             # cp_world=1 would incorrectly subtract the query suffix on every rank;
@@ -200,6 +201,22 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 )
             causal_seqs = seq_lens
             cp_world, cp_rank = 1, 0
+        elif causal_seqs.dtype != torch.int32:
+            causal_seqs = causal_seqs.to(torch.int32)
+        if self._decode_with_splits is not None:
+            return self._run_fixed_split_decode(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                layer=layer,
+                return_lse=True,
+                enable_dcp=True,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                causal_seqlens_kv_global=causal_seqs,
+            )
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -209,9 +226,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
-            seq_lens=(
-                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
-            ),
+            seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
@@ -219,14 +234,40 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             enable_dcp=True,
             cp_world=cp_world,
             cp_rank=cp_rank,
-            causal_seqlens_kv_global=(
-                causal_seqs
-                if causal_seqs.dtype == torch.int32
-                else causal_seqs.to(torch.int32)
-            ),
+            causal_seqlens_kv_global=causal_seqs,
             return_lse=True,  # DCP requires the rank-local LSE for the merge
         )
         return raw_out, lse
+
+    def _run_fixed_split_decode(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        layer: RadixAttention,
+        **dcp_kwargs,
+    ):
+        # Mirrors the stock trtllm_batch_decode_with_kv_cache_mla cute-dsl call
+        # (bf16 out, PDL by arch); DCP state and return_lse pass through.
+        return self._decode_with_splits(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=self._compute_decode_bmm1_scale(layer),
+            output_scale=1.0,
+            out_dtype=torch.bfloat16,
+            is_var_seq=True,
+            enable_pdl=_ENABLE_PDL,
+            **dcp_kwargs,
+        )
 
     def forward_decode(
         self,
