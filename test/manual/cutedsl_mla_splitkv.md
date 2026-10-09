@@ -19,10 +19,15 @@ export SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS=4
   `0, 1, 2, 4, 8`; `1` also checks the adapter against the original B128 path.
 - Restart workers for every value. Changing the environment after startup does
   not update captured graph scalars or workspace pointers.
-- Requires `flashinfer-python==0.6.17` or `0.6.18`, DCP size 1, no speculative decoding,
+- Requires `flashinfer-python==0.6.17` or `0.6.18`, no speculative decoding,
   ordinary one-query-token decode, and no skip-softmax. Other FlashInfer
   versions fail explicitly when the override is enabled; default `0` does not
   impose a version check.
+- Works with DCP (`--dcp-size > 1`, token or page KV layout). The override
+  replaces only the planner of the same monolithic DCP call, so the kernel
+  still returns the rank-local `(out, lse)` for the cross-rank merge. Each
+  rank scans about `1/dcp_size` of the context with `dcp_size` times the heads,
+  so re-sweep the split count under DCP instead of reusing the non-DCP value.
 
 The startup log reports requested splits, maximum batch capacity and reserved
 workspace. A short context can have fewer nonempty partitions than requested.
@@ -39,8 +44,10 @@ split argument when one becomes available.
 
 SGLang upstream commit `39e147443bfd750252892e1dc2e46af8439b0679` pins
 FlashInfer 0.6.18 and moves DCP metadata helpers to `TRTLLMMLABackend`. The
-fixed split override remains in the ordinary non-DCP decode hook; keep the
-upstream metadata helpers and fallback argument forwarding when rebasing.
+fixed split override lives in `CuteDslMLABackend._run_decode_kernel` for both
+the non-DCP and DCP branches; keep the upstream metadata helpers and fallback
+argument forwarding when rebasing. Under DCP the workspace is planned for the
+DCP-gathered decode heads (`num_decode_q_heads`), not the local heads.
 The two FlashInfer releases have identical monolithic decode wrappers and
 split/workspace planning interfaces. This source compatibility check does
 not replace GB300 numerical and performance validation after upgrading.
@@ -86,6 +93,19 @@ CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
   --batch-sizes 1 2 4 8 16 32 64 128 --heads 24 \
   --splits 1 4 8 16 32 --dtype fp8 --max-seq-len 1048576 \
   --enable-pdl --check-only --output-jsonl splitkv-batch-sweep.jsonl
+```
+
+Under DCP, check one rank's kernel shape (K3 DCP4: 96 gathered heads, about
+1/4 of the context per rank). `--dcp-page-layout` calls the kernel as a
+page-layout rank does, compares LSE too, and pads unused graph rows with zero
+local KV, as every rank except rank 0 sees for padding. Zero-KV rows are
+excluded from comparisons because SGLang overwrites them with `(0, -inf)`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_cutedsl_mla_splitkv.py \
+  --batch-size 128 --active-batch-size 120 --heads 96 --splits 1 2 4 8 \
+  --dtype fp8 --max-seq-len 262144 --length-scale 0.25 --dcp-page-layout \
+  --enable-pdl --output-jsonl splitkv-dcp4-b128.jsonl
 ```
 
 `--batch-size` and `--batch-sizes` are mutually exclusive. Fixed splits default
