@@ -173,6 +173,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
+        handle_shared_experts_tp,
         handle_data_parallelism,
         handle_decode_context_parallelism,
         handle_dwdp,
@@ -313,6 +314,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
+    run_hook(handle_shared_experts_tp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)

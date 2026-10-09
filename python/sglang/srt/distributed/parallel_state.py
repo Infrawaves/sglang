@@ -1080,9 +1080,11 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
-            )
+            # PyTorch renamed this collective; retain older-version support.
+            reduce_scatter = getattr(torch.distributed, "reduce_scatter_single", None)
+            if reduce_scatter is None:
+                reduce_scatter = torch.distributed.reduce_scatter_tensor
+            reduce_scatter(output, input, group=self.device_group)
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -2091,6 +2093,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -2120,6 +2123,13 @@ def get_attn_tp_group() -> GroupCoordinator:
         "attention tensor model parallel group is not initialized"
     )
     return _ATTN_TP
+
+
+def get_shared_experts_tp_group() -> GroupCoordinator:
+    assert _SHARED_EXPERTS_TP is not None, (
+        "shared-expert tensor model parallel group is not initialized"
+    )
+    return _SHARED_EXPERTS_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2212,7 +2222,13 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (
+                _DCP,
+                _ATTN_TP,
+                _SHARED_EXPERTS_TP,
+                _MOE_EP,
+                _MOE_TP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2463,6 +2479,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    shared_experts_tensor_parallel_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2704,6 +2721,55 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+
+    global _SHARED_EXPERTS_TP
+    assert _SHARED_EXPERTS_TP is None, (
+        "shared-expert TP group is already initialized"
+    )
+    if shared_experts_tensor_parallel_size is not None and not (
+        1 <= shared_experts_tensor_parallel_size <= attn_tp_size
+    ):
+        raise ValueError(
+            "shared-experts TP size must be at least 1 and no greater "
+            f"than attention TP size ({attn_tp_size})"
+        )
+    # Size 1 means replicated shared experts: there is no group to build.
+    if (shared_experts_tensor_parallel_size or 1) > 1:
+        if attn_tp_size % shared_experts_tensor_parallel_size != 0:
+            raise ValueError(
+                f"attention TP size ({attn_tp_size}) must be divisible by "
+                f"shared-experts TP size ({shared_experts_tensor_parallel_size})"
+            )
+        if shared_experts_tensor_parallel_size == attn_tp_size:
+            _SHARED_EXPERTS_TP = _ATTN_TP
+        else:
+            shared_size = shared_experts_tensor_parallel_size
+            shared_group_ranks = []
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                for replica_idx in range(attn_cp_size * attn_dp_size):
+                    start = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + replica_idx * attn_tp_size
+                    )
+                    for subgroup_start in range(start, start + attn_tp_size, shared_size):
+                        shared_group_ranks.append(
+                            list(range(subgroup_start, subgroup_start + shared_size))
+                        )
+            # pynccl, not c10d: c10d costs ~110 us more CPU per Shared AG/RS and
+            # the MoE launch path is CPU-bound. Buffers stay off symmetric memory
+            # (see KimiK3MoE._alloc_shared_gather_output).
+            _SHARED_EXPERTS_TP = init_model_parallel_group(
+                shared_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_pynccl=True,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="shared_experts_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
@@ -3040,13 +3106,23 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _SHARED_EXPERTS_TP
+    global _TP
+    global _ATTN_TP
     get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
-    global _TP
+    if (
+        _SHARED_EXPERTS_TP is not None
+        and _SHARED_EXPERTS_TP is not _ATTN_TP
+        and _SHARED_EXPERTS_TP is not _TP
+    ):
+        _SHARED_EXPERTS_TP.destroy()
+    _SHARED_EXPERTS_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3082,7 +3158,6 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
