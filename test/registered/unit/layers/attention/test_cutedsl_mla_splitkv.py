@@ -285,6 +285,7 @@ class TestCuTeDSLMLABenchmark(CustomTestCase):
             ["--splits", "1", "33"],
             ["--atol", "-0.1"],
             ["--rtol", "inf"],
+            ["--dcp-page-layout", "--q-len", "2"],
         ]
         for argv in invalid:
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
@@ -303,6 +304,20 @@ class TestCuTeDSLMLABenchmark(CustomTestCase):
                     )
                     with self.assertRaises(ValueError):
                         self.bench.build_cases(args)
+            # A page-layout DCP rank owns no KV for short or padded rows.
+            dcp = [
+                "--batch-size",
+                "2",
+                "--lengths-json",
+                str(path),
+                "--dcp-page-layout",
+            ]
+            path.write_text("[0, 5]")
+            [(_, _, lengths)] = self.bench.build_cases(self.bench.parse_args(dcp))
+            self.assertEqual(lengths, [0, 5])
+            path.write_text("[0, 0]")
+            with self.assertRaises(ValueError):
+                self.bench.build_cases(self.bench.parse_args(dcp))
             path.write_text("[1, 129]")
             args = self.bench.parse_args(
                 [

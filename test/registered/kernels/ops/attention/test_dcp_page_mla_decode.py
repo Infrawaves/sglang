@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=360, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "DCP layout parity requires CUDA")
@@ -29,8 +29,11 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
     LENGTHS = (1, 50, 64, 65, 512, 513, 1100)
     SCALE = (128 + 64) ** -0.5
 
-    def _make_backend(self, pool, req_to_token, workspace, seq_lens, *, layout):
+    def _make_backend(
+        self, pool, req_to_token, workspace, seq_lens, *, layout, decode_with_splits
+    ):
         backend = object.__new__(CuteDslMLABackend)
+        backend._decode_with_splits = decode_with_splits
         backend.page_size = self.PAGE_SIZE
         backend.dcp_kv_layout = layout
         backend.max_context_len = self.MAX_LEN
@@ -73,7 +76,7 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
         lse = torch.logsumexp(query.float() @ kv.float().T * self.SCALE, dim=-1)
         return output.flatten(1), lse
 
-    def _run_layout(self, layout, query, kv, workspace, layer):
+    def _run_layout(self, layout, query, kv, workspace, layer, decode_with_splits):
         outputs = {length: [] for length in self.LENGTHS}
         lses = {length: [] for length in self.LENGTHS}
         with (
@@ -146,7 +149,12 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
                         out_cache_loc=loc,
                     )
                     backend = self._make_backend(
-                        pool, req_to_token, workspace, seq_lens, layout=layout
+                        pool,
+                        req_to_token,
+                        workspace,
+                        seq_lens,
+                        layout=layout,
+                        decode_with_splits=decode_with_splits,
                     )
 
                     def prepare(length):
@@ -238,8 +246,23 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
     @torch.no_grad()
     def test_page_token_and_dense_attention_agree_in_eager_and_cuda_graph(self):
         """Both layouts must match dense attention, not just each other."""
+        self._check_layouts_against_dense(num_kv_splits=0)
+
+    @torch.no_grad()
+    def test_fixed_kv_splits_keep_dcp_out_and_lse(self):
+        """Fixed splits must keep the rank-local (out, lse), including empty shards."""
+        self._check_layouts_against_dense(num_kv_splits=8)
+
+    def _check_layouts_against_dense(self, *, num_kv_splits):
         if torch.cuda.get_device_capability()[0] != 10:
             self.skipTest("CuteDSL MLA requires a Blackwell SM10.x GPU")
+        decode_with_splits = None
+        if num_kv_splits:
+            from sglang.srt.layers.attention.cutedsl_mla_splitkv import (
+                create_cutedsl_mla_decode_with_splits,
+            )
+
+            decode_with_splits = create_cutedsl_mla_decode_with_splits(num_kv_splits)
         generator = torch.Generator(device="cuda").manual_seed(42)
         kv = (
             torch.randn(
@@ -273,8 +296,10 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
         workspace = torch.zeros(
             DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024, dtype=torch.int8, device="cuda"
         )
-        page = self._run_layout("page", query, kv, workspace, layer)
-        token = self._run_layout("token", query, kv, workspace, layer)
+        page = self._run_layout("page", query, kv, workspace, layer, decode_with_splits)
+        token = self._run_layout(
+            "token", query, kv, workspace, layer, decode_with_splits
+        )
         for length in self.LENGTHS:
             with self.subTest(length=length, mode="page-vs-token"):
                 torch.testing.assert_close(
