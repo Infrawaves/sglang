@@ -1,5 +1,7 @@
 """CPU contracts for the DCP page-layout MLA integration seams."""
 
+import itertools
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.attention import set_mla_kv_concat_q as fused_module
 from sglang.srt.layers.attention import cutedsl_mla_backend as cute_module
+from sglang.srt.layers.attention import cutedsl_mla_splitkv as splitkv_module
 from sglang.srt.layers.attention import trtllm_mla_backend as trt_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
@@ -406,6 +409,38 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                 )
                 self.assertIs(output, expected)
 
+    def test_fixed_splits_start_under_dcp_with_gathered_head_workspace(self):
+        """DCP decode attends with attn_dcp_size x local heads, so the fixed-split
+        workspace must be planned for those heads; DCP must not block startup."""
+
+        def fake_base_init(instance, *_args, **_kwargs):
+            instance.num_local_heads = 64
+            instance.num_decode_q_heads = 64 * get_parallel().attn_dcp_size
+            instance.kv_lora_rank = 512
+            instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
+
+        model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            req_to_token_pool=SimpleNamespace(size=4),
+            device="cpu",
+        )
+        with (
+            patch.dict(os.environ, {"SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS": "8"}),
+            patch.object(TRTLLMMLABackend, "__init__", fake_base_init),
+            patch.object(
+                splitkv_module,
+                "create_cutedsl_mla_decode_with_splits",
+                return_value=object(),
+            ),
+            patch.object(cute_module, "get_cuda_graph_max_batch_size", return_value=4),
+            patch.object(cute_module, "get_eager_max_batch_size", return_value=4),
+            get_context().override_server_args(dcp_size=4),
+        ):
+            backend = CuteDslMLABackend(model_runner)
+        self.assertIsNotNone(backend._decode_with_splits)
+        # 256 gathered heads span two M128 tiles; 64 local heads would fit in one.
+        self.assertEqual(backend.workspace_buffer.numel(), 4 * 128 * 2 * 8 * 513 * 4)
+
     def test_forward_decode_derives_page_local_and_token_global_coordinates(self):
         backend = object.__new__(CuteDslMLABackend)
         backend.data_type = torch.bfloat16
@@ -439,18 +474,36 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
             patch.object(cute_module, "get_in_autotune_dummy_run", return_value=False),
             patch.object(cute_module, "fixup_zero_kv_rows"),
         ):
-            calls = []
+            stock_calls, split_calls = [], []
 
             def fake_decode(**kwargs):
-                calls.append(kwargs)
+                stock_calls.append(kwargs)
                 return torch.zeros((1, 1, 1, 512)), torch.zeros((1, 1, 1))
 
-            for layout, causal_seq, cp_world, cp_rank, cached_length in (
-                ("token", 8, 3, 1, None),
-                ("page", 2, 1, 0, None),
-                ("token", 8, 3, 1, 3),
-                ("page", 2, 1, 0, 2),
+            def fake_split_decode(**kwargs):
+                split_calls.append(kwargs)
+                return torch.zeros((1, 1, 1, 512)), torch.zeros((1, 1, 1))
+
+            # SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS must keep the same DCP coordinates
+            # as the stock call; neither path may silently fall back to the other.
+            for use_fixed_splits, (
+                layout,
+                causal_seq,
+                cp_world,
+                cp_rank,
+                cached_length,
+            ) in itertools.product(
+                (False, True),
+                (
+                    ("token", 8, 3, 1, None),
+                    ("page", 2, 1, 0, None),
+                    ("token", 8, 3, 1, 3),
+                    ("page", 2, 1, 0, 2),
+                ),
             ):
+                backend._decode_with_splits = (
+                    fake_split_decode if use_fixed_splits else None
+                )
                 backend.dcp_kv_layout = layout
                 metadata = backend.forward_decode_metadata
                 metadata.seq_lens_k = (
@@ -461,7 +514,12 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                 metadata.global_seq_lens_k = (
                     forward_batch.seq_lens if cached_length is not None else None
                 )
-                with self.subTest(layout=layout, cached_length=cached_length):
+                num_stock, num_split = len(stock_calls), len(split_calls)
+                with self.subTest(
+                    layout=layout,
+                    cached_length=cached_length,
+                    use_fixed_splits=use_fixed_splits,
+                ):
                     with (
                         patch.object(
                             backend,
@@ -506,7 +564,11 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                         run_kernel.call_args.kwargs["causal_seqs"],
                         forward_batch.seq_lens,
                     )
-                    kwargs = calls[-1]
+                    self.assertEqual(
+                        (len(stock_calls) - num_stock, len(split_calls) - num_split),
+                        (0, 1) if use_fixed_splits else (1, 0),
+                    )
+                    kwargs = (split_calls if use_fixed_splits else stock_calls)[-1]
                     self.assertTrue(kwargs["enable_dcp"])
                     self.assertTrue(kwargs["return_lse"])
                     torch.testing.assert_close(
