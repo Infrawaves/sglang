@@ -88,6 +88,12 @@ def parse_args(argv=None):
         help="Experimental output parity relative tolerance",
     )
     parser.add_argument("--enable-pdl", action="store_true")
+    parser.add_argument(
+        "--dcp-page-layout",
+        action="store_true",
+        help="Call the kernels as a page-layout DCP rank does (enable_dcp, "
+        "cp_world=1, local lengths as the causal bound) and also compare LSE",
+    )
     parser.add_argument("--execution-mode", choices=["graph", "eager"], default="graph")
     parser.add_argument("--check-only", action="store_true", help="Skip timing")
     parser.add_argument(
@@ -282,6 +288,7 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
         execution_mode=args.execution_mode,
         seed=args.seed,
         is_var_seq=True,
+        dcp_page_layout=args.dcp_page_layout,
     )
     emit(dict(event="case_start", **context))
     # Allocate only real pages; rectangular page-table capacity remains graph-safe.
@@ -327,6 +334,29 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
         is_var_seq=True,
         enable_pdl=args.enable_pdl,
     )
+    if args.dcp_page_layout:
+        # lens_gpu is also the causal bound, so metadata phases stay consistent.
+        call.update(
+            return_lse=True,
+            enable_dcp=True,
+            cp_world=1,
+            cp_rank=0,
+            causal_seqlens_kv_global=lens_gpu,
+        )
+
+    def new_lse():
+        if not args.dcp_page_layout:
+            return {}
+        return dict(
+            lse=torch.empty((batch, q_len, heads), dtype=torch.float32, device="cuda")
+        )
+
+    def observed(out, lse_kwargs):
+        # DCP merges ranks by LSE, so it is compared together with the output.
+        if not lse_kwargs:
+            return out
+        return torch.cat((out.float().flatten(), lse_kwargs["lse"].flatten()))
+
     candidates = [("stock", stock.cute_dsl_mla_decode, stock_split, stock_ws)]
     for split in dict.fromkeys(args.splits):
         effective, size = plan_splits(batch, q_len, heads, 512, split, bound)
@@ -346,13 +376,16 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
         out = torch.empty(
             (batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda"
         )
+        lse_kwargs = new_lse()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(args.warmup):
-                fn(**call, workspace_buffer=workspace, out=out)
+                fn(**call, workspace_buffer=workspace, out=out, **lse_kwargs)
         torch.cuda.current_stream().wait_stream(stream)
-        eager = functools.partial(fn, **call, workspace_buffer=workspace, out=out)
+        eager = functools.partial(
+            fn, **call, workspace_buffer=workspace, out=out, **lse_kwargs
+        )
         if args.execution_mode == "graph":
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -366,6 +399,7 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
                 launch=launch,
                 eager=eager,
                 out=out,
+                lse_kwargs=lse_kwargs,
                 workspace=workspace,
                 effective=effective,
                 size=size,
@@ -375,7 +409,9 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
         )
 
     def check(run, expected, phase, reference_mode):
-        stats = compare_outputs(run["out"], expected, args.atol, args.rtol)
+        stats = compare_outputs(
+            observed(run["out"], run["lse_kwargs"]), expected, args.atol, args.rtol
+        )
         run["checks"][phase] = stats
         checked_lengths = changed_lengths if phase == "metadata_changed" else lengths
         emit(
@@ -409,16 +445,22 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
 
     emit(dict(event="reference_start", **context))
     runs[0]["launch"]()
-    reference = runs[0]["out"].clone()
+    reference = observed(runs[0]["out"], runs[0]["lse_kwargs"]).clone()
     for run in runs:
         phase = "stock_repeat" if run["label"] == "stock" else "initial"
         run_and_check(run, reference, phase, args.execution_mode)
+
+    def eager_stock_reference():
+        eager_out = torch.empty_like(runs[0]["out"])
+        lse_kwargs = new_lse()
+        stock.cute_dsl_mla_decode(
+            **call, workspace_buffer=runs[0]["workspace"], out=eager_out, **lse_kwargs
+        )
+        return observed(eager_out, lse_kwargs)
+
     # A graph result must also agree with an eager call of the stock planner.
     # This does not establish an independent numerical ground truth.
-    eager_ref = torch.empty_like(reference)
-    stock.cute_dsl_mla_decode(
-        **call, workspace_buffer=runs[0]["workspace"], out=eager_ref
-    )
+    eager_ref = eager_stock_reference()
     run_and_check(
         runs[0],
         eager_ref,
@@ -432,9 +474,7 @@ def run_case(args, name, lengths, torch, stock, create_decode, plan_splits, emit
     changed_lengths = [max(q_len, n // 2) if n else 0 for n in lengths]
     table_gpu.copy_(changed_tables)
     lens_gpu.copy_(torch.tensor(changed_lengths, dtype=torch.int32))
-    stock.cute_dsl_mla_decode(
-        **call, workspace_buffer=runs[0]["workspace"], out=eager_ref
-    )
+    eager_ref = eager_stock_reference()
     for run in runs:
         run_and_check(run, eager_ref, "metadata_changed", "eager")
     table_gpu.copy_(tables)
