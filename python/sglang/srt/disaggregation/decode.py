@@ -1003,7 +1003,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         self.retracted_queue.clear()
         for entry in self.demotion_queue:
-            retraction_discard(
+            discard_kv_cache_backup(
                 entry.req,
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
@@ -1213,7 +1213,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             self._pre_alloc(req)
-            restored = retraction_restore(
+            restored = restore_kv_cache(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,

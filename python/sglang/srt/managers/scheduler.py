@@ -5526,7 +5526,7 @@ class Scheduler(
                 for entry in self.disagg_decode_prealloc_queue.demotion_queue:
                     req = entry.req
                     if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                        retraction_discard(
+                        discard_kv_cache_backup(
                             req,
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
