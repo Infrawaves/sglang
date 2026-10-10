@@ -129,6 +129,7 @@ _PARALLEL_FIELDS = frozenset(
         "moe_dp_group",
         "moe_tp_group",
         "attn_tp_group",
+        "shared_experts_tp_group",
         "attn_cp_group",
         "dcp_group",
     }
@@ -430,6 +431,10 @@ class ParallelContext:
     @property
     def attn_tp_group(self) -> Any:
         return self._v("attn_tp_group", _ps().get_attn_tp_group)
+
+    @property
+    def shared_experts_tp_group(self) -> Any:
+        return self._v("shared_experts_tp_group", _ps().get_shared_experts_tp_group)
 
     @property
     def attn_cp_group(self) -> Any:
