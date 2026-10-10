@@ -1738,6 +1738,57 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Where Kimi-K3 image preprocessing (bicubic resize -> transparent-bg
+    # composite -> normalize+patchify) runs.
+    #   "auto" - pick per request. A request goes to the GPU path (eager in
+    #            the tokenizer process, or deferred to the vision-DP owner
+    #            rank when `_should_defer_gpu_preprocessing` says so) only if
+    #            its estimated GPU preprocessing peak fits in
+    #            SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB together with every
+    #            request already preprocessing on the GPU; otherwise it takes
+    #            the "cpu" path below. With the budget disabled this is the
+    #            previous unconditional GPU behavior.
+    #   "cpu"  - run the checkpoint's own HF processor on the CPU, and decode
+    #            JPEG with PIL instead of nvJPEG. No image preprocessing
+    #            allocates on any GPU, which removes the tokenizer-process
+    #            allocation behind request-level "CUDA out of memory" on
+    #            large multi-image requests. Costs host CPU and raises TTFT;
+    #            numerically this is the checkpoint's exact reference path,
+    #            not an approximation of it (the GPU bicubic resize tracks
+    #            PIL to ~5e-3, and nvJPEG needs fancy_upsampling to match
+    #            PIL's chroma upsampling at all).
+    #   "gpu"  - always preprocess eagerly on the GPU in the tokenizer
+    #            process, never defer. Only useful as an A/B baseline against
+    #            "cpu"; this is the configuration that OOMs.
+    # Changing this changes `gpu_image_decode`, which is part of the
+    # preprocess-artifact fingerprint, so cached artifacts from another mode
+    # are never reused across a restart.
+    SGLANG_K3_IMAGE_PREPROCESS_MODE = EnvStr("auto")
+    # GPU memory budget, in MiB, that "auto" mode lets image preprocessing use
+    # on the tokenizer's GPU at one time, summed over every request currently
+    # preprocessing there (concurrent processor workers each hold one). A
+    # request whose estimate does not fit next to the ones in flight is
+    # preprocessed on the CPU instead; nothing waits. The estimate comes from
+    # image headers, before decode, because nvJPEG decode itself lands on the
+    # GPU. Split evenly across --tokenizer-worker-num, which all share one GPU.
+    # The default leaves room under the ~10 GiB a B300 prefill rank has free
+    # beside the scheduler at --mem-fraction-static 0.85. Each decision is
+    # logged with its estimate when SGLANG_K3_IMAGE_PREPROCESS_LOG is on, which
+    # is the data to tune this from. Set to 0 (or any value <= 0) to disable,
+    # restoring the previous always-GPU "auto".
+    SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB = EnvInt(6144)
+    # Safety net under the budget above, for when the estimate is wrong: if
+    # Kimi-K3 image preprocessing on the tokenizer's GPU raises CUDA OOM,
+    # release the cached allocations and redo that request on the CPU instead
+    # of failing it with 500. Logged at WARNING every time it fires -- each one
+    # means the budget is set too high. Off only to reproduce the raw OOM,
+    # e.g. as the mode=gpu A/B baseline.
+    SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK = EnvBool(True)
+    # Log one line per processor call naming the backend that actually ran
+    # (plus image count and resolved visual-token total), and one line per
+    # "auto" budget decision with its estimate, to confirm the mode above is
+    # taking effect under real traffic. Turn it off to silence it entirely.
+    SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
