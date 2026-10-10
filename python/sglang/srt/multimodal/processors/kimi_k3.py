@@ -345,9 +345,13 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             for width, height in image_sizes
         ]
 
+        packed = None
         if images and torch.cuda.is_available():
             image_scale, image_bias = self._get_gpu_norm_tensors()
-            pixel_values, grid_thws = _gpu_preprocess_images(
+            # Ask for per-image tensors directly: this method's contract is a
+            # list, so packing them into one block here only to split it again
+            # would keep a full duplicate of every feature alive across the cat.
+            features, grid_thws = _gpu_preprocess_images(
                 images,
                 resize_configs,
                 image_scale,
@@ -357,24 +361,37 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                 post_resize=lambda x: _fill_transparent_bg(
                     x, self._transparent_bg_config
                 ),
+                per_image=True,
             )
         else:
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
             # image features and grids are independent of its text.
             output = self._cpu_call(self._image_token * len(images), images)
-            pixel_values = output["pixel_values"]
+            packed = output["pixel_values"]
             grid_thws = output["image_grid_thw"]
 
         grids = [tuple(int(value) for value in grid) for grid in grid_thws.tolist()]
         patch_counts = [math.prod(grid) for grid in grids]
-        if sum(patch_counts) != pixel_values.shape[0]:
+        if packed is not None:
+            # The CPU fallback still returns one block; split it as before.
+            if sum(patch_counts) != packed.shape[0]:
+                raise ValueError(
+                    "Kimi-K3 processor feature length does not match image grids: "
+                    f"{packed.shape[0]} != {sum(patch_counts)}"
+                )
+            features = list(packed.split(patch_counts))
+        elif len(features) != len(patch_counts) or any(
+            feature.shape[0] != count for feature, count in zip(features, patch_counts)
+        ):
+            # Per image rather than on the total: two images whose errors cancel
+            # in the sum would pass the packed check and silently mismatch.
             raise ValueError(
                 "Kimi-K3 processor feature length does not match image grids: "
-                f"{pixel_values.shape[0]} != {sum(patch_counts)}"
+                f"{[feature.shape[0] for feature in features]} != {patch_counts}"
             )
         return (
-            list(pixel_values.split(patch_counts)),
+            features,
             image_sizes,
             resize_configs,
             grids,

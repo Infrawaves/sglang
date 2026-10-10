@@ -262,17 +262,28 @@ def _gpu_preprocess_images(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    per_image: bool = False,
+) -> tuple[Union[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
     Groups images with the same target padded size for batch processing.
+
+    ``per_image`` returns one tensor per image instead of a single packed
+    block. A caller that splits the block apart again pays for a full
+    duplicate: every group's patchify output stays alive while ``torch.cat``
+    builds the copy. The per-image tensors index into their own group's
+    patchify output, so they share storage exactly the way the block's
+    ``split`` views already did -- without the copy in between.
     """
     n = len(images)
+    empty_grids = torch.empty(0, 3, dtype=torch.int64)
     if n == 0:
         device = image_scale.device
+        if per_image:
+            return [], empty_grids
         return (
             torch.empty(0, 3, patch_size, patch_size, device=device),
-            torch.empty(0, 3, dtype=torch.int64),
+            empty_grids,
         )
 
     groups = defaultdict(list)
@@ -335,8 +346,10 @@ def _gpu_preprocess_images(
                 all_patches[idx] = batch[i]
                 all_grids[idx] = grid
 
-    pixel_values = torch.cat(all_patches, dim=0)
     grid_thws = torch.tensor(all_grids, dtype=torch.int64)
+    if per_image:
+        return all_patches, grid_thws
+    pixel_values = torch.cat(all_patches, dim=0)
     return pixel_values, grid_thws
 
 
