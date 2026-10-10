@@ -897,6 +897,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = self._calc_padded_blocks(max_seq_k)
                 self.forward_prefill_metadata.block_kv_indices = (
                     self._create_block_kv_indices(
+                        forward_batch.kv_loc_plan,
                         bs,
                         max_seqlen_pad,
                         forward_batch.req_pool_indices,
