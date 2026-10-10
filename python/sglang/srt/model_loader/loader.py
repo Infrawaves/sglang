@@ -3406,7 +3406,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         mix of seed and checkpoint weights, which the barrier after loading does
         not catch.
         """
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.distributed.parallel_state import get_world_group
 
         try:
             group = get_world_group()
