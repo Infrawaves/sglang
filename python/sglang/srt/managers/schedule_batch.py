@@ -1015,6 +1015,10 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.prefill_ready_seq: Optional[int] = None
+        # None means "not judged yet", not "ineligible": the round-robin verdict is
+        # decided once at first truncation and then frozen, because the uncached
+        # length shrinks every round as finished chunks enter the radix cache.
+        self.round_robin_eligible: Optional[bool] = None
         self.kv = ReqKvInfo()
 
         # Full-KV-derived boundary whose SWA window should be inserted after

@@ -64,6 +64,10 @@ class Schedule(msgspec.Struct):
         bool,
         "Round-robin chunked PD prefill, including overlap and DSPARK (PP1, one attention TP group).",
     ] = False
+    chunked_prefill_round_robin_min_chunks: A[
+        int,
+        "Minimum number of prefill chunks a request must need before round-robin yielding applies to it. Judged once when the request is first truncated, from its uncached length. Requests below the threshold stay on the baseline path: resumed first with a full chunk budget. 0 or 1 disables the gate.",
+    ] = 1
     prefill_decode_interval: A[
         Optional[int],
         Arg(
