@@ -117,6 +117,10 @@ def handle_asr_validation(server_args: Any):
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
+    if cfg.recent_image_max_count < 1:
+        raise ValueError("--recent-image-max-count must be a positive integer.")
+    if not 0.0 < cfg.recent_image_keep_ratio <= 1.0:
+        raise ValueError("--recent-image-keep-ratio must be in (0, 1].")
     if (
         cfg.mm_preprocess_cache_size_mb is not None
         and cfg.mm_preprocess_cache_size_mb < 0
