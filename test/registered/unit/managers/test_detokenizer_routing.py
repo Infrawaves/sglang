@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+DETOKENIZER_LOGGER = "sglang.srt.managers.detokenizer_manager"
+
 
 def token_batch(rids, ipcs, chunks, finished=None, **overrides):
     n = len(rids)
@@ -333,6 +335,35 @@ class TestDetokenizerRouting(CustomTestCase):
             manager.handle_batch_token_id_out(reused).output_strs, ["fresh"]
         )
         self.assertFalse(manager.decode_status)
+
+    def test_full_state_table_keeps_states_used_by_the_batch(self):
+        """Starting a stream must not lose a stream finishing in the same batch."""
+        manager = make_detokenizer()
+        manager.decode_status = LimitedCapacityDict(capacity=2)
+        manager.handle_batch_token_id_out(
+            token_batch(["A", "B"], ["T0", "T0"], [b"a", b"b"])
+        )
+        batch = token_batch(
+            ["A", "C"], ["T0", "T0"], [b"!", b"c"], finished=[{"type": "length"}, None]
+        )
+        with self.assertLogs(DETOKENIZER_LOGGER, "WARNING") as logs:
+            self.assertEqual(
+                manager.handle_batch_token_id_out(batch).output_strs, ["!", "c"]
+            )
+        self.assertIn("state table full", logs.output[0])
+        self.assertEqual(set(manager.decode_status), {("T0", "B"), ("T0", "C")})
+
+    def test_state_table_eviction_warning_is_rate_limited(self):
+        table = LimitedCapacityDict(capacity=1)
+        table["k0"] = 0
+        with self.assertNoLogs(DETOKENIZER_LOGGER, "WARNING"):
+            table["k0"] = 1  # Updating an existing key never evicts.
+        with self.assertLogs(DETOKENIZER_LOGGER, "WARNING") as logs:
+            for i in range(1, 6):
+                table[f"k{i}"] = i
+        # Five evictions log at the 1st, 2nd and 4th only.
+        self.assertEqual(len(logs.output), 3)
+        self.assertEqual((table.num_evicted, list(table)), (5, ["k5"]))
 
     def test_utf8_and_stop_trimming(self):
         for disable_batch in (False, True):
