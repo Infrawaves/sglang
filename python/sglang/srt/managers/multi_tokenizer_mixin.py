@@ -109,19 +109,12 @@ class SocketMapping:
         sock_send(self._mapping[ipc_name], output)
 
 
-def _extract_field_by_index(
-    output: Any, field_name: str, index: int, check_length: bool = True
+def _extract_field_by_indices(
+    output: Any, field_name: str, indices: List[int], check_length: bool = True
 ) -> Any:
-    """Extract a field value from output by index, handling None and length checks.
+    """Gather a per-request field at ``indices``; None when the field is absent.
 
-    Args:
-        output: The output object containing the field
-        field_name: The name of the field to extract
-        index: The index to access in the field list
-        check_length: If True, check both field existence and length. If False, only check field existence.
-
-    Returns:
-        A list containing the field value at index, or None if not available.
+    With ``check_length``, a field too short for any of ``indices`` counts as absent.
     """
     field = getattr(output, field_name, None)
     if field is None:
@@ -134,259 +127,301 @@ def _extract_field_by_index(
             return None
 
     if isinstance(field, dict):
-        new_field = {}
-        for k, v in field.items():
-            if len(v) > index:
-                new_field[k] = [v[index]] if should_wrap_result else v[index]
-            else:
-                new_field[k] = [None] if should_wrap_result else None
+        new_field = {
+            k: [v[i] if len(v) > i else None for i in indices] for k, v in field.items()
+        }
         if should_wrap_result:
             return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
-    if check_length:
-        if len(field) <= index:
-            return None
+    if check_length and len(field) <= max(indices):
+        return None
 
-    new_field = [field[index]]
+    new_field = [field[i] for i in indices]
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
-def _handle_output_by_index(output, i):
-    """NOTE: A maintainable method is better here."""
+def _group_indices_by_key(keys: List[str]) -> Dict[str, List[int]]:
+    groups: Dict[str, List[int]] = {}
+    for i, key in enumerate(keys):
+        groups.setdefault(key, []).append(i)
+    return groups
+
+
+def _handle_output_by_index(output, i: int):
+    return _handle_output_by_indices(output, [i])
+
+
+def _handle_output_by_indices(output, indices: List[int]):
+    """Slice a batch output down to ``indices``; unsupported types pass through.
+
+    NOTE: A maintainable method is better here.
+    """
     if isinstance(output, BatchTokenIDOutput):
         new_output = BatchTokenIDOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
+            rids=[output.rids[i] for i in indices],
+            spec_verify_ct=_extract_field_by_indices(output, "spec_verify_ct", indices),
+            spec_num_correct_drafts=_extract_field_by_indices(
+                output, "spec_num_correct_drafts", indices
             ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_indices(
+                output, "spec_correct_drafts_histogram", indices
             ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
+            spec_num_block_accept_tokens=_extract_field_by_indices(
+                output, "spec_num_block_accept_tokens", indices
             ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
+            spec_num_cap_tokens=_extract_field_by_indices(
+                output, "spec_num_cap_tokens", indices
             ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
+            spec_cap_lens_histogram=_extract_field_by_indices(
+                output, "spec_cap_lens_histogram", indices
             ),
-            time_stats=_extract_field_by_index(output, "time_stats", i),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
-            decode_ids=_extract_field_by_index(output, "decode_ids", i),
-            read_offsets=_extract_field_by_index(output, "read_offsets", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
-            skip_special_tokens=_extract_field_by_index(
-                output, "skip_special_tokens", i
+            time_stats=_extract_field_by_indices(output, "time_stats", indices),
+            finished_reasons=_extract_field_by_indices(
+                output, "finished_reasons", indices
             ),
-            spaces_between_special_tokens=_extract_field_by_index(
-                output, "spaces_between_special_tokens", i
+            decoded_texts=_extract_field_by_indices(output, "decoded_texts", indices),
+            decode_ids=_extract_field_by_indices(output, "decode_ids", indices),
+            read_offsets=_extract_field_by_indices(output, "read_offsets", indices),
+            output_ids=_extract_field_by_indices(output, "output_ids", indices),
+            skip_special_tokens=_extract_field_by_indices(
+                output, "skip_special_tokens", indices
             ),
-            no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
+            spaces_between_special_tokens=_extract_field_by_indices(
+                output, "spaces_between_special_tokens", indices
             ),
-            image_tokens=_extract_field_by_index(output, "image_tokens", i),
-            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
-            video_tokens=_extract_field_by_index(output, "video_tokens", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
+            no_stop_trim=_extract_field_by_indices(output, "no_stop_trim", indices),
+            prompt_tokens=_extract_field_by_indices(output, "prompt_tokens", indices),
+            completion_tokens=_extract_field_by_indices(
+                output, "completion_tokens", indices
             ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
+            reasoning_tokens=_extract_field_by_indices(
+                output, "reasoning_tokens", indices
             ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
+            cached_tokens=_extract_field_by_indices(output, "cached_tokens", indices),
+            cached_tokens_details=_extract_field_by_indices(
+                output, "cached_tokens_details", indices
             ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
+            image_tokens=_extract_field_by_indices(output, "image_tokens", indices),
+            audio_tokens=_extract_field_by_indices(output, "audio_tokens", indices),
+            video_tokens=_extract_field_by_indices(output, "video_tokens", indices),
+            input_token_logprobs_val=_extract_field_by_indices(
+                output, "input_token_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
+            input_token_logprobs_idx=_extract_field_by_indices(
+                output, "input_token_logprobs_idx", indices, check_length=False
             ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
+            output_token_logprobs_val=_extract_field_by_indices(
+                output, "output_token_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
+            output_token_logprobs_idx=_extract_field_by_indices(
+                output, "output_token_logprobs_idx", indices, check_length=False
             ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
+            input_top_logprobs_val=_extract_field_by_indices(
+                output, "input_top_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            input_top_logprobs_idx=_extract_field_by_indices(
+                output, "input_top_logprobs_idx", indices, check_length=False
             ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
+            input_top_logprobs_val_flat=_extract_field_by_indices(
+                output, "input_top_logprobs_val_flat", indices, check_length=False
             ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
+            input_top_logprobs_idx_flat=_extract_field_by_indices(
+                output, "input_top_logprobs_idx_flat", indices, check_length=False
             ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
+            input_top_logprobs_flat_null_prefix=_extract_field_by_indices(
+                output,
+                "input_top_logprobs_flat_null_prefix",
+                indices,
+                check_length=False,
             ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
+            output_top_logprobs_val=_extract_field_by_indices(
+                output, "output_top_logprobs_val", indices, check_length=False
             ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
+            output_top_logprobs_idx=_extract_field_by_indices(
+                output, "output_top_logprobs_idx", indices, check_length=False
             ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
+            input_token_ids_logprobs_val=_extract_field_by_indices(
+                output, "input_token_ids_logprobs_val", indices, check_length=False
             ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
+            input_token_ids_logprobs_idx=_extract_field_by_indices(
+                output, "input_token_ids_logprobs_idx", indices, check_length=False
             ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
+            output_token_ids_logprobs_val=_extract_field_by_indices(
+                output, "output_token_ids_logprobs_val", indices, check_length=False
             ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
+            output_token_ids_logprobs_idx=_extract_field_by_indices(
+                output, "output_token_ids_logprobs_idx", indices, check_length=False
             ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
+            output_token_entropy_val=_extract_field_by_indices(
+                output, "output_token_entropy_val", indices, check_length=False
             ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
+            output_token_sampling_mask=_extract_field_by_indices(
+                output, "output_token_sampling_mask", indices, check_length=False
             ),
-            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            output_hidden_states=_extract_field_by_indices(
+                output, "output_hidden_states", indices, check_length=False
+            ),
+            routed_experts=_extract_field_by_indices(
+                output, "routed_experts", indices, check_length=False
+            ),
+            indexer_topk=_extract_field_by_indices(
+                output, "indexer_topk", indices, check_length=False
+            ),
+            retraction_counts=_extract_field_by_indices(
+                output, "retraction_counts", indices
+            ),
+            weight_versions=_extract_field_by_indices(
+                output, "weight_versions", indices
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
+            beam_search_output=_extract_field_by_indices(
+                output, "beam_search_output", indices, check_length=True
             ),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
+            token_steps=_extract_field_by_indices(
+                output, "token_steps", indices, check_length=False
             ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
+            customized_info=_extract_field_by_indices(
+                output, "customized_info", indices, check_length=False
             ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            dp_ranks=_extract_field_by_indices(
+                output, "dp_ranks", indices, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
-            rids=[output.rids[i]],
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            embeddings=_extract_field_by_index(output, "embeddings", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            rids=[output.rids[i] for i in indices],
+            finished_reasons=_extract_field_by_indices(
+                output, "finished_reasons", indices
+            ),
+            embeddings=_extract_field_by_indices(output, "embeddings", indices),
+            prompt_tokens=_extract_field_by_indices(output, "prompt_tokens", indices),
+            cached_tokens=_extract_field_by_indices(output, "cached_tokens", indices),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
+            rids=[output.rids[i] for i in indices],
+            spec_verify_ct=_extract_field_by_indices(output, "spec_verify_ct", indices),
+            spec_num_correct_drafts=_extract_field_by_indices(
+                output, "spec_num_correct_drafts", indices
             ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_indices(
+                output, "spec_correct_drafts_histogram", indices
             ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
+            spec_num_block_accept_tokens=_extract_field_by_indices(
+                output, "spec_num_block_accept_tokens", indices
             ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
+            spec_num_cap_tokens=_extract_field_by_indices(
+                output, "spec_num_cap_tokens", indices
             ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
+            spec_cap_lens_histogram=_extract_field_by_indices(
+                output, "spec_cap_lens_histogram", indices
             ),
-            time_stats=_extract_field_by_index(output, "time_stats", i),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            output_strs=_extract_field_by_index(output, "output_strs", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
+            time_stats=_extract_field_by_indices(output, "time_stats", indices),
+            finished_reasons=_extract_field_by_indices(
+                output, "finished_reasons", indices
             ),
-            image_tokens=_extract_field_by_index(output, "image_tokens", i),
-            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
-            video_tokens=_extract_field_by_index(output, "video_tokens", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
+            output_strs=_extract_field_by_indices(output, "output_strs", indices),
+            output_ids=_extract_field_by_indices(output, "output_ids", indices),
+            prompt_tokens=_extract_field_by_indices(output, "prompt_tokens", indices),
+            completion_tokens=_extract_field_by_indices(
+                output, "completion_tokens", indices
             ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
+            reasoning_tokens=_extract_field_by_indices(
+                output, "reasoning_tokens", indices
             ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
+            cached_tokens=_extract_field_by_indices(output, "cached_tokens", indices),
+            cached_tokens_details=_extract_field_by_indices(
+                output, "cached_tokens_details", indices
             ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
+            image_tokens=_extract_field_by_indices(output, "image_tokens", indices),
+            audio_tokens=_extract_field_by_indices(output, "audio_tokens", indices),
+            video_tokens=_extract_field_by_indices(output, "video_tokens", indices),
+            input_token_logprobs_val=_extract_field_by_indices(
+                output, "input_token_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
+            input_token_logprobs_idx=_extract_field_by_indices(
+                output, "input_token_logprobs_idx", indices, check_length=False
             ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
+            output_token_logprobs_val=_extract_field_by_indices(
+                output, "output_token_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
+            output_token_logprobs_idx=_extract_field_by_indices(
+                output, "output_token_logprobs_idx", indices, check_length=False
             ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
+            input_top_logprobs_val=_extract_field_by_indices(
+                output, "input_top_logprobs_val", indices, check_length=False
             ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            input_top_logprobs_idx=_extract_field_by_indices(
+                output, "input_top_logprobs_idx", indices, check_length=False
             ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
+            input_top_logprobs_val_flat=_extract_field_by_indices(
+                output, "input_top_logprobs_val_flat", indices, check_length=False
             ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
+            input_top_logprobs_idx_flat=_extract_field_by_indices(
+                output, "input_top_logprobs_idx_flat", indices, check_length=False
             ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
+            input_top_logprobs_flat_null_prefix=_extract_field_by_indices(
+                output,
+                "input_top_logprobs_flat_null_prefix",
+                indices,
+                check_length=False,
             ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
+            output_top_logprobs_val=_extract_field_by_indices(
+                output, "output_top_logprobs_val", indices, check_length=False
             ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
+            output_top_logprobs_idx=_extract_field_by_indices(
+                output, "output_top_logprobs_idx", indices, check_length=False
             ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
+            input_token_ids_logprobs_val=_extract_field_by_indices(
+                output, "input_token_ids_logprobs_val", indices, check_length=False
             ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
+            input_token_ids_logprobs_idx=_extract_field_by_indices(
+                output, "input_token_ids_logprobs_idx", indices, check_length=False
             ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
+            output_token_ids_logprobs_val=_extract_field_by_indices(
+                output, "output_token_ids_logprobs_val", indices, check_length=False
             ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
+            output_token_ids_logprobs_idx=_extract_field_by_indices(
+                output, "output_token_ids_logprobs_idx", indices, check_length=False
             ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
+            output_token_entropy_val=_extract_field_by_indices(
+                output, "output_token_entropy_val", indices, check_length=False
             ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
+            output_token_sampling_mask=_extract_field_by_indices(
+                output, "output_token_sampling_mask", indices, check_length=False
             ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
+            output_hidden_states=_extract_field_by_indices(
+                output, "output_hidden_states", indices, check_length=False
             ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            routed_experts=_extract_field_by_indices(
+                output, "routed_experts", indices, check_length=False
+            ),
+            indexer_topk=_extract_field_by_indices(
+                output, "indexer_topk", indices, check_length=False
+            ),
+            customized_info=_extract_field_by_indices(
+                output, "customized_info", indices, check_length=False
+            ),
+            dp_ranks=_extract_field_by_indices(
+                output, "dp_ranks", indices, check_length=False
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
+            retraction_counts=_extract_field_by_indices(
+                output, "retraction_counts", indices
             ),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
+            beam_search_output=_extract_field_by_indices(
+                output, "beam_search_output", indices, check_length=True
+            ),
+            weight_versions=_extract_field_by_indices(
+                output, "weight_versions", indices
+            ),
+            token_steps=_extract_field_by_indices(
+                output, "token_steps", indices, check_length=False
             ),
         )
     else:
@@ -415,10 +450,12 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
+                    groups = _group_indices_by_key(recv_obj.http_worker_ipcs)
+                    for ipc_name, indices in groups.items():
                         self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
+                            ipc_name,
+                            _handle_output_by_indices(output, indices),
+                            is_tokenizer=True,
                         )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
@@ -619,13 +656,17 @@ class MultiDetokenizerRouter:
                     and all(x is not None for x in ipcs)
                 ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
-                # Split per request, preserving its original tokenizer return address.
-                for i, ipc_key in enumerate(ipcs):
-                    one = _handle_output_by_index(recv_obj, i)
-                    if one is recv_obj:
+                # One sub-batch per detokenizer; items keep their tokenizer return address.
+                targets = [
+                    self._pick(rid=rid, http_worker_ipc=ipc)
+                    for rid, ipc in zip(recv_obj.rids, ipcs)
+                ]
+                for target, indices in _group_indices_by_key(targets).items():
+                    part = _handle_output_by_indices(recv_obj, indices)
+                    if part is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
-                    one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(recv_obj.rids[i], ipc_key), one)
+                    part.http_worker_ipcs = [ipcs[i] for i in indices]
+                    self._send(target, part)
                 continue
 
             raise ValueError(

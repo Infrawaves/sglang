@@ -158,15 +158,21 @@ class TestDetokenizerRouting(CustomTestCase):
             with self.subTest(workers=n):
                 router = self.make_router(n)
                 deliveries = self.route(router, messages)
-                counts = Counter(ipc for ipc, _ in deliveries)
-                self.assertEqual(len(deliveries), 1024)
+                # At most one sub-batch per (scheduler batch, detokenizer).
+                self.assertLessEqual(len(deliveries), len(messages) * n)
+                counts = Counter()
+                for ipc, item in deliveries:
+                    counts[ipc] += len(item.rids)
+                    self.assertEqual(
+                        item.http_worker_ipcs, [expected_owners[r] for r in item.rids]
+                    )
+                    self.assertTrue(
+                        all(router._pick(r, "ignored") == ipc for r in item.rids)
+                    )
+                self.assertEqual(sum(counts.values()), 1024)
                 self.assertEqual(set(counts), set(router.ipc_name_list))
                 self.assertLess(max(counts.values()), 1.15 * 1024 / n)
                 self.assertGreater(min(counts.values()), 0.85 * 1024 / n)
-                for _, item in deliveries:
-                    self.assertEqual(
-                        item.http_worker_ipcs, [expected_owners[item.rids[0]]]
-                    )
                 old_counts = Counter(
                     router._pick(None, expected_owners[rid]) for rid in expected_owners
                 )
@@ -184,8 +190,8 @@ class TestDetokenizerRouting(CustomTestCase):
         )
         destinations = defaultdict(set)
         for ipc, item in deliveries:
-            rid = item.rid if isinstance(item, BaseReq) else item.rids[0]
-            destinations[rid].add(ipc)
+            for rid in [item.rid] if isinstance(item, BaseReq) else item.rids:
+                destinations[rid].add(ipc)
         self.assertEqual(destinations["a"], {router._pick("a", "ignored")})
         self.assertEqual(destinations["b"], {router._pick("b", "ignored")})
         self.assertEqual(deliveries[-1][1].http_worker_ipc, "T2")
@@ -209,51 +215,79 @@ class TestDetokenizerRouting(CustomTestCase):
                 [ipc for ipc, item in deliveries if item is obj], router.ipc_name_list
             )
 
-    def test_token_and_embedding_batches_preserve_split_metadata(self):
-        router = self.make_router()
+    def test_split_gathers_fields_in_index_order(self):
+        """A sub-batch must keep every per-request field aligned with its rids."""
         token = token_batch(
-            ["a", "b"],
-            ["T0", "T1"],
-            [b"a", b"b"],
-            finished=[None, {"type": "length"}],
-            prompt_tokens=[11, 22],
-            dp_ranks=[3, 7],
-            output_token_logprobs_val=[[-0.1], [-0.2]],
+            ["a", "b", "c"],
+            ["T0", "T1", "T2"],
+            [b"a", b"b", b"c"],
+            finished=[None, {"type": "length"}, None],
+            prompt_tokens=[11, 22, 33],
+            dp_ranks=[3, 7, 9],
+            output_token_logprobs_val=[[-0.1], [-0.2], [-0.3]],
             customized_info=wrap_as_pickle({"trace": ["trace-a", "trace-b"]}),
-            time_stats=wrap_as_pickle([{"created": 1}, {"created": 2}]),
+            time_stats=wrap_as_pickle([{"created": 1}, {"created": 2}, {"created": 3}]),
+            spec_verify_ct=[],
         )
+        part = routing._handle_output_by_indices(token, [2, 0])
+        self.assertEqual(part.rids, ["c", "a"])
+        self.assertEqual(
+            [list(ids) for ids in part.decode_ids], [[ord("c")], [ord("a")]]
+        )
+        self.assertEqual(part.finished_reasons, [None, None])
+        self.assertEqual(part.prompt_tokens, [33, 11])
+        self.assertEqual(part.dp_ranks, [9, 3])
+        self.assertEqual(part.output_token_logprobs_val, [[-0.3], [-0.1]])
+        # A dict value shorter than the batch pads missing positions with None.
+        self.assertEqual(
+            unwrap_from_pickle(part.customized_info), {"trace": [None, "trace-a"]}
+        )
+        self.assertEqual(
+            unwrap_from_pickle(part.time_stats), [{"created": 3}, {"created": 1}]
+        )
+        # A length-checked field too short for the indices is dropped, not padded.
+        self.assertIsNone(part.spec_verify_ct)
+
         embedding = BatchEmbeddingOutput(
-            rids=["c", "d"],
-            http_worker_ipcs=["T2", "T3"],
-            finished_reasons=[{"type": "length"}] * 2,
-            embeddings=[[1.0, 2.0], [3.0, 4.0]],
-            prompt_tokens=[33, 44],
-            cached_tokens=[3, 4],
+            rids=["d", "e", "f"],
+            http_worker_ipcs=["T3", "T4", "T5"],
+            finished_reasons=[{"type": "length"}] * 3,
+            embeddings=[[1.0], [2.0], [3.0]],
+            prompt_tokens=[44, 55, 66],
+            cached_tokens=[4, 5, 6],
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
-        deliveries = self.route(router, [token, embedding])
-        self.assertEqual(len(deliveries), 4)
-        for i, (ipc, item) in enumerate(deliveries):
-            self.assertEqual(item.rids, ["abcd"[i]])
-            self.assertEqual(item.http_worker_ipcs, [f"T{i}"])
-            self.assertEqual(item.prompt_tokens, [11 * (i + 1)])
-            self.assertEqual(ipc, router._pick("abcd"[i], f"T{i}"))
-            if i < 2:
-                self.assertEqual(item.dp_ranks, [[3], [7]][i])
-                self.assertEqual(
-                    item.output_token_logprobs_val, [[[-0.1]], [[-0.2]]][i]
-                )
-                self.assertEqual(
-                    unwrap_from_pickle(item.customized_info),
-                    {"trace": [f"trace-{'ab'[i]}"]},
-                )
-                self.assertEqual(
-                    unwrap_from_pickle(item.time_stats), [{"created": i + 1}]
-                )
-            else:
-                self.assertEqual(item.embeddings, [embedding.embeddings[i - 2]])
-                self.assertEqual(item.cached_tokens, [i + 1])
+        part = routing._handle_output_by_indices(embedding, [1, 2])
+        self.assertEqual(part.rids, ["e", "f"])
+        self.assertEqual(part.embeddings, [[2.0], [3.0]])
+        self.assertEqual(part.cached_tokens, [5, 6])
+
+    def test_detokenizer_returns_one_batch_per_tokenizer(self):
+        manager = make_detokenizer()
+        rids = [f"r{i}" for i in range(5)]
+        batch = token_batch(
+            rids,
+            ["T0", "T1", "T0", "T2", "T1"],
+            [bytes([ord("a") + i]) for i in range(5)],
+        )
+        start = len(self.sent)
+        with (
+            patch.object(routing, "sock_recv", side_effect=iter([batch])),
+            self.assertRaises(StopIteration),
+        ):
+            manager.multi_http_worker_event_loop()
+        returned = [
+            (ipc, item.rids, item.output_strs) for ipc, item in self.sent[start:]
+        ]
+        self.assertEqual(
+            returned,
+            [
+                ("T0", ["r0", "r2"], ["a", "c"]),
+                ("T1", ["r1", "r4"], ["b", "e"]),
+                ("T2", ["r3"], ["d"]),
+            ],
+        )
 
     def test_restarted_tokenizer_same_rid_ignores_old_ipc_finish(self):
         manager = make_detokenizer()
@@ -373,7 +407,7 @@ class TestDetokenizerRouting(CustomTestCase):
         deliveries = self.route(
             router, [msgpack_decode(msgpack_encode(x)) for x in batches]
         )
-        self.assertEqual(len({ipc for ipc, _ in deliveries[:5]}), 1)
+        self.assertEqual(len({ipc for ipc, _ in deliveries[:3]}), 1)
         self.assertEqual({ipc for ipc, _ in deliveries}, set(router.ipc_name_list))
         returned_start = len(self.sent)
         for ipc in router.ipc_name_list:
@@ -392,7 +426,8 @@ class TestDetokenizerRouting(CustomTestCase):
         outputs = defaultdict(list)
         for ipc, item in self.sent[returned_start:]:
             item = msgpack_decode(msgpack_encode(item))
-            outputs[(ipc, item.rids[0])].extend(item.output_strs)
+            for rid, text in zip(item.rids, item.output_strs):
+                outputs[(ipc, rid)].append(text)
         expected = {("T0", "same"): ["", "", "€?"], ("T1", "same"): ["b", "!"]}
         expected.update({("T0", rid): ["start", "-end"] for rid in rids})
         self.assertEqual(dict(outputs), expected)
