@@ -213,10 +213,6 @@ class _GlobalState:
 
 _global_state: Optional[_GlobalState] = None
 
-# Hold the slot through lifespan shutdown: response threads and IPC sockets may
-# still be alive then. Process exit releases the lock, including after SIGKILL.
-_tokenizer_ipc_lease = None
-
 
 def set_global_state(global_state: _GlobalState):
     global _global_state
@@ -254,29 +250,10 @@ async def init_multi_tokenizer() -> ServerArgs:
         "API key is not supported in multi-tokenizer mode"
     )
 
-    global _tokenizer_ipc_lease
-    if get_serving().detokenizer_worker_num > 1:
-        from sglang.srt.utils.tokenizer_ipc import TokenizerIpcLease
-
-        if _tokenizer_ipc_lease is not None:
-            raise RuntimeError(
-                "Multi-tokenizer IPC is already initialized in this worker"
-            )
-        _tokenizer_ipc_lease = TokenizerIpcLease.acquire(
-            port_args.instance_id,
-            get_serving().tokenizer_worker_num,
-            get_serving().detokenizer_worker_num,
-        )
-        port_args.tokenizer_ipc_name = _tokenizer_ipc_lease.ipc_name
-        logger.info(
-            "Tokenizer slot %s maps to detokenizer %s",
-            _tokenizer_ipc_lease.slot,
-            _tokenizer_ipc_lease.slot % get_serving().detokenizer_worker_num,
-        )
-    else:
-        port_args.tokenizer_ipc_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
+    # Create a new ipc name for the current process
+    port_args.tokenizer_ipc_name = (
+        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"

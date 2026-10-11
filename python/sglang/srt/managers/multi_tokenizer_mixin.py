@@ -560,9 +560,9 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
-    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``decode_status`` stays consistent.
+    Hash each request's RID so a hot tokenizer can use all detokenizers while
+    every stream stays on one worker. The original ``http_worker_ipc`` remains
+    the return address and is the routing fallback for messages without a RID.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -574,7 +574,13 @@ class MultiDetokenizerRouter:
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
 
-    def _pick(self, key: str) -> str:
+        logger.info(
+            "Detokenizer routing: RID hash across %s workers (IPC fallback without RID)",
+            self.num_workers,
+        )
+
+    def _pick(self, rid: Optional[str], http_worker_ipc: str) -> str:
+        key = rid or http_worker_ipc
         return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
 
     def _send(self, ipc_name: str, obj: Any) -> None:
@@ -590,12 +596,12 @@ class MultiDetokenizerRouter:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Keep the return address separate from the request routing key.
             if isinstance(recv_obj, BaseReq):
                 assert recv_obj.http_worker_ipc is not None, (
                     f"Single req {recv_obj.rid=} missing http_worker_ipc"
                 )
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                self._send(self._pick(recv_obj.rid, recv_obj.http_worker_ipc), recv_obj)
                 continue
 
             # Batch request.
@@ -613,13 +619,13 @@ class MultiDetokenizerRouter:
                     and all(x is not None for x in ipcs)
                 ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
-                # Split per-item and route each by its own ipc.
+                # Split per request, preserving its original tokenizer return address.
                 for i, ipc_key in enumerate(ipcs):
                     one = _handle_output_by_index(recv_obj, i)
                     if one is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
                     one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                    self._send(self._pick(recv_obj.rids[i], ipc_key), one)
                 continue
 
             raise ValueError(

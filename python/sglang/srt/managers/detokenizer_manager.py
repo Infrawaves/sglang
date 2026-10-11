@@ -301,14 +301,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return results
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
-        bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
+
+        # Different tokenizer workers may accept the same caller-supplied RID.
+        # Namespace state by the return address even when RID routing sends those
+        # streams to the same detokenizer. A restarted tokenizer has a fresh IPC.
+        state_keys = [
+            (recv_obj.http_worker_ipcs[i], rid)
+            if recv_obj.http_worker_ipcs is not None
+            else rid
+            for i, rid in enumerate(recv_obj.rids)
+        ]
 
         # Initialize decode status
         read_ids, surr_ids = [], []
-        for i in range(bs):
-            rid = recv_obj.rids[i]
-            if rid not in self.decode_status:
+        for i, state_key in enumerate(state_keys):
+            if state_key not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=self._clamp_decode_ids(
@@ -317,9 +325,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                self.decode_status[rid] = s
+                self.decode_status[state_key] = s
             else:
-                s = self.decode_status[rid]
+                s = self.decode_status[state_key]
                 s.decode_ids.extend(
                     self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
                 )
@@ -370,10 +378,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Incremental decoding
         output_strs = []
-        for i in range(bs):
+        for i, state_key in enumerate(state_keys):
             rid = recv_obj.rids[i]
             try:
-                s = self.decode_status[rid]
+                s = self.decode_status[state_key]
             except KeyError:
                 raise RuntimeError(
                     f"Decode status not found for request {rid}. "
@@ -406,8 +414,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 
-            if rid in self.decode_status:
-                del self.decode_status[rid]
+            if state_key in self.decode_status:
+                del self.decode_status[state_key]
 
             reasoning_text_len = 0
             if recv_obj.reasoning_tokens[i] and isinstance(
