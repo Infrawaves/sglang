@@ -516,11 +516,19 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
+                    # At most one batch per tokenizer worker (the return hop).
+                    groups: Dict[str, List[int]] = {}
                     for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                        groups.setdefault(ipc_name, []).append(i)
+                    for ipc_name, indices in groups.items():
+                        try:
+                            parts = [_handle_output_by_indices(output, indices)]
+                        except _CannotSplitBatch:
+                            parts = [_handle_output_by_index(output, i) for i in indices]
+                        for part in parts:
+                            self.socket_mapping.send_output(
+                                ipc_name, part, is_tokenizer=True
+                            )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
