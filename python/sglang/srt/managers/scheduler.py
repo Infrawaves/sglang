@@ -86,6 +86,7 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    is_round_robin_eligible,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -1316,6 +1317,9 @@ class Scheduler(
         self.enable_chunked_prefill_round_robin = (
             get_schedule().enable_chunked_prefill_round_robin
         )
+        self.chunked_prefill_round_robin_min_chunks = (
+            get_schedule().chunked_prefill_round_robin_min_chunks
+        )
         self._validate_prefill_round_robin()
         self.suspended_prefill_queue: List[Req] = []
         # Terminal cleanup actions waiting for outstanding GPU results.
@@ -1327,6 +1331,12 @@ class Scheduler(
 
     def _validate_prefill_round_robin(self) -> None:
         if not self.enable_chunked_prefill_round_robin:
+            if self.chunked_prefill_round_robin_min_chunks > 1 and self.ps.tp_rank == 0:
+                logger.warning(
+                    "--chunked-prefill-round-robin-min-chunks=%d has no effect "
+                    "without --enable-chunked-prefill-round-robin.",
+                    self.chunked_prefill_round_robin_min_chunks,
+                )
             return
         if (
             get_disagg().disaggregation_mode != "prefill"
@@ -4109,6 +4119,12 @@ class Scheduler(
                 r for r in self.suspended_prefill_queue if r not in can_run_set
             ]
             assert round_robin_chunked_req is None or adder.new_chunked_req is None
+            if adder.new_chunked_req is not None:
+                adder.new_chunked_req.round_robin_eligible = is_round_robin_eligible(
+                    req=adder.new_chunked_req,
+                    chunked_prefill_size=self.chunked_prefill_size,
+                    min_chunks=self.chunked_prefill_round_robin_min_chunks,
+                )
             self.chunked_req = round_robin_chunked_req or adder.new_chunked_req
         elif adder.new_chunked_req is not None:
             # Update chunked prefill
