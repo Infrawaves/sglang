@@ -313,7 +313,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for i, rid in enumerate(recv_obj.rids)
         ]
 
-        # Initialize decode status
+        # Initialize decode status. Keep this batch's states locally: inserting a new
+        # stream into a full table can evict a stream that finishes in this batch.
+        states: List[DecodeStatus] = []
         read_ids, surr_ids = [], []
         for i, state_key in enumerate(state_keys):
             if state_key not in self.decode_status:
@@ -331,6 +333,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 s.decode_ids.extend(
                     self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
                 )
+            states.append(s)
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -378,19 +381,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Incremental decoding
         output_strs = []
-        for i, state_key in enumerate(state_keys):
-            rid = recv_obj.rids[i]
-            try:
-                s = self.decode_status[state_key]
-            except KeyError:
-                raise RuntimeError(
-                    f"Decode status not found for request {rid}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+        for i, (state_key, s) in enumerate(zip(state_keys, states)):
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
@@ -563,14 +554,24 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 
 class LimitedCapacityDict(OrderedDict):
     def __init__(self, capacity: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.capacity = capacity
+        self.num_evicted = 0
+        super().__init__(*args, **kwargs)
 
     def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
-            # Remove the oldest element (first item in the dict)
-            self.popitem(last=False)
-        # Set the new item
+        if key not in self and len(self) >= self.capacity:
+            evicted, _ = self.popitem(last=False)
+            self.num_evicted += 1
+            # Log at 1, 2, 4, 8, ... evictions; a full table would otherwise flood.
+            if self.num_evicted & (self.num_evicted - 1) == 0:
+                logger.warning(
+                    "Detokenizer state table full (capacity %d): evicted %s, "
+                    "%d evictions so far. A stream evicted mid-output loses text; "
+                    "raise SGLANG_DETOKENIZER_MAX_STATES or check for leaked states.",
+                    self.capacity,
+                    evicted,
+                    self.num_evicted,
+                )
         super().__setitem__(key, value)
 
 
