@@ -13,7 +13,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN
+from sglang.srt.function_call.kimik3_detector import (
+    KimiK3Detector as KimiK3ToolDetector,
+)
+from sglang.srt.function_call.kimik3_format import (
+    RESPONSE_OPEN,
+    THINK_CLOSE,
+    TOOLS_CLOSE,
+    TOOLS_OPEN,
+)
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -99,10 +107,20 @@ class _ReasoningTokenizer:
         9: "<special>",
         10: "橘",
         11: "子",
+        12: "<|open|>",
+        13: "tools",
+        14: "<|close|>",
+        15: '<|open|>call tool="python" index="1"<|sep|><|close|>call<|sep|>',
     }
 
     def encode(self, text, add_special_tokens=False):
-        return list(range(len(text)))
+        markers = {
+            THINK_CLOSE: [3, 4],
+            RESPONSE_OPEN: [6],
+            TOOLS_OPEN: [12, 13, 4],
+            TOOLS_CLOSE: [14, 13, 4],
+        }
+        return markers.get(text, list(range(len(text))))
 
     def decode(self, ids, *, skip_special_tokens=False, **kwargs):
         return "".join(
@@ -146,6 +164,7 @@ def _init_reasoning_config(tokenizer, *, reasoning_parser):
         is_generation=True,
         is_multimodal=False,
         think_end_ids=None,
+        reasoning_channel_start_ids=[],
         request_selectable_think_end_id_sequences=None,
     )
     with (
@@ -172,6 +191,55 @@ def _accept_token(req, token):
     req.output_ids.append(token)
     req.update_reasoning_tokens(token, [3, 4])
     req.update_finish_state()
+
+
+def _generate_kimi_turn(test, req, tokens):
+    """Run tokens one per step through scheduler and detokenizer; parse K3 output."""
+    processor = SimpleNamespace(
+        model_config=_init_reasoning_config(req.tokenizer, reasoning_parser="kimi_k3")
+    )
+    detokenizer = DetokenizerManager.__new__(DetokenizerManager)
+    detokenizer.tokenizer = req.tokenizer
+    detokenizer.vocab_size = req.vocab_size
+    detokenizer.decode_status = {}
+    detokenizer.disable_tokenizer_batch_decode = False
+    detokenizer.is_tool_call_parser_gpt_oss = False
+    emitted = []
+    for index, token in enumerate(tokens):
+        req.output_ids.append(token)
+        SchedulerBatchResultProcessor._maybe_update_reasoning_tokens(
+            processor, req, token
+        )
+        req.update_finish_state()
+        test.assertEqual(req.finished(), index == len(tokens) - 1)
+        accumulator = _GenerationStreamAccumulator(
+            return_logprob=False,
+            return_hidden_states=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            default_stream_interval=1,
+            default_force_stream_interval=1000,
+            get_cached_tokens_details=lambda req: None,
+            current_weight_version=None,
+        )
+        accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        if payload is not None:
+            output = detokenizer.handle_batch_token_id_out(payload)
+            emitted.extend(output.output_strs)
+
+    parser = ReasoningParser(model_type="kimi_k3", force_reasoning=True)
+    if not req.stream:
+        return parser.parse_non_stream("".join(emitted))
+    reasoning, content = "", ""
+    for chunk in emitted:
+        reasoning_chunk, content_chunk = parser.parse_stream_chunk(chunk)
+        reasoning += reasoning_chunk or ""
+        content += content_chunk or ""
+    reasoning_chunk, content_chunk = parser.parse_stream_end()
+    return reasoning + (reasoning_chunk or ""), content + (content_chunk or "")
 
 
 class TestReasoningStop(CustomTestCase):
@@ -286,6 +354,56 @@ class TestReasoningStop(CustomTestCase):
         self.assertEqual(
             req.finished_reason.to_json(), {"type": "stop", "matched": "橘子"}
         )
+
+    def test_kimi_tool_stop_before_think_close(self):
+        """Tools can finish before think closes without losing quoted reasoning or the call."""
+        for stream, no_stop_trim in product((False, True), (False, True)):
+            with self.subTest(stream=stream, no_stop_trim=no_stop_trim):
+                req = _make_reasoning_req(stop=["橘子", TOOLS_CLOSE])
+                req.stream = stream
+                req.sampling_params.no_stop_trim = no_stop_trim
+                # Quote both stops in thinking before opening the tools channel.
+                tokens = (1, 2, 14, 13, 4, 12, 13, 4, 15, 14, 13, 4)
+                reasoning, content = _generate_kimi_turn(self, req, tokens)
+                self.assertEqual(reasoning, "需要列出苹果、香蕉、橘子" + TOOLS_CLOSE)
+                self.assertEqual(
+                    content,
+                    TOOLS_OPEN
+                    + req.tokenizer.tokens[15]
+                    + (TOOLS_CLOSE if no_stop_trim else ""),
+                )
+                calls = KimiK3ToolDetector().detect_and_parse(content, tools=[]).calls
+                self.assertEqual(len(calls), 1)
+                self.assertEqual((calls[0].name, calls[0].parameters), ("python", "{}"))
+                self.assertEqual(
+                    req.finished_reason.to_json(),
+                    {"type": "stop", "matched": TOOLS_CLOSE},
+                )
+
+    def test_kimi_response_stop_before_think_close(self):
+        """A response channel opened before think closes must enable answer stops."""
+        for stream, no_stop_trim, (tokens, expected_reasoning) in product(
+            (False, True),
+            (False, True),
+            (
+                # Quoted stop in thinking, then the response channel; 橘子 is split.
+                ((1, 2, 6, 7, 10, 11), "需要列出苹果、香蕉、橘子"),
+                # Direct answer without a thinking channel.
+                ((6, 7, 10, 11), ""),
+            ),
+        ):
+            with self.subTest(stream=stream, no_stop_trim=no_stop_trim, tokens=tokens):
+                req = _make_reasoning_req()
+                req.stream = stream
+                req.sampling_params.no_stop_trim = no_stop_trim
+                reasoning, content = _generate_kimi_turn(self, req, tokens)
+                self.assertEqual(reasoning, expected_reasoning)
+                self.assertEqual(
+                    content, "苹果、香蕉、" + ("橘子" if no_stop_trim else "")
+                )
+                self.assertEqual(
+                    req.finished_reason.to_json(), {"type": "stop", "matched": "橘子"}
+                )
 
     def test_kimi_stop_keeps_thinking_and_answer_prefix(self):
         """Stop trimming must preserve thinking and stop at the first content match."""
