@@ -1661,8 +1661,7 @@ class Req(ReqDllmMixin):
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         # Reasoning-aware user stops currently target non-speculative decoding only.
         content_len = len(self.output_ids)
-        # The result processor creates a matcher only for a usable reasoning boundary.
-        if self._think_end_matcher is not None:
+        if self.require_reasoning:
             if not self._is_reasoning_over:
                 return 0
             content_len -= self.reasoning_tokens
@@ -1720,7 +1719,7 @@ class Req(ReqDllmMixin):
 
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids and (
-                self._think_end_matcher is None
+                not self.require_reasoning
                 or (
                     self._is_reasoning_over
                     and len(self.output_ids) > self.reasoning_tokens
@@ -1770,7 +1769,7 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
-        if self._think_end_matcher is not None and not self._is_reasoning_over:
+        if self.require_reasoning and not self._is_reasoning_over:
             return False
         if (
             len(self.sampling_params.stop_strs) > 0
@@ -1783,8 +1782,7 @@ class Req(ReqDllmMixin):
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
                     if stop_str_in_tail or (
-                        self._think_end_matcher is None
-                        and stop_str in self.decoded_text
+                        not self.require_reasoning and stop_str in self.decoded_text
                     ):
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         if stop_str_in_tail:

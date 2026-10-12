@@ -1386,6 +1386,8 @@ class SchedulerBatchResultProcessor:
             if request_think_end_ids is not None:
                 think_end_ids = request_think_end_ids
             if not think_end_ids:
+                # No usable boundary: user stops keep their legacy behavior.
+                req._is_reasoning_over = True
                 return
         req.update_reasoning_tokens(
             next_token_id,

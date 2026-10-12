@@ -944,15 +944,12 @@ class Scheduler(
                 if get_serving().reasoning_parser == "kimi_k3":
                     # K3's parser also leaves reasoning when the response or tools
                     # channel opens.
-                    channel_start_ids = [
+                    self.model_config.reasoning_channel_start_ids = [
                         self.tokenizer.encode(token, add_special_tokens=False)
                         for token in (
                             RESPONSE_OPEN,
                             reasoning_parser.detector.tool_start_token,
                         )
-                    ]
-                    self.model_config.reasoning_channel_start_ids = [
-                        ids for ids in channel_start_ids if ids
                     ]
             else:
                 logger.warning(
