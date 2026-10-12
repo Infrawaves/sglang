@@ -281,6 +281,21 @@ class TestReasoningStop(CustomTestCase):
                     req.finished_reason.to_json(), {"type": "stop", "matched": matched}
                 )
 
+    def test_user_stops_without_reasoning_tracking(self):
+        """Paths that never track reasoning (e.g. dLLM commits) keep legacy stops."""
+        for params, matched in (
+            ({"stop": "橘子"}, "橘子"),
+            ({"stop": None, "stop_token_ids": {11}}, 11),
+        ):
+            with self.subTest(params=params):
+                req = _make_reasoning_req(**params)
+                req.output_ids.extend([7, 10, 11])
+                req.update_finish_state(new_accepted_len=3)
+                self.assertIsNotNone(req.finished_reason)
+                self.assertEqual(
+                    req.finished_reason.to_json(), {"type": "stop", "matched": matched}
+                )
+
     def test_user_stops_wait_until_after_thinking(self):
         """Quoted stops and the thinking terminator must not end generation."""
         for params, matched in (
