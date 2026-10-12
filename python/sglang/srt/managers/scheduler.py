@@ -103,6 +103,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
@@ -940,6 +941,16 @@ class Scheduler(
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
+                if get_serving().reasoning_parser == "kimi_k3":
+                    # K3's parser also leaves reasoning when the response or tools
+                    # channel opens.
+                    self.model_config.reasoning_channel_start_ids = [
+                        self.tokenizer.encode(token, add_special_tokens=False)
+                        for token in (
+                            RESPONSE_OPEN,
+                            reasoning_parser.detector.tool_start_token,
+                        )
+                    ]
             else:
                 logger.warning(
                     "Reasoning parser think_end_token %r could not be encoded; "
