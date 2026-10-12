@@ -10,11 +10,16 @@ import unittest
 from array import array
 from itertools import product
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -133,6 +138,36 @@ def _make_reasoning_req(
     return req
 
 
+def _init_reasoning_config(tokenizer, *, reasoning_parser):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.server_args = None
+    scheduler.skip_tokenizer_init = tokenizer is None
+    scheduler.model_config = SimpleNamespace(
+        is_generation=True,
+        is_multimodal=False,
+        think_end_ids=None,
+        request_selectable_think_end_id_sequences=None,
+    )
+    with (
+        patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(
+                reasoning_parser=reasoning_parser,
+                tokenizer_path="test",
+                tokenizer_mode="auto",
+                tokenizer_backend="transformers",
+            ),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler.get_model",
+            return_value=SimpleNamespace(trust_remote_code=False, revision=None),
+        ),
+        patch("sglang.srt.managers.scheduler.get_tokenizer", return_value=tokenizer),
+    ):
+        scheduler.init_tokenizer()
+    return scheduler.model_config
+
+
 def _accept_token(req, token):
     req.output_ids.append(token)
     req.update_reasoning_tokens(token, [3, 4])
@@ -141,6 +176,57 @@ def _accept_token(req, token):
 
 class TestReasoningStop(CustomTestCase):
     """Non-speculative decoding only; speculative compatibility is out of scope."""
+
+    def test_user_stops_without_reasoning_terminator(self):
+        """Missing reasoning configuration must not disable otherwise valid stops."""
+        for params, tokenizer_enabled, matched in (
+            ({"stop": "橘子"}, True, "橘子"),
+            ({"stop": None, "stop_regex": "橘."}, True, "橘."),
+            ({"stop": None, "stop_token_ids": {11}}, True, 11),
+            ({"stop": None, "stop_token_ids": {11}}, False, 11),
+        ):
+            with self.subTest(params=params, tokenizer_enabled=tokenizer_enabled):
+                req = _make_reasoning_req(**params)
+                if not tokenizer_enabled:
+                    req.tokenizer = None
+                    req.sampling_params.normalize(tokenizer=None)
+                processor = SimpleNamespace(
+                    model_config=_init_reasoning_config(
+                        req.tokenizer,
+                        reasoning_parser=None if tokenizer_enabled else "kimi_k3",
+                    )
+                )
+                for token in (10, 11):
+                    req.output_ids.append(token)
+                    SchedulerBatchResultProcessor._maybe_update_reasoning_tokens(
+                        processor, req, token
+                    )
+                    req.update_finish_state()
+                    if token == 10:
+                        self.assertFalse(req.finished())
+                        self.assertEqual(
+                            req.check_match_stop_str_prefix(),
+                            params["stop"] == "橘子",
+                        )
+                self.assertIsNotNone(req.finished_reason)
+                self.assertEqual(
+                    req.finished_reason.to_json(), {"type": "stop", "matched": matched}
+                )
+
+    def test_user_stops_without_reasoning_tracking(self):
+        """Paths that never track reasoning (e.g. dLLM commits) keep legacy stops."""
+        for params, matched in (
+            ({"stop": "橘子"}, "橘子"),
+            ({"stop": None, "stop_token_ids": {11}}, 11),
+        ):
+            with self.subTest(params=params):
+                req = _make_reasoning_req(**params)
+                req.output_ids.extend([7, 10, 11])
+                req.update_finish_state(new_accepted_len=3)
+                self.assertIsNotNone(req.finished_reason)
+                self.assertEqual(
+                    req.finished_reason.to_json(), {"type": "stop", "matched": matched}
+                )
 
     def test_user_stops_wait_until_after_thinking(self):
         """Quoted stops and the thinking terminator must not end generation."""
