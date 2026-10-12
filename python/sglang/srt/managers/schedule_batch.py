@@ -2093,7 +2093,7 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
 
-    def update_reasoning_tokens(self, token_id, think_end_ids, *, tool_start_ids=None):
+    def update_reasoning_tokens(self, token_id, think_end_ids, *, channel_start_ids=()):
         if self._is_reasoning_over:
             return
 
@@ -2113,12 +2113,8 @@ class Req(ReqDllmMixin):
 
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
-        if (
-            tool_start_ids
-            and token_id
-            and token_id[-1] == tool_start_ids[-1]
-            and list(self.output_ids[-len(tool_start_ids) :]) == tool_start_ids
-        ):
+        # Non-speculative only: callers append first, and only the tail is checked.
+        if any(list(self.output_ids[-len(ids) :]) == ids for ids in channel_start_ids):
             self._is_reasoning_over = True
 
     def __repr__(self):

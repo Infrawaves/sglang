@@ -70,7 +70,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None, reasoning_tool_start_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, reasoning_channel_start_ids=[]
+        ),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
@@ -240,7 +242,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
         req.sampling_params.stop_token_ids = {19}
         processor = _make_processor()
         processor.model_config.think_end_ids = [7, 8]
-        processor.model_config.reasoning_tool_start_ids = [17, 18]
+        processor.model_config.reasoning_channel_start_ids = [[17, 18]]
 
         _commit_disagg_handoff(req, processor, 17)
         req.update_finish_state()

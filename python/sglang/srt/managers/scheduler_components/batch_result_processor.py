@@ -1390,7 +1390,7 @@ class SchedulerBatchResultProcessor:
         req.update_reasoning_tokens(
             next_token_id,
             think_end_ids,
-            tool_start_ids=self.model_config.reasoning_tool_start_ids,
+            channel_start_ids=self.model_config.reasoning_channel_start_ids,
         )
 
     def _mamba_prefix_cache_update(
