@@ -993,12 +993,8 @@ class KimiK3MoE(nn.Module):
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
-        # Top-k tensors were allocated on alt_stream but are consumed by the
-        # routed experts on current_stream. Tell the caching allocator about
-        # that lifetime before alt_stream is reused for the shared experts.
-        for value in topk_output:
-            if isinstance(value, torch.Tensor):
-                value.record_stream(current_stream)
+        # No record_stream on the top-k tensors (see _forward_unfused): every
+        # later alt_stream allocation follows an alt.wait_stream(current).
         return topk_output, routed_input
 
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
@@ -1132,6 +1128,20 @@ class KimiK3MoE(nn.Module):
         # Side-comm collective buffers: allocated on the current stream and
         # kept alive here until the tail join, so they need no record_stream.
         shared_comm_buffers = None
+        # SBO input read on the side stream, held until the tail join for the
+        # same reason (it may be a gathered tensor local to issue_shared).
+        shared_input_keepalive = None
+        # Nothing in this MoE block is record_stream'd (except the NPU
+        # fine-grained path, which never uses symm mem). Under --enable-symm-mem
+        # the Shared MLP output (down_proj) and the top-k tensors are allocated
+        # from the symmetric pool on alt_stream, and record_stream makes their
+        # reuse wait on event completion, which differs per rank. One rank then
+        # ncclMemAlloc's a new segment while another reuses a block, and the
+        # collective ncclCommWindowRegister on the next symm-context exit
+        # mismatches (hang / "remote process exited"). Lifetimes are ordered
+        # instead: the current stream joins shared_event before these tensors
+        # can be freed, and every alt_stream use first waits on the current
+        # stream, so a freed alt_stream block is reused only after its readers.
 
         def wait_shared_gather():
             # Fence before the routed experts: the side-stream AG must not
@@ -1156,7 +1166,7 @@ class KimiK3MoE(nn.Module):
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event, shared_gather_event
-            nonlocal shared_comm_buffers
+            nonlocal shared_comm_buffers, shared_input_keepalive
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if fine_grained_overlap:
@@ -1191,7 +1201,7 @@ class KimiK3MoE(nn.Module):
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                shared_input.record_stream(self.alt_stream)
+                shared_input_keepalive = shared_input
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1254,7 +1264,6 @@ class KimiK3MoE(nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
             if (
                 self._shared_experts_tp_comm
                 and not fine_grained_overlap
