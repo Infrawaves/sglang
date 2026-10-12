@@ -1834,6 +1834,9 @@ class Envs:
     # TP8 GB300 configuration; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Fuse the dense BF16 K3 o_proj with SP reduce-scatter and prefix addition.
+    # Only enable with SGLANG_K3_SP_COLLECTIVE.
+    SGLANG_K3_SP_GEMM_FUSION = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
