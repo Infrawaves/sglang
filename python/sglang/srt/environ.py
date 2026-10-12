@@ -537,6 +537,9 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Directory to write per-rank fingerprints (shape/stride/dtype/byte checksum)
+    # of every tensor on the model right after load, for diffing load paths.
+    SGLANG_DEBUG_WEIGHT_FINGERPRINT_DIR = EnvStr(None)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

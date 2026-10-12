@@ -22,6 +22,9 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
+from sglang.srt.debug_utils.weight_fingerprint import (
+    maybe_dump_loaded_model_fingerprint,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_loader.loader import get_model_loader
@@ -370,6 +373,10 @@ def load_model_with_memory_saver(
     if _is_npu:
         torch.npu.empty_cache()
     monkey_patch_vllm_parallel_state(reverse=True)
+
+    maybe_dump_loaded_model_fingerprint(
+        model, load_format=load_config.load_format, is_draft_worker=is_draft_worker
+    )
 
     return LoadedModel(
         loader=loader,
