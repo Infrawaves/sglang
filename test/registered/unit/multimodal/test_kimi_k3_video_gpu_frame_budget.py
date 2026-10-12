@@ -9,17 +9,26 @@ by an ``asyncio.Condition``: requests block until enough of a shared frame
 budget (``SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES``) is free, weighted by their
 own sampled-frame count rather than counted as one fixed-size slot.
 
+On top of that, ``SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH`` bounds how many requests
+may be waiting at this gate at once -- a request that would push the queue
+past this depth is rejected with HTTP 400 before it joins the queue, instead
+of queueing indefinitely behind an unbounded pile of already-decoded frame
+tensors.
+
 These tests exercise the gate directly against a minimal stand-in object
-carrying just the three instance attributes the method reads/writes
-(``_video_gpu_frame_budget``, ``_video_gpu_inflight_frames``,
-``_video_gpu_condition``) plus the method itself bound onto it -- this is the
-real production code path, not a reimplementation, just invoked without
-constructing a full ``KimiK3ImageProcessor`` (which needs a tokenizer/HF
-processor and is unrelated to this gate's own logic).
+carrying just the state the method reads/writes (``_video_gpu_frame_budget``,
+``_video_gpu_inflight_frames``, ``_video_gpu_condition``,
+``_video_gpu_queue_depth_limit``, ``_video_gpu_queue_depth``) plus the method
+itself bound onto it -- this is the real production code path, not a
+reimplementation, just invoked without constructing a full
+``KimiK3ImageProcessor`` (which needs a tokenizer/HF processor and is
+unrelated to this gate's own logic).
 """
 
 import asyncio
 import unittest
+
+from fastapi import HTTPException
 
 from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,7 +36,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_gate(max_inflight_frames):
+def _make_gate(max_inflight_frames, max_queue_depth=0):
     """A bare object carrying only the state _video_gpu_preprocess_slot needs."""
     gate = type("_Gate", (), {})()
     gate._video_gpu_frame_budget = (
@@ -35,6 +44,10 @@ def _make_gate(max_inflight_frames):
     )
     gate._video_gpu_inflight_frames = 0
     gate._video_gpu_condition = asyncio.Condition()
+    gate._video_gpu_queue_depth_limit = (
+        max_queue_depth if max_queue_depth > 0 else None
+    )
+    gate._video_gpu_queue_depth = 0
     gate._video_gpu_preprocess_slot = (
         KimiK3ImageProcessor._video_gpu_preprocess_slot.__get__(gate)
     )
@@ -163,6 +176,131 @@ class TestKimiK3VideoGpuFrameBudget(unittest.IsolatedAsyncioTestCase):
 
         async with gate._video_gpu_preprocess_slot(10_000):
             self.assertEqual(gate._video_gpu_inflight_frames, 0)
+
+    async def test_queue_depth_limit_rejects_with_400_once_exceeded(self):
+        # Budget of 100, queue depth limit of 1: the first 100-frame request
+        # occupies the whole budget, a second must queue (queue depth 1, at
+        # the limit), and a third arriving while the second is still queued
+        # must be rejected with 400 rather than queueing as well.
+        gate = _make_gate(100, max_queue_depth=1)
+        events = []
+
+        async def holder():
+            async with gate._video_gpu_preprocess_slot(100):
+                events.append("holder:enter")
+                await asyncio.sleep(0.05)
+                events.append("holder:exit")
+
+        async def queued_request():
+            await asyncio.sleep(0.01)
+            async with gate._video_gpu_preprocess_slot(50):
+                events.append("queued:enter")
+
+        async def rejected_request():
+            await asyncio.sleep(0.02)
+            with self.assertRaises(HTTPException) as ctx:
+                async with gate._video_gpu_preprocess_slot(50):
+                    pass
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertEqual(ctx.exception.detail, "Internal video format error")
+            events.append("rejected")
+
+        await asyncio.gather(holder(), queued_request(), rejected_request())
+
+        self.assertEqual(
+            events,
+            ["holder:enter", "rejected", "holder:exit", "queued:enter"],
+        )
+        # The queue-depth counter must be back to 0 once the queued request
+        # was admitted -- it must not leak past the request that used it.
+        self.assertEqual(gate._video_gpu_queue_depth, 0)
+
+    async def test_queue_depth_counter_frees_up_after_admission(self):
+        # After the queue-depth limit rejects a request, a later request
+        # must still be able to queue (and succeed) once a slot frees up --
+        # the counter must not stay stuck at the limit forever.
+        gate = _make_gate(100, max_queue_depth=1)
+        events = []
+
+        async def holder():
+            async with gate._video_gpu_preprocess_slot(100):
+                events.append("holder:enter")
+                await asyncio.sleep(0.05)
+                events.append("holder:exit")
+
+        async def queued_request():
+            await asyncio.sleep(0.01)
+            async with gate._video_gpu_preprocess_slot(50):
+                events.append("queued:enter")
+
+        async def rejected_request():
+            await asyncio.sleep(0.02)
+            with self.assertRaises(HTTPException):
+                async with gate._video_gpu_preprocess_slot(50):
+                    pass
+            events.append("rejected")
+
+        async def follow_up_request():
+            # By the time this runs, holder has released (t=0.05) and
+            # queued_request's brief 50-frame hold has also released, so
+            # the budget should be fully free again -- this must succeed
+            # without being rejected or queueing.
+            await asyncio.sleep(0.08)
+            async with gate._video_gpu_preprocess_slot(100):
+                events.append("follow_up:enter")
+
+        await asyncio.gather(
+            holder(), queued_request(), rejected_request(), follow_up_request()
+        )
+
+        self.assertEqual(gate._video_gpu_queue_depth, 0)
+        self.assertIn("follow_up:enter", events)
+
+    async def test_request_that_fits_immediately_is_never_rejected_by_queue_depth(
+        self,
+    ):
+        # Even a queue-depth limit as tight as 0 (the smallest a caller
+        # could set _video_gpu_queue_depth_limit to directly, bypassing the
+        # "0 or below disables the limit" env-var convention) must not
+        # reject a request that never actually has to wait -- the limit
+        # only applies to requests that queue.
+        gate = _make_gate(1000)
+        gate._video_gpu_queue_depth_limit = 0
+
+        async def video_request(sampled_frames):
+            async with gate._video_gpu_preprocess_slot(sampled_frames):
+                pass
+
+        # Neither call needs to wait (cumulative well under the 1000
+        # budget, and never overlapping in a way that forces a wait), so
+        # the zero-depth limit is never actually tested against a real
+        # queue.
+        await video_request(10)
+        await video_request(10)
+        self.assertEqual(gate._video_gpu_queue_depth, 0)
+
+    async def test_disabled_queue_depth_limit_allows_unbounded_queueing(self):
+        gate = _make_gate(100, max_queue_depth=0)
+        self.assertIsNone(gate._video_gpu_queue_depth_limit)
+        events = []
+
+        async def video_request(name, hold_seconds):
+            async with gate._video_gpu_preprocess_slot(100):
+                events.append(f"{name}:enter")
+                await asyncio.sleep(hold_seconds)
+                events.append(f"{name}:exit")
+
+        # All three fully saturate the budget on their own (100/100), so
+        # each of the 2nd and 3rd must queue behind the previous one -- with
+        # no queue-depth limit, none of them are rejected.
+        await asyncio.gather(
+            video_request("a", 0.03),
+            video_request("b", 0.02),
+            video_request("c", 0.01),
+        )
+
+        self.assertEqual(len(events), 6)
+        self.assertEqual(gate._video_gpu_queue_depth, 0)
 
 
 if __name__ == "__main__":
