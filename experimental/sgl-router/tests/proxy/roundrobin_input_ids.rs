@@ -128,6 +128,47 @@ async fn round_robin_plain_chat_forwards_input_ids() {
     );
 }
 
+/// Caller-supplied IDs are parsed as part of K3's new path only. Preserve the
+/// existing HF/Jinja/DeepSeek-V4 behavior: for a plain chat the router renders
+/// the messages and forwards the engine-equivalent IDs it produced.
+#[tokio::test]
+async fn non_k3_malformed_caller_ids_keep_existing_router_encoding_behavior() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hello there friend"}],
+    });
+
+    assert_eq!(
+        send(Arc::clone(&ctx), request.clone()).await,
+        StatusCode::OK
+    );
+    let expected_ids = captured(&mock)["input_ids"].clone();
+    assert!(expected_ids.is_array());
+
+    let mut request_with_bad_ids = request;
+    request_with_bad_ids["input_ids"] = json!("not an array of token IDs");
+    assert_eq!(
+        send(Arc::clone(&ctx), request_with_bad_ids).await,
+        StatusCode::OK,
+        "non-K3 input_ids must retain the prior worker/router handling"
+    );
+    assert_eq!(captured(&mock)["input_ids"], expected_ids);
+
+    // When the request has an engine-only tokenization option, the existing
+    // safety guard withholds router IDs and leaves caller IDs for the worker.
+    let worker_owned_ids = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hello there friend"}],
+        "reasoning_effort": "high",
+        "input_ids": "worker validates this",
+    });
+    let caller_ids = worker_owned_ids["input_ids"].clone();
+    assert_eq!(send(ctx, worker_owned_ids).await, StatusCode::OK);
+    assert_eq!(captured(&mock)["input_ids"], caller_ids);
+}
+
 /// Even under round-robin, a tool request omits `input_ids` (the safe predicate
 /// is policy-independent too).
 #[tokio::test]

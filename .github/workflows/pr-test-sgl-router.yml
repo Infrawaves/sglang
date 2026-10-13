@@ -58,6 +58,8 @@ jobs:
           filters: |
             sgl_router:
               - 'experimental/sgl-router/**'
+              # Shared with the router's Kimi-K3 encoder processes.
+              - 'python/sglang/srt/entrypoints/openai/kimi_k3_tokenization.py'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
@@ -253,6 +255,12 @@ jobs:
         # full test path `tokenizer::parity::parity_matrix`; substring
         # `parity_matrix` is unique to that test.
         run: cargo test --release --workspace -- --skip parity_matrix
+
+      # The Kimi-K3 helper tests load the shared Python module by file path
+      # with stub tokenizers, so they need neither SGLang nor model files.
+      - name: Kimi-K3 tokenizer helper tests
+        working-directory: experimental/sgl-router
+        run: python3 -m unittest discover -s tests -p 'test_kimi_k3*.py' -v
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates

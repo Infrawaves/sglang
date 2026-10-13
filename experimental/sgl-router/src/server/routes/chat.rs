@@ -259,27 +259,122 @@ pub async fn chat_completions(
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
+    let is_kimi_k3_encoder = ctx.tokenizers.has_kimi_encoder(&model_str);
     let want_tokens = should_tokenize_request(
         ctx.tokenizers.has_chat_encoder(&model_str),
         policy.needs_request_tokens(),
         ctx.bucket_selector.is_enabled(),
     );
-    let request_value: Option<serde_json::Value> = if want_tokens {
-        Some(serde_json::from_slice(&body).map_err(|_| {
-            ApiError::BadRequest("invalid request: body must be a JSON object".into())
-        })?)
+    // Parse large bodies off the HTTP/SSE executor. Caller IDs and unsupported
+    // media bypass K3's encoder queue, so identify them before taking a slot.
+    let (request_value, prepared_tokens) = if want_tokens {
+        let token_body = body.clone();
+        let parse_kimi_input_ids = is_kimi_k3_encoder;
+        let (value, caller_tokens) = tokio::task::spawn_blocking(move || {
+            let value: serde_json::Value = serde_json::from_slice(&token_body).map_err(|_| {
+                ApiError::BadRequest("invalid request: body must be a JSON object".into())
+            })?;
+            // Caller-provided IDs are a new K3 path. Keep the existing
+            // HF/Jinja/DeepSeek-V4 behavior, where request_tokens_for renders
+            // the message and the engine-input guard decides what to forward.
+            let caller_tokens =
+                if parse_kimi_input_ids && value.get("input_ids").is_some_and(|v| !v.is_null()) {
+                    let ids: Vec<u32> = serde_json::from_value(value["input_ids"].clone())
+                        .map_err(|_| {
+                            ApiError::BadRequest(
+                                "input_ids must be an array of unsigned token IDs".into(),
+                            )
+                        })?;
+                    Some(RequestTokens {
+                        ids,
+                        engine_equivalent: true,
+                    })
+                } else {
+                    None
+                };
+            Ok::<_, ApiError>((value, caller_tokens))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))??;
+        if caller_tokens.is_some()
+            || (is_kimi_k3_encoder && !crate::tokenizer::kimi_k3::is_supported_request(&value))
+        {
+            (Some(value), caller_tokens)
+        } else {
+            // Bound the new persistent Python K3 pool. Generic tokenizer
+            // paths retain their previous admission behavior; their CPU work
+            // is still moved off the async executor below.
+            let (permit, tokenizer_deadline) = if is_kimi_k3_encoder {
+                let deadline = std::time::Instant::now()
+                    .checked_add(ctx.tokenizers.kimi_encode_timeout)
+                    .ok_or_else(|| {
+                        ApiError::Internal(anyhow::anyhow!(
+                            "Kimi-K3 tokenizer timeout is too large"
+                        ))
+                    })?;
+                let permit = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    Arc::clone(&ctx.tokenizers.kimi_encode_slots).acquire_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    ApiError::EncoderUnavailable(anyhow::anyhow!(
+                        "Kimi-K3 tokenizer queue timed out"
+                    ))
+                })?
+                .map_err(|e| ApiError::Internal(e.into()))?;
+                (Some(permit), Some(deadline))
+            } else {
+                (None, None)
+            };
+            let tokenizers = Arc::clone(&ctx.tokenizers);
+            let token_model = model_id.clone();
+            tokio::task::spawn_blocking(move || {
+                // Cancellation does not release a K3 permit until the CPU job exits.
+                let _permit = permit;
+                let tokens = if tokenizers.has_kimi_encoder(&token_model.0) {
+                    let ids = tokenizers
+                        .encode_kimi_request(
+                            &token_model.0,
+                            &value,
+                            tokenizer_deadline.expect("K3 request has a tokenizer deadline"),
+                        )
+                        .map_err(|error| match error {
+                            crate::tokenizer::kimi_k3::EncodeError::Request(message) => {
+                                ApiError::BadRequest(message)
+                            }
+                            crate::tokenizer::kimi_k3::EncodeError::Internal(message) => {
+                                ApiError::EncoderUnavailable(anyhow::anyhow!(message))
+                            }
+                            crate::tokenizer::kimi_k3::EncodeError::Unavailable(error) => {
+                                ApiError::EncoderUnavailable(error)
+                            }
+                        })?;
+                    Some(RequestTokens {
+                        ids,
+                        engine_equivalent: true,
+                    })
+                } else {
+                    request_tokens_for(&tokenizers, &token_model, &value)
+                };
+                Ok::<_, ApiError>((Some(value), tokens))
+            })
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))??
+        }
     } else {
-        None
+        (None, None)
     };
-
-    // The ids feed both the routing decision (cache-aware consumes them; other
-    // policies ignore them) and — when engine-equivalent — the engine itself,
-    // forwarded as `input_ids` so it skips re-tokenizing the same prompt. The
-    // ingress owns the tokenize via the shared registry, so the choice of
-    // policy never changes whether we tokenize.
-    let request_tokens = request_value
-        .as_ref()
-        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    // K3 image IDs are valid worker input, but still contain one placeholder
+    // per image. Expansion and media hashing happen on P/D, so these IDs must
+    // not participate in cache matching or claim an exact prefill length.
+    // Apply the same rule to caller-supplied IDs accompanied by media.
+    let request_tokens = prepared_tokens.as_ref().filter(|_| {
+        !is_kimi_k3_encoder
+            || !request_value
+                .as_ref()
+                .is_some_and(crate::tokenizer::kimi_k3::requires_media_processing)
+    });
     let external_prefix = match (
         ctx.prefix_index.as_ref(),
         request_tokens.as_ref(),
@@ -781,18 +876,19 @@ pub async fn chat_completions(
         })
     };
 
-    // Forward the router-computed tokens to the engine as `input_ids` so it
-    // skips re-tokenizing the same prompt — but only when they are
-    // engine-equivalent (chat-encoder path) AND the request contains nothing
-    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
-    // Otherwise omit them and the engine tokenizes from `messages` as usual —
-    // a transparent, always-correct fallback (`messages` are always retained
-    // in the forwarded body). `forward_input_ids` is `Some` only when
-    // `request_value` is `Some` (a model the ingress tokenized for), so the
-    // predicate always has a parsed body to inspect.
-    let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
+    // K3 image prompt IDs can be forwarded independently of routing tokens;
+    // the workers still load and expand the media preserved in messages.
+    let forward_input_ids: Option<&[u32]> = match (prepared_tokens.as_ref(), request_value.as_ref())
     {
-        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
+        (Some(t), Some(v))
+            if t.engine_equivalent
+                && if is_kimi_k3_encoder {
+                    v.get("input_ids").is_none_or(serde_json::Value::is_null)
+                        && crate::tokenizer::kimi_k3::is_supported_request(v)
+                } else {
+                    input_ids_safe_to_forward(v)
+                } =>
+        {
             Some(t.ids.as_slice())
         }
         _ => None,
@@ -803,11 +899,13 @@ pub async fn chat_completions(
     // engine-side tokenization. Count only that case (see
     // `ingress_tokenize_offload_failed`); successful forwards and expected
     // omissions are not problems.
-    if ingress_tokenize_offload_failed(
-        ctx.tokenizers.has_chat_encoder(&model_str),
-        request_value.as_ref(),
-        request_tokens.as_ref(),
-    ) {
+    if !is_kimi_k3_encoder
+        && ingress_tokenize_offload_failed(
+            ctx.tokenizers.has_chat_encoder(&model_str),
+            request_value.as_ref(),
+            prepared_tokens.as_ref(),
+        )
+    {
         ctx.metrics.record_ingress_tokenize_error(&metrics_model);
     }
 

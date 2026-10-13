@@ -75,6 +75,7 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let chat_encoding = cli.chat_encoding.clone();
     // Bootstrap subscriber so a config-resolution error has structured
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.
@@ -94,7 +95,7 @@ async fn main() -> Result<()> {
     );
 
     let tokenizers = Arc::new(
-        sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
+        sgl_router::tokenizer::TokenizerRegistry::load_with_options(&cfg, chat_encoding)
             .context("load tokenizers")?,
     );
 

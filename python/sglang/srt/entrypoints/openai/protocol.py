@@ -966,7 +966,8 @@ class ChatCompletionRequest(BaseModel):
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
-    # and tool_call_constraint.
+    # and tool_call_constraint. Kimi-K3 also extracts media from messages;
+    # provide one unexpanded image placeholder per image for its MM processor.
     input_ids: Optional[List[int]] = None
 
     # For request id

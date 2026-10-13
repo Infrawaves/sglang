@@ -17,6 +17,8 @@ mod external_indexer_routing;
 mod failover;
 mod graceful_shutdown;
 mod header_forwarding;
+#[cfg(unix)]
+mod kimi_k3_input_ids;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod radix_tree_routing;

@@ -9,6 +9,8 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
+use crate::tokenizer::options::ChatEncodingOptions;
+
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
@@ -45,7 +47,7 @@ pub struct Cli {
     /// Model id this router serves (the OpenAI `model` field).
     #[arg(long)]
     pub model_id: String,
-    /// Tokenizer source: a local `tokenizer.json` path, or a HuggingFace
+    /// Tokenizer source: a local `tokenizer.json` (K3: model directory), or a HuggingFace
     /// repo id to download from. When omitted, falls back to `--model-id`
     /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
     #[arg(long)]
@@ -59,6 +61,9 @@ pub struct Cli {
     /// `--tokenizer-path`.
     #[arg(long)]
     pub no_tokenizer: bool,
+    /// Prompt preparation settings must match the serving workers.
+    #[command(flatten)]
+    pub chat_encoding: ChatEncodingOptions,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -765,6 +770,74 @@ mod tests {
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
     }
 
+    #[test]
+    fn chat_encoding_flags_preserve_worker_settings() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "kimi-k3",
+            "--worker-urls",
+            "http://x:30000",
+            "--default-chat-template-kwargs",
+            r#"{"enable_thinking":false,"reasoning_effort":"high"}"#,
+            "--chat-encoder",
+            "kimi-k3",
+            "--tokenizer-python",
+            "/opt/sglang/bin/python",
+            "--trust-remote-code",
+            "--tokenizer-revision",
+            "snapshot",
+            "--tokenizer-workers",
+            "3",
+            "--tokenizer-startup-timeout-secs",
+            "600",
+        ])
+        .unwrap();
+        let options = &cli.chat_encoding;
+        assert_eq!(
+            options.default_chat_template_kwargs["enable_thinking"],
+            false
+        );
+        assert_eq!(
+            options.default_chat_template_kwargs["reasoning_effort"],
+            "high"
+        );
+        assert!(options.is_kimi_k3("alias"));
+        assert!(options.trust_remote_code);
+        assert_eq!(options.tokenizer_python, "/opt/sglang/bin/python");
+        assert_eq!(options.tokenizer_revision.as_deref(), Some("snapshot"));
+        assert_eq!(options.tokenizer_workers.unwrap().get(), 3);
+        assert_eq!(options.tokenizer_startup_timeout_secs, 600);
+        assert!(cli.into_config().is_ok());
+    }
+
+    #[test]
+    fn chat_encoding_rejects_invalid_options() {
+        for (flag, value) in [
+            ("--default-chat-template-kwargs", "[]"),
+            ("--default-chat-template-kwargs", "null"),
+            ("--tokenizer-workers", "0"),
+            ("--tokenizer-workers", "-1"),
+            ("--tokenizer-timeout-secs", "0"),
+            ("--tokenizer-startup-timeout-secs", "0"),
+            ("--chat-encoder", "unknown"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "sgl-router",
+                    "--model-id",
+                    "tiny",
+                    "--worker-urls",
+                    "http://x:30000",
+                    flag,
+                    value,
+                ])
+                .is_err(),
+                "accepted {flag} {value}"
+            );
+        }
+    }
+
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the
     /// model id (treated as an HF repo id at load time).
     #[test]
@@ -791,7 +864,10 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path.as_deref(), Some("/models/qwen3/tokenizer.json"));
+        assert_eq!(
+            c.model.tokenizer_path.as_deref(),
+            Some("/models/qwen3/tokenizer.json")
+        );
     }
 
     #[test]

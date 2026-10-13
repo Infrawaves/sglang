@@ -14,8 +14,16 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("prompt encoder unavailable: {0:#}")]
+    EncoderUnavailable(#[source] anyhow::Error),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
+
+    /// The model is served, but this router does not implement the endpoint
+    /// for it (e.g. raw tokenize for a Python-encoded model).
+    #[error("not supported: {0}")]
+    NotSupported(String),
 
     /// Could not reach the upstream worker (connect refused, DNS, TLS, request
     /// build error). `source` captures the full anyhow chain for server-side
@@ -118,8 +126,12 @@ pub enum ApiError {
 impl ApiError {
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
+            ApiError::EncoderUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "encoder_unavailable")
+            }
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
+            ApiError::NotSupported(_) => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
             ApiError::UpstreamUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, "upstream_unreachable")
             }
@@ -185,6 +197,10 @@ impl IntoResponse for ApiError {
         // Pick a client-facing message that NEVER leaks worker URLs or raw
         // source chains; full structured details are logged server-side.
         let message = match &self {
+            ApiError::EncoderUnavailable(e) => {
+                tracing::error!("prompt encoder unavailable: {e:#}");
+                "prompt encoder unavailable".to_string()
+            }
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -259,7 +275,9 @@ impl IntoResponse for ApiError {
                 );
                 "service unavailable".to_string()
             }
-            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
+            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) | ApiError::NotSupported(_) => {
+                self.to_string()
+            }
         };
         let mut resp = (
             status,
