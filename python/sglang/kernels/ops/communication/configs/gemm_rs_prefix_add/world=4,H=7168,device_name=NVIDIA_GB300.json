@@ -4,7 +4,7 @@
     "device_name": "NVIDIA_GB300",
     "world_size": 4,
     "n": 7168,
-    "k": 2048,
+    "k": 3072,
     "dtype": "bfloat16"
   },
   "selection": {
@@ -21,7 +21,7 @@
       "bench/experiments/2026-10-08/small_m_20261008/",
       "bench/experiments/2026-10-08/tiny_m_20261008/"
     ],
-    "note": "These are historical strategy/configuration choices, not latency claims for the current source. Baseline means the complete native SGLang GEMM + RS + prefix path."
+    "note": "These are historical strategy/configuration choices, not latency claims for the current source. Baseline means the complete native SGLang GEMM + RS + prefix path. Measured with the benchmark default K=2048; K3 TP4 o_proj uses K=96x128/4=3072, re-run with --k 3072 to confirm the crossover."
   },
   "validation": {
     "shared_workspace_gpu_validated": false,
