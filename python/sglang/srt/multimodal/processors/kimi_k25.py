@@ -258,6 +258,10 @@ def _process_single_image(
     padded_w = new_w + config["pad_width"]
 
     x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
+    # The resize starts with .float(), so x never aliases the uint8 source.
+    # For a large source that source outweighs the resized image, and holding
+    # it keeps it resident across patchify, where the peak allocation lands.
+    del image
     if post_resize is not None:
         x = post_resize(x)
 
@@ -355,6 +359,10 @@ def _gpu_preprocess_images(
             # bicubic launches for common multi-image requests without padding
             # random-size inputs to a larger source resolution.
             resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
+            # Same as the single-image path: the resized parts never alias the
+            # uint8 sources, which would otherwise stay bound until the next
+            # group -- across patchify.
+            del indexed_images
             if post_resize is not None:
                 # Before the concat: a hook may change the channel count (K3
                 # composites RGBA onto a background and returns RGB), and mixed

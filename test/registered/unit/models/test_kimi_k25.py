@@ -6,6 +6,7 @@ import functools
 import io
 import pickle
 import tempfile
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -197,6 +198,47 @@ def test_kimi_gpu_preprocess_group_batching_matches_the_single_image_path():
         )
         torch.testing.assert_close(pixel_values[offset : offset + count], reference)
         offset += count
+
+
+def test_kimi_gpu_preprocess_frees_the_uint8_sources_before_patchify():
+    # to_chw makes a device copy of each source. For a large source that copy
+    # outweighs the resized image, so both branches must drop it once the
+    # resize is done instead of holding it across patchify. post_resize runs
+    # after the resize and before patchify, so every source copied so far must
+    # already be gone there. One image per group exercises the single-image
+    # branch; two share a group and exercise the batched one.
+    patch_size = 4
+    small = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    large = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    resize_configs = [small, large, large]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    sources = []
+
+    def copying_to_chw(image):
+        source = image.clone()
+        sources.append(weakref.ref(source))
+        return source
+
+    live_at_post_resize = []
+
+    def probe(x):
+        live_at_post_resize.append(sum(ref() is not None for ref in sources))
+        return x
+
+    _gpu_preprocess_images(
+        images,
+        resize_configs,
+        torch.full((1, 3, 1, 1), 1.0 / 255.0),
+        torch.zeros(1, 3, 1, 1),
+        patch_size,
+        to_chw=copying_to_chw,
+        post_resize=probe,
+    )
+
+    assert len(sources) == len(images)
+    assert live_at_post_resize and all(n == 0 for n in live_at_post_resize)
 
 
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
