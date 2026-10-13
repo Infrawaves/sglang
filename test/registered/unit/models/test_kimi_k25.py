@@ -809,6 +809,49 @@ def test_kimi_k3_samples_and_splits_video_into_four_frame_grids():
     assert all(frame.shape == (3, 6, 8) for chunk in chunks for frame in chunk.frames)
 
 
+class _FailingVideo(_FakeVideo):
+    def __init__(self, error):
+        super().__init__(frame_count=10, fps=5.0)
+        self.error = error
+
+    def get_frames_as_tensor(self, indices, num_threads=None):
+        raise self.error
+
+
+_VIDEO_CONFIG = {
+    "sample_fps": 4,
+    "max_num_frames_each_video": None,
+    "temporal_merge_kernel_size": 4,
+    "in_patch_limit": 100,
+    "in_patch_limit_each_frame": 20,
+    "in_patch_limit_video": 80,
+    "timestamp_mode": "hh:mm:ss.fff",
+}
+
+
+def test_kimi_k3_corrupt_video_frames_are_a_client_error():
+    """A damaged packet must be a 400, not a 500.
+
+    The header opens fine, so load_video's mapping never sees it; torchcodec
+    then raises a bare RuntimeError (FFmpeg AVERROR_INVALIDDATA) from the frame
+    decode. Other RuntimeErrors from the same call -- driver, CUDA, bugs -- are
+    server faults and must not be relabeled.
+    """
+    bad_data = RuntimeError(
+        "decode_av_frame, SingleStreamDecoder.cpp:1538, Could not push packet "
+        "to decoder: Invalid data found when processing input"
+    )
+    with pytest.raises(
+        ValueError, match=r"^Could not decode video: video is corrupted or truncated$"
+    ) as excinfo:
+        _split_k3_video(_FailingVideo(bad_data), _VIDEO_CONFIG, source_index=0)
+    assert excinfo.value.__cause__ is bad_data
+
+    server_fault = RuntimeError("Found no NVIDIA driver on your system.")
+    with pytest.raises(RuntimeError, match="NVIDIA driver"):
+        _split_k3_video(_FailingVideo(server_fault), _VIDEO_CONFIG, source_index=0)
+
+
 def test_kimi_k3_preprocess_preserves_temporal_grid_dimension():
     frames = tuple(torch.full((3, 14, 14), i, dtype=torch.uint8) for i in range(4))
     item = _KimiK3VisualItem(

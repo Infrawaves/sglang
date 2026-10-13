@@ -1986,6 +1986,22 @@ def corrupt_image_message(error: BaseException) -> str:
     return "Could not decode image: image is corrupted or truncated"
 
 
+# FFmpeg's AVERROR_INVALIDDATA text, which torchcodec wraps in a bare
+# RuntimeError when a frame's packet is damaged. The container can still open
+# fine (frame count and fps read from its header), so this only surfaces when
+# frames are decoded. Matched narrowly on purpose: a RuntimeError from the same
+# call can also be a missing driver, a CUDA fault or a decoder bug, which must
+# stay server errors.
+_CORRUPT_VIDEO_MARKERS = ("Invalid data found when processing input",)
+CORRUPT_VIDEO_MESSAGE = "Could not decode video: video is corrupted or truncated"
+
+
+def is_corrupt_video_error(error: BaseException) -> bool:
+    return isinstance(error, RuntimeError) and any(
+        marker in str(error) for marker in _CORRUPT_VIDEO_MARKERS
+    )
+
+
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
