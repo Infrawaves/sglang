@@ -154,8 +154,11 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         decode guard and reach the generic 500 handler.
         """
         data = _png_with_broken_chunk()
-        with self.assertRaisesRegex(ValueError, r"broken PNG file"):
+        with self.assertRaisesRegex(
+            ValueError, r"^Could not decode image: image is corrupted or truncated$"
+        ) as ctx:
             common.load_image(data, gpu_image_decode=False)
+        self.assertIsInstance(ctx.exception.__cause__, SyntaxError)
         with self.assertRaisesRegex(ValueError, r"corrupted or truncated"):
             _StubProcessor._load_single_item(data, Modality.IMAGE)
 
