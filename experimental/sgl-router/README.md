@@ -268,6 +268,90 @@ and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
 An explicit null `thinking_effort` with thinking enabled is not representable
 in the pinned formatter and falls back to engine-side rendering.
 
+### Python encoder pool (`--chat-encoder kimi-k3`)
+
+As an alternative to the native renderer above, the router can encode each K3
+text or image Chat request once with SGLang's own Python prompt preparation and
+forward the same `input_ids` to both prefill and decode workers. It runs persistent Python CPU
+processes using the **same SGLang checkout and tokenizer snapshot as P/D**.
+The Python environment must have SGLang and the model's tokenizer dependencies
+installed; it does not load model weights or launch GPU workers.
+
+Add these flags to your existing router command (keep your discovery/P/D flags):
+
+```bash
+--chat-encoder kimi-k3 \
+--tokenizer-path /models/kimi-k3 \
+--tokenizer-python python3 \
+--trust-remote-code \
+--tokenizer-workers 2 \
+--tokenizer-timeout-secs 300 \
+--tokenizer-startup-timeout-secs 300 \
+--default-chat-template-kwargs '{}'
+```
+
+`--tokenizer-path` is the model/tokenizer **directory** or HF repository for this
+encoder, rather than a `tokenizer.json` file. Use `--tokenizer-revision` when
+loading a pinned HF snapshot. `--trust-remote-code` must match your tokenizer's
+requirements. Match `--default-chat-template-kwargs` to P/D exactly.
+`--tokenizer-python` (default `python3`) must be an executable in the router
+container whose environment has SGLang installed; startup fails with
+`No such file or directory` if it is missing. With a source checkout, set `PYTHONPATH=/path/to/sglang/python` in the router environment.
+The model's native K3 renderer is used; worker-side custom template overrides
+are not supported by this offload.
+
+This encoder is opt-in: without `--chat-encoder kimi-k3`, K3 models keep the
+native renderer. `--default-chat-template-kwargs` is the same flag the native
+renderer uses.
+The default is one Python process; tune `--tokenizer-workers` to your CPU and
+memory budget. Initial startup waits for all processes to initialize, bounded
+by `--tokenizer-startup-timeout-secs`. Queue wait and encoding share each
+request's `--tokenizer-timeout-secs` budget. After a worker fails, its
+replacement starts in the background with the startup timeout; requests wait
+only until their own deadline, and later requests can use the replacement once
+it is ready.
+The `--tokenizer-*` and `--trust-remote-code` flags above only apply to this
+encoder; startup fails if any is set without `--chat-encoder kimi-k3`.
+`--disable-input-ids-forwarding` still applies: IDs are then used for routing
+only.
+Encoding errors are returned before either P/D request is sent: request errors
+return 400; process/protocol failures return 503 `encoder_unavailable`.
+
+Supported inputs include string content, text/image content arrays (`image_url`,
+including data URLs), tool history, request/message tools, reasoning options,
+response format and assistant continuation. The shared Python helper follows
+worker preprocessing, including
+schema normalization and K3's custom `apply_chat_template(tokenize=True)`.
+Caller-supplied `input_ids` are preserved. Audio, video (including `image_url`
+parts with `modalities: "video"`) and per-request `chat_template` overrides keep
+worker-side encoding.
+
+For images, the router encodes the template with one image placeholder per
+image and preserves the image URLs and options in `messages`. Both P/D workers
+must run this checkout: they recover image data from the messages, load and
+process the images, then expand placeholders through the existing K3
+multimodal processor. Image loading and vision processing remain on the workers.
+Workers still encode the short image-size framing; the existing CPU HF-processor
+fallback may also encode its expanded text internally.
+These unexpanded IDs are forwarded only; image requests skip router prefix-cache
+lookup and use the existing request-size token estimate for load and bucket
+selection. This estimate is not the final image token count. The same rule
+applies to caller-supplied IDs with media; text IDs continue to support exact
+length and prefix routing.
+
+Messages, tools and sampling options stay in the forwarded Chat bodies: P/D
+still validate requests, construct tool/stop constraints and decode output.
+Only full-prompt input encoding is offloaded. This K3 process pool serves Chat
+encoding; the router's raw `/v1/tokenize` and `/v1/detokenize` endpoints are not
+provided by it. Use the workers for those endpoints.
+
+Validate against your exact K3 snapshot before rollout: compare prompt IDs from
+worker `/tokenize` (Chat requests) with the helper for ordinary chat, tools,
+reasoning, continuation and image cases, including worker-side image expansion.
+Model-free process/P/D tests run with
+`cargo test --test proxy kimi_k3_input_ids`; shared-helper tests are in
+`experimental/sgl-router/tests/test_kimi_k3_tokenization.py` (run with `python3`).
+
 ## HTTP/2
 
 There is nothing to configure. The router negotiates per connection inbound and

@@ -19,6 +19,8 @@ mod graceful_shutdown;
 mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
+#[cfg(unix)]
+mod kimi_k3_input_ids;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod pd_protocol_binding;

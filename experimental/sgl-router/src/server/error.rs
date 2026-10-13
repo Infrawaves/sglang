@@ -42,6 +42,9 @@ enum ErrorClass {
     Timeout,
     /// 500 — internal router fault.
     Internal,
+    /// 501 — the model is served, but this router does not implement the
+    /// endpoint for it.
+    NotImplemented,
 }
 
 impl ErrorClass {
@@ -53,6 +56,7 @@ impl ErrorClass {
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorClass::NotImplemented => StatusCode::NOT_IMPLEMENTED,
         }
     }
 }
@@ -62,8 +66,16 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("prompt encoder unavailable: {0:#}")]
+    EncoderUnavailable(#[source] anyhow::Error),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
+
+    /// The model is served, but this router does not implement the endpoint
+    /// for it (e.g. raw tokenize for a Python-encoded model).
+    #[error("not supported: {0}")]
+    NotSupported(String),
 
     /// A request refused by the fleet-wide sampling contract
     /// (`--override-sampling-params` under `--sampling-param-conflict
@@ -190,6 +202,8 @@ impl ApiError {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
+            ApiError::EncoderUnavailable(_) => ErrorClass::NoTarget,
+            ApiError::NotSupported(_) => ErrorClass::NotImplemented,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
             ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
@@ -221,6 +235,8 @@ impl ApiError {
             // contract rejections separately from malformed client requests.
             ApiError::SamplingContract { .. } => "sampling_contract_violation",
             ApiError::ModelNotFound(_) => "model_not_found",
+            ApiError::EncoderUnavailable(_) => "encoder_unavailable",
+            ApiError::NotSupported(_) => "not_supported",
             ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
             // Mid-body drop: headers (incl. a status) arrived, then the body
             // didn't. We surface a 502 but echo the worker's status in
@@ -255,6 +271,8 @@ impl ApiError {
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
+            | ApiError::EncoderUnavailable(_)
+            | ApiError::NotSupported(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
             | ApiError::NoHealthyWorkers { .. }
@@ -306,6 +324,10 @@ impl IntoResponse for ApiError {
         // Pick a client-facing message that NEVER leaks worker URLs or raw
         // source chains; full structured details are logged server-side.
         let message = match &self {
+            ApiError::EncoderUnavailable(e) => {
+                tracing::error!("prompt encoder unavailable: {e:#}");
+                "prompt encoder unavailable".to_string()
+            }
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -381,6 +403,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
+            | ApiError::NotSupported(_)
             | ApiError::SamplingContract { .. } => self.to_string(),
         };
         let mut resp = (

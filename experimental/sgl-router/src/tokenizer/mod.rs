@@ -5,13 +5,17 @@ pub mod adapter;
 pub mod chat_formatter;
 mod deepseek;
 mod kimi;
+pub mod kimi_k3;
+pub mod options;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
+use options::ChatEncodingOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Which chats may carry router-rendered `input_ids`, by how well the model's
 /// renderer is verified against SGLang.
@@ -55,12 +59,22 @@ impl ChatFormatterEntry {
     }
 }
 
-#[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
+    kimi_encoders: DashMap<String, Arc<kimi_k3::KimiK3Pool>>,
+    /// Admission slots for Kimi-K3 Python encoder jobs only.
+    pub(crate) kimi_encode_slots: Arc<Semaphore>,
+    /// Per-request Kimi-K3 queue and encode deadline.
+    pub(crate) kimi_encode_timeout: std::time::Duration,
+}
+
+impl Default for TokenizerRegistry {
+    fn default() -> Self {
+        Self::with_options(&ChatEncodingOptions::default())
+    }
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -72,9 +86,49 @@ impl std::fmt::Debug for TokenizerRegistry {
 }
 
 impl TokenizerRegistry {
+    fn with_options(options: &ChatEncodingOptions) -> Self {
+        Self {
+            inner: DashMap::new(),
+            formatters: DashMap::new(),
+            kimi_encoders: DashMap::new(),
+            // No dynamo-render request acquires this semaphore.
+            kimi_encode_slots: Arc::new(Semaphore::new(0)),
+            kimi_encode_timeout: std::time::Duration::from_secs(options.tokenizer_timeout_secs),
+        }
+    }
+
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let me = TokenizerRegistry::default();
+        Self::load_with_options(cfg, ChatEncodingOptions::default())
+    }
+
+    pub fn load_with_options(
+        cfg: &crate::config::Config,
+        options: ChatEncodingOptions,
+    ) -> Result<Self> {
+        let mut me = Self::with_options(&options);
         let m = &cfg.model;
+        if !options.is_kimi_k3() {
+            let ignored = options.non_default_kimi_only_flags();
+            anyhow::ensure!(
+                ignored.is_empty(),
+                "{} only apply to the Kimi-K3 encoder, which is not enabled for model {} \
+                 (pass --chat-encoder kimi-k3)",
+                ignored.join(", "),
+                m.id
+            );
+        } else {
+            let count = options
+                .tokenizer_workers
+                .map_or(1, std::num::NonZeroUsize::get);
+            let defaults = serde_json::to_value(&m.default_chat_template_kwargs)?;
+            let pool = kimi_k3::KimiK3Pool::new(&m.tokenizer_path, &options, defaults)?;
+            me.kimi_encoders.insert(m.id.clone(), Arc::new(pool));
+            // Python processes are heavyweight; default to one instead of all CPUs.
+            me.kimi_encode_slots = Arc::new(Semaphore::new(count));
+            tracing::info!(model = %m.id, workers = count,
+                "Kimi-K3 prompt encoding enabled in persistent Python processes");
+            return Ok(me);
+        }
         let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
         match ChatFormatter::load(&m.id, &m.tokenizer_path) {
@@ -127,6 +181,24 @@ impl TokenizerRegistry {
         self.formatters.contains_key(model_id)
     }
 
+    pub fn has_kimi_encoder(&self, model_id: &str) -> bool {
+        self.kimi_encoders.contains_key(model_id)
+    }
+
+    pub fn encode_kimi_request(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
+        let pool = self
+            .kimi_encoders
+            .get(model_id)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
+        pool.encode(request, deadline)
+    }
+
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
         self.formatters
             .get(model_id)
@@ -153,7 +225,11 @@ impl TokenizerRegistry {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.inner.iter().map(|kv| kv.key().clone()).collect()
+        self.inner
+            .iter()
+            .map(|kv| kv.key().clone())
+            .chain(self.kimi_encoders.iter().map(|kv| kv.key().clone()))
+            .collect()
     }
 
     /// Attach a chat formatter to an already-loaded model. Lets policy tests in
@@ -228,6 +304,71 @@ mod tests {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         assert!(r.get("tiny").is_some());
         assert!(r.get("missing").is_none());
+    }
+
+    #[test]
+    fn kimi_only_flags_are_rejected_when_kimi_encoder_is_not_enabled() {
+        let (cfg, label) = (cfg(), "non-K3 encoder");
+        {
+            for (options, flag) in [
+                (
+                    ChatEncodingOptions {
+                        tokenizer_python: "/opt/sglang/bin/python".into(),
+                        ..Default::default()
+                    },
+                    "--tokenizer-python",
+                ),
+                (
+                    ChatEncodingOptions {
+                        tokenizer_revision: Some("snapshot".into()),
+                        ..Default::default()
+                    },
+                    "--tokenizer-revision",
+                ),
+                (
+                    ChatEncodingOptions {
+                        trust_remote_code: true,
+                        ..Default::default()
+                    },
+                    "--trust-remote-code",
+                ),
+                (
+                    ChatEncodingOptions {
+                        tokenizer_workers: std::num::NonZeroUsize::new(2),
+                        ..Default::default()
+                    },
+                    "--tokenizer-workers",
+                ),
+                (
+                    ChatEncodingOptions {
+                        tokenizer_timeout_secs: 30,
+                        ..Default::default()
+                    },
+                    "--tokenizer-timeout-secs",
+                ),
+                (
+                    ChatEncodingOptions {
+                        tokenizer_startup_timeout_secs: 60,
+                        ..Default::default()
+                    },
+                    "--tokenizer-startup-timeout-secs",
+                ),
+            ] {
+                let error = TokenizerRegistry::load_with_options(&cfg, options)
+                    .expect_err(&format!("{label} accepted {flag}"))
+                    .to_string();
+                assert!(error.contains(flag), "{label}: {error}");
+                assert!(error.contains("Kimi-K3"), "{label}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_options_keep_the_native_formatter_path() {
+        let r =
+            TokenizerRegistry::load_with_options(&cfg(), ChatEncodingOptions::default()).unwrap();
+        assert!(r.get("tiny").is_some());
+        assert!(!r.has_kimi_encoder("tiny"));
     }
 
     #[test]

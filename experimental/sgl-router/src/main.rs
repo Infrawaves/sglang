@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
+    let chat_encoding = cli.chat_encoding.clone();
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
@@ -69,8 +70,9 @@ async fn main() -> Result<()> {
     log_startup(&config);
 
     // Load tokenizers used to prepare requests for routing.
-    let tokenizers =
-        Arc::new(TokenizerRegistry::load_from_config(&config).context("load tokenizers")?);
+    let tokenizers = Arc::new(
+        TokenizerRegistry::load_with_options(&config, chat_encoding).context("load tokenizers")?,
+    );
 
     // (Optional) Create a gRPC client only when routing uses an external KV indexer.
     let external_kv_indexer_client = create_external_kv_indexer_client(&config)?;

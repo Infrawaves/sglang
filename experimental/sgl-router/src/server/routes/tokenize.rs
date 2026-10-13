@@ -40,6 +40,17 @@ pub struct DetokenizeResponse {
     pub text: String,
 }
 
+/// K3 models are served but have no Rust tokenizer: say so instead of 404.
+fn missing_tokenizer(ctx: &AppContext, model: &str) -> ApiError {
+    if ctx.tokenizers.has_kimi_encoder(model) {
+        ApiError::NotSupported(format!(
+            "raw tokenize/detokenize is unavailable for {model}; use the worker endpoints"
+        ))
+    } else {
+        ApiError::ModelNotFound(model.to_string())
+    }
+}
+
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<TokenizeRequest>,
@@ -47,7 +58,7 @@ pub async fn tokenize(
     let tok = ctx
         .tokenizers
         .get(&req.model)
-        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+        .ok_or_else(|| missing_tokenizer(&ctx, &req.model))?;
     // Structured log on failure so an operator can correlate
     // "every encode for model X errors" against the route, model id, and
     // prompt size. The generic anyhow-chain log in ApiError::Internal still
@@ -78,7 +89,7 @@ pub async fn detokenize(
     let tok = ctx
         .tokenizers
         .get(&req.model)
-        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+        .ok_or_else(|| missing_tokenizer(&ctx, &req.model))?;
     let text =
         adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
             tracing::error!(

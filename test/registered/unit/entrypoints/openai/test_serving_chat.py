@@ -741,6 +741,107 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_input_ids_preserve_images_without_encoding_prompt(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = None
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.reset_mock()
+        image_url = {
+            "url": "https://example.com/first.png",
+            "detail": "high",
+            "max_dynamic_patch": 8,
+            "content_hash": "sha256:" + "a" * 64,
+        }
+        data_url = "data:image/png;base64,aGVsbG8="
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "system", "content": "Compare the images."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": image_url},
+                        {"type": "text", "text": "Then inspect this:"},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+                {"role": "assistant", "content": "The first image"},
+            ],
+            input_ids=[101, 999, 102, 999, 103],
+            continue_final_message=True,
+            stop=["STOP"],
+            return_prompt_token_ids=True,
+        )
+        original = request.model_dump()
+        with (
+            patch.object(self.chat, "_encode_messages") as encode,
+            patch.object(self.chat, "_apply_jinja_template") as template,
+            patch.object(self.chat, "_apply_conversation_template") as conversation,
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(
+                request, self.fastapi_request
+            )
+
+        self.assertEqual(adapted.input_ids, request.input_ids)
+        self.assertEqual(
+            [item.url for item in adapted.image_data], [image_url["url"], data_url]
+        )
+        self.assertEqual(adapted.image_data[0].detail, "high")
+        self.assertEqual(adapted.image_data[0].max_dynamic_patch, 8)
+        self.assertEqual(adapted.image_data[0].content_hash, "sha256:" + "a" * 64)
+        self.assertEqual(adapted.image_data[1].detail, "auto")
+        self.assertEqual(adapted.modalities, ["image", "image"])
+        self.assertIsNone(adapted.text)
+        self.assertIsNone(adapted.video_data)
+        self.assertIsNone(adapted.audio_data)
+        self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        self.assertTrue(adapted.return_prompt_token_ids)
+        self.assertEqual(request.model_dump()["messages"], original["messages"])
+        encode.assert_not_called()
+        template.assert_not_called()
+        conversation.assert_not_called()
+        self.tm.tokenizer.encode.assert_not_called()
+        self.tm.tokenizer.decode.assert_not_called()
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
+
+    def test_kimi_k3_local_and_precomputed_ids_extract_identical_media(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = None
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 999, 8, 999, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Inspect both images."},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "image-2", "detail": "low"},
+                        },
+                    ],
+                },
+            ],
+        )
+        local = self.chat._process_messages(request, is_multimodal=True)
+        request.input_ids = list(local.prompt_ids)
+        self.tm.tokenizer.reset_mock()
+        forwarded = self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertEqual(forwarded.prompt_ids, local.prompt_ids)
+        self.assertEqual(forwarded.image_data, local.image_data)
+        self.assertEqual(forwarded.modalities, local.modalities)
+        self.assertEqual(
+            [item.url for item in forwarded.image_data], ["image-1", "image-2"]
+        )
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
+        self.tm.tokenizer.encode.assert_not_called()
+        self.tm.tokenizer.decode.assert_not_called()
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [

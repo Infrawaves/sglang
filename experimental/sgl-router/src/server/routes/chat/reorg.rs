@@ -37,7 +37,7 @@ pub(super) async fn chat_completions(
         .get(&model)
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
     // Length-based routing needs tokenization even for load-only group policies.
-    let request = PreparedChatRequest::prepare(ctx, model, fields, body, true)?;
+    let request = PreparedChatRequest::prepare_async(ctx, model, fields, body, true).await?;
     let input_tokens = request.input_token_count as u64;
     let expected_peak_tokens = request
         .max_output_tokens

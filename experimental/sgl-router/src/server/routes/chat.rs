@@ -74,7 +74,8 @@ async fn chat_completions_legacy(
         .map_err(|error| pool_error(error, &model))?;
 
     let request =
-        PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
+        PreparedChatRequest::prepare_async(ctx, model, fields, body, policy.needs_request_tokens())
+            .await?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(

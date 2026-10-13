@@ -763,8 +763,7 @@ async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
         }
     }
     let _servers = TestServers([p_task, d_task]);
-    let mut cfg = config();
-    cfg.model.tokenizer_path = None;
+    let cfg = config();
     let ctx = build_ctx_with_config(
         vec![
             WorkerSpec {
