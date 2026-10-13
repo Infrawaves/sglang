@@ -2110,10 +2110,10 @@ CORRUPT_IMAGE_EXCEPTIONS = (OSError, SyntaxError, EOFError, struct.error, zlib.e
 
 
 def corrupt_image_message(error: BaseException) -> str:
-    return (
-        "Could not decode image: the image data is corrupted or truncated "
-        f"({type(error).__name__}: {error})"
-    )
+    # Keep the client message short; the original error stays chained (`from e`).
+    if isinstance(error, UnidentifiedImageError):
+        return "Could not decode image: cannot identify image file"
+    return "Could not decode image: image is corrupted or truncated"
 
 
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
