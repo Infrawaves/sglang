@@ -231,7 +231,7 @@ class DispatchTableTest(unittest.TestCase):
     def test_checked_in_table_keeps_only_enabled_fused_shapes(self):
         table = load_dispatch_table(4, 7168, "NVIDIA_GB300")
         pull = DispatchConfig("pull", KernelConfig(256, 128, 2), "common")
-        self.assertEqual(table.k, 2048)
+        self.assertEqual(table.k, 3072)
         # Baseline 512-2048 and the disabled historical 4K push are dropped.
         self.assertEqual(table.configs, {8192: pull, 12288: pull, 16384: pull})
 

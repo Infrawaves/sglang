@@ -80,7 +80,13 @@ def create_gemm_fusion_manager(
         )
         return None
 
-    # The image registers the SM100 operators; this module never loads binaries.
+    try:
+        # Importing the package loads its extension, which registers
+        # torch.ops.mega_ops in this TP worker.
+        import mega_ops  # noqa: F401
+    except ImportError as exc:
+        logger.warning("K3 SP GEMM fusion disabled; cannot import mega_ops: %s", exc)
+        return None
     missing_ops = [
         name
         for name in (

@@ -96,6 +96,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(torch, "empty", lambda shape, **kwargs: Tensor(shape))
     mega_ops = SimpleNamespace(**{name: Mock() for name in SM100_OPS})
     monkeypatch.setattr(torch, "ops", SimpleNamespace(mega_ops=mega_ops))
+    monkeypatch.setitem(sys.modules, "mega_ops", ModuleType("mega_ops"))
     monkeypatch.setattr(
         fusion,
         "get_exec",
@@ -141,7 +142,7 @@ def o_proj(monkeypatch, group):
     o_proj.use_decode_attn_tp = False
     o_proj.tp_size = group.world_size
     o_proj.output_size = 7168
-    o_proj.weight = Tensor((7168, 2048))
+    o_proj.weight = Tensor((7168, 3072))
     return o_proj
 
 
@@ -179,6 +180,22 @@ def test_manager_creation_needs_only_registered_ops(group, runtime):
     manager = fusion.create_gemm_fusion_manager(group, 7168)
     assert manager is not None
     assert manager.gemm_rs_operator is None
+
+
+def test_missing_package_keeps_native(group, runtime, monkeypatch, caplog):
+    # A None entry makes ``import mega_ops`` raise ImportError.
+    monkeypatch.setitem(sys.modules, "mega_ops", None)
+    assert fusion.create_gemm_fusion_manager(group, 7168) is None
+    assert "cannot import mega_ops" in caplog.text
+
+
+def test_b300_tp8_table_enables_pull_from_8k(group, runtime, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA B300 SXM6 AC")
+    group.world_size = 8
+    manager = fusion.create_gemm_fusion_manager(group, 7168)
+    assert manager is not None
+    assert manager.dispatch_table.k == 1536
+    assert manager.dispatch_table.configs == {8192: PULL, 12288: PULL, 16384: PULL}
 
 
 def test_missing_ops_or_table_keeps_native(group, runtime, caplog):
@@ -225,8 +242,8 @@ def test_prepare_sizes_workspace_for_shapes_under_service_ceiling(
     assert operator.args[:5] == (group.cpu_group, 1, 4, 12288, 7168)
     assert operator.args[6] == {PULL.kernel}
     assert [call.args for call in operator.prepare.call_args_list] == [
-        (8192, 2048, PULL),
-        (12288, 2048, PULL),
+        (8192, 3072, PULL),
+        (12288, 3072, PULL),
     ]
     assert manager.zero_prefix_buffer.shape == (3072, 7168)
     runtime.synchronize.assert_called_once_with()
@@ -245,7 +262,7 @@ def test_prepare_below_fused_envelope_allocates_nothing(
 
 @pytest.mark.parametrize("prefix_rows", [None, 8192, 2048])
 def test_fused_call_notifies_shard_and_prefix_once(manager, o_proj, prefix_rows):
-    attention_output = Tensor((8192, 2048))
+    attention_output = Tensor((8192, 3072))
     prefix_sum = None if prefix_rows is None else Tensor((prefix_rows, 7168))
     with fusion.use_o_proj_fusion_call(prefix_sum, 8192) as fusion_call:
         output, bias = manager.try_fused_o_proj(o_proj, attention_output)
@@ -269,7 +286,7 @@ def test_consecutive_layers_keep_separate_model_outputs(manager, o_proj):
     outputs = []
     for _ in range(2):
         with fusion.use_o_proj_fusion_call(None, 8192):
-            outputs.append(manager.try_fused_o_proj(o_proj, Tensor((8192, 2048)))[0])
+            outputs.append(manager.try_fused_o_proj(o_proj, Tensor((8192, 3072)))[0])
     assert outputs[0].data_ptr() != outputs[1].data_ptr()
     assert len(manager.gemm_rs_operator.calls) == 2
 
@@ -277,15 +294,15 @@ def test_consecutive_layers_keep_separate_model_outputs(manager, o_proj):
 @pytest.mark.parametrize("m", [512, 1024, 2048, 4096, 10000])
 def test_baseline_disabled_and_unmeasured_shapes_stay_native(manager, o_proj, m):
     with fusion.use_o_proj_fusion_call(None, m) as fusion_call:
-        assert manager.try_fused_o_proj(o_proj, Tensor((m, 2048))) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((m, 3072))) is None
         assert fusion_call.fused_output is None
     assert manager.gemm_rs_operator.calls == []
 
 
 def test_no_scope_trimmed_padding_and_other_k_stay_native(manager, o_proj):
-    assert manager.try_fused_o_proj(o_proj, Tensor((8192, 2048))) is None
+    assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
     with fusion.use_o_proj_fusion_call(None, 12288):
-        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 2048))) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
     with fusion.use_o_proj_fusion_call(None, 8192):
         assert manager.try_fused_o_proj(o_proj, Tensor((8192, 4096))) is None
     assert manager.gemm_rs_operator.calls == []
@@ -326,14 +343,14 @@ def test_custom_unquantized_method_subclass_is_unsupported(manager, o_proj):
 )
 def test_explicit_linear_overrides_stay_native(manager, o_proj, kwargs):
     with fusion.use_o_proj_fusion_call(None, 8192):
-        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 2048)), **kwargs) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072)), **kwargs) is None
     assert manager.gemm_rs_operator.calls == []
 
 
 def test_forward_batch_kwarg_is_accepted(manager, o_proj):
     with fusion.use_o_proj_fusion_call(None, 8192):
         assert (
-            manager.try_fused_o_proj(o_proj, Tensor((8192, 2048)), forward_batch=None)
+            manager.try_fused_o_proj(o_proj, Tensor((8192, 3072)), forward_batch=None)
             is not None
         )
 
@@ -342,7 +359,7 @@ def test_forward_batch_kwarg_is_accepted(manager, o_proj):
     "problem", ["wrong_dtype", "not_contiguous", "prefix_dtype", "prefix_layout"]
 )
 def test_incompatible_dtype_or_layout_stays_native(manager, o_proj, problem):
-    attention_output = Tensor((8192, 2048))
+    attention_output = Tensor((8192, 3072))
     prefix_sum = Tensor((2048, 7168))
     if problem == "wrong_dtype":
         attention_output.dtype = torch.float16
@@ -362,12 +379,12 @@ def test_megatron_sp_and_decode_attn_tp_stay_native(manager, o_proj, monkeypatch
         monkeypatch.setattr(
             fusion, "get_forward", lambda: SimpleNamespace(sp_active=True)
         )
-        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 2048))) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
         monkeypatch.setattr(
             fusion, "get_forward", lambda: SimpleNamespace(sp_active=False)
         )
         o_proj.use_decode_attn_tp = True
-        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 2048))) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
     assert manager.gemm_rs_operator.calls == []
 
 
@@ -375,13 +392,13 @@ def test_launch_failure_does_not_claim_completion(manager, o_proj):
     manager.gemm_rs_operator = Mock(side_effect=RuntimeError("kernel launch failed"))
     with fusion.use_o_proj_fusion_call(None, 8192) as fusion_call:
         with pytest.raises(RuntimeError, match="kernel launch failed"):
-            manager.try_fused_o_proj(o_proj, Tensor((8192, 2048)))
+            manager.try_fused_o_proj(o_proj, Tensor((8192, 3072)))
         assert fusion_call.fused_output is None
 
 
 def test_one_context_prepares_and_runs_both_modes(group, o_proj, runtime, monkeypatch):
     monkeypatch.setattr(ops, "GemmRSPrefixAdd", FakeOperator)
-    table = ops.DispatchTable(2048, {4096: PUSH, 8192: PULL})
+    table = ops.DispatchTable(3072, {4096: PUSH, 8192: PULL})
     manager = fusion.K3SPGemmFusionManager(group, table, 7168)
     manager.prepare(8192)
     operator = manager.gemm_rs_operator
@@ -389,5 +406,5 @@ def test_one_context_prepares_and_runs_both_modes(group, o_proj, runtime, monkey
     assert [call.args[2] for call in operator.prepare.call_args_list] == [PUSH, PULL]
     for m in (4096, 8192, 4096):
         with fusion.use_o_proj_fusion_call(None, m):
-            assert manager.try_fused_o_proj(o_proj, Tensor((m, 2048))) is not None
+            assert manager.try_fused_o_proj(o_proj, Tensor((m, 3072))) is not None
     assert [call[4] for call in operator.calls] == [PUSH, PULL, PUSH]
