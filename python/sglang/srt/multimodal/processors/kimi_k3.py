@@ -72,6 +72,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils import is_cuda, load_image
+from sglang.srt.utils.common import CORRUPT_VIDEO_MESSAGE, is_corrupt_video_error
 
 logger = logging.getLogger(__name__)
 
@@ -278,17 +279,24 @@ def _split_k3_video(
     frame_indices = (
         np.linspace(0, total_frames - 1, sampled_nframes).round().astype(int).tolist()
     )
-    if hasattr(video, "get_frames_as_tensor"):
-        # This function runs one video per thread on the shared IO pool, so the
-        # decoder's own inner thread pool would multiply against that outer
-        # concurrency -- see SGLANG_K3_VIDEO_DECODE_THREADS (default 1).
-        decoded_frames = video.get_frames_as_tensor(
-            frame_indices, num_threads=envs.SGLANG_K3_VIDEO_DECODE_THREADS.get()
-        )
-    elif hasattr(video, "get_frames_at"):
-        decoded_frames = video.get_frames_at(frame_indices)
-    else:
-        decoded_frames = [video[index] for index in frame_indices]
+    try:
+        if hasattr(video, "get_frames_as_tensor"):
+            # This function runs one video per thread on the shared IO pool, so
+            # the decoder's own inner thread pool would multiply against that
+            # outer concurrency -- see SGLANG_K3_VIDEO_DECODE_THREADS (default 1).
+            decoded_frames = video.get_frames_as_tensor(
+                frame_indices, num_threads=envs.SGLANG_K3_VIDEO_DECODE_THREADS.get()
+            )
+        elif hasattr(video, "get_frames_at"):
+            decoded_frames = video.get_frames_at(frame_indices)
+        else:
+            decoded_frames = [video[index] for index in frame_indices]
+    except RuntimeError as e:
+        # A damaged packet is a bad upload (400), not a server fault. The
+        # header opened fine, so load_video's own mapping never saw it.
+        if is_corrupt_video_error(e):
+            raise ValueError(CORRUPT_VIDEO_MESSAGE) from e
+        raise
     frames = [_video_frame_to_chw(frame) for frame in decoded_frames]
 
     temporal_merge = int(media_proc_cfg.get("temporal_merge_kernel_size", 4))
