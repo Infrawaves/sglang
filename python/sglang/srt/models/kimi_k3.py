@@ -2562,6 +2562,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        o_proj_call=None,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -2574,7 +2575,8 @@ class KimiK3DecoderLayer(nn.Module):
         # prefill rejects the row mismatch, and silent paths would write the
         # padded rows' garbage KV through zero-padded out_cache_loc (clobbering
         # pool slot 0 -> cross-request corruption). Run attention on the real
-        # rows and zero-pad the output back.
+        # rows and zero-pad the output back (the fused o_proj pads its input
+        # instead).
         num_padded = hidden_states.shape[0]
         num_real = num_padded
         if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
@@ -2589,6 +2591,9 @@ class KimiK3DecoderLayer(nn.Module):
                     forward_batch,
                     zero_allocator,
                 )
+            if o_proj_call is not None and o_proj_call.fused_output is not None:
+                # For fuse o_proj+rs kernel, the output is already padded.
+                return attn_out
             padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
                 attn_out, num_padded
             )
@@ -2739,7 +2744,11 @@ class KimiK3DecoderLayer(nn.Module):
             )
         with o_proj_call_context as o_proj_call:
             hidden_states = self._run_self_attn(
-                hidden_states, positions, forward_batch, zero_allocator
+                hidden_states,
+                positions,
+                forward_batch,
+                zero_allocator,
+                o_proj_call=o_proj_call,
             )
         fused_o_proj_output = None if o_proj_call is None else o_proj_call.fused_output
         rows = None
@@ -3156,7 +3165,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
         # taps already capture here, so reuse them without the usual +1 shift.
         self.set_dspark_layers_to_capture(layer_ids)
-        
+
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         # BaseRunner.warmup runs this once before any eager warmup or graph
         # capture forward, whether or not CUDA graphs are enabled.

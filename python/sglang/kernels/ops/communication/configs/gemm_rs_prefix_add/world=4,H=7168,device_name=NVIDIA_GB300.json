@@ -8,7 +8,7 @@
     "dtype": "bfloat16"
   },
   "selection": {
-    "rule": "exact_m",
+    "rule": "floor_m",
     "fallback": "baseline"
   },
   "source": {

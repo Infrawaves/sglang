@@ -141,7 +141,7 @@ class K3SPGemmFusionManager:
         dispatch_configs = {
             m: dispatch
             for m, dispatch in self.dispatch_table.configs.items()
-            if m <= max_m
+            if m <= max_m and dispatch.mode != "baseline"
         }
         if not dispatch_configs:
             return
@@ -177,6 +177,21 @@ class K3SPGemmFusionManager:
             sorted(dispatch_configs),
         )
 
+    def _dispatch_for(self, m: int):
+        dispatch = self._prepared_dispatch.get(m)
+        if dispatch is not None:
+            return dispatch
+        if self.gemm_rs_operator is None:
+            return None
+        dispatch = self.dispatch_table.select(m)
+        # Skip stream capture and baseline path.
+        if dispatch is None or torch.cuda.is_current_stream_capturing():
+            return None
+        with torch.inference_mode(False), torch.cuda.device(self.device):
+            self.gemm_rs_operator.prepare(m, self.dispatch_table.k, dispatch)
+        self._prepared_dispatch[m] = dispatch
+        return dispatch
+
     def supports(self, o_proj) -> bool:
         from sglang.srt.layers.linear import RowParallelLinear
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -203,21 +218,28 @@ class K3SPGemmFusionManager:
         ):
             return None
         m, k = attention_output.shape
-        dispatch = self._prepared_dispatch.get(m)
+        num_rows = fusion_call.num_global_tokens
         if (
-            dispatch is None
-            or m != fusion_call.num_global_tokens
+            m > num_rows
             or k != self.dispatch_table.k
             or attention_output.dtype != torch.bfloat16
             or not attention_output.is_contiguous()
         ):
             return None
-        num_local_tokens = m // self.group.world_size
+        dispatch = self._dispatch_for(num_rows)
+        if dispatch is None:
+            return None
+        num_local_tokens = num_rows // self.group.world_size
         prefix_sum = fusion_call.prefix_sum
         if prefix_sum is None:
             prefix_sum = self.zero_prefix_buffer[:num_local_tokens]
         elif prefix_sum.dtype != torch.bfloat16 or not prefix_sum.is_contiguous():
             return None
+        if m < num_rows:
+            # Padded M to the next multiple of world_size for the fused kernel.
+            padded = attention_output.new_zeros(num_rows, k)
+            padded[:m] = attention_output
+            attention_output = padded
         output = torch.empty(
             (num_local_tokens, self.hidden_size),
             device=self.device,

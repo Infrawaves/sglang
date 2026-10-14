@@ -52,6 +52,13 @@ class Tensor:
         self.device = device
         self.contiguous = True
         self.ptr = next(self.addresses) if ptr is None else ptr
+        self.writes = []
+
+    def new_zeros(self, *shape):
+        return Tensor(shape, dtype=self.dtype, device=self.device)
+
+    def __setitem__(self, rows, value):
+        self.writes.append((rows, value))
 
     def is_contiguous(self):
         return self.contiguous
@@ -92,6 +99,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: stream)
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA GB300")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch, "zeros", lambda shape, **kwargs: Tensor(shape))
     monkeypatch.setattr(torch, "empty", lambda shape, **kwargs: Tensor(shape))
     mega_ops = SimpleNamespace(**{name: Mock() for name in SM100_OPS})
@@ -195,7 +203,16 @@ def test_b300_tp8_table_enables_pull_from_8k(group, runtime, monkeypatch):
     manager = fusion.create_gemm_fusion_manager(group, 7168)
     assert manager is not None
     assert manager.dispatch_table.k == 1536
-    assert manager.dispatch_table.configs == {8192: PULL, 12288: PULL, 16384: PULL}
+    baseline = ops.DispatchConfig("baseline")
+    assert manager.dispatch_table.configs == {
+        512: baseline,
+        1024: baseline,
+        2048: baseline,
+        4096: baseline,
+        8192: PULL,
+        12288: PULL,
+        16384: PULL,
+    }
 
 
 def test_missing_ops_or_table_keeps_native(group, runtime, caplog):
@@ -291,20 +308,81 @@ def test_consecutive_layers_keep_separate_model_outputs(manager, o_proj):
     assert len(manager.gemm_rs_operator.calls) == 2
 
 
-@pytest.mark.parametrize("m", [512, 1024, 2048, 4096, 10000])
-def test_baseline_disabled_and_unmeasured_shapes_stay_native(manager, o_proj, m):
+@pytest.mark.parametrize("m", [8, 512, 1024, 2048, 4096, 6000, 8188])
+def test_baseline_disabled_and_small_shapes_stay_native(manager, o_proj, m):
+    # 6000 and 8188 floor onto GB300's disabled 4K push bucket.
     with fusion.use_o_proj_fusion_call(None, m) as fusion_call:
         assert manager.try_fused_o_proj(o_proj, Tensor((m, 3072))) is None
         assert fusion_call.fused_output is None
     assert manager.gemm_rs_operator.calls == []
+    assert len(manager.gemm_rs_operator.prepare.call_args_list) == 3
 
 
-def test_no_scope_trimmed_padding_and_other_k_stay_native(manager, o_proj):
-    assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
+@pytest.mark.parametrize("m,bucket", [(8196, 8192), (13280, 12288), (16384, 16384)])
+def test_unbucketed_m_fuses_with_floor_bucket_prepared_once(manager, o_proj, m, bucket):
+    operator = manager.gemm_rs_operator
+    eager_prepares = len(operator.prepare.call_args_list)
+    for _ in range(2):
+        with fusion.use_o_proj_fusion_call(None, m) as fusion_call:
+            output, _ = manager.try_fused_o_proj(o_proj, Tensor((m, 3072)))
+        assert output.shape == (m // 4, 7168)
+        assert fusion_call.fused_output.shard_start_row == m // 4
+    dispatch = manager.dispatch_table.configs[bucket]
+    assert [call[4] for call in operator.calls] == [dispatch, dispatch]
+    lazy = operator.prepare.call_args_list[eager_prepares:]
+    if m == bucket:
+        assert lazy == []
+    else:
+        assert [call.args for call in lazy] == [(m, 3072, dispatch)]
+
+
+def test_capture_never_prepares_lazily(manager, o_proj, monkeypatch):
+    operator = manager.gemm_rs_operator
+    eager_prepares = len(operator.prepare.call_args_list)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with fusion.use_o_proj_fusion_call(None, 13280):
+        assert manager.try_fused_o_proj(o_proj, Tensor((13280, 3072))) is None
+    # A bucket size is prepared up front, so a capture still fuses it.
     with fusion.use_o_proj_fusion_call(None, 12288):
-        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
+        assert manager.try_fused_o_proj(o_proj, Tensor((12288, 3072))) is not None
+    assert len(operator.prepare.call_args_list) == eager_prepares
+    assert len(operator.calls) == 1
+
+
+def test_unprepared_manager_stays_native(group, dispatch_table, runtime, o_proj):
+    manager = fusion.K3SPGemmFusionManager(group, dispatch_table, 7168)
     with fusion.use_o_proj_fusion_call(None, 8192):
+        assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
+
+
+def test_no_scope_excess_rows_and_other_k_stay_native(manager, o_proj):
+    assert manager.try_fused_o_proj(o_proj, Tensor((8192, 3072))) is None
+    with fusion.use_o_proj_fusion_call(None, 8192):
+        assert manager.try_fused_o_proj(o_proj, Tensor((8196, 3072))) is None
         assert manager.try_fused_o_proj(o_proj, Tensor((8192, 4096))) is None
+    assert manager.gemm_rs_operator.calls == []
+
+
+def test_trimmed_attention_rows_are_zero_padded_into_the_kernel(manager, o_proj):
+    attention_output = Tensor((13277, 3072))
+    with fusion.use_o_proj_fusion_call(None, 13280) as fusion_call:
+        output, _ = manager.try_fused_o_proj(o_proj, attention_output)
+    [(input, _, prefix, call_output, dispatch)] = manager.gemm_rs_operator.calls
+    assert input.shape == (13280, 3072)
+    assert input.writes == [(slice(None, 13277), attention_output)]
+    assert prefix.shape == (3320, 7168)
+    assert output is call_output
+    assert output.shape == (3320, 7168)
+    assert fusion_call.fused_output.shard_start_row == 3320
+    assert dispatch == manager.dispatch_table.configs[12288]
+
+
+def test_trimmed_attention_on_a_native_bucket_does_not_copy(manager, o_proj):
+    attention_output = Tensor((5997, 3072))
+    attention_output.new_zeros = Mock()
+    with fusion.use_o_proj_fusion_call(None, 6000):
+        assert manager.try_fused_o_proj(o_proj, attention_output) is None
+    attention_output.new_zeros.assert_not_called()
     assert manager.gemm_rs_operator.calls == []
 
 
