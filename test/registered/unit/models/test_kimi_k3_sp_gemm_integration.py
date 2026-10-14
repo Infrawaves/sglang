@@ -131,7 +131,9 @@ def _forward_batch(*, idle=False, extend=False, real_rows=None):
 
 
 class TestKimiK3SPGemmAttentionBoundary(unittest.TestCase):
-    def _run_attention(self, *, idle=False, real_rows=8, padded_output=None):
+    def _run_attention(
+        self, *, idle=False, real_rows=8, padded_output=None, o_proj_call=None
+    ):
         sp = SimpleNamespace(
             o_proj_output_rows=Mock(side_effect=lambda rows: nullcontext()),
             finish_padded_o_proj_output=Mock(return_value=padded_output),
@@ -155,6 +157,7 @@ class TestKimiK3SPGemmAttentionBoundary(unittest.TestCase):
             _Tensor(8, 1, "positions"),
             _forward_batch(idle=idle, extend=True, real_rows=real_rows),
             object(),
+            o_proj_call=o_proj_call,
         )
         return output, hidden, owner, sp
 
@@ -175,6 +178,22 @@ class TestKimiK3SPGemmAttentionBoundary(unittest.TestCase):
         padded_output = _Tensor(8, name="symmetric")
         output, _, _, sp = self._run_attention(real_rows=6, padded_output=padded_output)
         self.assertIs(output, padded_output)
+        sp.finish_padded_o_proj_output.assert_called_once()
+
+    def test_trimmed_attention_keeps_the_fused_shard(self):
+        # The fused o_proj padded its input, so its shard needs no output pad.
+        o_proj_call = SimpleNamespace(fused_output=object())
+        output, _, owner, sp = self._run_attention(real_rows=6, o_proj_call=o_proj_call)
+        self.assertIs(output, owner._run_self_attn_inner.return_value)
+        self.assertEqual(output.writes, [])
+        sp.finish_padded_o_proj_output.assert_not_called()
+
+    def test_trimmed_attention_without_fusion_pads_the_output(self):
+        output, _, _, sp = self._run_attention(
+            real_rows=6, o_proj_call=SimpleNamespace(fused_output=None)
+        )
+        self.assertEqual(output.shape, (8, 8))
+        self.assertEqual(output.writes[0][0], slice(None, 6))
         sp.finish_padded_o_proj_output.assert_called_once()
 
     def test_unpadded_attention_preserves_output(self):

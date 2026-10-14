@@ -228,12 +228,52 @@ class Sm100TileOrderTest(unittest.TestCase):
 
 
 class DispatchTableTest(unittest.TestCase):
-    def test_checked_in_table_keeps_only_enabled_fused_shapes(self):
+    def test_checked_in_table_marks_baseline_and_disabled_shapes(self):
         table = load_dispatch_table(4, 7168, "NVIDIA_GB300")
         pull = DispatchConfig("pull", KernelConfig(256, 128, 2), "common")
+        baseline = DispatchConfig("baseline")
         self.assertEqual(table.k, 3072)
-        # Baseline 512-2048 and the disabled historical 4K push are dropped.
-        self.assertEqual(table.configs, {8192: pull, 12288: pull, 16384: pull})
+        # Baseline 512-2048 and the disabled historical 4K push stay native.
+        self.assertEqual(
+            table.configs,
+            {
+                512: baseline,
+                1024: baseline,
+                2048: baseline,
+                4096: baseline,
+                8192: pull,
+                12288: pull,
+                16384: pull,
+            },
+        )
+
+    def test_selection_takes_the_largest_bucket_not_exceeding_m(self):
+        table = load_dispatch_table(8, 7168, "NVIDIA_B300_SXM6_AC")
+        pull = table.configs[8192]
+        for m, expected in (
+            (8, None),
+            (511, None),
+            (4096, None),
+            (8184, None),
+            (8192, pull),
+            (13280, table.configs[12288]),
+            (16384, table.configs[16384]),
+            (32768, table.configs[16384]),
+        ):
+            with self.subTest(m=m):
+                self.assertEqual(table.select(m), expected)
+
+    def test_native_bucket_bounds_the_fused_bucket_below_it(self):
+        fused = DispatchConfig("pull", KernelConfig(256, 128, 2), "common")
+        table = _MODULE.DispatchTable(
+            1536, {2048: fused, 4096: DispatchConfig("baseline")}
+        )
+        self.assertEqual(table.select(3000), fused)
+        self.assertIsNone(table.select(4096))
+        self.assertIsNone(table.select(9000))
+        # The disabled GB300 4K push keeps 4096-8191 native.
+        gb300 = load_dispatch_table(4, 7168, "NVIDIA_GB300")
+        self.assertIsNone(gb300.select(6000))
 
     def test_missing_table_selects_native(self):
         self.assertIsNone(load_dispatch_table(8, 7168, "NVIDIA_GB300"))
