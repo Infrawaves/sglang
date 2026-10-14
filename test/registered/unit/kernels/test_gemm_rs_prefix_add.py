@@ -322,6 +322,8 @@ class ContextTest(unittest.TestCase):
         jit_utils.empty_sentinel = Mock()
         jit_utils.load_jit = Mock()
         jit_utils.make_cpp_args = Mock()
+        nvtx_utils = types.ModuleType("sglang.srt.utils.nvtx_utils")
+        nvtx_utils.operations_nvtx_range = lambda _: contextlib.nullcontext()
         patcher = patch.dict(
             sys.modules,
             {
@@ -329,6 +331,7 @@ class ContextTest(unittest.TestCase):
                 "torch.distributed": dist,
                 "torch.distributed._symmetric_memory": symm,
                 "sglang.kernels.jit.utils": jit_utils,
+                "sglang.srt.utils.nvtx_utils": nvtx_utils,
             },
         )
         patcher.start()
