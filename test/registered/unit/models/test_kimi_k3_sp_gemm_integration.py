@@ -546,20 +546,23 @@ class TestKimiK3SPGemmInitialization(unittest.TestCase):
         self.assertIsNone(run.state.gemm_fusion_manager)
         run.gather.assert_not_called()
 
-    def test_attn_res_priority_skips_gemm_initialization_with_warning(self):
+    def test_attn_res_composes_with_gemm_initialization(self):
         for fusion_enabled in (False, True):
             with self.subTest(fusion_enabled=fusion_enabled):
                 run = self._initialize(
                     fusion_enabled=fusion_enabled, attn_res_enabled=True
                 )
-                run.factory.assert_not_called()
-                self.assertIsNone(run.state.gemm_fusion_manager)
+                run.envs.SGLANG_K3_SP_GEMM_FUSION.get.assert_called_once()
+                if fusion_enabled:
+                    run.factory.assert_called_once_with(run.group, 7168)
+                    self.assertIs(
+                        run.state.gemm_fusion_manager, run.factory.return_value
+                    )
+                else:
+                    run.factory.assert_not_called()
+                    self.assertIsNone(run.state.gemm_fusion_manager)
                 run.gather.assert_not_called()
-                warned = any(
-                    "SGLANG_K3_SP_GEMM_FUSION is ignored" in call.args[0]
-                    for call in run.logger.warning.call_args_list
-                )
-                self.assertEqual(warned, fusion_enabled)
+                run.logger.warning.assert_not_called()
 
     def test_unavailable_manager_does_not_log_fusion_enabled(self):
         run = self._initialize(fusion_enabled=True, manager_available=False)
