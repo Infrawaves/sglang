@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from sglang.kernels.ops.communication.inkling_all_reduce import STATE_SIZE, flags_numel
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 from .tile_order import build_tile_m_order
 from .workspace import WorkspaceLayout
@@ -136,29 +137,34 @@ class GemmRSPrefixAdd:
             config.tile_m,
             config.tile_n,
         )
+        # The CUTLASS kernel name is an unreadable template instantiation, so
+        # label the launch for torch profiler and (with
+        # SGLANG_ENABLE_NVTX_OPERATIONS=1) Nsight Systems traces.
         if dispatch.mode == "pull":
-            torch.ops.mega_ops.sm100_gemm_rs_prefix_add_pull(
-                input,
-                weight,
-                prefix,
-                output,
-                self._gemm_partial_output,
-                self._partial_multicast_ptr,
-                self._ready_multicast_ptr,
-                *shared_kernel_args,
-            )
+            with operations_nvtx_range("mega_ops::sm100_gemm_rs_prefix_add_pull"):
+                torch.ops.mega_ops.sm100_gemm_rs_prefix_add_pull(
+                    input,
+                    weight,
+                    prefix,
+                    output,
+                    self._gemm_partial_output,
+                    self._partial_multicast_ptr,
+                    self._ready_multicast_ptr,
+                    *shared_kernel_args,
+                )
         else:
-            torch.ops.mega_ops.sm100_gemm_rs_prefix_add_push(
-                input,
-                weight,
-                prefix,
-                output,
-                self._gemm_partial_output,
-                self._push_receive_buffer,
-                self._payload_peer_ptrs,
-                self.layout.plane_stride_elements,
-                *shared_kernel_args,
-            )
+            with operations_nvtx_range("mega_ops::sm100_gemm_rs_prefix_add_push"):
+                torch.ops.mega_ops.sm100_gemm_rs_prefix_add_push(
+                    input,
+                    weight,
+                    prefix,
+                    output,
+                    self._gemm_partial_output,
+                    self._push_receive_buffer,
+                    self._payload_peer_ptrs,
+                    self.layout.plane_stride_elements,
+                    *shared_kernel_args,
+                )
         return output
 
     __call__ = forward
