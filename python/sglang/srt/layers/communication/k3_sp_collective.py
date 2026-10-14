@@ -118,12 +118,9 @@ def _init_state() -> Optional[_State]:
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
         )
-        if envs.SGLANG_K3_SP_GEMM_FUSION.get():
-            logger.warning(
-                "SGLANG_K3_SP_GEMM_FUSION is ignored: the attention-residual "
-                "carry owns the post-o_proj RS (SGLANG_K3_SP_ATTN_RES)."
-            )
-    elif envs.SGLANG_K3_SP_GEMM_FUSION.get():
+    # Composes with the attention-residual carry: the fused o_proj consumes the
+    # carry's local-shard prefix and takes precedence over the separate RS.
+    if envs.SGLANG_K3_SP_GEMM_FUSION.get():
         from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
             create_gemm_fusion_manager,
         )

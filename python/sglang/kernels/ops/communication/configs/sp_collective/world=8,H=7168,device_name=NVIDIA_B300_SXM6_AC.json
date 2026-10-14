@@ -9,7 +9,7 @@
   "selection": {
     "rule": "nearest global-token bucket at or below the workload",
     "fallback": "nccl",
-    "note": "Standalone RS push won through T=1024 and NVLS pull won at T=2048/4096. Fused pull RS+residual+attention-residual wins through T=512; the separate path wins from T=1024. Fused attention-residual+direct AG wins every measured bucket T=8..4096. NCCL won standalone collectives at T=8192 and T=16384; fusion falls back outside its measured envelope."
+    "note": "Standalone RS push won through T=1024 and NVLS pull won at T=2048/4096. Fused pull RS+residual+attention-residual wins through T=512; the separate path wins from T=1024. Fused attention-residual+direct AG wins every measured bucket T=8..4096. NCCL won standalone collectives at T=8192 and T=16384; fusion falls back outside its measured envelope. B300 override: attn_res_all_gather T=8192/16384 forced to fused_direct (unmeasured; max_blocks still the small-T value) to replace the separate NCCL AG in prefill."
   },
   "configs": {
     "reduce_scatter": {
@@ -212,7 +212,12 @@
         "max_blocks": 64
       },
       "8192": {
-        "strategy": "separate"
+        "strategy": "fused_direct",
+        "max_blocks": 128
+      },
+      "16384": {
+        "strategy": "fused_direct",
+        "max_blocks": 128
       }
     }
   }
