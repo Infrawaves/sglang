@@ -10,7 +10,8 @@ use std::num::NonZeroU32;
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
-    default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
+    default_cb_cool_down, default_host, default_max_chat_body_bytes, default_port,
+    default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
@@ -66,6 +67,14 @@ pub struct ModelArgs {
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+
+    /// Route without a tokenizer, for models whose tokenizer is not a HuggingFace
+    /// `tokenizer.json` (e.g. tiktoken-based ones). The engine tokenizes prompts,
+    /// `/v1/tokenize` and `/v1/detokenize` are unavailable, and routing uses the
+    /// body-size token estimate. Rejected with `--policy cache_aware` and
+    /// mutually exclusive with `--tokenizer-path`.
+    #[arg(long)]
+    pub no_tokenizer: bool,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
     /// Use for worker parser/template overrides or template stop strings.
@@ -123,6 +132,10 @@ pub struct ServerArgs {
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
+    /// Max accepted `/v1/chat/completions` and `/v1/responses` body size in bytes.
+    /// Larger bodies are rejected with 413 before routing.
+    #[arg(long, default_value_t = default_max_chat_body_bytes())]
+    pub max_chat_body_bytes: usize,
 
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
@@ -361,6 +374,18 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
+        // Reject combinations that would silently mean something other than written.
+        if self.model.no_tokenizer {
+            ensure!(
+                self.model.tokenizer_path.is_none(),
+                "--no-tokenizer and --tokenizer-path are mutually exclusive"
+            );
+            ensure!(
+                self.routing.policy != PolicyKind::CacheAware,
+                "--policy cache_aware requires a tokenizer (it routes on prompt token hashes); \
+                 drop --no-tokenizer, or pick a load-based policy"
+            );
+        }
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
             ensure!(
                 self.affinity.affinity_mode != Some(AffinityMode::Soft),
@@ -443,10 +468,12 @@ impl Cli {
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
-                tokenizer_path: self
-                    .model
-                    .tokenizer_path
-                    .unwrap_or_else(|| self.model.model_id.clone()),
+                // `None` under --no-tokenizer (validated above).
+                tokenizer_path: (!self.model.no_tokenizer).then(|| {
+                    self.model
+                        .tokenizer_path
+                        .unwrap_or_else(|| self.model.model_id.clone())
+                }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
@@ -465,6 +492,7 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                max_chat_body_bytes: self.server.max_chat_body_bytes,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -1156,7 +1184,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -1170,7 +1198,69 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("/models/qwen3/tokenizer.json"));
+    }
+
+    #[test]
+    fn no_tokenizer_clears_tokenizer_path() {
+        let c = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "load_based",
+            "--no-tokenizer",
+        ])
+        .unwrap();
+        assert!(c.model.tokenizer_path.is_none());
+    }
+
+    #[test]
+    fn no_tokenizer_rejects_explicit_tokenizer_path() {
+        let err = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--no-tokenizer",
+            "--tokenizer-path",
+            "/model/tokenizer.json",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn no_tokenizer_rejects_cache_aware_policy() {
+        let err = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--no-tokenizer",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires a tokenizer"), "got: {err}");
+    }
+
+    #[test]
+    fn max_chat_body_bytes_defaults_and_overrides() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 70_000_000);
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--max-chat-body-bytes",
+            "536870912",
+        ]))
+        .unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 512 << 20);
     }
 
     #[test]

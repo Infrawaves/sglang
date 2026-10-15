@@ -3,6 +3,7 @@
 
 //! Chat request validation, optional tokenization, and outgoing body preparation.
 
+use super::InferenceEndpoint;
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
@@ -29,6 +30,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) input_token_count: usize,
     caller_set_rid: bool,
     fans_out: bool,
+    pub(super) endpoint: InferenceEndpoint,
     forwarding_scope: ForwardingScope,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -51,17 +53,23 @@ impl PreparedChatRequest {
         // Validate configured sampling rules and collect missing defaults for forwarding.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
+        let endpoint = fields.endpoint;
+        let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding
+            || endpoint == InferenceEndpoint::Responses
+        {
             ForwardingScope::Never
         } else {
             ctx.tokenizers.forwarding_scope(&model.0)
         };
         let can_forward_input_ids = forwarding_scope != ForwardingScope::Never;
-        let needs_tokens = should_tokenize_request(
-            can_forward_input_ids,
-            policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
-        );
+        // Responses may carry instructions, tool items and stored history that the
+        // chat encoder cannot reproduce; route those on load and the size estimate.
+        let needs_tokens = endpoint == InferenceEndpoint::ChatCompletions
+            && should_tokenize_request(
+                can_forward_input_ids,
+                policy_needs_request_tokens,
+                ctx.bucket_selector.is_enabled(),
+            );
         // Parse the full body only when rendering or routing needs tokens.
         let parsed_body = needs_tokens
             .then(|| serde_json::from_slice(&body))
@@ -83,7 +91,10 @@ impl PreparedChatRequest {
             tokens,
             input_token_count,
             caller_set_rid: fields.caller_set_rid,
-            fans_out: requests_multiple_samples(&fields, &sampling_defaults),
+            // The Responses API has no `n`; one request is one engine generation.
+            fans_out: endpoint == InferenceEndpoint::ChatCompletions
+                && requests_multiple_samples(&fields, &sampling_defaults),
+            endpoint,
             forwarding_scope,
             parsed_body,
             sampling_defaults,
@@ -99,7 +110,11 @@ impl PreparedChatRequest {
         if pd_mode {
             return Some(format!("sgl-router-{}", uuid::Uuid::new_v4()));
         }
-        Some(uuid::Uuid::new_v4().simple().to_string())
+        Some(match self.endpoint {
+            InferenceEndpoint::ChatCompletions => uuid::Uuid::new_v4().simple().to_string(),
+            // The engine echoes `request_id` as the response ID; keep its default shape.
+            InferenceEndpoint::Responses => format!("resp_{}", uuid::Uuid::new_v4().simple()),
+        })
     }
 
     pub(super) fn into_outgoing_body(
@@ -125,7 +140,7 @@ impl PreparedChatRequest {
             input_ids,
             bootstrap,
             &self.sampling_defaults,
-            engine_rid,
+            engine_rid.map(|rid| (self.endpoint.request_id_field(), rid)),
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
@@ -153,7 +168,7 @@ impl PreparedChatRequest {
             }
             self.parsed_body
                 .as_ref()
-                .and_then(|body| body.get("rid"))
+                .and_then(|body| body.get(self.endpoint.request_id_field()))
                 .filter(|rid| !rid.is_null())
                 .map(|rid| match rid.as_str() {
                     Some(rid) => rid.to_owned(),
@@ -185,10 +200,13 @@ impl PreparedChatRequest {
 /// Routing and sampling fields retained by the lightweight request parser.
 #[derive(Debug, Default)]
 pub(super) struct RoutingFields {
+    endpoint: InferenceEndpoint,
     stream: Option<bool>,
     pub(super) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
+    /// Responses API output budget; chat requests ignore this key.
+    max_output_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
     // Preserve both string and list IDs without retaining their contents.
     caller_set_rid: bool,
@@ -299,6 +317,7 @@ enum RoutingKey {
     Model,
     MaxTokens,
     MaxCompletionTokens,
+    MaxOutputTokens,
 }
 
 impl RoutingKey {
@@ -308,6 +327,7 @@ impl RoutingKey {
             Self::Model => 1 << 1,
             Self::MaxTokens => 1 << 2,
             Self::MaxCompletionTokens => 1 << 3,
+            Self::MaxOutputTokens => 1 << 4,
         }
     }
 
@@ -317,6 +337,7 @@ impl RoutingKey {
             Self::Model => "model",
             Self::MaxTokens => "max_tokens",
             Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::MaxOutputTokens => "max_output_tokens",
         }
     }
 }
@@ -325,7 +346,27 @@ enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
     Rid,
+    /// The Responses API request ID (`request_id`).
+    RequestId,
     Other,
+}
+
+impl RequestKey {
+    /// Keep chat parsing unchanged; Responses reads its own budget and ID keys.
+    fn for_endpoint(self, endpoint: InferenceEndpoint) -> Self {
+        match (endpoint, self) {
+            (
+                InferenceEndpoint::ChatCompletions,
+                Self::Routing(RoutingKey::MaxOutputTokens) | Self::RequestId,
+            ) => Self::Other,
+            (
+                InferenceEndpoint::Responses,
+                Self::Routing(RoutingKey::MaxTokens | RoutingKey::MaxCompletionTokens) | Self::Rid,
+            ) => Self::Other,
+            (InferenceEndpoint::Responses, Self::RequestId) => Self::Rid,
+            (_, key) => key,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for RequestKey {
@@ -344,7 +385,9 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "model" => RequestKey::Routing(RoutingKey::Model),
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
+                    "max_output_tokens" => RequestKey::Routing(RoutingKey::MaxOutputTokens),
                     "rid" => RequestKey::Rid,
+                    "request_id" => RequestKey::RequestId,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -358,6 +401,7 @@ impl<'de> Deserialize<'de> for RequestKey {
 
 struct RoutingFieldsVisitor {
     read_sampling: bool,
+    endpoint: InferenceEndpoint,
 }
 
 impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
@@ -371,10 +415,13 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
         self,
         mut map: M,
     ) -> Result<RoutingFields, M::Error> {
-        let mut fields = RoutingFields::default();
+        let mut fields = RoutingFields {
+            endpoint: self.endpoint,
+            ..RoutingFields::default()
+        };
         let mut seen_routing_keys = 0u8;
         while let Some(key) = map.next_key::<RequestKey>()? {
-            match key {
+            match key.for_endpoint(self.endpoint) {
                 RequestKey::Routing(field) => {
                     if seen_routing_keys & field.bit() != 0 {
                         return Err(serde::de::Error::custom(format_args!(
@@ -391,6 +438,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                         RoutingKey::MaxCompletionTokens => {
                             fields.max_completion_tokens = map.next_value()?
                         }
+                        RoutingKey::MaxOutputTokens => {
+                            fields.max_output_tokens = map.next_value()?
+                        }
                     }
                 }
                 RequestKey::Sampling(field) => {
@@ -405,7 +455,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                 RequestKey::Rid => {
                     fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
                 }
-                RequestKey::Other => {
+                RequestKey::RequestId | RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
                     map.next_value::<IgnoredAny>()?;
                 }
@@ -419,26 +469,42 @@ impl<'de> Deserialize<'de> for RoutingFields {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         d.deserialize_map(RoutingFieldsVisitor {
             read_sampling: true,
+            endpoint: InferenceEndpoint::ChatCompletions,
         })
     }
 }
 
-/// Preserve valid JSON with sampling numbers outside f64 range (for example, 1e400).
-fn parse_without_sampling_values(body: &[u8]) -> Result<RoutingFields, serde_json::Error> {
+fn parse_fields(
+    body: &[u8],
+    read_sampling: bool,
+    endpoint: InferenceEndpoint,
+) -> Result<RoutingFields, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(body);
     let fields = serde::Deserializer::deserialize_map(
         &mut de,
         RoutingFieldsVisitor {
-            read_sampling: false,
+            read_sampling,
+            endpoint,
         },
     )?;
     de.end()?;
     Ok(fields)
 }
 
+/// Preserve valid JSON with sampling numbers outside f64 range (for example, 1e400).
+fn parse_without_sampling_values(
+    body: &[u8],
+    endpoint: InferenceEndpoint,
+) -> Result<RoutingFields, serde_json::Error> {
+    parse_fields(body, false, endpoint)
+}
+
 impl RoutingFields {
     fn requested_max_output_tokens(&self) -> Option<u64> {
-        self.max_completion_tokens.or(self.max_tokens)
+        match self.endpoint {
+            InferenceEndpoint::ChatCompletions => self.max_completion_tokens.or(self.max_tokens),
+            InferenceEndpoint::Responses => self.max_output_tokens,
+        }
     }
 
     fn sampling_field(&self, field: SamplingField) -> SamplingValue {
@@ -491,7 +557,7 @@ pub(super) struct BootstrapFields {
 fn append_top_level_fields(
     body: &Bytes,
     sampling_defaults: &[(SamplingField, Number)],
-    rid: Option<&str>,
+    rid: Option<(&str, &str)>,
 ) -> Option<Bytes> {
     use std::io::Write as _;
 
@@ -503,7 +569,7 @@ fn append_top_level_fields(
     let has_members = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    let rid_budget = rid.map_or(0, |rid| rid.len() + ",\"rid\":\"\"".len());
+    let rid_budget = rid.map_or(0, |(key, rid)| key.len() + rid.len() + ",\"\":\"\"".len());
     let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + rid_budget + 1);
     output.extend_from_slice(&body[..close]);
     let mut wrote_any = has_members;
@@ -514,11 +580,11 @@ fn append_top_level_fields(
         write!(output, "\"{}\":{}", field.wire_name(), value).ok()?;
         wrote_any = true;
     }
-    if let Some(rid) = rid {
+    if let Some((key, rid)) = rid {
         if wrote_any {
             output.push(b',');
         }
-        output.extend_from_slice(b"\"rid\":");
+        write!(output, "\"{key}\":").ok()?;
         serde_json::to_writer(&mut output, rid).ok()?;
     }
     output.extend_from_slice(&body[close..]);
@@ -532,7 +598,8 @@ fn build_outgoing_body(
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
     sampling_defaults: &[(SamplingField, Number)],
-    rid: Option<&str>,
+    // Request-ID key (`rid` for chat, `request_id` for responses) and value.
+    rid: Option<(&str, &str)>,
 ) -> Result<Bytes, ApiError> {
     let needs_parse = input_ids.is_some() || bootstrap.is_some();
     if !needs_parse && sampling_defaults.is_empty() && rid.is_none() {
@@ -554,8 +621,8 @@ fn build_outgoing_body(
             return Err(invalid_request());
         }
     };
-    if let Some(rid) = rid {
-        body_fields.insert("rid".into(), Value::String(rid.to_owned()));
+    if let Some((key, rid)) = rid {
+        body_fields.insert(key.into(), Value::String(rid.to_owned()));
     }
     for (field, default) in sampling_defaults {
         body_fields.insert(field.wire_name().into(), default.clone().into());
@@ -811,17 +878,25 @@ fn sampling_violation(spec: &ParamSpec, provided: SamplingValue) -> Option<Strin
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
-    let err = match serde_json::from_slice::<RoutingFields>(body) {
+    parse_request_fields(body, InferenceEndpoint::ChatCompletions)
+}
+
+pub(super) fn parse_request_fields(
+    body: &Bytes,
+    endpoint: InferenceEndpoint,
+) -> Result<RoutingFields, ApiError> {
+    let err = match parse_fields(body, true, endpoint) {
         Ok(fields) => return Ok(fields),
         Err(e) => e,
     };
     // Retry without numeric conversion so sampling rules can handle values such as 1e400.
-    if let Ok(fields) = parse_without_sampling_values(body) {
+    if let Ok(fields) = parse_without_sampling_values(body, endpoint) {
         return Ok(fields);
     }
     // Keep deserialization details out of the client-visible error.
-    tracing::debug!(error = %err, "chat-completions routing-fields deserialize failed");
+    tracing::debug!(error = %err, path = endpoint.path(), "routing-fields deserialize failed");
     Err(invalid_request())
 }
 
