@@ -84,9 +84,6 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
-    NewTokenRatioTracker,
-)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -386,13 +383,6 @@ class _DpRankQuery(NamedTuple):
     future: Future
 
 
-@dataclass
-class DemotedRequest:
-    req: Req
-    demoted_start_time: float
-    demoted_tokens: int
-
-
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -444,9 +434,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
-        self.demotion_queue: List[DemotedRequest] = []
-        self.resume_failure_cnt: Dict[str, int] = {}
-        self.demoted_tokens_total = 0
         self.pending_reqs: List[DecodeRequest] = []
         # At most one in-flight authoritative room -> DP-rank lookup per addr.
         self._prefill_dp_rank_queries: Dict[str, _DpRankQuery] = {}
@@ -969,18 +956,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
         self.retracted_queue.clear()
-        for entry in self.demotion_queue:
-            discard_kv_cache_backup(
-                entry.req,
-                self.tree_cache,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
-            if get_disagg().disaggregation_decode_retraction_backup != "ssd":
-                self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
-        self.demotion_queue.clear()
-        if hasattr(self, "resume_failure_cnt"):
-            self.resume_failure_cnt.clear()
-        self.demoted_tokens_total = 0
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1010,17 +985,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
-            if (
-                get_disagg().disaggregation_decode_retraction_backup == "ssd"
-                and not self.tree_cache.retraction_restore_admissible(req)
-            ):
-                # L3 write still in flight, or no L2 staging even after reclaim.
-                # Checked before _pre_alloc so a refusal leaves no device state.
-                continue
-
-            # No mamba budget here: the decode pool sizes mamba slots to at least
-            # the request rows and each request holds exactly one, so this row
-            # check already covers the slot _pre_alloc will take.
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -1041,21 +1005,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ):
                     break
 
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
+            req.is_retracted = False
             self._pre_alloc(req)
-            restored = restore_kv_cache(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
-            if not restored:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-            else:
-                req.is_retracted = False
-                resumed_reqs.append(req)
-                indices_to_remove.add(i)
-
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1066,175 +1019,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
+            restore_kv_cache(
+                req,
+                self.tree_cache,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+
         self.retracted_queue = [
             entry
             for i, entry in enumerate(self.retracted_queue)
             if i not in indices_to_remove
         ]
 
-        return resumed_reqs
-
-    def add_demoted_req(
-        self, req: Req, demoted_start_time: Optional[float] = None
-    ) -> None:
-        req.is_demoted = True
-        req.last_demote_output_len = len(req.output_ids)
-        if not hasattr(self, "resume_failure_cnt"):
-            self.resume_failure_cnt = {}
-        self.resume_failure_cnt[req.rid] = 0
-        demoted_tokens = req.seqlen
-        if get_disagg().disaggregation_decode_retraction_backup != "ssd":
-            self.scheduler.remain_cpu_demote_tokens -= demoted_tokens
-        self.demotion_queue.append(
-            DemotedRequest(
-                req=req,
-                demoted_start_time=(
-                    time.monotonic()
-                    if demoted_start_time is None
-                    else demoted_start_time
-                ),
-                demoted_tokens=demoted_tokens,
-            )
-        )
-        self.demoted_tokens_total += demoted_tokens
-
-    def demoted_reqs(self) -> List[Req]:
-        return [entry.req for entry in self.demotion_queue]
-
-    def demotion_queue_cache_usage(self) -> float:
-        return self.demoted_tokens_total / self.scheduler.max_total_num_tokens
-
-    def get_demoted_req_indices_to_resume(self) -> List[int]:
-        """Read the recovery deadline only on the request-plane leader."""
-        recovery_duration = get_disagg().proactive_demotion_recovery_duration
-        now = time.monotonic()
-        return [
-            i
-            for i, entry in enumerate(self.demotion_queue)
-            if now - entry.demoted_start_time >= recovery_duration
-        ]
-
-    def resume_demote_reqs(self, expired_indices: List[int]) -> List[Req]:
-        if not hasattr(self, "resume_failure_cnt"):
-            self.resume_failure_cnt = {}
-        if not expired_indices:
-            return []
-
-        resumed_reqs: List[Req] = []
-        indices_to_remove = set()
-        retry_indices = set()
-        original_queue = self.demotion_queue
-        allocator = self.token_to_kv_pool_allocator
-        uses_swa_reservation = self._uses_swa_reservation()
-        swa_req_ring = is_swa_req_ring(allocator)
-
-        for i in expired_indices:
-            entry = self.demotion_queue[i]
-            req = entry.req
-            rid = getattr(req, "rid", None)
-            if (
-                get_disagg().disaggregation_decode_retraction_backup == "ssd"
-                and not self.tree_cache.retraction_restore_admissible(req)
-            ):
-                # This may reclaim L2: every rank must take the same admission
-                # path, before any device allocation or request state change.
-                continue
-            if self.req_to_token_pool.available_size() <= 0:
-                break
-
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if swa_req_ring:
-                swa_required = allocator.swa_ring_cost_tokens
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                count_retracted=False, extra_reserved_reqs=len(resumed_reqs)
-            )
-            swa_allocatable_tokens = None
-            if uses_swa_reservation:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
-                    count_retracted=False, extra_reserved_reqs=len(resumed_reqs)
-                )
-            if not self._prealloc_reservation_fits(
-                full_required,
-                swa_required,
-                full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=swa_allocatable_tokens,
-            ):
-                break
-            if allocator.prealloc_fits_assumes_reclaim():
-                full_len, swa_len = self._prealloc_kv_lens(req)
-                error = self._reclaim_swa_tail_capacity(
-                    swa_len, req.rid, full_len=full_len
-                )
-                if error is not None:
-                    raise RuntimeError(f"Cannot resume demoted request: {error}")
-
-            self._pre_alloc(req)
-            restored = restore_kv_cache(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
-            # Need to free allocated L1 cache when restore fails.
-            if not restored:
-                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-                    metrics_reporter = getattr(self.scheduler, "metrics_reporter", None)
-                    if (
-                        metrics_reporter is not None
-                        and metrics_reporter.is_stats_logging_rank
-                        and metrics_reporter.enable_metrics
-                    ):
-                        metrics_reporter.metrics_collector.increment_demotion_resume_failures(
-                            1
-                        )
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-                failure_cnt = (
-                    self.resume_failure_cnt.get(rid, 0) + 1 if rid is not None else 0
-                )
-                if failure_cnt >= 3:
-                    if rid is not None:
-                        self.resume_failure_cnt.pop(rid, None)
-                    discard_kv_cache_backup(
-                        req,
-                        self.tree_cache,
-                        get_disagg().disaggregation_decode_retraction_backup,
-                    )
-                    self.demoted_tokens_total -= entry.demoted_tokens
-                    indices_to_remove.add(i)
-                    from sglang.srt.managers.scheduler import _make_abort_req
-
-                    # Directly abort demoted request since it cannot be resumed
-                    self.scheduler.ipc_channels.send_to_tokenizer.send_output(
-                        _make_abort_req(req), req
-                    )
-                else:
-                    if rid is not None:
-                        self.resume_failure_cnt[rid] = failure_cnt
-                    entry.demoted_start_time = time.monotonic()
-                    retry_indices.add(i)
-                continue
-            req.is_demoted = False
-            if rid is not None:
-                self.resume_failure_cnt.pop(rid, None)
-            if get_disagg().disaggregation_decode_retraction_backup != "ssd":
-                self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
-            self.demoted_tokens_total -= entry.demoted_tokens
-            if self.demoted_tokens_total < 0:
-                raise RuntimeError(
-                    f"Demoted token accounting underflowed: {self.demoted_tokens_total}"
-                )
-
-        retry_entries = [
-            entry for i, entry in enumerate(original_queue) if i in retry_indices
-        ]
-        self.demotion_queue = [
-            entry
-            for i, entry in enumerate(original_queue)
-            if i not in indices_to_remove and i not in retry_indices
-        ] + retry_entries
         return resumed_reqs
 
     def _update_handshake_waiters(
@@ -3640,144 +3438,9 @@ class SchedulerDisaggregationDecodeMixin:
                     )
         return new_batch
 
-    def need_to_proactive_retract_request(self: Scheduler) -> bool:
-        # Experimental fixed-rule demotion: trigger on cache pressure alone,
-        # with no output-length imbalance gate.
-        collector = self.decode_metric_collector
-        if not get_disagg().enable_proactive_decode_demotion or collector is None:
-            return False
-
-        # The fixed rule no longer consumes quantiles; keep them ticking only
-        # so the collector stays warm for observability.
-        collector.maybe_update()
-
-        if self.remain_cpu_demote_tokens <= 0:
-            return False
-
-        cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
-        return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
-
-    def _decode_pool_above_demotion_threshold(self: Scheduler) -> bool:
-        cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
-        return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
-
-    def proactively_demote_longest_request(self: Scheduler) -> bool:
-        batch = self.running_batch
-        if batch is None or batch.is_empty():
-            return False
-
-        max_input_len = self.server_args.proactive_demotion_max_input_len
-        min_output_len = self.server_args.proactive_demotion_min_output_len
-
-        def is_demotion_candidate(req: Req) -> bool:
-            return (
-                not req.finished()
-                and not req.is_retracted
-                and not req.is_demoted
-                and len(req.origin_input_ids) <= max_input_len
-                and len(req.output_ids) - req.last_demote_output_len >= min_output_len
-            )
-
-        ssd_retraction = get_disagg().disaggregation_decode_retraction_backup == "ssd"
-        demoted_any = False
-        candidates = [req for req in batch.reqs if is_demotion_candidate(req)]
-        candidates.sort(key=lambda req: req.seqlen, reverse=True)
-        demoted_reqs = []
-        while self.remain_cpu_demote_tokens > 0:
-            if not candidates:
-                break
-
-            victim = candidates.pop(0)
-            victim_index = next(i for i, r in enumerate(batch.reqs) if r is victim)
-            backup_saved = batch.release_req(
-                victim_index,
-                max(0, batch.batch_size() - 1),
-                offload_kv=True,
-                is_demoted=True,
-            )
-            if backup_saved:
-                victim.time_stats.set_retract_time()
-                self.disagg_decode_prealloc_queue.add_demoted_req(victim)
-                demoted_reqs.append(victim)
-                demoted_any = True
-            else:
-                if ssd_retraction:
-                    # L2 staging is exhausted even after reclaim; the victim
-                    # keeps its device KV and stays in the batch. A shorter
-                    # candidate may still fit, so only same-or-longer ones
-                    # leave this wave.
-                    logger.warning(
-                        "Proactive decode demotion backup failed; keeping req=%s "
-                        "in the running batch",
-                        victim.rid,
-                    )
-                    candidates = [c for c in candidates if c.seqlen < victim.seqlen]
-                    continue
-
-                victim.is_demoted = False
-                prepare_abort(
-                    victim,
-                    "Proactive demotion host KV backup failed; request aborted.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                self.output_streamer.stream_output([victim], victim.return_logprob)
-
-            batch.filter_batch(
-                keep_indices=[
-                    index for index, _ in enumerate(batch.reqs) if index != victim_index
-                ]
-            )
-            batch.batch_is_full = False
-            self.new_token_ratio_tracker.current = (
-                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(batch.reqs)
-            )
-            logger.warning(
-                "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
-                victim.rid,
-                victim.seqlen,
-                len(victim.output_ids),
-            )
-            if ssd_retraction and not self._decode_pool_above_demotion_threshold():
-                break
-
-        if demoted_reqs:
-            self.metrics_reporter.num_demoted_reqs += len(demoted_reqs)
-            if self.metrics_reporter.enable_metrics:
-                self.metrics_reporter.metrics_collector.increment_demoted_reqs(
-                    num_demoted_reqs=len(demoted_reqs),
-                    num_demoted_input_tokens=sum(
-                        len(req.origin_input_ids) for req in demoted_reqs
-                    ),
-                    num_demoted_output_tokens=sum(
-                        len(req.output_ids) for req in demoted_reqs
-                    ),
-                )
-
-        return demoted_any
-
-    def resume_demote_reqs(self: Scheduler) -> List[Req]:
-        queue = self.disagg_decode_prealloc_queue
-        if not queue.demotion_queue:
-            return []
-
-        expired_indices = None
-        if self.dp_tp_group.rank_in_group == 0:
-            expired_indices = queue.get_demoted_req_indices_to_resume()
-
-        expired_indices = self.dp_tp_group.broadcast_object(expired_indices, src=0)
-        # SSD admission can evict L2, so every rank applies it after the
-        # leader broadcasts only the time-based eligibility decision.
-        resumed_reqs = queue.resume_demote_reqs(expired_indices)
-        self.waiting_queue.extend(resumed_reqs)
-        return resumed_reqs
-
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        pump_retraction_acks = (
-            get_disagg().disaggregation_decode_retraction_backup == "ssd"
-            and bool(self.tree_cache.retraction_ssd_backups)
-        )
-        if self.enable_decode_hicache or pump_retraction_acks:
+        if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
@@ -3790,13 +3453,6 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-
-        if get_disagg().enable_proactive_decode_demotion:
-            self.resume_demote_reqs()
-
-        if self.need_to_proactive_retract_request():
-            self.proactively_demote_longest_request()
-
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return

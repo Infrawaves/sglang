@@ -222,7 +222,6 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
-        pin: bool = False,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -230,9 +229,6 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
-        # Retraction writes ask the backend to protect these keys from
-        # eviction; ordinary write-through leaves this False.
-        self.pin = pin
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -554,12 +550,11 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # Replicated MLA pages are written by one rank per DCP shard within
-        # each attention-TP replica.
-        # TODO(zhangmj): Revisit writer ownership and load balancing across DCP replicas.
+        # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
-            and self.storage_config.tp_rank >= self.storage_config.dcp_size
+            # todo: load balancing
+            and self.storage_config.tp_rank != 0
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -735,7 +730,6 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
-        parallel = get_parallel()
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -753,10 +747,6 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
-            dcp_rank=parallel.attn_dcp_rank,
-            dcp_size=parallel.attn_dcp_size,
-            attn_dp_rank=parallel.attn_dp_rank,
-            attn_dp_size=parallel.attn_dp_size,
         )
 
     def reset(self):
@@ -1307,9 +1297,7 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(
-                prefix_keys=prefix_keys, pin=operation.pin
-            )
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

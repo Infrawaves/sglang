@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import logging
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
-import msgspec
 import numpy as np
 import torch
 
@@ -34,29 +32,12 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-class RetractionStorageState(Enum):
-    L2_READY = "L2_READY"
-    L3_WRITE_PENDING = "L3_WRITE_PENDING"
-    L3_READY = "L3_READY"
-    L3_WRITE_FAILED = "L3_WRITE_FAILED"
-    DISCARD_PENDING = "DISCARD_PENDING"
-    RELEASED = "RELEASED"
-
-
-class RetractionBackup(msgspec.Struct, kw_only=True):
+class RetractionBackup(NamedTuple):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
-    # SSD retraction metadata.  The host indices remain owned by the backup
-    # until the storage acknowledgement is drained by the scheduler.
-    storage_operation_id: Optional[int] = None
-    storage_hashes: Optional[list[str]] = None
-    storage_state: RetractionStorageState = RetractionStorageState.L2_READY
-    # Cross-rank identity of the storage payload, hashed once at registration
-    # because the keys it covers are immutable from then on.
-    storage_identity: Optional[int] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -261,16 +242,13 @@ def backup_kv_cache(
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
-    if backend not in ("host_pool", "ssd"):
+    if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    if backend == "ssd":
-        req.kv.retraction_backup = unified_cache.retraction_backup_ssd(req)
-    elif backend == "host_pool":
-        req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
     return req.kv.retraction_backup is not None
 
 
@@ -280,25 +258,19 @@ def restore_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
-) -> bool:
-    """Returns False when an SSD L3 read failed and the device KV must be rolled back."""
+) -> None:
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-        return True
-    if backend not in ("host_pool", "ssd"):
+        return
+    if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
-        return True
+        return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    if backend == "ssd":
-        if not unified_cache.retraction_restore_ssd(req, req.kv.retraction_backup):
-            return False
-    elif backend == "host_pool":
-        unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
-    return True
 
 
 def discard_kv_cache_backup(
@@ -306,19 +278,6 @@ def discard_kv_cache_backup(
 ) -> None:
     if backend == "cpu_tensor":
         req.kv.retraction_backup = None
-        return
-    if backend == "ssd":
-        unified_cache = cast("UnifiedRadixCache", tree_cache)
-        backup = req.kv.retraction_backup
-        if backup is not None:
-            unified_cache.retraction_discard_ssd(backup)
-            req.kv.retraction_backup = None
-        if (
-            backup is None
-            or backup.storage_state != RetractionStorageState.DISCARD_PENDING
-        ):
-            # An in-flight write still owns the keys; its ack releases them.
-            unified_cache.release_retraction_l3(req)
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
@@ -333,10 +292,6 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     """Give the request's kv row back; with ``is_insert`` the tree first keeps
     what it can key."""
-    if req.kv.retraction_l3_keys is not None and req.kv.retraction_backup is None:
-        # A retraction sets retraction_backup before releasing, so a bare
-        # release is terminal: the request will never resume from L3.
-        cast("UnifiedRadixCache", tree_cache).release_retraction_l3(req)
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import hashlib
 import logging
 import threading
 import time
@@ -38,27 +37,14 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.common import (
-    RetractionBackup,
-    RetractionStorageState,
-)
-from sglang.srt.mem_cache.hicache_storage import (
-    STORAGE_BATCH_SIZE,
-    HiCacheStorageExtraInfo,
-    PoolName,
-    PoolTransfer,
-    SidecarPoolSpec,
-    count_pool_hits,
-)
+from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    StorageOperation as HybridStorageOperation,
-)
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -147,10 +133,6 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
-
-# Retraction ACK digests are negated to smuggle an equality check through a
-# MIN-only all-reduce, so they must stay strictly inside signed int64.
-_RETRACTION_DIGEST_MASK = (1 << 63) - 1
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -299,16 +281,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
-        # Retraction backups are not radix-tree nodes.  Keep their storage
-        # lifecycle separately so an L3 acknowledgement can release staging
-        # without making the request visible to ordinary prefix matching.
-        self.retraction_ssd_backups: dict[int, RetractionBackup] = {}
-        self.retraction_ssd_requests: dict[int, Req] = {}
-        # Hard-pinned objects whose delete failed; nothing else ever frees
-        # them, so they ride along with the next terminal release.
-        self.retraction_l3_orphans: dict[PoolName, set[str]] = {}
-        # Static, rank-identical predicate used for the SSD ACK collective.
-        self.retraction_storage_enabled = False
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
@@ -419,8 +391,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
-        self.retraction_ssd_backups.clear()
-        self.retraction_ssd_requests.clear()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
 
@@ -1412,18 +1382,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_retraction_backup(self) -> bool:
         if self.cache_controller is None or self.host_pool_group is None:
             return False
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if self.supports_mamba():
-            return (
-                isinstance(kv_cache, HybridLinearKVPool)
-                and not self.supports_swa()
-                and {
-                    PoolName.KV,
-                    PoolName.MAMBA,
-                }
-                <= self.host_pool_group.entry_map.keys()
-            )
+            return False
 
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, SWAKVPool):
             return (
                 self.supports_swa()
@@ -1440,8 +1402,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
-                "--disaggregation-decode-retraction-backup=host_pool or ssd "
-                "requires an MHA, hybrid-SWA, or hybrid-linear HiCache host stack."
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "an MHA or hybrid-SWA HiCache host stack."
             )
 
         for spec in self.sidecar_pool_specs:
@@ -1457,27 +1419,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     f"pool={spec.pool_name}, host_slots={sidecar_size}, "
                     f"source={spec.indices_from_pool}, source_slots={source_size}."
                 )
-
-    def validate_retraction_storage_pin(self) -> None:
-        """Refuse to start when L3 cannot hold demoted KV back from eviction.
-
-        Checked here rather than at write time: a raise from the storage
-        backup thread would escape backup_thread_func, which catches only
-        Empty, killing the thread before it acks and stranding the staging.
-        """
-        if self.cache_controller is None or not self.enable_storage:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd requires an "
-                "attached HiCache storage backend."
-            )
-        backend = self.cache_controller.storage_backend
-        if backend is None or not backend.supports_pin():
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd requires a "
-                "storage backend that can hard-pin keys against its own "
-                f"eviction; backend={type(backend).__name__} cannot. Demoted "
-                "KV would be evictable by unrelated traffic."
-            )
 
     @staticmethod
     def _pad_retraction_indices(indices: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -1523,15 +1464,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             ]
 
-        if self.supports_mamba():
-            assert req.kv.holds_mamba, f"retraction of {req.rid} without a mamba slot"
-            component_transfers[ComponentType.MAMBA] = [
-                PoolTransfer(
-                    name=PoolName.MAMBA,
-                    device_indices=req.kv.mamba_pool_idx.unsqueeze(0).to(torch.int64),
-                )
-            ]
-
         kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_indices)
         extra_transfers = [
             transfer
@@ -1551,75 +1483,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return 0
         return self.evict_host(num_tokens)
-
-    def _host_pool_can_stage(self, pool: Optional[PoolName], need: int) -> bool:
-        if self.host_pool_group.available_size(pool=pool) >= need:
-            return True
-        if pool is None:
-            self._reclaim_retraction_host(need)
-        else:
-            evict = self.host_pool_group.entry_map[pool].host_evict_fn
-            if evict is not None:
-                evict(need)
-        return self.host_pool_group.available_size(pool=pool) >= need
-
-    def retraction_restore_admissible(self, req: Req) -> bool:
-        backup = req.kv.retraction_backup
-        if backup is None:
-            return True
-        if backup.storage_state == RetractionStorageState.L3_WRITE_PENDING:
-            return False
-        if backup.host_indices is not None:
-            return True
-        need = ceil_align(max(0, req.seqlen - 1), self.page_size)
-        if not self._host_pool_can_stage(None, need):
-            return False
-        for transfer in backup.pool_transfers or []:
-            if transfer.indices_from_pool is not None or not transfer.keys:
-                continue
-            entry = self.host_pool_group.entry_map[transfer.name]
-            host_pool = entry.host_pool
-            logical_page_size = (
-                getattr(host_pool, "logical_page_size", None) or host_pool.page_size
-            )
-            side_need = len(transfer.keys) * logical_page_size
-            if not self._host_pool_can_stage(transfer.name, side_need):
-                return False
-        return True
-
-    def _retraction_storage_transfers(
-        self, backup: RetractionBackup, kv_keys: list[str]
-    ) -> list[PoolTransfer]:
-        transfers = backup.pool_transfers or []
-        keys_by_pool: dict[PoolName, list[str]] = {PoolName.KV: kv_keys}
-        for transfer in transfers:
-            if transfer.indices_from_pool is not None:
-                source_keys = keys_by_pool.get(transfer.indices_from_pool)
-                if source_keys is None:
-                    raise ValueError(
-                        f"Retraction pool {transfer.name} references an unknown "
-                        f"source pool {transfer.indices_from_pool}"
-                    )
-                transfer.keys = list(source_keys)
-            else:
-                if transfer.host_indices is None:
-                    raise ValueError(
-                        f"Retraction pool {transfer.name} has no host indices"
-                    )
-                entry = self.host_pool_group.entry_map[transfer.name]
-                host_pool = entry.host_pool
-                pool_page_size = (
-                    getattr(host_pool, "logical_page_size", None) or host_pool.page_size
-                )
-                page_count = len(transfer.host_indices) // pool_page_size
-                if page_count <= 0 or page_count > len(kv_keys):
-                    raise ValueError(
-                        f"Retraction pool {transfer.name} has an invalid page count"
-                    )
-                transfer.keys = list(kv_keys[-page_count:])
-            assert transfer.keys is not None
-            keys_by_pool[transfer.name] = transfer.keys
-        return transfers
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1660,273 +1523,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.discard_kv_cache_backup(backup)
             raise
         return backup
-
-    def retraction_backup_ssd(self, req: Req) -> Optional[RetractionBackup]:
-        """Stage a retraction in L2 and enqueue its asynchronous L3 write.
-
-        The device-to-host copy is completed before this method returns, so the
-        caller may release the device KV immediately.  The host pages remain
-        owned by the returned backup until the ``ack_backup_queue`` operation
-        is drained; that drain is intentionally scheduler-owned.
-        """
-        if (
-            self.host_memory_mode != "cache"
-            or not self.enable_storage
-            or self.cache_controller is None
-        ):
-            return None
-
-        if not self.cache_controller.storage_backend.supports_pin():
-            logger.warning(
-                "Skipping SSD demotion: storage backend %s cannot pin keys "
-                "against eviction.",
-                type(self.cache_controller.storage_backend).__name__,
-            )
-            return None
-
-        backup = self.backup_kv_cache(req)
-        if backup is None or backup.host_indices is None:
-            return None
-
-        valid_tokens = max(0, req.seqlen - 1)
-        token_ids = list(req.origin_input_ids) + list(req.output_ids[:-1])
-        token_ids = token_ids[:valid_tokens]
-        # TODO(zhangmj): no refresh/rewrite on key reuse. Revisit if a backend
-        # without hard pin (TTL-based protection) is ever admitted here.
-        namespace_seed = hashlib.sha256(
-            f"sglang-retraction:{req.rid}".encode()
-        ).hexdigest()
-        # Page-math and pool-layout violations are bugs, not request outcomes:
-        # they propagate. Only the storage enqueue below degrades to a write
-        # failure, which the caller answers by keeping the device KV.
-        try:
-            hashes = self.cache_controller.get_hash_str(
-                token_ids, namespace_seed, page_size=self.page_size
-            )
-            if not isinstance(hashes, list) or len(hashes) * self.page_size < len(
-                backup.host_indices
-            ):
-                raise RuntimeError(
-                    "SSD retraction hash count does not cover the staged KV pages"
-                )
-            hashes = hashes[: len(backup.host_indices) // self.page_size]
-            backup.storage_hashes = hashes
-            storage_transfers = self._retraction_storage_transfers(backup, hashes)
-            # Every key this identity covers is final now; hashing it here
-            # keeps the per-drain digest to an integer fold.
-            backup.storage_identity = self._retraction_storage_identity(backup)
-        except Exception:
-            self._release_retraction_ssd_staging(backup)
-            raise
-
-        operation_id = self.cache_controller.write_storage(
-            host_indices=backup.host_indices,
-            token_ids=[],
-            hash_value=hashes,
-            extra_pools=storage_transfers or None,
-            pin=True,
-        )
-        backup.storage_operation_id = operation_id
-        backup.storage_state = RetractionStorageState.L3_WRITE_PENDING
-        self.retraction_ssd_backups[operation_id] = backup
-        self.retraction_ssd_requests[operation_id] = req
-        self._record_retraction_l3(req, backup)
-        return backup
-
-    def get_retraction_ssd_backup(
-        self, operation_id: int
-    ) -> Optional[RetractionBackup]:
-        return self.retraction_ssd_backups.get(operation_id)
-
-    def _transition_retraction_storage(
-        self,
-        backup: RetractionBackup,
-        *,
-        expected: tuple[RetractionStorageState, ...],
-        target: RetractionStorageState,
-    ) -> bool:
-        if backup.storage_state not in expected:
-            return False
-        backup.storage_state = target
-        return True
-
-    def _retraction_write_succeeded(
-        self, operation: HybridStorageOperation, backup: RetractionBackup
-    ) -> bool:
-        """Validate the complete write result before releasing L2 staging."""
-        if not isinstance(operation, HybridStorageOperation):
-            return False
-        if backup.storage_hashes is None:
-            return False
-        if (
-            not self.cache_controller.backup_skip
-            and operation.completed_tokens
-            != len(backup.storage_hashes) * self.page_size
-        ):
-            return False
-        results = operation.pool_storage_result.extra_pool_hit_pages
-        for transfer in backup.pool_transfers or []:
-            # Replicated MLA data and any other pool not owned by this rank are
-            # neutral votes. A rank-sharded side pool is checked locally.
-            if not self.cache_controller.should_backup(transfer):
-                continue
-            if transfer.keys is None or results.get(transfer.name, 0) != len(
-                transfer.keys
-            ):
-                return False
-        return True
-
-    @staticmethod
-    def _retraction_storage_identity(backup: RetractionBackup) -> int:
-        """Hash a backup's storage payload identity once, at registration."""
-        payload = repr(
-            (
-                tuple(backup.storage_hashes or ()),
-                tuple(
-                    (str(transfer.name), tuple(transfer.keys or ()))
-                    for transfer in backup.pool_transfers or []
-                ),
-            )
-        ).encode("utf-8")
-        return (
-            int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
-            & _RETRACTION_DIGEST_MASK
-        )
-
-    @staticmethod
-    def _retraction_result_digest(
-        records: list[tuple[HybridStorageOperation, Optional[RetractionBackup], bool]],
-    ) -> int:
-        digest = 0
-        for position, (_operation, backup, _ok) in enumerate(records):
-            identity = 0
-            if backup is not None and backup.storage_identity is not None:
-                identity = backup.storage_identity
-            digest = (
-                digest * 1000003 + position * 31 + identity + 1
-            ) & _RETRACTION_DIGEST_MASK
-        return digest
-
-    def _agree_retraction_write_results(
-        self,
-        records: list[tuple[HybridStorageOperation, Optional[RetractionBackup], bool]],
-    ) -> list[bool]:
-        if not records:
-            return []
-        digest = self._retraction_result_digest(records)
-        sync_values = torch.tensor(
-            [int(ok) for _operation, _backup, ok in records] + [digest, -digest],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        self._all_reduce(sync_values, torch.distributed.ReduceOp.MIN)
-        if int(sync_values[-2]) != -int(sync_values[-1]):
-            raise RuntimeError(
-                "SSD retraction ACK order diverged across request-plane ranks"
-            )
-        return [bool(value) for value in sync_values[:-2].tolist()]
-
-    def _release_retraction_l2(self, backup: RetractionBackup) -> None:
-        if backup.host_indices is not None:
-            self.host_pool_group.free(backup.host_indices)
-            backup.host_indices = None
-        transfers = backup.pool_transfers or []
-        self.host_pool_group.release_transfers(transfers)
-        for transfer in transfers:
-            transfer.host_indices = None
-
-    def _release_retraction_ssd_staging(self, backup: RetractionBackup) -> None:
-        try:
-            self._release_retraction_l2(backup)
-        finally:
-            backup.storage_state = RetractionStorageState.RELEASED
-
-    def _record_retraction_l3(self, req: Req, backup: RetractionBackup) -> None:
-        cc = self.cache_controller
-        record = req.kv.retraction_l3_keys
-        if record is None:
-            record = req.kv.retraction_l3_keys = {}
-        if not cc.backup_skip and backup.storage_hashes:
-            record.setdefault(PoolName.KV, set()).update(backup.storage_hashes)
-        for transfer in backup.pool_transfers or []:
-            if transfer.keys and cc.should_backup(transfer):
-                record.setdefault(transfer.name, set()).update(transfer.keys)
-
-    def release_retraction_l3(self, req: Req) -> None:
-        record = req.kv.retraction_l3_keys
-        req.kv.retraction_l3_keys = None
-        if self.cache_controller is None or not self.enable_storage:
-            return
-        pending = self.retraction_l3_orphans
-        self.retraction_l3_orphans = {}
-        for name, keys in (record or {}).items():
-            pending.setdefault(name, set()).update(keys)
-        transfers = [
-            PoolTransfer(name=name, keys=sorted(keys))
-            for name, keys in pending.items()
-            if keys
-        ]
-        if not transfers:
-            return
-        try:
-            failed = self.cache_controller.storage_backend.batch_remove_v2(transfers)
-        except Exception:
-            logger.exception(
-                "SSD retraction L3 cleanup raised; retrying at the next release"
-            )
-            failed = transfers
-        for transfer in failed:
-            if transfer.keys:
-                self.retraction_l3_orphans.setdefault(transfer.name, set()).update(
-                    transfer.keys
-                )
-
-    def _finish_retraction_ssd_backup(self, operation_id: int, success: bool) -> None:
-        """Consume an L3 acknowledgement and release L2 only on success."""
-        backup = self.retraction_ssd_backups.get(operation_id)
-        if backup is None:
-            return
-        if backup.storage_state == RetractionStorageState.DISCARD_PENDING:
-            if not self._transition_retraction_storage(
-                backup,
-                expected=(RetractionStorageState.DISCARD_PENDING,),
-                target=RetractionStorageState.RELEASED,
-            ):
-                return
-            self._release_retraction_l2(backup)
-            req = self.retraction_ssd_requests.get(operation_id)
-            if req is not None:
-                self.release_retraction_l3(req)
-            self.retraction_ssd_backups.pop(operation_id, None)
-            self.retraction_ssd_requests.pop(operation_id, None)
-            return
-        if not success:
-            if not self._transition_retraction_storage(
-                backup,
-                expected=(RetractionStorageState.L3_WRITE_PENDING,),
-                target=RetractionStorageState.L3_WRITE_FAILED,
-            ):
-                return
-            # Keep the complete L2 copy as the recovery fallback. The request
-            # owns this record and releases the staging after restore or abort.
-            req = self.retraction_ssd_requests.get(operation_id)
-            if req is not None:
-                req.kv.retraction_backup = backup
-            self.retraction_ssd_backups.pop(operation_id, None)
-            self.retraction_ssd_requests.pop(operation_id, None)
-            return
-        if not self._transition_retraction_storage(
-            backup,
-            expected=(RetractionStorageState.L3_WRITE_PENDING,),
-            target=RetractionStorageState.L3_READY,
-        ):
-            return
-        self._release_retraction_l2(backup)
-        req = self.retraction_ssd_requests.get(operation_id)
-        if req is not None:
-            req.kv.retraction_backup = backup
-        self.retraction_ssd_backups.pop(operation_id, None)
-        self.retraction_ssd_requests.pop(operation_id, None)
 
     def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
@@ -1973,172 +1569,7 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         completion.finish_event.synchronize()
-        if self.supports_mamba():
-            req.kv.mamba_needs_clear = False
         self.discard_kv_cache_backup(backup)
-
-    def retraction_restore_ssd(self, req: Req, backup: RetractionBackup) -> bool:
-        assert backup.storage_state != RetractionStorageState.L3_WRITE_PENDING, (
-            "SSD retraction restore requested before the L3 write completed; "
-            "retraction_restore_admissible must gate this call"
-        )
-        if backup.host_indices is not None:
-            self.restore_kv_cache(req, backup)
-            backup.storage_state = RetractionStorageState.RELEASED
-            if backup.storage_operation_id is not None:
-                self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
-                self.retraction_ssd_requests.pop(backup.storage_operation_id, None)
-            return True
-        if (
-            not self.enable_storage
-            or self.cache_controller is None
-            or not backup.storage_hashes
-        ):
-            raise RuntimeError("SSD retraction backup is no longer restorable")
-
-        storage_hashes = backup.storage_hashes
-        device_indices, current_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            raise RuntimeError("Insufficient L2 staging capacity for SSD restore")
-
-        # Recreate independent sidecar allocations; transfers derived from KV
-        # share the primary host indices through HostPoolGroup resolution.
-        saved_by_name = {x.name: x for x in backup.pool_transfers or []}
-        restore_transfers: list[PoolTransfer] = []
-        for transfer in current_transfers:
-            saved = saved_by_name.get(transfer.name)
-            if saved is None:
-                # The request's pool layout is static for its lifetime.  Keep
-                # the lookup direct so a configuration change cannot silently
-                # fabricate a sidecar payload.
-                self.host_pool_group.free(host_indices)
-                raise AssertionError(
-                    f"SSD retraction sidecar {transfer.name} is missing"
-                )
-            if transfer.device_indices is None:
-                self.host_pool_group.free(host_indices)
-                raise AssertionError(
-                    f"SSD retraction sidecar {transfer.name} has no device indices"
-                )
-            restore_transfers.append(
-                replace(
-                    transfer,
-                    host_indices=None,
-                    device_indices=torch.empty(
-                        len(transfer.device_indices), dtype=torch.int64
-                    ),
-                    keys=list(saved.keys or []),
-                )
-            )
-        resolved = self.host_pool_group.resolve_host_transfers(
-            restore_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
-        if resolved is None and restore_transfers:
-            self.host_pool_group.free(host_indices)
-            raise RuntimeError("Insufficient sidecar L2 capacity for SSD restore")
-
-        operation = type("_RetractionPrefetch", (), {})()
-        operation.request_id = req.rid
-        operation.is_terminated = lambda: False
-        # Hard pins protect against eviction, but storage reads can still fail.
-        read_ok = True
-        try:
-            with self.host_pool_group.layout_lease():
-                for start in range(0, len(storage_hashes), STORAGE_BATCH_SIZE):
-                    page_hashes = list(
-                        storage_hashes[start : start + STORAGE_BATCH_SIZE]
-                    )
-                    page_host_indices = host_indices[
-                        start * self.page_size : (start + len(page_hashes))
-                        * self.page_size
-                    ]
-                    hit_pages = self.cache_controller.page_get_func(
-                        operation,
-                        page_hashes,
-                        page_host_indices,
-                        HiCacheStorageExtraInfo(),
-                    )
-                    if hit_pages != len(page_hashes):
-                        logger.warning(
-                            "SSD retraction KV read for req=%s returned %d/%d pages; "
-                            "skipping this restore attempt",
-                            req.rid,
-                            hit_pages,
-                            len(page_hashes),
-                        )
-                        read_ok = False
-                        break
-
-                sidecars = [x for x in resolved or [] if x.name != PoolName.KV]
-                if read_ok and sidecars:
-                    results = self.cache_controller.storage_backend.batch_get_v2(
-                        sidecars
-                    )
-                    hit_counts = count_pool_hits(results)
-                    for transfer in sidecars:
-                        expected = len(transfer.keys or [])
-                        if hit_counts.get(transfer.name, 0) != expected:
-                            logger.warning(
-                                "SSD retraction sidecar %s read for req=%s returned "
-                                "%d/%d pages; skipping this restore attempt",
-                                transfer.name,
-                                req.rid,
-                                hit_counts.get(transfer.name, 0),
-                                expected,
-                            )
-                            read_ok = False
-                            break
-
-        except Exception:
-            logger.exception("SSD retraction read failed for req=%s; retrying", req.rid)
-            read_ok = False
-
-        # Every rank must retain its backup until every shard is readable.
-        # Otherwise a successful rank enters decode while another retries.
-        result = torch.tensor([int(read_ok)], dtype=torch.int64, device="cpu")
-        self._all_reduce(result, torch.distributed.ReduceOp.MIN)
-        if not result[0]:
-            self.host_pool_group.free(host_indices)
-            self.host_pool_group.release_transfers(resolved)
-            return False
-
-        staged = RetractionBackup(
-            host_indices=host_indices,
-            pool_transfers=resolved,
-            storage_hashes=storage_hashes,
-            storage_state=RetractionStorageState.L2_READY,
-        )
-        self.restore_kv_cache(req, staged)
-        # The L3 objects outlive this resume: see _record_retraction_l3.
-        backup.storage_state = RetractionStorageState.RELEASED
-        if backup.storage_operation_id is not None:
-            self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
-            self.retraction_ssd_requests.pop(backup.storage_operation_id, None)
-        return True
-
-    def retraction_discard_ssd(self, backup: RetractionBackup) -> None:
-        """Release retained L2 staging for an SSD retraction backup."""
-        if backup.storage_operation_id is not None:
-            if self._transition_retraction_storage(
-                backup,
-                expected=(RetractionStorageState.L3_WRITE_PENDING,),
-                target=RetractionStorageState.DISCARD_PENDING,
-            ):
-                self.retraction_ssd_backups[backup.storage_operation_id] = backup
-                return
-            if backup.storage_state == RetractionStorageState.DISCARD_PENDING:
-                return
-        self._release_retraction_l2(backup)
-        backup.storage_state = RetractionStorageState.RELEASED
-        if backup.storage_operation_id is not None:
-            self.retraction_ssd_backups.pop(backup.storage_operation_id, None)
-            self.retraction_ssd_requests.pop(backup.storage_operation_id, None)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
@@ -3390,8 +2821,6 @@ class UnifiedRadixCache(BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
-        synchronize_retraction_results: bool = True,
-        retraction_writes_pending: bool = True,
     ) -> None:
         cc = self.cache_controller
 
@@ -3625,69 +3054,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
-            operations = None
-            retraction_results = None
-            if self.retraction_storage_enabled and retraction_writes_pending:
-                records: list[
-                    tuple[HybridStorageOperation, Optional[RetractionBackup], bool]
-                ] = []
-                operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
-                for operation in operations:
-                    backup = self.retraction_ssd_backups.get(operation.id)
-                    if backup is None:
-                        records.append((operation, None, True))
-                    elif not synchronize_retraction_results:
-                        # Local detach has no request-plane agreement. A pending
-                        # retraction is therefore made discard-only before cleanup.
-                        if (
-                            backup.storage_state
-                            == RetractionStorageState.L3_WRITE_PENDING
-                        ):
-                            backup.storage_state = (
-                                RetractionStorageState.DISCARD_PENDING
-                            )
-                        records.append((operation, backup, True))
-                    else:
-                        records.append(
-                            (
-                                operation,
-                                backup,
-                                self._retraction_write_succeeded(operation, backup),
-                            )
-                        )
-
-                if synchronize_retraction_results:
-                    agreed = self._agree_retraction_write_results(records)
-                else:
-                    # Detach releases staging rather than committing an L3
-                    # handoff, so every pending retraction resolves as a
-                    # failure regardless of its local outcome.
-                    agreed = [False] * len(records)
-
-                retraction_results = {
-                    operation.id: agreed[index]
-                    for index, (operation, backup, _local_ok) in enumerate(records)
-                    if backup is not None
-                }
-
             drained = 0
-            for operation in (
-                operations
-                if operations is not None
-                else _drain_queue(cc.ack_backup_queue, n_backup)
-            ):
+            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
-                if (
-                    retraction_results is not None
-                    and operation.id in retraction_results
-                ):
-                    # Retraction staging is owned by the request lifecycle, so
-                    # this consumes the ACK and skips the ordinary radix
-                    # cleanup below -- there is no tree lock to drop.
-                    self._finish_retraction_ssd_backup(
-                        operation.id, retraction_results[operation.id]
-                    )
-                elif buffer_mode:
+                if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
                 else:
@@ -3755,20 +3125,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 for pool_name in extra_pool_names
             ],
         ]
-
-        retraction_slot = (
-            [-int(bool(self.retraction_ssd_backups))]
-            if self.retraction_storage_enabled
-            else []
+        qsizes = torch.tensor(
+            local_qsize_list,
+            dtype=torch.int,
         )
-        qsizes = torch.tensor(local_qsize_list + retraction_slot, dtype=torch.int)
         self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
-        extra_end = len(qsize_list) - len(retraction_slot)
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:extra_end])
+            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
         }
         self._drain_storage_control_queues_impl(
             n_storage_hit=n_storage_hit,
@@ -3777,7 +3143,6 @@ class UnifiedRadixCache(BasePrefixCache):
             n_release=n_release,
             extra_release_counts=extra_release_counts,
             log_metrics=True,
-            retraction_writes_pending=bool(retraction_slot and -qsize_list[-1]),
         )
 
     def drain_storage_control_queues_local(self) -> None:
@@ -3802,7 +3167,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 name: None for name in cc.extra_host_mem_release_queues
             },
             log_metrics=False,
-            synchronize_retraction_results=False,
         )
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
@@ -3863,7 +3227,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _sync_hicache_ready_counts(
         self,
-    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...], bool]:
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
@@ -3894,18 +3258,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
-
-        retraction_slot = (
-            [-int(bool(self.retraction_ssd_backups))]
-            if self.retraction_storage_enabled
-            else []
-        )
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
-                *retraction_slot,
                 digest,
                 -digest,
             ],
@@ -3921,13 +3278,11 @@ class UnifiedRadixCache(BasePrefixCache):
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
-        tail = 2 + len(retraction_slot)
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2 : len(count_values) - tail]),
+            tuple(count_values[2:-2]),
             extra_pool_names,
-            bool(retraction_slot and -count_values[-3]),
         )
 
     def writing_check(
@@ -4125,7 +3480,6 @@ class UnifiedRadixCache(BasePrefixCache):
             load_finish_count,
             storage_queue_sizes,
             extra_pool_names,
-            retraction_writes_pending,
         ) = self._sync_hicache_ready_counts()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
@@ -4143,7 +3497,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 n_release=n_release,
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
-                retraction_writes_pending=retraction_writes_pending,
             )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()

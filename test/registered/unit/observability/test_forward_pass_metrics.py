@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 import prometheus_client
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
@@ -368,8 +367,7 @@ class TestIdleMetrics(CustomTestCase):
             ),
         )
 
-    def test_decode_queue_metrics_survive_queue_drain(self):
-        """Idle reports must clear drained queue gauges and old priority labels."""
+    def test_host_receive_metrics_survive_queue_drain(self):
         registry = prometheus_client.CollectorRegistry()
         labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
         sample_labels = {key: str(value) for key, value in labels.items()}
@@ -387,21 +385,7 @@ class TestIdleMetrics(CustomTestCase):
         self.reporter.current_scheduler_metrics_enabled = True
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
-        self.scheduler.max_total_num_tokens = 100
-        self.scheduler.remain_cpu_demote_tokens = 100
-        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        prealloc_queue.scheduler = self.scheduler
-        prealloc_queue.queue = []
-        prealloc_queue.demotion_queue = []
-        prealloc_queue.demoted_tokens_total = 0
-        # An SWA reservation limit must not change the demotion budget's denominator.
-        prealloc_queue.max_total_num_tokens = 50
-        self.scheduler.disagg_decode_prealloc_queue = prealloc_queue
-        for priority, seqlen in ((1, 30), (3, 20)):
-            prealloc_queue.add_demoted_req(
-                types.SimpleNamespace(priority=priority, seqlen=seqlen, output_ids=[]),
-                demoted_start_time=0.0,
-            )
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)
             for priority in (1, 2)
@@ -415,16 +399,7 @@ class TestIdleMetrics(CustomTestCase):
         with get_context().override_server_args(
             disaggregation_decode_host_receive_threshold=0.8
         ):
-            for waiting, drain_count, demotion_counts, cache_usage in (
-                (True, 0, (2, 1, 1), 0.5),
-                (True, 1, (1, 0, 1), 0.2),
-                (False, 1, (0, 0, 0), 0.0),
-            ):
-                prealloc_queue.demoted_tokens_total -= sum(
-                    entry.demoted_tokens
-                    for entry in prealloc_queue.demotion_queue[:drain_count]
-                )
-                del prealloc_queue.demotion_queue[:drain_count]
+            for waiting in (True, False):
                 for req in host_reqs:
                     req.host_staged = waiting
                 with patch(
@@ -440,20 +415,6 @@ class TestIdleMetrics(CustomTestCase):
                         ),
                         expected if waiting else 0,
                     )
-                for priority, expected in zip(("", "1", "3"), demotion_counts):
-                    self.assertEqual(
-                        registry.get_sample_value(
-                            "sglang:num_demotion_queue_reqs",
-                            {**sample_labels, "priority": priority},
-                        ),
-                        expected,
-                    )
-                self.assertEqual(
-                    registry.get_sample_value(
-                        "sglang:demotion_queue_cache_usage", sample_labels
-                    ),
-                    cache_usage,
-                )
                 self.assertEqual(
                     registry.get_sample_value(
                         "sglang:num_decode_host_receive_reqs_total", sample_labels

@@ -90,46 +90,13 @@ class Disagg(msgspec.Struct):
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
-                "'ssd' uses HiCache L2 staging and persists backups in L3 storage. "
                 "'none' keeps no backup: a retracted request is aborted with "
                 "503 for the client to retry. "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool", "ssd", "none"],
+            choices=["cpu_tensor", "host_pool", "none"],
         ),
     ] = None
-    enable_proactive_decode_demotion: A[
-        bool,
-        "Enable scheduler-local proactive decode demotion of short-input, long-output requests under cache pressure.",
-    ] = False
-    proactive_decode_demotion_output_len_threthold: A[
-        int,
-        "P95/P50 output-length ratio gate; unused by the fixed-rule demotion path.",
-    ] = 8
-    proactive_decode_demotion_cache_usage: A[
-        float,
-        "KV pool usage ratio that enables proactive decode demotion.",
-    ] = 0.70
-    proactive_safe_cpu_demote_cache_usage: A[
-        float,
-        "Total KV that proactive demotion may keep offloaded to CPU, as a ratio of the GPU KV pool size.",
-    ] = 0.2
-    candidate_demotion_output_len_threthold: A[
-        float,
-        "Output-length multiplier over P50; unused by the fixed-rule demotion path.",
-    ] = 2.0
-    proactive_demotion_max_input_len: A[
-        int,
-        "Maximum input length in tokens for a proactive demotion candidate.",
-    ] = 4096
-    proactive_demotion_min_output_len: A[
-        int,
-        "Minimum generated output length in tokens for a proactive demotion candidate.",
-    ] = 8192
-    proactive_demotion_recovery_duration: A[
-        float,
-        "Minimum seconds a proactively demoted request stays offloaded.",
-    ] = 180.0
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",

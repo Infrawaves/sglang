@@ -128,7 +128,6 @@ class SchedulerStats:
 
     # Retract
     num_retracted_reqs: int = 0
-    num_demoted_reqs: int = 0
     num_paused_reqs: int = 0
 
     # PD disaggregation
@@ -140,8 +139,6 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
-    num_demotion_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    demotion_queue_cache_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -490,35 +487,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of retracted output tokens.",
             labelnames=labels.keys(),
         )
-        self.num_demoted_reqs = Gauge(
-            name="sglang:num_demoted_reqs",
-            documentation="The number of proactively demoted requests.",
-            labelnames=labels.keys(),
-        )
-        self.num_demoted_reqs_total = Counter(
-            name="sglang:num_demoted_requests_total",
-            documentation="Total number of proactively demoted requests.",
-            labelnames=labels.keys(),
-        )
-        self.num_demoted_input_tokens_total = Counter(
-            name="sglang:num_demoted_input_tokens_total",
-            documentation=(
-                "Total number of input tokens in proactively demoted requests."
-            ),
-            labelnames=labels.keys(),
-        )
-        self.num_demoted_output_tokens_total = Counter(
-            name="sglang:num_demoted_output_tokens_total",
-            documentation=(
-                "Total number of output tokens in proactively demoted requests."
-            ),
-            labelnames=labels.keys(),
-        )
-        self.num_demotion_resume_failures_total = Counter(
-            name="sglang:num_demotion_resume_failures_total",
-            documentation="Total number of failed proactive demotion resume attempts.",
-            labelnames=labels.keys(),
-        )
         self.num_paused_reqs = Gauge(
             name="sglang:num_paused_reqs",
             documentation="The number of paused requests by async weight sync.",
@@ -578,21 +546,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.num_demotion_queue_reqs = Gauge(
-            name="sglang:num_demotion_queue_reqs",
-            documentation="The number of requests currently in the demotion queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.demotion_queue_cache_usage = Gauge(
-            name="sglang:demotion_queue_cache_usage",
-            documentation=(
-                "KV tokens of all demoted requests across storage tiers as a "
-                "fraction of GPU KV capacity; values may exceed 1."
-            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1322,23 +1275,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             num_retracted_output_tokens
         )
 
-    def increment_demoted_reqs(
-        self,
-        num_demoted_reqs: int,
-        num_demoted_input_tokens: int,
-        num_demoted_output_tokens: int,
-    ) -> None:
-        self.num_demoted_reqs_total.labels(**self.labels).inc(num_demoted_reqs)
-        self.num_demoted_input_tokens_total.labels(**self.labels).inc(
-            num_demoted_input_tokens
-        )
-        self.num_demoted_output_tokens_total.labels(**self.labels).inc(
-            num_demoted_output_tokens
-        )
-
-    def increment_demotion_resume_failures(self, value: int = 1) -> None:
-        self.num_demotion_resume_failures_total.labels(**self.labels).inc(value)
-
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
@@ -1477,7 +1413,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
-        self._log_gauge(self.num_demoted_reqs, stats.num_demoted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
 
         # PD disaggregation
@@ -1500,12 +1435,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
-        )
-        self._log_gauge_queue_count(
-            self.num_demotion_queue_reqs, stats.num_demotion_queue_reqs
-        )
-        self._log_gauge(
-            self.demotion_queue_cache_usage, stats.demotion_queue_cache_usage
         )
 
         # Utilization

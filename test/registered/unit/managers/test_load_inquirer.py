@@ -80,7 +80,6 @@ class TestContextLengthLoad(CustomTestCase):
         prealloc=(),
         transfer=(),
         retracted=(),
-        demotion=(),
         bootstrap=(),
         mode=DisaggregationMode.DECODE,
         method="context_bucket",
@@ -119,7 +118,6 @@ class TestContextLengthLoad(CustomTestCase):
             get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(
                 queue=prealloc,
                 retracted_queue=retracted,
-                demotion_queue=[SimpleNamespace(req=req) for req in demotion],
             ),
             get_disagg_decode_transfer_queue=lambda: SimpleNamespace(queue=transfer),
             get_spec_total_num_accept_tokens=lambda: 0,
@@ -150,13 +148,13 @@ class TestContextLengthLoad(CustomTestCase):
             return inquirer.get_loads()
 
     def test_decode_counts_each_lifecycle_queue_once(self):
-        lengths = [8192, 8193, 16385, 32769, 65537, 131073]
-        queues = ("running", "waiting", "prealloc", "transfer", "retracted", "demotion")
+        lengths = [8192, 8193, 16385, 32769, 65537]
+        queues = ("running", "waiting", "prealloc", "transfer", "retracted")
         inquirer = self.make_inquirer(
             **{queue: [self.req(length)] for queue, length in zip(queues, lengths)}
         )
         load = self.get_loads(inquirer)
-        self.assertEqual(load.context_length_histogram, [1, 1, 1, 1, 1, 1, 0, 0, 0])
+        self.assertEqual(load.context_length_histogram, [1, 1, 1, 1, 1, 0, 0, 0, 0])
         self.assertEqual(load.num_context_tokens, sum(lengths))
         self.assertEqual(sum(load.context_length_histogram), 6)
         self.assertEqual(load.num_running_reqs + load.num_waiting_reqs, 6)

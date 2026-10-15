@@ -76,7 +76,7 @@ def prepare_hicache_staging(
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
         memory.enable_hierarchical_cache
-        or get_disagg().disaggregation_decode_retraction_backup in ("host_pool", "ssd")
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
         return
 
@@ -181,14 +181,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     unified_decode_radix = (
         memory.enable_unified_memory and disagg.disaggregation_decode_enable_radix_cache
     )
-    if backend in ("host_pool", "ssd") and unified_decode_radix:
+    if backend == "host_pool" and unified_decode_radix:
         raise ValueError(
-            f"Unified-memory H2D/D2H does not support {backend} decode "
+            "Unified-memory H2D/D2H does not support host-pool decode "
             "retraction with decode radix cache yet."
         )
-    if backend in ("host_pool", "ssd") and unified_hybrid_swa:
+    if backend == "host_pool" and unified_hybrid_swa:
         raise ValueError(
-            f"Unified-memory hybrid-SWA H2D/D2H does not support {backend} "
+            "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "
             "decode retraction yet."
         )
     if backend is None:
@@ -215,21 +215,22 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
         )
-        # TODO(zhangmj): maintain host_pool for priority scheduling, but need
-        # to disable when disable hicache.
+        schedule = get_schedule()
+        priority_preemption = (
+            schedule.enable_priority_scheduling
+            and not schedule.disable_priority_preemption
+        )
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
-            # Unified MHA pools pass the isinstance checks below but hand out
-            # virtual slots the host transfer never translates.
-            and not memory.enable_unified_memory
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
             and not disagg.disaggregation_decode_enable_offload_kvcache
+            and not priority_preemption
             and supports_host_pool
             else "cpu_tensor"
         )
@@ -398,28 +399,25 @@ def build_kv_cache(
     with auto_size_hicache(
         params,
         hicache_draft_plan,
-        enabled=enable_hierarchical_cache or retraction_backup in ("host_pool", "ssd"),
+        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
     ):
         tree_cache = create_tree_cache(tree_context)
 
         if (
-            enable_hierarchical_cache or retraction_backup in ("host_pool", "ssd")
+            enable_hierarchical_cache or retraction_backup == "host_pool"
         ) and hicache_draft_plan is not None:
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
             )
 
-    if retraction_backup in ("host_pool", "ssd"):
+    if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):
             raise ValueError(
-                "--disaggregation-decode-retraction-backup host_pool/ssd requires "
+                "--disaggregation-decode-retraction-backup=host_pool requires "
                 "UnifiedRadixCache with HiCache attached."
             )
-        tree_cache.retraction_storage_enabled = retraction_backup == "ssd"
         tree_cache.validate_retraction_host_capacity()
-        if retraction_backup == "ssd":
-            tree_cache.validate_retraction_storage_pin()
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

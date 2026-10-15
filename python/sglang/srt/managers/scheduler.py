@@ -299,7 +299,6 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
-from sglang.srt.observability.decode_metric_collector import DecodeMetricCollector
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -598,10 +597,7 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        if (
-            self.enable_hierarchical_cache
-            or get_disagg().disaggregation_decode_retraction_backup == "ssd"
-        ):
+        if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
@@ -1524,9 +1520,6 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
-        self.decode_metric_collector = None
-        self.if_output_len_imbalance = False
-        self.remain_cpu_demote_tokens = 0
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1623,14 +1616,6 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
-            if get_disagg().enable_proactive_decode_demotion:
-                self.decode_metric_collector = DecodeMetricCollector()
-                # Fixed demotion CPU offload budget in tokens
-                # Never spent under ssd: admission is the L2 allocation itself.
-                self.remain_cpu_demote_tokens = int(
-                    self.server_args.proactive_safe_cpu_demote_cache_usage
-                    * self.max_total_num_tokens
-                )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -4938,8 +4923,6 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
-            if self.decode_metric_collector is not None:
-                self.decode_metric_collector.observe_batch_output_lengths(batch.reqs)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -5062,30 +5045,14 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if not (self.enable_hierarchical_cache or self.enable_lmcache):
+        if self.enable_hierarchical_cache or self.enable_lmcache:
+            self.tree_cache.clear_storage_backend()
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
+            if_success = True
+        else:
             logging.warning("Hierarchical cache or LMCache is not enabled.")
-            return ClearHiCacheReqOutput(success=False)
-        if (
-            get_disagg().disaggregation_decode_retraction_backup == "ssd"
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and (
-                self.disagg_decode_prealloc_queue.retracted_queue
-                or self.disagg_decode_prealloc_queue.demotion_queue
-                or self.tree_cache.retraction_ssd_backups
-            )
-        ):
-            # L3 holds the only KV copy of every demoted or retracted request;
-            # clearing it now would make them unrestorable.
-            logger.warning(
-                "Refusing to clear HiCache storage: %d retracted and %d demoted "
-                "requests still hold their KV in L3.",
-                len(self.disagg_decode_prealloc_queue.retracted_queue),
-                len(self.disagg_decode_prealloc_queue.demotion_queue),
-            )
-            return ClearHiCacheReqOutput(success=False)
-        self.tree_cache.clear_storage_backend()
-        logger.info("Hierarchical cache or LMCache cleared successfully!")
-        return ClearHiCacheReqOutput(success=True)
+            if_success = False
+        return ClearHiCacheReqOutput(success=if_success)
 
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
@@ -5224,7 +5191,6 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-            idle &= len(self.disagg_decode_prealloc_queue.demotion_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -5237,12 +5203,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.demotion_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-                if get_disagg().disaggregation_decode_retraction_backup == "ssd":
-                    idle &= not self.tree_cache.retraction_ssd_backups
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -5804,39 +5767,6 @@ class Scheduler(
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
-            if self.disagg_decode_prealloc_queue.demotion_queue:
-                remaining_demoted = []
-                for entry in self.disagg_decode_prealloc_queue.demotion_queue:
-                    req = entry.req
-                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        if (
-                            get_disagg().disaggregation_decode_retraction_backup
-                            != "ssd"
-                        ):
-                            self.remain_cpu_demote_tokens += entry.demoted_tokens
-                        self.disagg_decode_prealloc_queue.demoted_tokens_total -= (
-                            entry.demoted_tokens
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(req), req
-                        )
-                    else:
-                        remaining_demoted.append(entry)
-                self.disagg_decode_prealloc_queue.demotion_queue = remaining_demoted
-                resume_failure_cnt = getattr(
-                    self.disagg_decode_prealloc_queue, "resume_failure_cnt", {}
-                )
-                self.disagg_decode_prealloc_queue.resume_failure_cnt = {
-                    entry.req.rid: resume_failure_cnt[entry.req.rid]
-                    for entry in remaining_demoted
-                    if entry.req.rid in resume_failure_cnt
-                }
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

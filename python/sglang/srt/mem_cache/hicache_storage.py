@@ -40,11 +40,6 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
-    # Effective attention topology used to scope DCP/DP storage objects.
-    dcp_rank: int = 0
-    dcp_size: int = 1
-    attn_dp_rank: int = 0
-    attn_dp_size: int = 1
 
 
 @dataclass
@@ -53,8 +48,6 @@ class HiCacheStorageExtraInfo:
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
-    # Hard pin in L3 storage
-    pin: bool = False
 
 
 class PoolName(str, Enum):
@@ -351,12 +344,6 @@ class HiCacheStorage(ABC):
 
     def get_stats(self):
         return None
-
-    def supports_pin(self) -> bool:
-        return False
-
-    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> List[PoolTransfer]:
-        raise NotImplementedError
 
 
 class MetadataCache:

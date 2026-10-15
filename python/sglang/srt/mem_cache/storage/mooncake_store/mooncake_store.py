@@ -31,10 +31,6 @@ DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
 
-# mooncake-store/include/types.h ErrorCode::OBJECT_NOT_FOUND, as the Python
-# binding's batch_remove returns it.
-_MOONCAKE_OBJECT_NOT_FOUND = -704
-
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
@@ -300,21 +296,6 @@ class MooncakeBaseStore:
                 supports_group_ids = False
         return ReplicateConfig, supports_group_ids
 
-    @staticmethod
-    def _import_mooncake_hard_pin() -> bool:
-        try:
-            from mooncake.store import ReplicateConfig
-        except ImportError:
-            return False
-        # pybind def_readwrite fields answer hasattr on the class; fall back to
-        # an instance for builds that only expose them per object.
-        probes = [ReplicateConfig]
-        try:
-            probes.append(ReplicateConfig())
-        except Exception:
-            pass
-        return any(hasattr(probe, "with_hard_pin") for probe in probes)
-
     def _load_config(self, storage_config: Any = None):
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
@@ -354,40 +335,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-    @staticmethod
-    def _build_key_suffixes(
-        local_rank: int,
-        pp_rank: int,
-        enable_pp: bool,
-        dcp_rank: int = 0,
-        dcp_size: int = 1,
-        attn_dp_rank: int = 0,
-        attn_dp_size: int = 1,
-    ) -> Tuple[str, str]:
-        """Build Mamba and MLA suffixes for one effective attention rank."""
-        pp_suffix = f"{pp_rank}" if enable_pp else ""
-        dp_suffix = (
-            f"dp{attn_dp_rank}_{attn_dp_size}"
-            if dcp_size > 1 and attn_dp_size > 1
-            else ""
-        )
-        dcp_suffix = f"dcp{dcp_rank}_{dcp_size}" if dcp_size > 1 else ""
-
-        mha_parts = [f"{local_rank}"]
-        if enable_pp:
-            mha_parts.append(pp_suffix)
-        if dp_suffix:
-            mha_parts.append(dp_suffix)
-
-        mla_parts = []
-        if pp_suffix:
-            mla_parts.append(pp_suffix)
-        if dp_suffix:
-            mla_parts.append(dp_suffix)
-        if dcp_suffix:
-            mla_parts.append(dcp_suffix)
-        return "_".join(mha_parts), "_".join(mla_parts)
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -461,7 +408,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and self._supports_group_ids
                 and self._replicate_config_cls is not None
             )
-            self._supports_hard_pin = self._import_mooncake_hard_pin()
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
@@ -636,10 +582,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
                 self.attn_cp_size = storage_config.attn_cp_size
-                dcp_rank = storage_config.dcp_rank
-                dcp_size = storage_config.dcp_size
-                attn_dp_rank = storage_config.attn_dp_rank
-                attn_dp_size = storage_config.attn_dp_size
                 self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
@@ -648,21 +590,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
-                dcp_rank = 0
-                dcp_size = 1
-                attn_dp_rank = 0
-                attn_dp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            self.mha_suffix, self.mla_suffix = self._build_key_suffixes(
-                self.local_rank,
-                self.pp_rank,
-                self.enable_pp,
-                dcp_rank,
-                dcp_size,
-                attn_dp_rank,
-                attn_dp_size,
-            )
+            if self.enable_pp:
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mla_suffix = f"{self.pp_rank}"
+            else:
+                self.mha_suffix = f"{self.local_rank}"
+                self.mla_suffix = ""
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -673,18 +608,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                self.mha_suffix = [
-                    self._build_key_suffixes(
-                        rank,
-                        self.pp_rank,
-                        self.enable_pp,
-                        dcp_rank,
-                        dcp_size,
-                        attn_dp_rank,
-                        attn_dp_size,
-                    )[0]
-                    for rank in target_ranks
-                ]
+                if self.enable_pp:
+                    self.mha_suffix = [
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                    ]
+                else:
+                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
 
@@ -993,12 +922,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(
-        self,
-        transfers: List[PoolTransfer],
-        is_set: bool,
-        pin: bool = False,
-    ):
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -1006,12 +930,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
-            logical_page_size = (
-                getattr(host_pool, "logical_page_size", None) or page_size
-            )
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == len(host_indices) // logical_page_size
+            assert len(keys) == len(host_indices) // page_size
 
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
@@ -1039,7 +960,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                         self._filter_group_ids(group_ids, missing_idx),
-                        pin=pin,
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
@@ -1064,11 +984,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(
-            transfers,
-            is_set=True,
-            pin=extra_info is not None and extra_info.pin,
-        )
+        return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1133,11 +1049,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        page_size = getattr(self.mem_pool_host, "page_size", 1) or 1
-        logical_page_size = (
-            getattr(self.mem_pool_host, "logical_page_size", None) or page_size
-        )
-        assert len(keys) == len(host_indices) // logical_page_size
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1250,7 +1162,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_buffer_ptrs,
                 set_buffer_sizes,
                 self._filter_group_ids(group_ids, set_indices),
-                pin=extra_info is not None and extra_info.pin,
             )
             end_time = time.perf_counter()
 
@@ -1422,66 +1333,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # it is unnecessary to close it manually.
         pass
 
-    def _primary_page_object_keys(self, keys: List[str]) -> List[str]:
-        """Object keys behind logical primary-KV page keys."""
-        if self.mem_pool_host.kv_buffer is None:
-            return []
-        object_keys: List[str] = []
-        for key in keys:
-            if self.is_mla_backend:
-                object_keys.append(f"{key}_{self.mla_suffix}_k")
-            elif self.should_split_heads:
-                for suffix in self.mha_suffix:
-                    object_keys.append(f"{key}_{suffix}_k")
-                    object_keys.append(f"{key}_{suffix}_v")
-            else:
-                object_keys.append(f"{key}_{self.mha_suffix}_k")
-                object_keys.append(f"{key}_{self.mha_suffix}_v")
-        return object_keys
-
-    def batch_remove_v2(self, transfers: List[PoolTransfer]) -> List[PoolTransfer]:
-        object_keys: List[str] = []
-        # Logical (pool, key) owner of each object key, for the failure report.
-        owners: List[Tuple[PoolName, str]] = []
-        for transfer in transfers:
-            keys = transfer.keys or []
-            if not keys:
-                continue
-            if transfer.name == PoolName.KV:
-                expanded = self._primary_page_object_keys(keys)
-            else:
-                expanded, _ = self._get_hybrid_page_component_keys(keys, transfer)
-            # Both expansions are page-major with a fixed fan-out per key.
-            fan_out = len(expanded) // len(keys)
-            object_keys.extend(self._tag_keys(expanded))
-            owners.extend((transfer.name, key) for key in keys for _ in range(fan_out))
-        if not object_keys:
-            return []
-        # force=True: the restore read that just finished granted these objects
-        # a fresh lease, and the keys are private to one request.
-        results = self.store.batch_remove(object_keys, True)
-        failed: dict[PoolName, set[str]] = {}
-        for (name, key), status in zip(owners, results):
-            # Pages a failed write never landed report not-found; nothing is
-            # pinned there, so only a present-but-undeletable object fails.
-            if status in (0, _MOONCAKE_OBJECT_NOT_FOUND):
-                continue
-            failed.setdefault(name, set()).add(key)
-        if failed:
-            logger.info(
-                "Retraction L3 cleanup: %d hard-pinned keys not removed; "
-                "retrying at the next release.",
-                sum(len(keys) for keys in failed.values()),
-            )
-        return [
-            PoolTransfer(name=name, keys=sorted(keys)) for name, keys in failed.items()
-        ]
-
     def clear(self) -> None:
         self.store.remove_all()
-
-    def supports_pin(self) -> bool:
-        return self._supports_hard_pin
 
     def _put_batch_zero_copy_impl(
         self,
@@ -1489,8 +1342,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
-        *,
-        pin: bool = False,
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1501,17 +1352,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
-
-        if pin:
-            # No support check here on purpose: callers must not ask for a pin
-            # this backend cannot give, so there is deliberately no
-            # write-anyway-unpinned path. Retraction checks supports_pin()
-            # before it stages.
-            #
-            # Hard pin: every eviction pass skips the object, so a full store
-            # fails this put instead of dropping a demoted request's only copy.
-            config = config or self._replicate_config_cls()
-            config.with_hard_pin = True
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()

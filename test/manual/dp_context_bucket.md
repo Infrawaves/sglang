@@ -48,8 +48,8 @@ request-count rule to send subsequent long requests back to it.
 
 The reported context sum counts each request's full context, including shared
 prefixes. It measures neither allocated KV blocks nor predicted remaining output.
-The counted queues are waiting, Decode preallocation, transfer, retraction and
-demotion; grammar compilation and paused requests are not included.
+The counted queues are waiting, Decode preallocation, transfer and retraction;
+grammar compilation and paused requests are not included.
 
 Running at batch 128 does not prevent a rank from receiving another request:
 the existing scheduler queues handle admission. No extra global queue, reordering

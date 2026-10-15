@@ -117,7 +117,6 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -945,10 +944,6 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
-    # L3 objects this rank wrote for the request across demotions (ssd backup).
-    # They stay hard-pinned until the request finishes so a re-demotion only
-    # writes new pages; release_kv_cache drops them on the terminal release.
-    retraction_l3_keys: Optional[dict[PoolName, set[str]]] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -1068,9 +1063,6 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
-        # Output length at the last proactive demotion; re-demotion requires
-        # another proactive_demotion_min_output_len tokens on top of this.
-        self.last_demote_output_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1235,8 +1227,6 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
-        # Indicates if the req has ever been demoted.
-        self.is_demoted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1983,11 +1973,10 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
-    def reset_for_retract(self, *, is_demoted: bool = False):
-        # A proactive demotion shares the resource reset below but remains
-        # distinct from an ordinary retraction in request state and metadata.
-        if not is_demoted:
-            self.retraction_count += 1
+    def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -2001,10 +1990,7 @@ class Req(ReqDllmMixin):
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
-        if is_demoted:
-            self.is_demoted = True
-        else:
-            self.is_retracted = True
+        self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
@@ -2274,7 +2260,6 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    is_demoted: bool = False,
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
@@ -2294,20 +2279,13 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
-        # Should not demote request when the KV backup failed.
-        if (
-            is_demoted
-            and not backup_saved
-            and get_disagg().disaggregation_decode_retraction_backup == "ssd"
-        ):
-            return False
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    req.reset_for_retract(is_demoted=is_demoted)
+    req.reset_for_retract()
     return backup_saved
 
 
@@ -3467,7 +3445,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         idx: int,
         remaing_req_count: int,
         offload_kv: bool = True,
-        is_demoted: bool = False,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3477,7 +3454,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
-            is_demoted=is_demoted,
         )
 
     def prepare_encoder_info_decode(self):

@@ -351,50 +351,18 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
 def handle_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if (
-        cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
+        cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.disaggregation_mode != "decode"
     ):
         raise ValueError(
-            f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
-            "is only supported on a PD decode server."
+            "--disaggregation-decode-retraction-backup=host_pool is only "
+            "supported on a PD decode server."
         )
-    backup = cfg.disaggregation_decode_retraction_backup
-    if backup == "host_pool" and cfg.dcp_size > 1:
+    if cfg.disaggregation_decode_retraction_backup == "host_pool" and cfg.dcp_size > 1:
         raise ValueError(
             "--disaggregation-decode-retraction-backup=host_pool does not "
             "support --dcp-size > 1."
         )
-    if backup == "ssd" and cfg.dcp_size > 1:
-        if not use_mla_backend(server_args):
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd with DCP "
-                "requires an MLA-family model."
-            )
-        if not model_config_of(server_args).is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd with DCP "
-                "requires the supported MLA hybrid retraction stack; pure "
-                "MLA is not supported."
-            )
-        if cfg.hicache_storage_backend != "mooncake":
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd with DCP "
-                "requires --hicache-storage-backend mooncake."
-            )
-        if cfg.attn_cp_size > 1:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd with DCP "
-                "does not support attention context parallelism; "
-                "attn_cp_size must be 1."
-            )
-        attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-        attn_tp_size = cfg.tp_size // attn_dp_size // cfg.attn_cp_size
-        if attn_tp_size % cfg.dcp_size != 0:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd with DCP "
-                "requires attn_tp_size to be divisible by dcp_size, got "
-                f"attn_tp_size={attn_tp_size}, dcp_size={cfg.dcp_size}."
-            )
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.enable_priority_scheduling
@@ -421,41 +389,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
-    if (
-        cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd")
-        and cfg.enable_unified_memory
-    ):
-        raise ValueError(
-            f"--disaggregation-decode-retraction-backup={cfg.disaggregation_decode_retraction_backup} "
-            "is incompatible with --enable-unified-memory: the unified pool's "
-            "device slots are virtual and the host retraction transfer does not "
-            "translate them."
-        )
-
-    if cfg.disaggregation_decode_retraction_backup == "ssd":
-        if cfg.pp_size > 1:
-            # TODO(zhangmj): need to support PP with SSD retraction backup
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd does not support "
-                "--pp-size > 1: the PP decode loop never drains storage "
-                "acknowledgements, so a demoted request could not resume."
-            )
-        if cfg.hicache_storage_backend is None:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd requires "
-                "--hicache-storage-backend."
-            )
-        if cfg.enable_unified_cache_external_linker:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd is incompatible "
-                "with --enable-unified-cache-external-linker."
-            )
-        if cfg.enable_hisparse:
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=ssd is incompatible "
-                "with --enable-hisparse: a failed SSD demotion keeps the request "
-                "running, but HiSparse tears its side buffers down first."
-            )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
@@ -472,10 +405,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
             )
-        if cfg.disaggregation_decode_retraction_backup in ("host_pool", "ssd"):
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
             raise ValueError(
                 "The arguments disaggregation-decode-enable-offload-kvcache and "
-                "disaggregation-decode-retraction-backup=host_pool/ssd are mutually exclusive: "
+                "disaggregation-decode-retraction-backup=host_pool are mutually exclusive: "
                 "both build a decode host pool."
             )
 
