@@ -235,6 +235,13 @@ class CacheUsage(BaseModel):
     creation_1h_tokens: int = Field(default=0, ge=0)
     normal_input_tokens: int = Field(default=0, ge=0)
 
+    def response_headers(self) -> Dict[str, str]:
+        """Expose both creation tiers, including zero, from this decision."""
+        return {
+            "Msh-Usage-Cache-Write-Tokens-5m": str(self.creation_5m_tokens),
+            "Msh-Usage-Cache-Write-Tokens-1h": str(self.creation_1h_tokens),
+        }
+
     @property
     def total_input_tokens(self) -> int:
         return (

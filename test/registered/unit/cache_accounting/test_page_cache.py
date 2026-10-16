@@ -55,6 +55,24 @@ def plan(ids, *, ttl=300, page_size=4, **kwargs):
 
 
 class TestPageCachePlan(unittest.TestCase):
+    def test_fixed_256_block_boundaries(self):
+        self.assertEqual(cache.CACHE_BLOCK_SIZE, 256)
+        for length, complete_blocks, tail in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (255, 0, 255),
+            (256, 1, 0),
+            (257, 1, 1),
+            (511, 1, 255),
+            (512, 2, 0),
+            (513, 2, 1),
+        ]:
+            with self.subTest(length=length):
+                result = plan(list(range(length)), page_size=cache.CACHE_BLOCK_SIZE)
+                self.assertEqual(len(result.page_keys), complete_blocks)
+                self.assertEqual(result.prompt_tokens, length)
+                self.assertEqual(result.prompt_tokens % result.page_size, tail)
+
     def test_page_boundaries_and_partial_tail(self):
         for length, expected in [(0, 0), (3, 0), (4, 1), (5, 1), (8, 2)]:
             with self.subTest(length=length):
@@ -184,9 +202,10 @@ class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
         store = cache.RedisPageCacheStore("redis://unused")
         with patch.object(
             store, "_client", side_effect=AssertionError("must not connect")
-        ):
-            with self.assertRaises(cache.CacheAccountingError):
+        ) as client:
+            with self.assertRaises(ValueError):
                 await store.account(malformed)
+        client.assert_not_called()
 
     @unittest.skipUnless(
         importlib.util.find_spec("redis"), "redis Python package required"
@@ -269,12 +288,40 @@ class TestRedisScript(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.store.aclose()
 
-    def make_plan(self, count=9, *, ttl=300):
+    def make_plan(self, count=9, *, ttl=300, page_size=4):
         return plan(
             list(range(count)),
             namespace=self.namespace,
             ttl=ttl,
+            page_size=page_size,
         )
+
+    async def test_fixed_256_block_accounting_and_prefix_extension(self):
+        for ttl in (300, 3600):
+            for length, read, written, tail in [
+                (255, 0, 0, 255),
+                (256, 0, 256, 0),
+                (257, 256, 0, 1),
+                (511, 256, 0, 255),
+                (512, 256, 256, 0),
+                (513, 512, 0, 1),
+            ]:
+                with self.subTest(ttl=ttl, length=length):
+                    result = await self.store.account(
+                        self.make_plan(
+                            length, ttl=ttl, page_size=cache.CACHE_BLOCK_SIZE
+                        )
+                    )
+                    self.assertEqual(
+                        result,
+                        cache.CacheUsage(
+                            read,
+                            written if ttl == 300 else 0,
+                            written if ttl == 3600 else 0,
+                            tail,
+                        ),
+                    )
+                    self.assertEqual(sum(result.to_dict().values()), length)
 
     async def test_prefix_extension_read_write_and_tail_conserve_tokens(self):
         initial = await self.store.account(self.make_plan(9))
@@ -307,25 +354,42 @@ class TestRedisScript(unittest.IsolatedAsyncioTestCase):
         for first_ttl, second_ttl in ((300, 3600), (3600, 300)):
             with self.subTest(first_ttl=first_ttl):
                 namespace = f"{self.namespace}:{first_ttl}"
-                first = plan(list(range(9)), namespace=namespace, ttl=first_ttl)
+                first = plan(
+                    list(range(513)),
+                    namespace=namespace,
+                    ttl=first_ttl,
+                    page_size=cache.CACHE_BLOCK_SIZE,
+                )
                 second = plan(
-                    list(range(9)),
+                    list(range(513)),
                     namespace=namespace,
                     ttl=second_ttl,
+                    page_size=cache.CACHE_BLOCK_SIZE,
                 )
                 expected_first = cache.CacheUsage(
-                    0, 8 if first_ttl == 300 else 0, 8 if first_ttl == 3600 else 0, 1
+                    0,
+                    512 if first_ttl == 300 else 0,
+                    512 if first_ttl == 3600 else 0,
+                    1,
                 )
                 expected_second = cache.CacheUsage(
-                    0, 8 if second_ttl == 300 else 0, 8 if second_ttl == 3600 else 0, 1
+                    0,
+                    512 if second_ttl == 300 else 0,
+                    512 if second_ttl == 3600 else 0,
+                    1,
                 )
                 self.assertEqual(await self.store.account(first), expected_first)
                 self.assertEqual(await self.store.account(second), expected_second)
                 for ttl in (300, 3600):
-                    following = plan(list(range(9)), namespace=namespace, ttl=ttl)
+                    following = plan(
+                        list(range(513)),
+                        namespace=namespace,
+                        ttl=ttl,
+                        page_size=cache.CACHE_BLOCK_SIZE,
+                    )
                     self.assertEqual(
                         await self.store.account(following),
-                        cache.CacheUsage(8, 0, 0, 1),
+                        cache.CacheUsage(512, 0, 0, 1),
                     )
 
     async def test_renewing_either_ttl_tier_leaves_other_tier_expiration_untouched(
@@ -389,6 +453,17 @@ class TestRedisScript(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(cache.CacheAccountingError):
             await self.store.account(original)
         self.assertEqual(await client.exists(original.page_keys[0]), 0)
+
+    async def test_fixed_256_block_failure_does_not_return_usage_or_mutate_pages(self):
+        original = self.make_plan(769, page_size=cache.CACHE_BLOCK_SIZE)
+        client = self.store._client()
+        await client.set(original.page_keys[0], "1", ex=5)
+        await client.hset(original.page_keys[1], "corrupt", "value")
+        with self.assertRaises(cache.CacheAccountingError):
+            await self.store.account(original)
+        self.assertTrue(0 < await client.ttl(original.page_keys[0]) <= 5)
+        self.assertEqual(await client.hget(original.page_keys[1], "corrupt"), b"value")
+        self.assertEqual(await client.exists(original.page_keys[2]), 0)
 
 
 if __name__ == "__main__":

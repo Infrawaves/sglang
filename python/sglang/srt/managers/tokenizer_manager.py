@@ -62,6 +62,7 @@ from sglang.srt.beam_search.output import (
     try_build_beam_search_out_dict,
 )
 from sglang.srt.cache_accounting import (
+    CACHE_BLOCK_SIZE,
     CacheAccountingError,
     CacheUsage,
     PageCachePlan,
@@ -1111,7 +1112,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if input_ids is None:
             raise ValueError("Cache accounting requires final input token IDs")
         cfg = get_serving()
-        # Read the resolved runtime page size, including backend overrides.
+        # Accounting uses 256-token blocks independently of GPU KV page size.
         # Keep all namespace inputs fixed before Scheduler dispatch.
         namespace = json.dumps(
             {
@@ -1130,7 +1131,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids=input_ids,
             api_key=obj.api_key,
             namespace=namespace,
-            page_size=get_schedule().page_size,
+            page_size=CACHE_BLOCK_SIZE,
             ttl_seconds=obj.cache_ttl_seconds,
         )
         self.rid_to_state[obj.rid].cache_plan = plan
@@ -1141,6 +1142,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prompt_tokens: int,
         completion_tokens: int,
         finish_reason: Any,
+        cached_tokens: int = 0,
     ) -> None:
         plan = state.cache_plan
         if (
@@ -1159,7 +1161,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise CacheAccountingError(
                     "Cache prompt-token count differs from final input IDs"
                 )
-            return await self._cache_store.account(plan)
+            try:
+                return await self._cache_store.account(plan)
+            except CacheAccountingError:
+                # Freeze the engine's actual prefix hit from this output. A
+                # failed Redis operation cannot confirm any cache creation.
+                read_tokens = max(0, min(prompt_tokens, cached_tokens))
+                return CacheUsage(
+                    read_tokens=read_tokens,
+                    normal_input_tokens=prompt_tokens - read_tokens,
+                )
 
         task = asyncio.create_task(account_once())
         state.cache_task = task
@@ -2926,6 +2937,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.prompt_tokens[i],
                     recv_obj.completion_tokens[i],
                     recv_obj.finished_reasons[i],
+                    cached_tokens=recv_obj.cached_tokens[i],
                 )
                 meta_info.update(
                     {

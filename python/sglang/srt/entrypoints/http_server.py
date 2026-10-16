@@ -89,6 +89,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     ClassifyRequest,
     CompletionRequest,
     DecisionRequest,
@@ -520,6 +521,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Msh-Usage-Cache-Write-Tokens-5m",
+        "Msh-Usage-Cache-Write-Tokens-1h",
+    ],
 )
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
@@ -1843,11 +1848,18 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
-        )
+    result = await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
     )
+    if (
+        isinstance(result, ChatCompletionResponse)
+        and result.usage.cache_usage is not None
+    ):
+        return ORJSONResponse(
+            content=result.model_dump(mode="json"),
+            headers=result.usage.cache_usage.response_headers(),
+        )
+    return model_json_response(result)
 
 
 @app.post(

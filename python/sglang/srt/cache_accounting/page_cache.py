@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Page-aligned prompt-cache accounting isolated by API key in Redis.
+"""Prompt-cache accounting in 256-token blocks, isolated by API key in Redis.
 
 The caller supplies a model/tokenizer/template/adapter namespace
 and calls ``account`` once, at the first successful output event. Redis operations
-are not retried automatically; errors leave accounting unconfirmed.
+are not retried automatically; errors leave accounting unconfirmed so the caller
+can fall back to the engine's actual cache usage.
 """
 
 import asyncio
@@ -12,6 +13,8 @@ import math
 import struct
 from dataclasses import asdict, dataclass
 from typing import Any, Sequence
+
+CACHE_BLOCK_SIZE = 256
 
 _KEY_PREFIX = "sglang:cache:v1"
 _DOMAIN = b"sglang:cache:v1\x00"
@@ -63,12 +66,13 @@ def build_page_cache_plan(
 ) -> PageCachePlan:
     """Hash complete input pages with a cumulative, fixed-uint32 token encoding.
 
-    ``namespace`` isolates deployments and input interpretation. TTL is part of
-    identity: 5m and 1h
-    requests have independent pages and expiration timelines.
-    Partial final pages remain normal input. Page size comes from the inference
-    engine; accounting adds no page-count limit. Each first-page prefix defines
-    a Redis Cluster hash slot instead of pinning all prefixes for one API key.
+    Production callers pass ``CACHE_BLOCK_SIZE`` as ``page_size``; the low-level
+    parameter remains available for testing. Partial final blocks remain normal
+    input, independently of the engine's physical cache page size. ``namespace``
+    isolates deployments and input interpretation. TTL is part of identity: 5m
+    and 1h requests have independent pages and expiration timelines. Accounting
+    adds no page-count limit. Each first-page prefix defines a Redis Cluster hash
+    slot instead of pinning all prefixes for one API key.
     """
     _positive_int("page_size", page_size)
     if type(ttl_seconds) is not int or ttl_seconds not in _TTLS:
@@ -246,10 +250,7 @@ class RedisPageCacheStore:
         return self._redis
 
     async def account(self, plan: PageCachePlan) -> CacheUsage:
-        try:
-            _validate_plan(plan)
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise CacheAccountingError("Invalid cache plan") from exc
+        _validate_plan(plan)
         if not plan.page_keys:
             return CacheUsage(normal_input_tokens=plan.prompt_tokens)
         try:

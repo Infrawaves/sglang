@@ -5,7 +5,7 @@
 //! Defaults belong to the worker: omitted options and `{}` remain unchanged.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::config::{Cli, ParamSpec, SamplingField};
@@ -34,6 +34,41 @@ const SSE_PARTS: [&str; 4] = [
     "tokens\":700}}}\n\n",
     "data: [DONE]\n\n",
 ];
+const SSE_WITHOUT_USAGE: [&str; 2] = [SSE_PARTS[0], SSE_PARTS[3]];
+
+fn response_headers(writes: [&str; 2], mixed_case: bool) -> HeaderMap {
+    let names = if mixed_case {
+        [
+            "Msh-Usage-Cache-Write-Tokens-5m",
+            "MSH-USAGE-CACHE-WRITE-TOKENS-1H",
+        ]
+    } else {
+        [
+            "msh-usage-cache-write-tokens-5m",
+            "msh-usage-cache-write-tokens-1h",
+        ]
+    };
+    let mut headers = HeaderMap::new();
+    for (name, value) in names.into_iter().zip(writes) {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    for name in [
+        "set-cookie",
+        "openai-organization",
+        "openai-project",
+        "authorization",
+        "msh-usage-cache-write-tokens-30m",
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static("private-upstream-value"),
+        );
+    }
+    headers
+}
 
 fn options() -> Vec<Option<Value>> {
     vec![
@@ -170,7 +205,7 @@ fn request_body(options: Option<&Value>, streaming: bool) -> Value {
     body
 }
 
-async fn send(ctx: Arc<AppContext>, body: &Value) -> bytes::Bytes {
+async fn send(ctx: Arc<AppContext>, body: &Value, writes: [&str; 2]) -> bytes::Bytes {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -180,6 +215,26 @@ async fn send(ctx: Arc<AppContext>, body: &Value) -> bytes::Bytes {
         .unwrap();
     let response = build_router(ctx).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK, "body={body}");
+    // Inspect initial headers before collecting any JSON or SSE body bytes.
+    for (name, expected) in [
+        ("Msh-Usage-Cache-Write-Tokens-5m", writes[0]),
+        ("MSH-USAGE-CACHE-WRITE-TOKENS-1H", writes[1]),
+    ] {
+        assert_eq!(
+            response.headers().get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "initial response header {name}",
+        );
+    }
+    for name in [
+        "set-cookie",
+        "openai-organization",
+        "openai-project",
+        "authorization",
+        "msh-usage-cache-write-tokens-30m",
+    ] {
+        assert!(response.headers().get(name).is_none(), "must strip {name}");
+    }
     collect_body(response.into_body()).await
 }
 
@@ -212,13 +267,17 @@ fn captured(worker: &MockWorker, original: &Value, forward_ids: bool) -> Value {
 #[tokio::test]
 async fn plain_options_survive_sampling_splice_and_input_ids_rebuild() {
     let expected = response_body();
-    let worker = MockWorker::start_returning_error(StatusCode::OK, expected.clone()).await;
+    let worker = MockWorker::start_json_with_response_headers(
+        expected.clone(),
+        response_headers(["700", "0"], true),
+    )
+    .await;
     for reorg in [false, true] {
         for forward_ids in [false, true] {
             let ctx = context(&worker, None, reorg, forward_ids, true);
             for options in options() {
                 let body = request_body(options.as_ref(), false);
-                let response = send(Arc::clone(&ctx), &body).await;
+                let response = send(Arc::clone(&ctx), &body, ["700", "0"]).await;
                 assert_eq!(response.as_ref(), expected.to_string().as_bytes());
                 let forwarded = captured(&worker, &body, forward_ids);
                 assert_eq!(forwarded["temperature"], 1);
@@ -231,12 +290,16 @@ async fn plain_options_survive_sampling_splice_and_input_ids_rebuild() {
 
 #[tokio::test]
 async fn unmodified_plain_body_and_stream_usage_pass_through() {
-    let worker = MockWorker::start(SSE_PARTS.to_vec()).await;
+    let worker = MockWorker::start_with_response_headers(
+        SSE_PARTS.to_vec(),
+        response_headers(["0", "700"], false),
+    )
+    .await;
     for reorg in [false, true] {
         let ctx = context(&worker, None, reorg, false, false);
         for options in options() {
             let body = request_body(options.as_ref(), true);
-            let response = send(Arc::clone(&ctx), &body).await;
+            let response = send(Arc::clone(&ctx), &body, ["0", "700"]).await;
             assert_eq!(response.as_ref(), SSE_PARTS.concat().as_bytes());
             assert_eq!(captured(&worker, &body, false), body);
             let captured_body = worker.captured.lock().unwrap().last_body.clone().unwrap();
@@ -251,26 +314,39 @@ async fn unmodified_plain_body_and_stream_usage_pass_through() {
 #[tokio::test]
 async fn pd_preserves_options_and_returns_only_decode_json_or_stream_usage() {
     // Prefill's conflicting counters must never replace or add to decode usage.
-    let prefill = MockWorker::start_returning_error(
-        StatusCode::OK,
+    let prefill = MockWorker::start_json_with_response_headers(
         json!({"usage": {"prompt_tokens_details": {
             "cached_tokens": 9999, "cache_write_tokens": 9999
         }}}),
+        response_headers(["9999", "8888"], true),
     )
     .await;
     for streaming in [false, true] {
         let expected = response_body();
-        let decode = if streaming {
-            MockWorker::start(SSE_PARTS.to_vec()).await
+        let writes = if streaming {
+            ["700", "0"]
         } else {
-            MockWorker::start_returning_error(StatusCode::OK, expected.clone()).await
+            ["0", "700"]
+        };
+        let decode = if streaming {
+            MockWorker::start_with_response_headers(
+                SSE_PARTS.to_vec(),
+                response_headers(writes, true),
+            )
+            .await
+        } else {
+            MockWorker::start_json_with_response_headers(
+                expected.clone(),
+                response_headers(writes, false),
+            )
+            .await
         };
         for reorg in [false, true] {
             for forward_ids in [false, true] {
                 let ctx = context(&prefill, Some(&decode), reorg, forward_ids, true);
                 for options in options() {
                     let body = request_body(options.as_ref(), streaming);
-                    let response = send(Arc::clone(&ctx), &body).await;
+                    let response = send(Arc::clone(&ctx), &body, writes).await;
                     if streaming {
                         assert_eq!(response.as_ref(), SSE_PARTS.concat().as_bytes());
                     } else {
@@ -291,6 +367,53 @@ async fn pd_preserves_options_and_returns_only_decode_json_or_stream_usage() {
                     assert!(p["bootstrap_room"].as_u64().is_some());
                     assert_eq!(p["bootstrap_host"], "127.0.0.1");
                     assert_eq!(p["bootstrap_port"], 8997);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_headers_survive_without_stream_usage_and_ignore_prefill_headers() {
+    let prefill = MockWorker::start_json_with_response_headers(
+        json!({"prefill": true}),
+        response_headers(["9999", "8888"], true),
+    )
+    .await;
+    for writes in [["0", "0"], ["700", "0"], ["0", "700"]] {
+        for streaming in [false, true] {
+            let mut expected = response_body();
+            let total_write =
+                writes[0].parse::<u64>().unwrap() + writes[1].parse::<u64>().unwrap();
+            expected["usage"]["prompt_tokens_details"]["cache_write_tokens"] = json!(total_write);
+            let worker = if streaming {
+                MockWorker::start_with_response_headers(
+                    SSE_WITHOUT_USAGE.to_vec(),
+                    response_headers(writes, true),
+                )
+                .await
+            } else {
+                MockWorker::start_json_with_response_headers(
+                    expected.clone(),
+                    response_headers(writes, false),
+                )
+                .await
+            };
+            for reorg in [false, true] {
+                for pd in [false, true] {
+                    let ctx = if pd {
+                        context(&prefill, Some(&worker), reorg, false, false)
+                    } else {
+                        context(&worker, None, reorg, false, false)
+                    };
+                    let mut body = request_body(None, streaming);
+                    body.as_object_mut().unwrap().remove("stream_options");
+                    let response = send(ctx, &body, writes).await;
+                    if streaming {
+                        assert_eq!(response.as_ref(), SSE_WITHOUT_USAGE.concat().as_bytes());
+                    } else {
+                        assert_eq!(response.as_ref(), expected.to_string().as_bytes());
+                    }
                 }
             }
         }
