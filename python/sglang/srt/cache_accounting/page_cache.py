@@ -9,10 +9,14 @@ can fall back to the engine's actual cache usage.
 
 import asyncio
 import hashlib
+import logging
 import math
 import struct
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Sequence
+
+logger = logging.getLogger(__name__)
 
 CACHE_BLOCK_SIZE = 256
 
@@ -249,13 +253,26 @@ class RedisPageCacheStore:
             )
         return self._redis
 
-    async def account(self, plan: PageCachePlan) -> CacheUsage:
+    async def account(
+        self, plan: PageCachePlan, *, rid: str | None = None
+    ) -> CacheUsage:
         _validate_plan(plan)
         if not plan.page_keys:
             return CacheUsage(normal_input_tokens=plan.prompt_tokens)
+        request_id = rid if rid is not None else "-"
+        started = time.perf_counter()
+        timeout_ms = self._timeout_seconds * 1000
         try:
+            client = self._client()
+            logger.info(
+                "Cache Redis EVAL start rid=%s page_count=%d ttl=%d timeout_ms=%.3f",
+                request_id,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+                timeout_ms,
+            )
             result = await asyncio.wait_for(
-                self._client().eval(
+                client.eval(
                     _ACCOUNT_LUA,
                     len(plan.page_keys),
                     *plan.page_keys,
@@ -276,9 +293,43 @@ class RedisPageCacheStore:
                 or (plan.ttl_seconds == 3600 and result[1])
             ):
                 raise ValueError("Invalid cache Redis result")
-            return CacheUsage(*result)
+            usage = CacheUsage(*result)
         except Exception as exc:
+            is_timeout = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+            if not is_timeout:
+                try:
+                    from redis.exceptions import TimeoutError as RedisTimeoutError
+                except ImportError:
+                    pass
+                else:
+                    is_timeout = isinstance(exc, RedisTimeoutError)
+            logger.warning(
+                "Cache Redis EVAL failed rid=%s result=%s error_type=%s "
+                "page_count=%d ttl=%d elapsed_ms=%.3f timeout_ms=%.3f",
+                request_id,
+                "timeout" if is_timeout else "error",
+                type(exc).__name__,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+                (time.perf_counter() - started) * 1000,
+                timeout_ms,
+            )
             raise CacheAccountingError("Redis cache accounting is unconfirmed") from exc
+        logger.info(
+            "Cache Redis EVAL complete rid=%s result=success page_count=%d ttl=%d "
+            "read=%d write_5m=%d write_1h=%d normal=%d elapsed_ms=%.3f "
+            "timeout_ms=%.3f",
+            request_id,
+            len(plan.page_keys),
+            plan.ttl_seconds,
+            usage.read_tokens,
+            usage.creation_5m_tokens,
+            usage.creation_1h_tokens,
+            usage.normal_input_tokens,
+            (time.perf_counter() - started) * 1000,
+            timeout_ms,
+        )
+        return usage
 
     async def aclose(self) -> None:
         client, self._redis = self._redis, None

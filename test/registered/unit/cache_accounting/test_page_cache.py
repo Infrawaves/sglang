@@ -18,7 +18,7 @@ import unittest
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 # Load this dependency-free module without importing sglang.__init__, which
 # initializes the model-serving environment. This also permits stdlib-only QA.
@@ -147,6 +147,12 @@ class TestPageCachePlan(unittest.TestCase):
 
 
 class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.logger = Mock()
+        logger_patch = patch.object(cache, "logger", self.logger)
+        logger_patch.start()
+        self.addCleanup(logger_patch.stop)
+
     async def test_no_complete_page_never_initializes_redis(self):
         store = cache.RedisPageCacheStore("redis://unused")
         with patch.object(
@@ -162,6 +168,91 @@ class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
                 "normal_input_tokens": 3,
             },
         )
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
+        await store.aclose()
+
+    async def test_eval_start_and_success_logs_include_rid_and_confirmed_usage(self):
+        store = cache.RedisPageCacheStore("redis://unused", timeout_seconds=0.2)
+        store._redis = AsyncMock()
+        store._redis.eval.return_value = [4, 4, 0, 1]
+        result = await store.account(plan(list(range(9))), rid="request-redis-1")
+        self.assertEqual(result, cache.CacheUsage(4, 4, 0, 1))
+        store._redis.eval.assert_awaited_once()
+        self.assertEqual(self.logger.info.call_count, 2)
+        start, complete = [
+            call.args[0] % call.args[1:] for call in self.logger.info.call_args_list
+        ]
+        self.assertEqual(
+            start,
+            "Cache Redis EVAL start rid=request-redis-1 page_count=2 ttl=300 "
+            "timeout_ms=200.000",
+        )
+        self.assertRegex(
+            complete,
+            r"^Cache Redis EVAL complete rid=request-redis-1 result=success "
+            r"page_count=2 ttl=300 read=4 write_5m=4 write_1h=0 normal=1 "
+            r"elapsed_ms=\d+\.\d{3} timeout_ms=200\.000$",
+        )
+        self.logger.warning.assert_not_called()
+        await store.aclose()
+
+    async def test_eval_failure_logs_classification_without_sensitive_contents(self):
+        errors = [(TimeoutError, "timeout"), (ConnectionError, "error")]
+        try:
+            from redis.exceptions import TimeoutError as RedisTimeoutError
+        except ImportError:
+            pass
+        else:
+            errors.append((RedisTimeoutError, "timeout"))
+        original = plan(list(range(9)))
+        secrets = (
+            "redis://:secret-password@private-redis:6379/0",
+            "secret-api-key",
+            "secret-input-content",
+            original.page_keys[0],
+        )
+        for error_type, classification in errors:
+            with self.subTest(error_type=error_type):
+                self.logger.reset_mock()
+                store = cache.RedisPageCacheStore("redis://unused", timeout_seconds=0.2)
+                store._redis = AsyncMock()
+                store._redis.eval.side_effect = error_type(" ".join(secrets))
+                with self.assertRaises(cache.CacheAccountingError):
+                    await store.account(original, rid="request-redis-2")
+                self.logger.info.assert_called_once()
+                self.logger.warning.assert_called_once()
+                warning = self.logger.warning.call_args
+                message = warning.args[0] % warning.args[1:]
+                self.assertIn(
+                    f"rid=request-redis-2 result={classification} "
+                    f"error_type={error_type.__name__}",
+                    message,
+                )
+                self.assertIn("timeout_ms=200.000", message)
+                for secret in secrets:
+                    self.assertNotIn(secret, message)
+                self.assertEqual(warning.kwargs, {})
+                await store.aclose()
+
+    async def test_cancellation_propagates_without_failure_or_success_log(self):
+        entered = asyncio.Event()
+
+        async def blocked_eval(*args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        store = cache.RedisPageCacheStore("redis://unused")
+        store._redis = AsyncMock()
+        store._redis.eval.side_effect = blocked_eval
+        task = asyncio.create_task(store.account(plan(list(range(9))), rid="cancelled"))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.logger.info.assert_called_once()
+        self.assertIn("EVAL start", self.logger.info.call_args.args[0])
+        self.logger.warning.assert_not_called()
         await store.aclose()
 
     async def test_redis_error_and_malformed_result_do_not_invent_usage(self):
@@ -193,7 +284,12 @@ class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
         store._redis.eval.side_effect = slow_eval
         with self.assertRaises(cache.CacheAccountingError) as failure:
             await store.account(plan([1, 2, 3, 4]))
-        self.assertIsInstance(failure.exception.__cause__, TimeoutError)
+        self.assertIsInstance(
+            failure.exception.__cause__, (TimeoutError, asyncio.TimeoutError)
+        )
+        self.logger.warning.assert_called_once()
+        warning = self.logger.warning.call_args
+        self.assertIn("result=timeout", warning.args[0] % warning.args[1:])
         await store.aclose()
 
     async def test_invalid_plan_is_rejected_before_redis(self):
@@ -206,6 +302,8 @@ class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await store.account(malformed)
         client.assert_not_called()
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
 
     @unittest.skipUnless(
         importlib.util.find_spec("redis"), "redis Python package required"
@@ -322,6 +420,22 @@ class TestRedisScript(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
                     self.assertEqual(sum(result.to_dict().values()), length)
+
+    async def test_real_eval_logs_cold_and_hit_results_with_request_id(self):
+        original = self.make_plan(513, ttl=3600, page_size=cache.CACHE_BLOCK_SIZE)
+        with patch.object(cache, "logger") as logger:
+            cold = await self.store.account(original, rid="real-cold")
+            hit = await self.store.account(original, rid="real-hit")
+        self.assertEqual(cold, cache.CacheUsage(0, 0, 512, 1))
+        self.assertEqual(hit, cache.CacheUsage(512, 0, 0, 1))
+        self.assertEqual(logger.info.call_count, 4)
+        messages = [call.args[0] % call.args[1:] for call in logger.info.call_args_list]
+        self.assertIn("EVAL start rid=real-cold page_count=2 ttl=3600", messages[0])
+        self.assertIn("rid=real-cold result=success", messages[1])
+        self.assertIn("read=0 write_5m=0 write_1h=512 normal=1", messages[1])
+        self.assertIn("rid=real-hit result=success", messages[3])
+        self.assertIn("read=512 write_5m=0 write_1h=0 normal=1", messages[3])
+        logger.warning.assert_not_called()
 
     async def test_prefix_extension_read_write_and_tail_conserve_tokens(self):
         initial = await self.store.account(self.make_plan(9))

@@ -204,6 +204,12 @@ python -m sglang.launch_server \
 
 Redis URL 不接受凭证、query 或 fragment，避免凭证出现在启动参数日志和 server_info。需要 Redis 认证时，通过 `SGLANG_CACHE_REDIS_USERNAME`、`SGLANG_CACHE_REDIS_PASSWORD` 环境变量提供。
 
+启用后，启动日志说明当前角色是否负责计量。每次请求在首次成功输出时执行一次 Redis 计量，Redis 访问日志记录请求 ID、操作、TTL、块数、耗时和超时阈值；完成日志提供本次读取、两档写入和普通输入量。超时及连接、认证、脚本或返回值异常会产生 warning，并记录错误类型；降级日志说明改用引擎实际读取量、两档写入均为 0。流式后续 chunk 复用同一结果，不重复访问和记录计量。不足一个完整块时不访问 Redis。
+
+日志不包含原始 API key、身份摘要、Redis key、连接凭证、请求文本或 token IDs，也不输出可能包含这些信息的异常原文。
+
+Metrics 留待后续接入：Redis 访问次数与超时/错误次数、访问耗时分布，以及读取、两档写入和降级次数。标签控制在角色、TTL、操作及结果等有限维度，请求 ID 和用户身份不作为 metrics 标签。本次仅增加日志。
+
 | 新配置 | 默认 |
 | --- | --- |
 | enable_cache_accounting | false |
@@ -250,6 +256,8 @@ cargo test --test proxy prompt_cache_accounting
 
 本地已验证 Python/Redis 回归。本次 `experimental/sgl-router` 的 Rust 编译与测试按约定由评审方执行，当前没有运行。
 
-本机未启动 GPU 模型服务，端到端推理、GPU 性能及实际部署流量下的 Redis 容量仍需部署环境验收。评审应重点看：以首次输出为计量时点是否符合业务、Redis 故障时物理读取降级是否符合口径、长输入下的 Redis 操作耗时，以及多租户身份后续如何接入。
+已在 GB300 上以 DeepSeek-R1-Distill-Qwen-7B、TP1 运行单体及 P/D 分离测试。PD 使用两个 GPU，通过真实 Mooncake TCP 交接 KV，并开启 KV checksum；直接配对 P/D 请求验证 JSON/SSE、5m/1h 隔离、默认 5m、跨响应模式复用、关闭 include_usage，以及中途断连后的 abort 与缓存复用。每个请求 D 只执行一次 Redis 计量，P 不访问 Redis。实际暂停和停止独立 Redis，分别验证超时、连接失败日志及写入 0/物理读取降级，恢复 Redis 后可重新计量。
+
+以上 PD 结果验证引擎链路，尚不包含新 `experimental/sgl-router` 二进制的端到端验证。测试机预装的旧 `sglang_router` 在诊断中丢弃了 1h TTL，不能替代本分支 Router 验收。GPU 性能及实际部署流量下的 Redis 容量仍需部署环境评估，尤其是长输入的 Lua 耗时、日志吞吐量和多租户身份接入。
 
 参考：[Redis Lua 原子性与脚本约束](https://redis.io/docs/latest/develop/programmability/eval-intro/)。
