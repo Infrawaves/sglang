@@ -12,11 +12,12 @@ import asyncio
 import importlib.util
 import json
 import sys
+import time
 import unittest
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 # CI registration is parsed statically; avoid importing heavyweight sglang.
 if "sglang.test.ci.ci_register" in sys.modules:
@@ -65,7 +66,19 @@ def _load_disaggregation_mode():
 _DISAGG_MODE = _load_disaggregation_mode()
 
 
-def _load_manager_helpers(*, serving=None, schedule=None):
+def _log_message(call):
+    template, *values = call.args
+    return template % tuple(values)
+
+
+def _load_manager_helpers(
+    *,
+    serving=None,
+    schedule=None,
+    disagg=None,
+    cache_store_class=None,
+    cache_logger=None,
+):
     path = _SRT / "managers" / "tokenizer_manager.py"
     source = ast.parse(path.read_text())
     manager = next(
@@ -74,6 +87,7 @@ def _load_manager_helpers(*, serving=None, schedule=None):
         if isinstance(node, ast.ClassDef) and node.name == "TokenizerManager"
     )
     names = {
+        "_init_cache_accounting",
         "_start_cache_accounting",
         "_attach_cache_usage",
         "_prepare_cache_plan",
@@ -103,8 +117,15 @@ def _load_manager_helpers(*, serving=None, schedule=None):
     namespace = {
         "asyncio": asyncio,
         "json": json,
+        "time": time,
+        "os": SimpleNamespace(environ={}),
+        "logger": cache_logger if cache_logger is not None else Mock(),
         "get_serving": lambda: serving,
         "get_schedule": lambda: schedule,
+        "get_disagg": lambda: disagg,
+        "RedisPageCacheStore": (
+            cache_store_class if cache_store_class is not None else Mock()
+        ),
         "build_page_cache_plan": _CACHE.build_page_cache_plan,
         "CACHE_BLOCK_SIZE": _CACHE.CACHE_BLOCK_SIZE,
         "CacheAccountingError": _CACHE.CacheAccountingError,
@@ -113,6 +134,68 @@ def _load_manager_helpers(*, serving=None, schedule=None):
     }
     exec(compile(ast.fix_missing_locations(extracted), str(path), "exec"), namespace)
     return namespace["ManagerHelpers"]
+
+
+class TestTokenizerCacheInitialization(unittest.TestCase):
+    def test_enabled_startup_logs_responsibility_without_redis_details(self):
+        for role, logged_role, action in (
+            ("null", "standalone", "account"),
+            ("decode", "decode", "account"),
+            ("prefill", "prefill", "skip_prefill"),
+        ):
+            with self.subTest(role=role):
+                logger = Mock()
+                store_class = Mock()
+                cfg = SimpleNamespace(
+                    enable_cache_accounting=True,
+                    cache_redis_url="redis://private-redis-host:6379/0",
+                    cache_timeout=0.2,
+                )
+                manager = _load_manager_helpers(
+                    serving=cfg,
+                    disagg=SimpleNamespace(disaggregation_mode=role),
+                    cache_store_class=store_class,
+                    cache_logger=logger,
+                )()
+                manager._init_cache_accounting()
+                self.assertEqual(manager._cache_tasks, set())
+                if role == "prefill":
+                    store_class.assert_not_called()
+                    self.assertIsNone(manager._cache_store)
+                else:
+                    store_class.assert_called_once_with(
+                        cfg.cache_redis_url,
+                        timeout_seconds=0.2,
+                        username=None,
+                        password=None,
+                    )
+                    self.assertIs(manager._cache_store, store_class.return_value)
+                logger.info.assert_called_once()
+                self.assertEqual(
+                    _log_message(logger.info.call_args),
+                    "Cache accounting startup enabled=True "
+                    f"role={logged_role} action={action} block_size=256",
+                )
+                self.assertNotIn(
+                    cfg.cache_redis_url, _log_message(logger.info.call_args)
+                )
+                logger.warning.assert_not_called()
+
+    def test_disabled_startup_does_not_initialize_store_or_log(self):
+        logger = Mock()
+        store_class = Mock()
+        manager = _load_manager_helpers(
+            serving=SimpleNamespace(enable_cache_accounting=False),
+            disagg=SimpleNamespace(disaggregation_mode="decode"),
+            cache_store_class=store_class,
+            cache_logger=logger,
+        )()
+        manager._init_cache_accounting()
+        self.assertIsNone(manager._cache_store)
+        self.assertEqual(manager._cache_tasks, set())
+        store_class.assert_not_called()
+        logger.info.assert_not_called()
+        logger.warning.assert_not_called()
 
 
 class TestTokenizerCachePreparation(unittest.TestCase):
@@ -275,7 +358,9 @@ class TestTokenizerCachePreparation(unittest.TestCase):
 
 class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.manager = _load_manager_helpers()()
+        self.logger = Mock()
+        self.manager = _load_manager_helpers(cache_logger=self.logger)()
+        self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
         self.plan = _CACHE.build_page_cache_plan(
             input_ids=list(range(10)),
             api_key="verified-api-key-hash",
@@ -289,6 +374,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.account = AsyncMock(return_value=self.usage)
         self.manager._cache_store = SimpleNamespace(account=self.account)
         self.state = SimpleNamespace(
+            obj=SimpleNamespace(rid="cache-request-1"),
             cache_plan=self.plan,
             cache_task=None,
             cache_usage=None,
@@ -330,17 +416,26 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.start(completion_tokens=2)
         second = await self.attach(text="b")
         self.assertIs(self.state.cache_task, task)
-        self.account.assert_awaited_once_with(self.plan)
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
         self.assertEqual(first["meta_info"]["cache_usage"], self.usage.to_dict())
         self.assertEqual(
             second["meta_info"]["cache_usage"],
             first["meta_info"]["cache_usage"],
         )
+        self.logger.info.assert_called_once()
+        self.logger.warning.assert_not_called()
+        message = _log_message(self.logger.info.call_args)
+        self.assertRegex(
+            message,
+            r"^Cache accounting complete rid=cache-request-1 role=decode ttl=300 "
+            r"block_size=4 prompt=10 read=4 write_5m=4 write_1h=0 normal=2 "
+            r"source=redis elapsed_ms=\d+\.\d{3}$",
+        )
 
     async def test_eos_with_no_visible_text_still_accounts_generated_token(self):
         self.start(finish_reason={"type": "stop", "matched": 2})
         out = await self.attach(text="")
-        self.account.assert_awaited_once_with(self.plan)
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
         self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
 
     async def test_no_generated_token_does_not_touch_store(self):
@@ -348,6 +443,8 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertIsNone(self.state.cache_task)
         self.account.assert_not_awaited()
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
 
     async def test_abort_or_error_does_not_create_cache(self):
         for reason in ("abort", "error"):
@@ -378,14 +475,67 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["meta_info"]["cache_usage"], expected)
         self.assertEqual(second["meta_info"]["cache_usage"], expected)
         self.assertIs(self.state.cache_task, task)
-        self.account.assert_awaited_once_with(self.plan)
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
+
+    async def test_redis_fallback_logs_once_without_exception_contents_or_secrets(self):
+        secrets = (
+            "redis://private-redis-host:6379/0",
+            "secret-api-key",
+            "secret-input-content",
+            "verified-api-key-hash",
+            self.plan.page_keys[0],
+        )
+        error = _CACHE.CacheAccountingError(" ".join(secrets))
+        error.__cause__ = TimeoutError(" ".join(secrets))
+        self.account.side_effect = error
+        self.start(cached_tokens=7)
+        await self.attach()
+        self.start(completion_tokens=2, cached_tokens=9)
+        await self.attach()
+        self.logger.warning.assert_called_once()
+        self.logger.info.assert_called_once()
+        warning = _log_message(self.logger.warning.call_args)
+        complete = _log_message(self.logger.info.call_args)
+        self.assertEqual(
+            warning,
+            "Cache accounting Redis fallback rid=cache-request-1 role=decode "
+            "ttl=300 error_type=TimeoutError",
+        )
+        self.assertIn("read=7 write_5m=0 write_1h=0 normal=3 source=physical", complete)
+        for secret in secrets:
+            self.assertNotIn(secret, warning + complete)
+        self.assertEqual(self.logger.warning.call_args.kwargs, {})
+        self.assertEqual(self.logger.info.call_args.kwargs, {})
+
+    async def test_no_complete_block_logs_without_claiming_redis_was_used(self):
+        self.state.cache_plan = _CACHE.build_page_cache_plan(
+            input_ids=[1, 2, 3],
+            api_key="verified-api-key-hash",
+            namespace="weights-v1",
+            page_size=_CACHE.CACHE_BLOCK_SIZE,
+            ttl_seconds=3600,
+        )
+        self.account.return_value = _CACHE.CacheUsage(normal_input_tokens=3)
+        self.manager.disaggregation_mode = _DISAGG_MODE.NULL
+        self.start(prompt_tokens=3)
+        await self.manager._attach_cache_usage(self.state, {"meta_info": {}})
+        self.logger.info.assert_called_once()
+        message = _log_message(self.logger.info.call_args)
+        self.assertIn("role=standalone ttl=3600 block_size=256 prompt=3", message)
+        self.assertIn(
+            "read=0 write_5m=0 write_1h=0 normal=3 source=no_complete_block", message
+        )
+        self.logger.warning.assert_not_called()
 
     async def test_redis_failure_keeps_physical_read_within_prompt(self):
         self.account.side_effect = _CACHE.CacheAccountingError("Redis unavailable")
         for physical_read, expected_read in ((-1, 0), (0, 0), (7, 7), (11, 10)):
             with self.subTest(physical_read=physical_read):
                 self.state = SimpleNamespace(
-                    cache_plan=self.plan, cache_task=None, cache_usage=None
+                    obj=SimpleNamespace(rid="cache-request-1"),
+                    cache_plan=self.plan,
+                    cache_task=None,
+                    cache_usage=None,
                 )
                 self.start(cached_tokens=physical_read)
                 out = await self.attach(cached_tokens=physical_read)
@@ -407,7 +557,9 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Invalid cache plan"):
             await self.attach()
         self.assertIsNone(self.state.cache_usage)
-        self.account.assert_awaited_once_with(self.plan)
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
 
     async def test_tail_partition_and_physical_cache_metric_are_preserved(self):
         self.start()
@@ -426,6 +578,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             ttl_seconds=300,
         )
         other_state = SimpleNamespace(
+            obj=SimpleNamespace(rid="cache-request-2"),
             cache_plan=other_plan,
             cache_task=None,
             cache_usage=None,
@@ -435,13 +588,13 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(self.state.cache_task, other_state.cache_task)
         await asyncio.gather(self.state.cache_task, other_state.cache_task)
         self.assertEqual(self.account.await_count, 2)
-        self.account.assert_any_await(self.plan)
-        self.account.assert_any_await(other_plan)
+        self.account.assert_any_await(self.plan, rid="cache-request-1")
+        self.account.assert_any_await(other_plan, rid="cache-request-2")
 
     async def test_cancelled_client_wait_does_not_cancel_started_accounting(self):
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def delayed_account(plan):
+        async def delayed_account(plan, *, rid=None):
             started.set()
             await release.wait()
             return self.usage
@@ -457,7 +610,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.state.cache_task.cancelled())
         release.set()
         self.assertEqual(await self.state.cache_task, self.usage)
-        self.account.assert_awaited_once_with(self.plan)
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
 
 
 if __name__ == "__main__":

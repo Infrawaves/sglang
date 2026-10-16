@@ -572,19 +572,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
-        self._cache_store = None
-        self._cache_tasks: set[asyncio.Task] = set()
-        if (
-            get_serving().enable_cache_accounting
-            and get_disagg().disaggregation_mode != "prefill"
-        ):
-            cfg = get_serving()
-            self._cache_store = RedisPageCacheStore(
-                cfg.cache_redis_url,
-                timeout_seconds=cfg.cache_timeout,
-                username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
-                password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
-            )
+        self._init_cache_accounting()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -1055,6 +1043,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_params_class=self.sampling_params_class,
         )
 
+    def _init_cache_accounting(self) -> None:
+        cfg = get_serving()
+        role = get_disagg().disaggregation_mode
+        self._cache_store = None
+        self._cache_tasks: set[asyncio.Task] = set()
+        if not cfg.enable_cache_accounting:
+            return
+        if role == "prefill":
+            action = "skip_prefill"
+        else:
+            self._cache_store = RedisPageCacheStore(
+                cfg.cache_redis_url,
+                timeout_seconds=cfg.cache_timeout,
+                username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
+                password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
+            )
+            action = "account"
+        logger.info(
+            "Cache accounting startup enabled=%s role=%s action=%s block_size=%d",
+            cfg.enable_cache_accounting,
+            "standalone" if role == "null" else role,
+            action,
+            CACHE_BLOCK_SIZE,
+        )
+
     def _validate_cache_request(self, obj: GenerateReqInput) -> None:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             obj.cache_ttl_seconds = None
@@ -1156,21 +1169,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return
 
+        rid = state.obj.rid
+        role = (
+            "standalone"
+            if self.disaggregation_mode == DisaggregationMode.NULL
+            else self.disaggregation_mode.value
+        )
+
         async def account_once():
+            started = time.perf_counter()
             if prompt_tokens != plan.prompt_tokens:
                 raise CacheAccountingError(
                     "Cache prompt-token count differs from final input IDs"
                 )
+            source = "redis" if plan.page_keys else "no_complete_block"
             try:
-                return await self._cache_store.account(plan)
-            except CacheAccountingError:
+                usage = await self._cache_store.account(plan, rid=rid)
+            except CacheAccountingError as exc:
                 # Freeze the engine's actual prefix hit from this output. A
                 # failed Redis operation cannot confirm any cache creation.
                 read_tokens = max(0, min(prompt_tokens, cached_tokens))
-                return CacheUsage(
+                usage = CacheUsage(
                     read_tokens=read_tokens,
                     normal_input_tokens=prompt_tokens - read_tokens,
                 )
+                source = "physical"
+                logger.warning(
+                    "Cache accounting Redis fallback rid=%s role=%s ttl=%d "
+                    "error_type=%s",
+                    rid,
+                    role,
+                    plan.ttl_seconds,
+                    type(exc.__cause__ if exc.__cause__ is not None else exc).__name__,
+                )
+            logger.info(
+                "Cache accounting complete rid=%s role=%s ttl=%d block_size=%d "
+                "prompt=%d read=%d write_5m=%d write_1h=%d normal=%d source=%s "
+                "elapsed_ms=%.3f",
+                rid,
+                role,
+                plan.ttl_seconds,
+                plan.page_size,
+                prompt_tokens,
+                usage.read_tokens,
+                usage.creation_5m_tokens,
+                usage.creation_1h_tokens,
+                usage.normal_input_tokens,
+                source,
+                (time.perf_counter() - started) * 1000,
+            )
+            return usage
 
         task = asyncio.create_task(account_once())
         state.cache_task = task
