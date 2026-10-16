@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
@@ -147,11 +148,16 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
+    capacity_multiplier: int = 1,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
     kwargs = {}
+    if is_dummy:
+        # Allocator-only MLA host pool (#36800): same token capacity, no memory.
+        kwargs["is_dummy"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if mtp_draft_device_pools:
@@ -164,10 +170,11 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    host_size = get_memory().hicache_size if host_size is None else host_size
     return kv_host_pool_cls(
         kv_pool,
-        get_memory().hicache_ratio,
-        get_memory().hicache_size if host_size is None else host_size,
+        get_memory().hicache_ratio * capacity_multiplier,
+        host_size * capacity_multiplier,
         page_size,
         get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
@@ -1147,13 +1154,32 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        host_size=kv_host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
+    # Built before host allocation (world-collective): it decides whether this
+    # rank's MLA host pool is real (node leader) or allocator-only (follower).
+    from sglang.srt.mem_cache.mla_host_node_leader import (
+        maybe_create_node_leader_context,
     )
+
+    node_leader = maybe_create_node_leader_context(
+        kv_pool,
+        full_layer_mapping,
+        params.tp_cache_group,
+        params.attn_tp_cache_group,
+        draft_pools=mtp_draft_device_pools,
+    )
+    with (
+        node_leader.leader_budget_scope()
+        if node_leader is not None
+        else contextlib.nullcontext()
+    ):
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=params.page_size,
+            use_mla=use_mla,
+            host_size=kv_host_size,
+            mtp_draft_device_pools=mtp_draft_device_pools,
+            **(node_leader.host_pool_kwargs() if node_leader is not None else {}),
+        )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
@@ -1218,6 +1244,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=node_leader,
     )
     return host_pool_group, cache_controller
 
