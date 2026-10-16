@@ -181,6 +181,13 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Internal cache accounting context. HTTP handlers populate api_key with
+    # the verified key's digest from request.state, never the raw credential.
+    api_key: Optional[str] = field(default=None, kw_only=True)
+    cache_ttl_seconds: Optional[int] = field(default=None, kw_only=True)
+    # True when the client explicitly asked for accounting; unsupported
+    # request shapes are then rejected instead of silently skipped.
+    cache_required: bool = field(default=False, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.

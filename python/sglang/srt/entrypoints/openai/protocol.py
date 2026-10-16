@@ -191,6 +191,7 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    cache_write_tokens: Optional[int] = Field(default=None, ge=0)
     # Multimodal prompt token counts (only populated when present in the prompt)
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
@@ -199,9 +200,13 @@ class PromptTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Drop multimodal fields when absent so text-only/cache-only responses
-        # keep the original {"cached_tokens": N} shape.
-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+        # Keep existing response shapes when optional details are absent.
+        for key in (
+            "cache_write_tokens",
+            "image_tokens",
+            "audio_tokens",
+            "video_tokens",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -213,6 +218,33 @@ class CompletionTokensDetails(BaseModel):
     reasoning_tokens: int = 0
 
 
+class PromptCacheOptions(BaseModel):
+    """Configure the cache policy for complete pages of the input prefix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["implicit"] = "implicit"
+    ttl: Literal["5m", "1h"] = "5m"
+
+
+class CacheUsage(BaseModel):
+    """A per-request prefix cache accounting snapshot."""
+
+    read_tokens: int = Field(default=0, ge=0)
+    creation_5m_tokens: int = Field(default=0, ge=0)
+    creation_1h_tokens: int = Field(default=0, ge=0)
+    normal_input_tokens: int = Field(default=0, ge=0)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return (
+            self.read_tokens
+            + self.creation_5m_tokens
+            + self.creation_1h_tokens
+            + self.normal_input_tokens
+        )
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -220,6 +252,8 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     completion_tokens_details: Optional[CompletionTokensDetails] = None
+    # Kept on the object for internal protocol adapters, never on the OpenAI wire.
+    cache_usage: Optional[CacheUsage] = Field(default=None, exclude=True)
 
 
 class StreamOptions(BaseModel):
@@ -898,6 +932,10 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    prompt_cache_options: Optional[PromptCacheOptions] = Field(
+        default=None,
+        description="When server cache accounting is enabled, omission uses implicit mode with a 5m TTL.",
+    )
     tool_choice: Union[
         ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
     ] = Field(default="auto", examples=["none"])

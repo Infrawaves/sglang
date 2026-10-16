@@ -457,6 +457,11 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        close_cache = getattr(
+            _global_state.tokenizer_manager, "close_cache_accounting", None
+        )
+        if close_cache is not None:
+            await close_cache()
         request_preprocessor = getattr(
             _global_state.tokenizer_manager, "process_request_preprocessor", None
         )
