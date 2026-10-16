@@ -191,6 +191,19 @@ class Serving(msgspec.Struct):
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
+    enable_cache_accounting: A[
+        bool,
+        "Enable Redis-backed, page-aligned input-cache accounting on the first generation output.",
+    ] = False
+    cache_redis_url: A[
+        Optional[str],
+        "Redis URL without credentials or query parameters (redis:// or rediss://). Set SGLANG_CACHE_REDIS_USERNAME/PASSWORD in the environment for authentication.",
+    ] = None
+    cache_namespace: A[
+        Optional[str],
+        "Redis namespace used to isolate cache accounting entries.",
+    ] = None
+    cache_timeout: A[float, "Timeout in seconds for each cache Redis operation."] = 0.2
     return_input_ids: A[
         bool,
         "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids_in_sglext were set on the request.",

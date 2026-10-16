@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCacheCreation,
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
@@ -44,6 +45,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     is_server_tool,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    CacheUsage,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
@@ -119,12 +121,29 @@ def _anthropic_usage_from_openai(
             output_tokens=0 if include_output else None,
         )
 
-    usage_fields: dict[str, int] = {}
+    usage_fields: dict[str, Any] = {}
     cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
-        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-        if cached_tokens:
-            usage_fields["cache_read_input_tokens"] = cached_tokens
+        cache = getattr(usage, "cache_usage", None)
+        if cache is not None:
+            cache = CacheUsage.model_validate(cache)
+            if cache.total_input_tokens != (getattr(usage, "prompt_tokens", 0) or 0):
+                raise ValueError("Cache usage must sum to prompt_tokens.")
+            usage_fields.update(
+                input_tokens=cache.normal_input_tokens,
+                cache_read_input_tokens=cache.read_tokens,
+                cache_creation_input_tokens=(
+                    cache.creation_5m_tokens + cache.creation_1h_tokens
+                ),
+                cache_creation=AnthropicCacheCreation(
+                    ephemeral_5m_input_tokens=cache.creation_5m_tokens,
+                    ephemeral_1h_input_tokens=cache.creation_1h_tokens,
+                ),
+            )
+        else:
+            usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+            if cached_tokens:
+                usage_fields["cache_read_input_tokens"] = cached_tokens
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -557,6 +576,10 @@ class AnthropicServing:
             "stream": anthropic_request.stream or False,
             **anthropic_request.pd_routing_kwargs(),
         }
+        if anthropic_request.prompt_cache_options is not None:
+            request_data["prompt_cache_options"] = (
+                anthropic_request.prompt_cache_options
+            )
 
         if anthropic_request.temperature is not None:
             request_data["temperature"] = anthropic_request.temperature
@@ -766,6 +789,12 @@ class AnthropicServing:
                 error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
                 message=_scrub_error_message(str(e.detail), e.status_code),
             )
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -811,6 +840,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -820,13 +855,43 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
+        generator = self._generate_anthropic_stream(
+            adapted_request, processed_request, anthropic_request, raw_request
+        )
+        stream = generator
+        if getattr(adapted_request, "cache_ttl_seconds", None) is not None:
+            try:
+                # Resolve cache accounting before committing HTTP 200.
+                first_event = await generator.__anext__()
+            except asyncio.CancelledError:
+                await generator.aclose()
+                raise
+            except HTTPException as e:
+                await generator.aclose()
+                return self._error_response(
+                    status_code=e.status_code,
+                    error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                    message=str(e.detail),
+                )
+            except StopAsyncIteration:
+                return self._error_response(
+                    status_code=500,
+                    error_type="api_error",
+                    message="Backend produced no events",
+                )
+
+            async def prepend_first_event():
+                try:
+                    yield first_event
+                    async for event in generator:
+                        yield event
+                finally:
+                    await generator.aclose()
+
+            stream = prepend_first_event()
+
         return StreamingResponse(
-            self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
-            ),
+            stream,
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
                 adapted_request
@@ -855,8 +920,31 @@ class AnthropicServing:
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        cache_ttl_seconds = getattr(adapted_request, "cache_ttl_seconds", None)
 
         def _message_start_event(usage) -> MessageStartEvent:
+            # OpenAI exposes aggregate read/write counts. This endpoint has one
+            # TTL per request, so recover its creation tier without adding
+            # private accounting fields to the public OpenAI stream.
+            details = getattr(usage, "prompt_tokens_details", None)
+            write_tokens = getattr(details, "cache_write_tokens", None)
+            if (
+                usage is not None
+                and getattr(usage, "cache_usage", None) is None
+                and cache_ttl_seconds is not None
+                and write_tokens is not None
+            ):
+                read_tokens = details.cached_tokens
+                one_hour = cache_ttl_seconds == 3600
+                snapshot = CacheUsage(
+                    read_tokens=read_tokens,
+                    creation_5m_tokens=0 if one_hour else write_tokens,
+                    creation_1h_tokens=write_tokens if one_hour else 0,
+                    normal_input_tokens=usage.prompt_tokens
+                    - read_tokens
+                    - write_tokens,
+                )
+                usage = usage.model_copy(update={"cache_usage": snapshot})
             return MessageStartEvent(
                 message=AnthropicMessagesResponse(
                     id=message_id,
@@ -1015,6 +1103,14 @@ class AnthropicServing:
                 break
             except asyncio.CancelledError:
                 raise
+            except HTTPException as e:
+                if not message_started and cache_ttl_seconds is not None:
+                    raise
+                for frame in _flush_on_error(
+                    ERROR_TYPE_MAP.get(e.status_code, "api_error"), str(e.detail)
+                ):
+                    yield frame
+                return
             except ValueError as e:
                 # _generate_chat_stream re-raises ValueError when its own
                 # ``stream_started`` flag is still False — surface as a

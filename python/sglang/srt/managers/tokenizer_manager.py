@@ -61,6 +61,13 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
+from sglang.srt.cache_accounting import (
+    CacheAccountingError,
+    CacheUsage,
+    PageCachePlan,
+    RedisPageCacheStore,
+    build_page_cache_plan,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -281,6 +288,9 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    cache_plan: Optional[PageCachePlan] = None
+    cache_task: Optional[asyncio.Task] = None
+    cache_usage: Optional[CacheUsage] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -561,6 +571,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+        self._cache_store = None
+        self._cache_tasks: set[asyncio.Task] = set()
+        if (
+            get_serving().enable_cache_accounting
+            and get_disagg().disaggregation_mode != "prefill"
+        ):
+            cfg = get_serving()
+            self._cache_store = RedisPageCacheStore(
+                cfg.cache_redis_url,
+                timeout_seconds=cfg.cache_timeout,
+                username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
+                password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
+            )
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -1015,6 +1038,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         if not isinstance(obj, GenerateReqInput):
             return
+        self._validate_cache_request(obj)
         self.validate_logprob_params(obj)
         validate_generation_request(
             obj,
@@ -1029,6 +1053,138 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_backend=get_exec().kernel.sampling_backend,
             sampling_params_class=self.sampling_params_class,
         )
+
+    def _validate_cache_request(self, obj: GenerateReqInput) -> None:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.api_key = None
+            return
+        if obj.cache_ttl_seconds is None:
+            return
+        if not get_serving().enable_cache_accounting:
+            raise ValueError("Cache accounting is not enabled on this server")
+        if obj.cache_ttl_seconds not in (300, 3600):
+            raise ValueError("cache_ttl_seconds must be 300 or 3600")
+        if not isinstance(obj.api_key, str) or not obj.api_key.strip():
+            raise ValueError("Cache accounting requires an authenticated API key")
+        params = obj.sampling_params or {}
+        if isinstance(params, dict):
+            params = {
+                **(getattr(self, "preferred_sampling_params", None) or {}),
+                **params,
+            }
+        if (
+            not isinstance(params, dict)
+            or params.get("n", 1) != 1
+            or (params.get("beam_width") or 1) != 1
+            or params.get("use_beam_search", False)
+            or params.get("max_new_tokens") == 0
+            or isinstance(obj.text, list)
+            or (obj.input_ids and isinstance(obj.input_ids[0], list))
+            or obj.input_embeds is not None
+            or obj.session_params is not None
+            or obj.positional_embed_overrides is not None
+            or obj.lora_path is not None
+            or obj.lora_id is not None
+            or obj.contains_mm_input()
+            or not self.is_generation
+        ):
+            if not obj.cache_required:
+                # Implicit accounting: serve the request without cache usage
+                # instead of rejecting shapes the accountant cannot price.
+                obj.cache_ttl_seconds = None
+                obj.api_key = None
+                return
+            raise ValueError(
+                "Cache accounting currently supports a single plain-text "
+                "generation without sessions, adapters, embeddings, or beam search"
+            )
+
+    def _prepare_cache_plan(
+        self, obj: GenerateReqInput, input_ids: Optional[List[int]]
+    ) -> None:
+        if obj.cache_ttl_seconds is None:
+            return
+        self._validate_cache_request(obj)
+        if obj.cache_ttl_seconds is None:
+            return
+        if input_ids is None:
+            raise ValueError("Cache accounting requires final input token IDs")
+        cfg = get_serving()
+        # Read the resolved runtime page size, including backend overrides.
+        # Keep all namespace inputs fixed before Scheduler dispatch.
+        namespace = json.dumps(
+            {
+                "deployment": cfg.cache_namespace,
+                "model": self.model_path,
+                "weights": self.config_value("weight_version"),
+                "tokenizer": cfg.tokenizer_path,
+                "tokenizer_template": getattr(self.tokenizer, "chat_template", None),
+                "chat_template": cfg.chat_template,
+                "hf_chat_template_name": cfg.hf_chat_template_name,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        plan = build_page_cache_plan(
+            input_ids=input_ids,
+            api_key=obj.api_key,
+            namespace=namespace,
+            page_size=get_schedule().page_size,
+            ttl_seconds=obj.cache_ttl_seconds,
+        )
+        self.rid_to_state[obj.rid].cache_plan = plan
+
+    def _start_cache_accounting(
+        self,
+        state: ReqState,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: Any,
+    ) -> None:
+        plan = state.cache_plan
+        if (
+            plan is None
+            or state.cache_task is not None
+            or completion_tokens <= 0
+            or (
+                isinstance(finish_reason, dict)
+                and finish_reason.get("type") in ("abort", "error")
+            )
+        ):
+            return
+
+        async def account_once():
+            if prompt_tokens != plan.prompt_tokens:
+                raise CacheAccountingError(
+                    "Cache prompt-token count differs from final input IDs"
+                )
+            return await self._cache_store.account(plan)
+
+        task = asyncio.create_task(account_once())
+        state.cache_task = task
+        # Do not await Redis in the shared batch-output receiver. Each response
+        # waits for its own decision before exposing any usage to its client.
+        tasks = getattr(self, "_cache_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    async def _attach_cache_usage(self, state: ReqState, out: dict) -> None:
+        if state.cache_task is None:
+            return
+        if state.cache_usage is None:
+            state.cache_usage = await asyncio.shield(state.cache_task)
+        out["meta_info"]["cache_usage"] = state.cache_usage.to_dict()
+
+    async def close_cache_accounting(self) -> None:
+        if self._cache_store is not None:
+            if self._cache_tasks:
+                await asyncio.gather(*tuple(self._cache_tasks), return_exceptions=True)
+            await self._cache_store.aclose()
 
     def validate_logprob_params(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1077,6 +1233,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+
+        if isinstance(obj, GenerateReqInput) and obj.cache_ttl_seconds is not None:
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                obj.cache_ttl_seconds = None
+                obj.api_key = None
+            elif request is not None:
+                # /generate also parses GenerateReqInput from the public body.
+                # Override its key field with the verified credential's digest.
+                api_key = getattr(request.state, "api_key", None)
+                if not isinstance(api_key, str) or not api_key.strip():
+                    raise ValueError(
+                        "Cache accounting requires an authenticated API key"
+                    )
+                obj.api_key = api_key
 
         # Reject the entire raw batch before expansion or dispatch of any member.
         self.validate_request_params(obj)
@@ -1731,6 +1901,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        if isinstance(obj, GenerateReqInput):
+            self._prepare_cache_plan(obj, input_ids)
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -2189,6 +2361,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if meta_info is not None:
                         for key, values in state.customized_info_accumulated.items():
                             meta_info.setdefault(key, list(values))
+
+            try:
+                await self._attach_cache_usage(state, out)
+            except CacheAccountingError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Cache accounting is temporarily unavailable",
+                ) from exc
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -2741,6 +2921,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                self._start_cache_accounting(
+                    state,
+                    recv_obj.prompt_tokens[i],
+                    recv_obj.completion_tokens[i],
+                    recv_obj.finished_reasons[i],
+                )
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
@@ -3729,6 +3915,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        await self.close_cache_accounting()
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()

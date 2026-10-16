@@ -8,6 +8,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 from typing import Any, Optional
 
 
@@ -202,6 +203,22 @@ def add_api_key_middleware(
                 )
                 await response(scope, receive, send)
                 return
+
+            # Allowed requests can include open/probe routes. Derive an identity
+            # only when the Bearer credential matches a configured server key.
+            if authz:
+                parts = authz.split(" ", 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    token = parts[1]
+                    token_bytes = token.encode("utf-8")
+                    if any(
+                        key and secrets.compare_digest(token_bytes, key.encode("utf-8"))
+                        for key in (self.api_key, self.admin_api_key)
+                    ):
+                        scope.setdefault("state", {}).setdefault(
+                            "api_key",
+                            "api-key:" + sha256(token_bytes).hexdigest(),
+                        )
 
             await self.app(scope, receive, send)
 

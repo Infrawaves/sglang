@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
@@ -105,6 +107,33 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def validate_cache_accounting(cfg: Any) -> None:
+    if not cfg.enable_cache_accounting or cfg.disaggregation_mode == "prefill":
+        return
+    parsed = urlparse(cfg.cache_redis_url or "")
+    if parsed.scheme not in ("redis", "rediss") or not parsed.hostname:
+        raise ValueError("Cache accounting requires a redis:// or rediss:// URL")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "--cache-redis-url must not contain credentials, query "
+            "parameters, or fragments; use SGLANG_CACHE_REDIS_USERNAME "
+            "and SGLANG_CACHE_REDIS_PASSWORD for authentication"
+        )
+    if not cfg.cache_namespace or not cfg.cache_namespace.strip():
+        raise ValueError("Cache accounting requires --cache-namespace")
+    if not math.isfinite(cfg.cache_timeout) or cfg.cache_timeout <= 0:
+        raise ValueError("--cache-timeout must be finite and positive")
+    if cfg.tokenizer_worker_num != 1:
+        raise ValueError("Cache accounting currently requires one tokenizer worker")
+    if cfg.dcp_size != 1:
+        raise ValueError("Cache accounting does not yet support DCP pages")
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -174,6 +203,7 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    validate_cache_accounting(cfg)
     validate_request_limits(cfg.max_parallel_samples, cfg.max_batch_outputs)
 
     # Check parallel size constraints
