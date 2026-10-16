@@ -11,9 +11,12 @@ from hashlib import sha256
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse
 from fastapi.testclient import TestClient
 
 # CI registration is parsed statically; avoid importing heavyweight sglang.
@@ -67,6 +70,9 @@ def _register_production_routes(app):
         "Request": Request,
         "RequestValidationError": RequestValidationError,
         "ChatCompletionRequest": _PROTOCOL.ChatCompletionRequest,
+        "ChatCompletionResponse": _PROTOCOL.ChatCompletionResponse,
+        "ORJSONResponse": ORJSONResponse,
+        "CORSMiddleware": CORSMiddleware,
     }
     code = ast.Module(
         body=[
@@ -76,6 +82,19 @@ def _register_production_routes(app):
                 level=0,
             ),
             *nodes,
+            *[
+                node
+                for node in tree.body
+                if isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "app"
+                and node.value.func.attr == "add_middleware"
+                and node.value.args
+                and isinstance(node.value.args[0], ast.Name)
+                and node.value.args[0].id == "CORSMiddleware"
+            ],
         ],
         type_ignores=[],
     )
@@ -86,10 +105,11 @@ def _register_production_routes(app):
 class _RecordingHandler:
     def __init__(self):
         self.calls = []
+        self.response = None
 
     async def handle_request(self, request, raw_request):
         self.calls.append((request, raw_request.state.api_key))
-        return {"accepted": True}
+        return self.response if self.response is not None else {"accepted": True}
 
 
 class TestChatCacheRoutes(unittest.TestCase):
@@ -183,7 +203,9 @@ class TestChatCacheRoutes(unittest.TestCase):
             {"Authorization": "bearer verified-key"},
         ):
             with self.subTest(headers=headers):
-                response = self.client.post(self.path, json=self.body(), headers=headers)
+                response = self.client.post(
+                    self.path, json=self.body(), headers=headers
+                )
                 self.assertEqual(response.status_code, 200)
                 _, api_key = self.handler.calls[-1]
                 self.assertEqual(
@@ -218,6 +240,83 @@ class TestChatCacheRoutes(unittest.TestCase):
                 response = self.client.post(self.path, json=body, headers=self.headers)
                 self.assertEqual(response.status_code, 422)
         self.assertEqual(self.handler.calls, [])
+
+    def test_json_cache_headers_and_usage_come_from_the_same_snapshot(self):
+        for ttl, read, write in (("5m", 200, 700), ("1h", 200, 700), ("1h", 900, 0)):
+            with self.subTest(ttl=ttl, write=write):
+                snapshot = _PROTOCOL.CacheUsage(
+                    read_tokens=read,
+                    creation_5m_tokens=write if ttl == "5m" else 0,
+                    creation_1h_tokens=write if ttl == "1h" else 0,
+                    normal_input_tokens=100,
+                )
+                self.handler.response = _PROTOCOL.ChatCompletionResponse(
+                    id="cache-json",
+                    model="model-v1",
+                    metadata={"trace_id": UUID("12345678-1234-5678-1234-567812345678")},
+                    choices=[
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    usage=_PROTOCOL.UsageInfo(
+                        prompt_tokens=1000,
+                        completion_tokens=100,
+                        total_tokens=1100,
+                        prompt_tokens_details={
+                            "cached_tokens": read,
+                            "cache_write_tokens": write,
+                        },
+                        cache_usage=snapshot,
+                    ),
+                )
+                response = self.client.post(
+                    self.path,
+                    json=self.body(ttl),
+                    headers={**self.headers, "Origin": "https://client.example"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-5m"],
+                    str(snapshot.creation_5m_tokens),
+                )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-1h"],
+                    str(snapshot.creation_1h_tokens),
+                )
+                usage = response.json()["usage"]
+                self.assertEqual(
+                    response.json()["metadata"],
+                    {"trace_id": "12345678-1234-5678-1234-567812345678"},
+                )
+                self.assertNotIn("cache_usage", usage)
+                self.assertEqual(usage["prompt_tokens"], 1000)
+                self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], read)
+                self.assertEqual(
+                    usage["prompt_tokens_details"]["cache_write_tokens"],
+                    sum(
+                        int(response.headers[header])
+                        for header in snapshot.response_headers()
+                    ),
+                )
+                exposed = response.headers["access-control-expose-headers"].lower()
+                for header in snapshot.response_headers():
+                    self.assertIn(header.lower(), exposed)
+
+    def test_legacy_json_and_errors_do_not_gain_cache_headers(self):
+        for result in (
+            {"accepted": True},
+            ORJSONResponse({"error": "unavailable"}, status_code=503),
+        ):
+            with self.subTest(result=result):
+                self.handler.response = result
+                response = self.client.post(
+                    self.path, json=self.body(), headers=self.headers
+                )
+                self.assertNotIn("Msh-Usage-Cache-Write-Tokens-5m", response.headers)
+                self.assertNotIn("Msh-Usage-Cache-Write-Tokens-1h", response.headers)
 
 
 if __name__ == "__main__":
