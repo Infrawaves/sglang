@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PromptCacheOptions
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -34,6 +36,11 @@ class AnthropicErrorResponse(BaseModel):
     error: AnthropicError
 
 
+class AnthropicCacheCreation(BaseModel):
+    ephemeral_5m_input_tokens: NonNegativeInt = 0
+    ephemeral_1h_input_tokens: NonNegativeInt = 0
+
+
 class AnthropicUsage(BaseModel):
     """Token usage information.
 
@@ -46,6 +53,7 @@ class AnthropicUsage(BaseModel):
     output_tokens: Optional[NonNegativeInt] = None
     cache_creation_input_tokens: Optional[NonNegativeInt] = None
     cache_read_input_tokens: Optional[NonNegativeInt] = None
+    cache_creation: Optional[AnthropicCacheCreation] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
@@ -364,6 +372,7 @@ class AnthropicMessagesRequest(BaseModel):
     messages: list[AnthropicMessage]
     max_tokens: int
     metadata: Optional[dict[str, Any]] = None
+    prompt_cache_options: Optional[PromptCacheOptions] = None
     stop_sequences: Optional[list[str]] = None
     stream: Optional[bool] = False
     system: Optional[Union[str, list[AnthropicContentBlock]]] = None
