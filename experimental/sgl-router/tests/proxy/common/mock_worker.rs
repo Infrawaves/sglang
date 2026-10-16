@@ -80,14 +80,11 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
-            .route("/v1/responses", post(responses))
             .route("/server_info", get(serve_tiny_server_info))
             .route(
                 "/abort_request",
                 abort_request_route(abort_log.clone(), captured.clone()),
             )
-            // Let router body-limit tests reach the worker with large payloads.
-            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -500,18 +497,6 @@ async fn serve_tiny_server_info() -> Json<Value> {
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
-/// Same as `chat`, but marks the upstream path so tests can tell the endpoints apart.
-async fn responses(state: State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
-    let captured = state.captured.clone();
-    let response = chat(state, headers, body).await;
-    captured
-        .lock()
-        .unwrap()
-        .headers
-        .insert("x-mock-path".into(), "/v1/responses".into());
-    response
-}
-
 async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();

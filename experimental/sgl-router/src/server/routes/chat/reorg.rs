@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::forward::{forward_chat_request, SelectedWorkers};
-use super::preparation::PreparedChatRequest;
+use super::preparation::{parse_routing_fields, PreparedChatRequest};
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
-    parse_request, InferenceEndpoint, X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
+    X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
 };
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::ModelId;
@@ -24,15 +24,19 @@ pub(super) async fn chat_completions(
     resolvers: &HashMap<ModelId, BucketResolver>,
     headers: HeaderMap,
     body: Bytes,
-    endpoint: InferenceEndpoint,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (model, fields) = parse_request(ctx, &body, endpoint)?;
+    let mut fields = parse_routing_fields(&body)?;
+    let model = ModelId(
+        fields
+            .model
+            .take()
+            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
+    );
     let resolver = resolvers
         .get(&model)
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
     // Length-based routing needs tokenization even for load-only group policies.
-    // Responses cannot be chat-tokenized and use the body-size estimate instead.
     let request = PreparedChatRequest::prepare(ctx, model, fields, body, true)?;
     let input_tokens = request.input_token_count as u64;
     let expected_peak_tokens = request

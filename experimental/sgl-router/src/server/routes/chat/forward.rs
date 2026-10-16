@@ -23,6 +23,7 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 type LoadGuards = (LoadGuard, RouterInflightLoadGuard);
@@ -82,7 +83,6 @@ pub(super) async fn forward_chat_request(
         (decode, bootstrap)
     });
     let engine_rid = request.engine_rid(pd.is_some());
-    let path = request.endpoint.path();
     let bodies = request.into_outgoing_bodies(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
@@ -109,7 +109,6 @@ pub(super) async fn forward_chat_request(
             ctx,
             prefill,
             headers.clone(),
-            path,
             bodies.prefill.expect("PD dispatch has a prefill body"),
             prefill_load_guards,
             bootstrap.room,
@@ -131,7 +130,6 @@ pub(super) async fn forward_chat_request(
         ctx,
         &response_worker,
         &headers,
-        path,
         bodies.response,
         if prefill_result.is_some() { None } else { engine_rid.as_deref() },
         response_load_guards,
@@ -212,7 +210,6 @@ fn spawn_prefill_request(
     ctx: &AppContext,
     prefill_worker: Arc<Worker>,
     headers: HeaderMap,
-    path: &'static str,
     body: Bytes,
     load_guards: LoadGuards,
     bootstrap_room: u64,
@@ -227,7 +224,7 @@ fn spawn_prefill_request(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
                 &prefill_worker.breaker,
-                path,
+                CHAT_PATH,
                 &headers,
                 body,
                 None,
@@ -283,7 +280,6 @@ async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
     headers: &HeaderMap,
-    path: &'static str,
     body: Bytes,
     engine_rid: Option<&str>,
     load_guards: LoadGuards,
@@ -299,7 +295,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                path,
+                CHAT_PATH,
                 headers,
                 body,
                 engine_rid,
@@ -317,7 +313,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                path,
+                CHAT_PATH,
                 headers,
                 body,
                 engine_rid,

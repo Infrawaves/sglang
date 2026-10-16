@@ -4,6 +4,7 @@
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
+use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -181,7 +182,6 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
-    let max_chat_body_bytes = ctx.config.proxy.max_chat_body_bytes;
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
@@ -201,13 +201,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(max_chat_body_bytes))
-                .layer(middleware::from_fn(log_413)),
-        )
-        .route(
-            "/v1/responses",
-            post(crate::server::routes::chat::responses)
-                .layer(DefaultBodyLimit::max(max_chat_body_bytes))
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
@@ -454,7 +448,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let logs = captured(&buf);
-        assert!(logs.contains("request_id=rid-venus"), "{logs}");
+        assert!(logs.contains("request_id=\"rid-venus\""), "{logs}");
         assert!(!logs.contains("rid-client"), "{logs}");
     }
 

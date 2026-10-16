@@ -21,19 +21,10 @@ pub struct ProxyConfig {
     pub request_timeout_secs: u64,
     /// Maximum silence between streamed upstream chunks before the stream fails.
     pub stream_idle_timeout_secs: u64,
-    /// Maximum accepted body size for `/v1/chat/completions` and `/v1/responses`,
-    /// in bytes. Larger bodies are rejected with HTTP 413 before routing.
-    pub max_chat_body_bytes: usize,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
     300
-}
-
-/// Default maximum accepted inference body size, in bytes.
-/// Deployments can override it with `--max-chat-body-bytes`.
-pub const fn default_max_chat_body_bytes() -> usize {
-    70_000_000
 }
 
 impl Default for ProxyConfig {
@@ -41,7 +32,6 @@ impl Default for ProxyConfig {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
-            max_chat_body_bytes: default_max_chat_body_bytes(),
         }
     }
 }
@@ -318,8 +308,7 @@ pub struct ModelConfig {
     pub id: String,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`].
-    /// `None` under `--no-tokenizer`.
-    pub tokenizer_path: Option<String>,
+    pub tokenizer_path: String,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
