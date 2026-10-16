@@ -218,6 +218,10 @@ class Memory(msgspec.Struct):
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
+    enable_mla_hicache_per_node: A[
+        bool,
+        "Keep one HiCache host copy of replicated MLA KV per node: the first rank on each node loads it and broadcasts each layer to the other local GPUs over NVLink. The leader's MLA host pool takes the whole node's share (--hicache-ratio/--hicache-size times the local rank count); the other local ranks allocate no MLA host memory.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
