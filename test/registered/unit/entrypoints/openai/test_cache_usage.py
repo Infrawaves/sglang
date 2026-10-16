@@ -1,6 +1,7 @@
 import json
 import unittest
 from hashlib import sha256
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,25 @@ SNAPSHOT = {
 
 
 class TestCacheUsage(unittest.TestCase):
+    def test_write_headers_include_both_tiers_and_zero(self):
+        for snapshot in (
+            CacheUsage(creation_5m_tokens=700),
+            CacheUsage(creation_1h_tokens=700),
+            CacheUsage(read_tokens=200, normal_input_tokens=100),
+        ):
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(
+                    snapshot.response_headers(),
+                    {
+                        "Msh-Usage-Cache-Write-Tokens-5m": str(
+                            snapshot.creation_5m_tokens
+                        ),
+                        "Msh-Usage-Cache-Write-Tokens-1h": str(
+                            snapshot.creation_1h_tokens
+                        ),
+                    },
+                )
+
     def test_cache_snapshot_and_legacy_metrics_are_independent(self):
         snapshot = {
             "read_tokens": 200,
@@ -332,6 +352,8 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapted_requests = []
         self.fail_accounting = False
+        self.snapshot_override = None
+        self.abort_first = False
 
         async def run_in_request_preprocessor(func, *args):
             return func(*args)
@@ -352,6 +374,8 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     16 if adapted_request.cache_ttl_seconds == 3600 else 0
                 ),
             }
+            if self.snapshot_override is not None:
+                snapshot = dict(self.snapshot_override)
             counts = (1, 2) if adapted_request.stream else (2,)
             for count in counts:
                 yield {
@@ -367,7 +391,15 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                             else {}
                         ),
                         "weight_version": "test-version",
-                        "finish_reason": {"type": "stop"} if count == 2 else None,
+                        "finish_reason": (
+                            {
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Generation unavailable",
+                            }
+                            if self.abort_first
+                            else ({"type": "stop"} if count == 2 else None)
+                        ),
                     },
                 }
 
@@ -544,11 +576,26 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 request.stream_options.continuous_usage_stats = continuous
                 response = await self.chat.handle_request(request, self.raw_request())
                 self.assertIsInstance(response, StreamingResponse)
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-5m"],
+                    "0" if ttl == "1h" else "16",
+                )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-1h"],
+                    "16" if ttl == "1h" else "0",
+                )
                 frames = [frame async for frame in response.body_iterator]
                 self.assertEqual(frames[-1], "data: [DONE]\n\n")
                 final = json.loads(frames[-2][6:])
                 self.assertEqual(final["choices"], [])
                 self.assert_cache_usage(final["usage"], ttl)
+                self.assertEqual(
+                    sum(
+                        int(response.headers[f"Msh-Usage-Cache-Write-Tokens-{tier}"])
+                        for tier in ("5m", "1h")
+                    ),
+                    final["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+                )
                 if continuous:
                     usages = [
                         chunk["usage"]
@@ -562,6 +609,90 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                             usage["prompt_tokens_details"],
                             {"cached_tokens": 16, "cache_write_tokens": 16},
                         )
+
+    async def test_stream_headers_do_not_require_usage_chunks(self):
+        for ttl in ("5m", "1h"):
+            with self.subTest(ttl=ttl):
+                request = self.request(ttl, stream=True)
+                request.stream_options = None
+                response = await self.chat.handle_request(request, self.raw_request())
+                # The headers must exist before consuming any response body.
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-5m"],
+                    "16" if ttl == "5m" else "0",
+                )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-1h"],
+                    "16" if ttl == "1h" else "0",
+                )
+                frames = [frame async for frame in response.body_iterator]
+                for frame in frames[:-1]:
+                    self.assertIsNone(json.loads(frame[6:]).get("usage"))
+
+    async def test_physical_fallback_stream_has_zero_write_headers_and_usage(self):
+        self.snapshot_override = {
+            "read_tokens": 32,
+            "creation_5m_tokens": 0,
+            "creation_1h_tokens": 0,
+            "normal_input_tokens": 11,
+        }
+        for include_usage in (False, True):
+            with self.subTest(include_usage=include_usage):
+                request = self.request("1h", stream=True)
+                request.stream_options.include_usage = include_usage
+                response = await self.chat.handle_request(request, self.raw_request())
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-5m"], "0"
+                )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-1h"], "0"
+                )
+                frames = [frame async for frame in response.body_iterator]
+                if include_usage:
+                    usage = json.loads(frames[-2][6:])["usage"]
+                    self.assertEqual(
+                        usage["prompt_tokens_details"],
+                        {"cached_tokens": 32, "cache_write_tokens": 0},
+                    )
+                    self.assertEqual(usage["prompt_tokens"], 43)
+                    self.assertNotIn("cache_usage", usage)
+                else:
+                    for frame in frames[:-1]:
+                        self.assertIsNone(json.loads(frame[6:]).get("usage"))
+
+    async def test_stream_headers_use_a_separate_snapshot_for_each_request(self):
+        responses = [
+            await self.chat.handle_request(
+                self.request(ttl, stream=True), self.raw_request()
+            )
+            for ttl in ("5m", "1h")
+        ]
+        self.assertEqual(responses[0].headers["Msh-Usage-Cache-Write-Tokens-5m"], "16")
+        self.assertEqual(responses[0].headers["Msh-Usage-Cache-Write-Tokens-1h"], "0")
+        self.assertEqual(responses[1].headers["Msh-Usage-Cache-Write-Tokens-5m"], "0")
+        self.assertEqual(responses[1].headers["Msh-Usage-Cache-Write-Tokens-1h"], "16")
+        for response in responses:
+            _ = [frame async for frame in response.body_iterator]
+
+    async def test_disabled_stream_keeps_cache_headers_absent(self):
+        self.config.enable_cache_accounting = False
+        response = await self.chat.handle_request(
+            self.request(None, stream=True, omit_options=True),
+            Request({"type": "http", "headers": []}),
+        )
+        self.assertNotIn("Msh-Usage-Cache-Write-Tokens-5m", response.headers)
+        self.assertNotIn("Msh-Usage-Cache-Write-Tokens-1h", response.headers)
+        _ = [frame async for frame in response.body_iterator]
+
+    async def test_first_error_event_does_not_expose_cache_write_headers(self):
+        self.abort_first = True
+        response = await self.chat.handle_request(
+            self.request("1h", stream=True), self.raw_request()
+        )
+        self.assertNotIn("Msh-Usage-Cache-Write-Tokens-5m", response.headers)
+        self.assertNotIn("Msh-Usage-Cache-Write-Tokens-1h", response.headers)
+        frames = [frame async for frame in response.body_iterator]
+        self.assertIn("error", json.loads(frames[0][6:]))
 
     async def test_backend_failure_returns_http_503_for_both_response_modes(self):
         self.fail_accounting = True

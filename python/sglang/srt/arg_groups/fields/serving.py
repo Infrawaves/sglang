@@ -192,7 +192,7 @@ class Serving(msgspec.Struct):
     ] = False
     enable_cache_accounting: A[
         bool,
-        "Enable Redis-backed, page-aligned input-cache accounting on the first generation output.",
+        "Enable Redis-backed input-cache accounting in 256-token blocks on the first generation output.",
     ] = False
     cache_redis_url: A[
         Optional[str],

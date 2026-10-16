@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Page-level prompt-cache accounting."""
+"""Prompt-cache accounting with fixed 256-token blocks."""
 
 from sglang.srt.cache_accounting.page_cache import (
+    CACHE_BLOCK_SIZE,
     CacheAccountingError,
     CacheUsage,
     PageCachePlan,
@@ -10,6 +11,7 @@ from sglang.srt.cache_accounting.page_cache import (
 )
 
 __all__ = [
+    "CACHE_BLOCK_SIZE",
     "CacheAccountingError",
     "CacheUsage",
     "PageCachePlan",

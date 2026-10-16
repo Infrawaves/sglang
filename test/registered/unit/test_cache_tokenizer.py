@@ -106,6 +106,7 @@ def _load_manager_helpers(*, serving=None, schedule=None):
         "get_serving": lambda: serving,
         "get_schedule": lambda: schedule,
         "build_page_cache_plan": _CACHE.build_page_cache_plan,
+        "CACHE_BLOCK_SIZE": _CACHE.CACHE_BLOCK_SIZE,
         "CacheAccountingError": _CACHE.CacheAccountingError,
         "CacheUsage": _CACHE.CacheUsage,
         "DisaggregationMode": _DISAGG_MODE,
@@ -155,17 +156,18 @@ class TestTokenizerCachePreparation(unittest.TestCase):
 
     def prepare(self, input_ids=None):
         if input_ids is None:
-            input_ids = list(range(10))
+            input_ids = list(range(514))
         self.manager._prepare_cache_plan(self.obj, input_ids)
         return self.state.cache_plan
 
-    def test_resolved_runtime_page_size_and_final_ids_determine_boundaries(self):
+    def test_fixed_256_token_blocks_use_final_input_ids(self):
         plan = self.prepare()
-        self.assertEqual(plan.page_size, 4)
-        self.assertEqual(plan.prompt_tokens, 10)
+        self.assertEqual(plan.page_size, 256)
+        self.assertEqual(plan.prompt_tokens, 514)
         self.assertEqual(len(plan.page_keys), 2)
         self.assertEqual(plan.prompt_tokens % plan.page_size, 2)
-        # Raw construction-time page_size=1 must not affect the result.
+        # Neither resolved nor construction-time KV page size affects accounting.
+        self.assertEqual(self.schedule.page_size, 4)
         self.assertEqual(self.manager.server_args.page_size, 1)
 
     def test_prefill_ignores_cache_options_before_configuration_and_identity(self):
@@ -178,41 +180,43 @@ class TestTokenizerCachePreparation(unittest.TestCase):
         self.assertIsNone(self.obj.api_key)
         self.assertIsNone(self.state.cache_plan)
 
-    def test_decode_uses_selected_ttl_and_runtime_page_size(self):
+    def test_decode_uses_selected_ttl_and_256_token_blocks(self):
         self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
         for ttl in (300, 3600):
             with self.subTest(ttl=ttl):
                 self.obj.cache_ttl_seconds = ttl
                 plan = self.prepare()
                 self.assertEqual(plan.ttl_seconds, ttl)
-                self.assertEqual(plan.page_size, 4)
+                self.assertEqual(plan.page_size, 256)
                 self.assertEqual(len(plan.page_keys), 2)
 
-    def test_engine_page_size_one_accepts_more_than_4096_complete_pages(self):
+    def test_engine_page_size_one_does_not_change_accounting_blocks(self):
         self.schedule.page_size = 1
         plan = self.prepare(list(range(4097)))
-        self.assertEqual(plan.page_size, 1)
+        self.assertEqual(plan.page_size, 256)
         self.assertEqual(plan.prompt_tokens, 4097)
-        self.assertEqual(len(plan.page_keys), 4097)
+        self.assertEqual(len(plan.page_keys), 16)
+        self.assertEqual(plan.prompt_tokens % plan.page_size, 1)
 
-    def test_changing_resolved_engine_page_size_changes_page_boundaries(self):
+    def test_changing_engine_page_size_preserves_accounting_identity(self):
+        first = self.prepare()
         self.schedule.page_size = 8
-        plan = self.prepare(list(range(19)))
-        self.assertEqual(plan.page_size, 8)
+        plan = self.prepare()
+        self.assertEqual(plan.page_size, 256)
         self.assertEqual(len(plan.page_keys), 2)
-        self.assertEqual(plan.prompt_tokens % plan.page_size, 3)
+        self.assertEqual(plan.page_keys, first.page_keys)
 
     def test_content_page_keys_are_stable_across_requests(self):
         first = self.prepare()
         self.obj.rid = "r2"
         second_state = SimpleNamespace(cache_plan=None)
         self.manager.rid_to_state["r2"] = second_state
-        self.manager._prepare_cache_plan(self.obj, list(range(10)))
+        self.manager._prepare_cache_plan(self.obj, list(range(514)))
         second = second_state.cache_plan
         self.assertEqual(first.page_keys, second.page_keys)
 
     def test_namespace_and_input_identity_are_frozen_before_output(self):
-        ids = list(range(10))
+        ids = list(range(514))
         first = self.prepare(ids)
         original_keys = first.page_keys
         self.weights = "weights-v2"
@@ -220,7 +224,7 @@ class TestTokenizerCachePreparation(unittest.TestCase):
         self.manager.tokenizer.chat_template = "template-v2"
         ids[0] = 99
         self.assertEqual(first.page_keys, original_keys)
-        second = self.prepare(list(range(10)))
+        second = self.prepare(list(range(514)))
         self.assertNotEqual(first.page_keys, second.page_keys)
 
     def test_subpage_input_does_not_get_a_partial_page_key(self):
@@ -290,9 +294,20 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             cache_usage=None,
         )
 
-    def start(self, *, prompt_tokens=10, completion_tokens=1, finish_reason=None):
+    def start(
+        self,
+        *,
+        prompt_tokens=10,
+        completion_tokens=1,
+        finish_reason=None,
+        cached_tokens=0,
+    ):
         self.manager._start_cache_accounting(
-            self.state, prompt_tokens, completion_tokens, finish_reason
+            self.state,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason,
+            cached_tokens=cached_tokens,
         )
 
     async def attach(self, *, text="", cached_tokens=7):
@@ -350,24 +365,49 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.state.cache_task)
         self.assertNotIn("cache_usage", out["meta_info"])
 
-    async def test_redis_failure_remains_failed_and_does_not_retry_on_next_chunk(self):
+    async def test_redis_failure_freezes_physical_read_and_does_not_retry(self):
         self.account.side_effect = _CACHE.CacheAccountingError(
             "unconfirmed Redis result"
         )
-        self.start()
+        self.start(cached_tokens=7)
         task = self.state.cache_task
-        for _ in range(2):
-            with self.assertRaisesRegex(_CACHE.CacheAccountingError, "unconfirmed"):
-                await self.attach()
-            self.start(completion_tokens=2)
+        first = await self.attach(cached_tokens=7)
+        self.start(completion_tokens=2, cached_tokens=9)
+        second = await self.attach(cached_tokens=9)
+        expected = _CACHE.CacheUsage(read_tokens=7, normal_input_tokens=3).to_dict()
+        self.assertEqual(first["meta_info"]["cache_usage"], expected)
+        self.assertEqual(second["meta_info"]["cache_usage"], expected)
         self.assertIs(self.state.cache_task, task)
         self.account.assert_awaited_once_with(self.plan)
+
+    async def test_redis_failure_keeps_physical_read_within_prompt(self):
+        self.account.side_effect = _CACHE.CacheAccountingError("Redis unavailable")
+        for physical_read, expected_read in ((-1, 0), (0, 0), (7, 7), (11, 10)):
+            with self.subTest(physical_read=physical_read):
+                self.state = SimpleNamespace(
+                    cache_plan=self.plan, cache_task=None, cache_usage=None
+                )
+                self.start(cached_tokens=physical_read)
+                out = await self.attach(cached_tokens=physical_read)
+                cache = out["meta_info"]["cache_usage"]
+                self.assertEqual(cache["read_tokens"], expected_read)
+                self.assertEqual(cache["creation_5m_tokens"], 0)
+                self.assertEqual(cache["creation_1h_tokens"], 0)
+                self.assertEqual(sum(cache.values()), self.plan.prompt_tokens)
 
     async def test_prompt_count_mismatch_is_strict_and_never_writes(self):
         self.start(prompt_tokens=9)
         with self.assertRaises(_CACHE.CacheAccountingError):
             await self.attach()
         self.account.assert_not_awaited()
+
+    async def test_local_accounting_error_does_not_fall_back_to_physical_read(self):
+        self.account.side_effect = ValueError("Invalid cache plan")
+        self.start(cached_tokens=7)
+        with self.assertRaisesRegex(ValueError, "Invalid cache plan"):
+            await self.attach()
+        self.assertIsNone(self.state.cache_usage)
+        self.account.assert_awaited_once_with(self.plan)
 
     async def test_tail_partition_and_physical_cache_metric_are_preserved(self):
         self.start()

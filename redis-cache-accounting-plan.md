@@ -1,6 +1,6 @@
 # Redis 页级缓存计量框架评审稿
 
-这版框架已迁移到 `zq/v0.5.21-video-image-cpupre-nodemotion`。输入 tokenization 完成后准备页哈希；首次收到成功生成结果时执行 Redis 原子计量；每请求的异步响应任务等待结果后返回 usage。功能默认关闭，引擎原有缓存指标保留在内部元数据中。PD 模式只在 Decode 侧统计，Prefill 沿用原有推理流程。
+实现分支为 `liuhe/cache_write`，基于 `zq/v0.5.21-video-image-cpupre-nodemotion`。输入 tokenization 完成后准备页哈希；首次收到成功生成结果时执行 Redis 原子计量；每请求的异步响应任务等待结果后返回 usage。功能默认关闭，引擎原有缓存指标保留在内部元数据中。PD 模式只在 Decode 侧统计，Prefill 沿用原有推理流程。
 
 ## 用户规则
 
@@ -8,18 +8,19 @@
 - TTL 有 5min、1h 两档，**TTL 属于缓存身份**。同一用户、同一输入的两档记录互不命中，分别续期。
 - 5min 请求只读取并续期 5min 记录，1h 请求只读取并续期 1h 记录；本档没有记录时，即使另一档存在也按本档 write 处理。
 - 有效记录命中后按该档时长续期；成功创建记录计 write，读取有效记录计 read。
-- 计量单位为输入 token，尾部不足一页的 token 计普通输入。
+- 每块固定 256 tokens，尾部不足 256 的 token 计普通输入。
+- Redis 故障时，本次 write 为 0，read 使用引擎本次实际缓存命中量。
 
 ## 数据和页边界
 
-直接使用推理引擎已经解析完成的 `get_schedule().page_size`，包括 backend 对页大小的调整。缓存计量不设置独立页大小，也不增加页数上限；输入长度沿用引擎现有校验。框架暂不开放 DCP，其实际 radix 页可能进一步放大。
+计量块大小固定为 `CACHE_BLOCK_SIZE = 256`，独立于推理引擎的 KV page-size；不修改引擎页大小，也不增加缓存页数上限。输入长度沿用引擎现有校验。框架暂不开放 DCP。
 
-最终送给模型的输入 IDs 按 P 个 token 切成完整页，最后不足 P 个的尾部不写 Redis。namespace 包含部署标识、模型、权重版本、tokenizer 和模板信息。每页使用固定 uint32 大端编码和累计 SHA256；用户身份、namespace、P 和 TTL 都参与 seed。
+最终送给模型的输入 IDs 按 256 个 token 切成完整页，最后不足 256 个的尾部不写 Redis。namespace 包含部署标识、模型、权重版本、tokenizer 和模板信息。每页使用固定 uint32 大端编码和累计 SHA256；用户身份、namespace、块大小和 TTL 都参与 seed。
 
 ```text
-seed = hash(domain, api_key_hash, namespace, page_size, ttl_seconds)
-hash_0 = hash(seed, tokens[0:P])
-hash_1 = hash(hash_0, tokens[P:2P])
+seed = hash(domain, api_key_hash, namespace, 256, ttl_seconds)
+hash_0 = hash(seed, tokens[0:256])
+hash_1 = hash(hash_0, tokens[256:512])
 ...
 ```
 
@@ -37,16 +38,16 @@ sglang:cache:v1:{FIRST_PAGE_DIGEST}:page:PAGE_DIGEST
 
 只读取从输入开头起连续存在的最长完整页前缀。第一次缺页之后，即便后面存在孤立记录，所有后续完整页仍按创建处理。续期命中页并写入后续页，在一段 Lua 中原子完成。
 
-例：P=4，当前输入 14 tokens，共 3 个完整页和 2 个尾部 token。
+例：当前输入 800 tokens，共 3 个完整页和 32 个尾部 token。
 
 | Redis 状态 | read | write | 普通输入 |
 | --- | ---: | ---: | ---: |
-| 无记录 | 0 | 12 | 2 |
-| 连续命中前两页 | 8 | 4 | 2 |
-| 三页全命中 | 12 | 0 | 2 |
-| 第1页存在、第2页缺失、第3页存在 | 4 | 8 | 2 |
+| 无记录 | 0 | 768 | 32 |
+| 连续命中前两页 | 512 | 256 | 32 |
+| 三页全命中 | 768 | 0 | 32 |
+| 第1页存在、第2页缺失、第3页存在 | 256 | 512 | 32 |
 
-始终满足 `read + write_5m + write_1h + normal = prompt_tokens`。例如 5m 已缓存，不代表相同输入的 1h 请求命中。页大小不同也不共享记录。
+始终满足 `read + write_5m + write_1h + normal = prompt_tokens`。例如 5m 已缓存，不代表相同输入的 1h 请求命中。两档独立创建和续期，不跨档读取或继承 TTL；这以本项目的隔离规则为准。
 
 此模式支持页边界上的输入前缀扩展：原请求写入的完整页可以被后续更长请求读取，新增完整页计 write，尾部计普通输入。当前不解析消息块级缓存断点，缓存范围为整个实际输入中的完整页。
 
@@ -54,13 +55,15 @@ sglang:cache:v1:{FIRST_PAGE_DIGEST}:page:PAGE_DIGEST
 
 ```mermaid
 flowchart TD
-    A[认证与请求策略] --> B[最终输入 IDs 与引擎 page size]
+    A[认证与请求策略] --> B[最终输入 IDs 按 256 tokens 分块]
     B --> C[冻结累计页哈希]
     C --> D[推理及输出 detokenization]
     D --> E[TokenizerManager 首次收到成功生成结果]
     E --> F[创建每请求 Redis 异步任务]
     F --> G[Lua 原子判定 连续前缀续期 后续页创建]
     G --> H[固定缓存 usage]
+    F -->|Redis 故障| J[write 为 0 read 为引擎实际命中]
+    J --> H
     H --> I[流式或非流式响应]
 ```
 
@@ -74,11 +77,13 @@ Redis I/O 不放进 GPU scheduler，也不在共享批次接收循环中逐请�
 
 ## 并发和失败
 
-Lua 先验证所有参数和 key 类型，然后读取最长连续前缀，再统一续期或创建。原子执行防止同批冷启动把同一页重复算成首次创建。脚本按引擎 page_size 产生的全部完整页处理，所有 key 显式通过 KEYS 传入，不进行 SCAN。
+Lua 先验证所有参数和 key 类型，然后读取最长连续前缀，再统一续期或创建。原子执行防止同批冷启动把同一页重复算成首次创建。脚本处理全部完整的 256-token 页，所有 key 显式通过 KEYS 传入，不进行 SCAN。
 
 每个请求只启动一次 Redis 计量任务，流式后续 chunk 复用本请求内存中的固定结果。Redis 只保存缓存页记录。新请求按 Redis 当时的页面状态重新判定 read/write。
 
-查询、执行超时或结果不确定时采取严格模式：不能当作 miss，不能虚报 write。响应链路返回 503；缓存请求在发送流式 HTTP 响应头前预取首事件，因此首次计量失败仍能返回正确 HTTP 状态。未开启缓存的请求保留原路径。
+Redis 连接、执行超时或结果不确定时，按业务约定降级：两个档位 write 都为 0，read 取首次成功输出携带的引擎实际 `cached_tokens`，普通输入为 `prompt_tokens - read`。物理命中量不按 256 取整，取值限制在 0 到完整输入数之间。该结果在请求内冻结，后续分片不重新分类，初始响应头和尾部 usage 使用同一结果。未开启缓存的请求保留原路径。
+
+如果 Redis 已执行但响应丢失，本次仍报 write 0；已经建立的条目可能被后续请求命中。最终输入 IDs 与引擎输入数量不一致属于内部一致性错误，仍拒绝生成不一致的 usage。
 
 Redis 调用失败后不自动重试，后续 chunk 也不会重新发起计量。
 
@@ -98,7 +103,7 @@ Redis 调用失败后不自动重试，后续 chunk 也不会重新发起计量�
 
 这个 Router 接收原始请求体，只提取路由和采样所需字段；注入 input IDs、采样默认值、请求 ID 和 PD bootstrap 时，保留完整 JSON 中的其余字段。顶层缓存选项沿用这条路径透传。PD 同时传给 P 和 D；P 的请求仅关闭流式输出，缓存选项保持原样。省略选项或 TTL 时，默认 5 分钟由 D 侧引擎处理，Router 保留请求中原有的省略状态。
 
-`Authorization` 已在请求头透传白名单中。普通 JSON 响应和 SSE 流式响应都沿用 D 的原始响应内容，其中包含 `cached_tokens` 和 `cache_write_tokens`。Router 沿用现有转发实现，本次通过真实请求链路的测试源码明确这些透传约定。
+`Authorization` 已在请求头透传白名单中。普通 JSON 响应和 SSE 流式响应都沿用 D 的原始响应内容，其中包含 `cached_tokens` 和 `cache_write_tokens`。成功响应额外透传 D 返回的两档写入响应头；采用精确白名单，不合并 P 的写入量，也不转发其他上游私有响应头。
 
 OpenAI chat 使用标准路径 `POST /v1/chat/completions`。
 
@@ -133,7 +138,7 @@ Authorization: Bearer API_KEY
 
 PD 模式下，Prefill 收到 `prompt_cache_options` 也直接忽略这份缓存计量，不因本功能未开启而拒绝请求；Decode 执行一次 Redis 统计并返回 usage。这样同一请求不会先在 P 算 write、随后又在 D 算 read。目标分支原有 CPU 预处理子进程仍使用已验证的身份摘要，不传入新的原始密钥字段。
 
-OpenAI usage 中，`prompt_tokens` 始终是完整输入数；使用本功能时，`prompt_tokens_details.cached_tokens` 表示本次从 Redis 读取的 token 数，`cache_write_tokens` 表示本次写入所选 TTL 档位的 token 数。返回格式如下：
+OpenAI usage 中，`prompt_tokens` 始终是完整输入数；使用本功能时，`prompt_tokens_details.cached_tokens` 表示本次缓存读取量，`cache_write_tokens` 表示本次写入量。正常使用 Redis 的计量结果；Redis 故障时使用前述物理读取降级结果。返回格式如下：
 
 ```json
 {
@@ -149,28 +154,37 @@ OpenAI usage 中，`prompt_tokens` 始终是完整输入数；使用本功能时
 }
 ```
 
-这个字段示例中，普通输入为 `1000 - 200 - 700 = 100`，不单独增加公开字段；真实计量中的 read/write 数量按引擎 page size 对齐，普通输入为不足一页的尾部。输出 token 不参与本次输入缓存计量。内部快照不序列化为公开的 `usage.cache_usage`，即使请求 `return_meta_info` 也不会在 choice 的元数据中暴露它。
+这个例子仅展示协议字段，普通输入为 `1000 - 200 - 700 = 100`，不单独增加公开字段。正常 Redis 计量的 read/write 按 256 对齐，普通输入为不足一页的尾部；Redis 故障时 read 使用未取整的物理命中。输出 token 不参与本次输入缓存计量。内部快照不序列化为公开的 `usage.cache_usage`，即使请求 `return_meta_info` 也不会在 choice 的元数据中暴露它。
 
 服务开启本功能后，即使 read/write 都为 0，也显式返回这两个计数，不依赖旧的 `--enable-cache-report`。服务关闭本功能时，保持原有缓存报告行为，不增加 `cache_write_tokens`。
 
-OpenAI 流式请求设置 `"stream": true` 和 `"stream_options": {"include_usage": true}`，在最后一个 usage 事件的 `prompt_tokens_details` 中读取同样的两个字段。设置 `continuous_usage_stats` 时，中间事件携带相同的输入计量快照，不重复累加。5m 与 1h 缓存身份和续期规则严格隔离。
+成功响应的初始 HTTP 首部包含以下两项，非流式和 SSE 使用相同名称；值为该请求实际写入的非负整数，没有写入的档位明确报 0：
 
-Anthropic usage 将内部快照映射为以下格式，以前文 P=4、14 个输入 token 的 5m 请求为例：
+```http
+Msh-Usage-Cache-Write-Tokens-5m: 0
+Msh-Usage-Cache-Write-Tokens-1h: 256
+```
+
+两个头的数值之和等于 `cache_write_tokens`。全命中、仅续期和 Redis 故障时两个头均为 0。头从冻结的计量结果产生，不根据请求 TTL 推测写入量；CORS 暴露这两个响应头供浏览器读取。
+
+OpenAI 流式请求设置 `"stream": true` 和 `"stream_options": {"include_usage": true}`，在 `[DONE]` 前返回 `choices: []` 的完整 usage chunk，包含完整输入、输出、总量和缓存分项。HTTP 首部在发送首事件前根据同一快照设置；`include_usage=false` 时也有两个写入头。设置 `continuous_usage_stats` 时，中间事件携带相同的输入计量快照，不重复累加。
+
+Anthropic usage 继续将内部快照映射为以下格式，以前文 800 个输入 token、命中两页的 5m 请求为例：
 
 ```json
 {
-  "input_tokens": 2,
-  "cache_read_input_tokens": 8,
-  "cache_creation_input_tokens": 4,
+  "input_tokens": 32,
+  "cache_read_input_tokens": 512,
+  "cache_creation_input_tokens": 256,
   "cache_creation": {
-    "ephemeral_5m_input_tokens": 4,
+    "ephemeral_5m_input_tokens": 256,
     "ephemeral_1h_input_tokens": 0
   },
   "output_tokens": 128
 }
 ```
 
-上例总输入为14。流式 message_start 携带同一份输入快照，后续不重复累加。空 completion 的初始 role 事件也携带快照。Anthropic 流式适配器通过 OpenAI 的公开 read/write 计数和请求所选 TTL 恢复创建分档。
+上例总输入为 800。流式 message_start 携带同一份输入快照，后续不重复累加。空 completion 的初始 role 事件也携带快照。Anthropic 流式适配器通过 OpenAI 的公开 read/write 计数和请求所选 TTL 恢复创建分档。本次新增 HTTP 写入头的接口范围为 OpenAI Chat Completions。
 
 ## 启用与评审入口
 
@@ -186,7 +200,7 @@ python -m sglang.launch_server \
   --cache-namespace MODEL_WEIGHT_AND_TOKENIZER_REVISION
 ```
 
-上述缓存参数用于单体引擎或现有 Decode 启动命令。PD 部署保留各自原有参数，在 D 侧开启 `--enable-cache-accounting` 并配置 Redis，P 侧不需要开启。D 侧需配置能校验 Router 转发 Bearer 凭据的 `--api-key`，才能生成可信身份摘要；未接入可信认证时，D 侧缓存请求会拒绝。D 侧仍使用该引擎实际解析的 page size。
+上述缓存参数用于单体引擎或现有 Decode 启动命令。PD 部署保留各自原有参数，在 D 侧开启 `--enable-cache-accounting` 并配置 Redis，P 侧不需要开启。D 侧需配置能校验 Router 转发 Bearer 凭据的 `--api-key`，才能生成可信身份摘要；未接入可信认证时，D 侧缓存请求会拒绝。计量始终按 256 tokens 分块。
 
 Redis URL 不接受凭证、query 或 fragment，避免凭证出现在启动参数日志和 server_info。需要 Redis 认证时，通过 `SGLANG_CACHE_REDIS_USERNAME`、`SGLANG_CACHE_REDIS_PASSWORD` 环境变量提供。
 
@@ -197,7 +211,7 @@ Redis URL 不接受凭证、query 或 fragment，避免凭证出现在启动参�
 | cache_namespace | 未设置，启用时必填 |
 | cache_timeout | 0.2 秒 |
 
-例如，引擎实际 page_size=16 时，每16个输入 token 形成一页；page_size=1 时，每个 token 形成一页。页数由输入长度自然决定，不要求额外的缓存页数配置。
+例如输入 1000 tokens，无论引擎 KV page-size 是 1 还是 16，均有 3 个完整计量块、共 768 tokens；尾部 232 tokens 计普通输入。页数由输入长度自然决定，不要求额外的缓存页数配置。
 
 主要代码：
 
@@ -217,9 +231,9 @@ Redis URL 不接受凭证、query 或 fragment，避免凭证出现在启动参�
 
 一期支持单请求、n=1、纯文本生成，含流式和非流式，以及 PD 模式下的 D 侧计量。多模态输入、input embedding、位置 embedding 覆盖、LoRA、会话重建和 beam 等尚未接入计量的请求，显式要求缓存时拒绝，默认隐式请求则跳过本功能；纯文本请求可在多模态模型上计量。DCP 和多 tokenizer worker 暂未开放。沿用引擎原有 KV 算法。
 
-测试覆盖页边界、尾页、累计前缀、输入扩展、中间缺页、用户和版本隔离、TTL 两档隔离、续期及过期、并发首次创建、Redis 错误、首次输出仅计一次、EOS 空文本、取消、输入守恒、身份伪造、配置限制及两种协议的 usage。Redis Lua 集成测试使用真实 Redis；TokenizerManager 方法采用 AST 载入隔离 GPU 依赖，协议及 usage 测试使用真实轻量模块。
+测试覆盖 256 边界、尾页、累计前缀、输入扩展、中间缺页、用户和版本隔离、TTL 两档隔离、续期及过期、并发首次创建、Redis 错误降级、首次输出仅计一次、EOS 空文本、取消、输入守恒、身份伪造、配置限制及两种协议的 usage。JSON/SSE 响应头与 usage 的一致性、零写入和无 include_usage 的 SSE 单独覆盖。Redis Lua 集成测试使用真实 Redis；TokenizerManager 方法采用 AST 载入隔离 GPU 依赖，协议及 usage 测试使用真实轻量模块。
 
-Router 测试源码覆盖缓存选项在请求体改写后的保留，以及从 `/v1/chat/completions` 入口到 P/D worker 的参数、Bearer 和响应透传，包含普通和流式响应。TTL 默认值及非法参数由引擎入口测试覆盖。
+Router 测试源码覆盖缓存选项在请求体改写后的保留，以及从 `/v1/chat/completions` 入口到 P/D worker 的参数、Bearer 和响应透传，包含普通和流式响应、两档写入响应头、零值及仅使用 D 响应头。TTL 默认值及非法参数由引擎入口测试覆盖。
 
 在仓库根目录可以单独验证页哈希与 manager 计量边界；设置 `REDIS_SERVER_BIN` 后，第一条命令也会启动临时真实 Redis 验证 Lua：
 
@@ -236,6 +250,6 @@ cargo test --test proxy prompt_cache_accounting
 
 本地已验证 Python/Redis 回归。本次 `experimental/sgl-router` 的 Rust 编译与测试按约定由评审方执行，当前没有运行。
 
-本机未启动 GPU 模型服务，端到端推理、GPU 性能及实际部署流量下的 Redis 容量仍需部署环境验收。评审应重点看：以首次输出为计量时点是否符合业务、尾页按普通输入是否符合口径、引擎页大小及长输入下的 Redis 操作耗时，以及多租户身份后续如何接入。
+本机未启动 GPU 模型服务，端到端推理、GPU 性能及实际部署流量下的 Redis 容量仍需部署环境验收。评审应重点看：以首次输出为计量时点是否符合业务、Redis 故障时物理读取降级是否符合口径、长输入下的 Redis 操作耗时，以及多租户身份后续如何接入。
 
 参考：[Redis Lua 原子性与脚本约束](https://redis.io/docs/latest/develop/programmability/eval-intro/)。

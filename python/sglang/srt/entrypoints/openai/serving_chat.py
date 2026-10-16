@@ -48,6 +48,7 @@ from sglang.srt.entrypoints.openai import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     AllowedToolChoice,
+    CacheUsage,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -154,6 +155,7 @@ def _warn_k3_unsupported_reasoning_effort(value: Any) -> None:
         "Logged once per value.",
         key,
     )
+
 
 _KIMI_K3_MAX_VIDEO_INPUTS = 2
 
@@ -2044,7 +2046,10 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse | ErrorResponse:
         """Handle streaming chat completion request"""
-        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+        cache_context: dict[str, CacheUsage] = {}
+        generator = self._generate_chat_stream(
+            adapted_request, request, raw_request, cache_context=cache_context
+        )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
@@ -2062,6 +2067,11 @@ class OpenAIServingChat(OpenAIServingBase):
         return StreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
+            headers=(
+                cache_context["usage"].response_headers()
+                if "usage" in cache_context
+                else None
+            ),
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
@@ -2070,6 +2080,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        cache_context: dict[str, CacheUsage] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         # Parsers for tool calls and reasoning
@@ -2209,6 +2220,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
+                    if (
+                        cache_context is not None
+                        and "usage" not in cache_context
+                        and index in cache_usage
+                    ):
+                        # Publish only for a successful first role event,
+                        # independently of the caller's usage options.
+                        cache_context["usage"] = CacheUsage.model_validate(
+                            cache_usage[index]
+                        )
                     # A stop/EOS token may produce no content chunk. Carry the
                     # cache snapshot here so Anthropic message_start still
                     # reports the complete input accounting in that case.
