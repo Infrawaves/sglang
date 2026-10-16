@@ -214,6 +214,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_context: Optional[Any] = None,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -240,6 +241,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            mla_dedup_context=mla_dedup_context,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -248,7 +250,10 @@ class HybridCacheController(BaseHiCacheController):
             and transfer_layer_id_max != self.transfer_layer_id_max
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+            self.layer_done_counter = LayerDoneCounter(
+                self.transfer_layer_id_max,
+                on_layer_ready=self.layer_done_counter.on_layer_ready,
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -699,7 +704,10 @@ class HybridCacheController(BaseHiCacheController):
     ) -> list[L2Transfer]:
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
-        if host_indices.numel() > 0:
+        # Node-leader MLA dedup: followers hold no KV on host; their device KV
+        # comes from the leader's per-layer broadcast. Other pools are unchanged.
+        skip_anchor = self.mla_dedup is not None and self.mla_dedup.is_follower
+        if host_indices.numel() > 0 and not skip_anchor:
             transfers.append(
                 L2Transfer(
                     host_pool=anchor.host_pool,
