@@ -9,7 +9,7 @@ the checked-in GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Optional
 
@@ -42,6 +42,7 @@ class _State:
     def __init__(self, group: GroupCoordinator, comm: CustomAllReduceV2):
         self.group = group
         self.comm = comm
+        self.gemm_fusion_manager = None
 
 
 _STATE: Optional[_State] = None
@@ -117,11 +118,67 @@ def _init_state() -> Optional[_State]:
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
         )
+    # Composes with the attention-residual carry: the fused o_proj consumes the
+    # carry's local-shard prefix and takes precedence over the separate RS.
+    if envs.SGLANG_K3_SP_GEMM_FUSION.get():
+        from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
+            create_gemm_fusion_manager,
+        )
+
+        _STATE.gemm_fusion_manager = create_gemm_fusion_manager(group, _HIDDEN_SIZE)
+        if _STATE.gemm_fusion_manager is not None:
+            logger.info("K3 SP GEMM fusion enabled (o_proj + RS + prefix addition)")
     return _STATE
 
 
 def enabled() -> bool:
     return _init_state() is not None
+
+
+def install_o_proj_wrapper(o_proj) -> None:
+    state = _init_state()
+    manager = state.gemm_fusion_manager
+    if manager is not None and not manager.supports(o_proj):
+        manager = None
+    native_o_proj_forward = o_proj.forward
+
+    def forward(x, *args, **kwargs):
+        if manager is not None and not args:
+            fused_output = manager.try_fused_o_proj(o_proj, x, **kwargs)
+            if fused_output is not None:
+                return fused_output
+
+        output_rows = get_o_proj_output_rows(x.shape[0])
+        if requires_symmetric_rs(output_rows, x.device):
+            output = get_o_proj_output_buffer(output_rows, x.dtype, o_proj.output_size)
+            result = native_o_proj_forward(
+                x, *args, output_tensor=output[: x.shape[0]], **kwargs
+            )
+            register_o_proj_output(result[0], output)
+            return result
+        return native_o_proj_forward(x, *args, **kwargs)
+
+    o_proj.forward = forward
+
+
+def o_proj_fusion_call(prefix_sum, num_global_tokens: int):
+    state = _STATE
+    if state is None or state.gemm_fusion_manager is None:
+        return nullcontext(None)
+    from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
+        use_o_proj_fusion_call,
+    )
+
+    return use_o_proj_fusion_call(prefix_sum, num_global_tokens)
+
+
+def prepare_gemm_fusion() -> None:
+    state = _STATE
+    if state is None or state.gemm_fusion_manager is None:
+        return
+    from sglang.srt.runtime_context import max_prefill_buffer_tokens
+
+    state.gemm_fusion_manager.prepare(max_prefill_buffer_tokens())
 
 
 def _symm_buffer(
