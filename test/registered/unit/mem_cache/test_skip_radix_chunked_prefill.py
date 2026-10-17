@@ -1,9 +1,3 @@
-"""CPU 回归：跳过 radix 插入仍须保留当前请求已完成的 chunk。
-
-通过 AST 执行真实调度、索引写入和释放函数，避免导入 CUDA/Torch。
-轻量替身只保存 token 索引和物理页归属，不验证 GPU 内核。
-"""
-
 import ast
 import unittest
 from array import array
