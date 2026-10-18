@@ -181,8 +181,8 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
-    # Internal cache accounting context. HTTP handlers populate api_key with
-    # the verified key's digest from request.state, never the raw credential.
+    # Internal cache accounting context: the digest of a gateway cache_user_id
+    # or a verified API key, never the raw user identity or credential.
     api_key: Optional[str] = field(default=None, kw_only=True)
     cache_ttl_seconds: Optional[int] = field(default=None, kw_only=True)
     # True when the client explicitly asked for accounting; unsupported

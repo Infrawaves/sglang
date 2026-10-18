@@ -1,12 +1,18 @@
+import ast
 import json
+import pickle
 import unittest
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from pydantic import ValidationError
 
 from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from sglang.srt.entrypoints.anthropic.serving import (
@@ -15,19 +21,21 @@ from sglang.srt.entrypoints.anthropic.serving import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponse,
+    MessageProcessingResult,
     PromptTokensDetails,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 SNAPSHOT = {
+    "ttl_seconds": 3600,
     "read_tokens": 16,
-    "creation_5m_tokens": 0,
-    "creation_1h_tokens": 16,
-    "normal_input_tokens": 11,
+    "write_tokens": 16,
 }
 
 
@@ -72,17 +80,18 @@ class _FakeChat:
             ttl_seconds = 3600 if options is not None and options.ttl == "1h" else 300
         return SimpleNamespace(cache_ttl_seconds=ttl_seconds), request
 
+    async def _run_request_conversion(self, request, raw_request):
+        return self._convert_to_internal_request(request, raw_request)
+
     async def _handle_non_streaming_request(
         self, adapted_request, request, raw_request
     ):
-        one_hour = adapted_request.cache_ttl_seconds == 3600
         usage = UsageProcessor.calculate_token_usage(
             prompt_tokens=43,
             completion_tokens=2,
             cache_usage={
                 **SNAPSHOT,
-                "creation_5m_tokens": 0 if one_hour else 16,
-                "creation_1h_tokens": 16 if one_hour else 0,
+                "ttl_seconds": adapted_request.cache_ttl_seconds,
             },
         )
         return ChatCompletionResponse(
@@ -118,6 +127,343 @@ class _UnavailableChat(_FakeChat):
         )
 
 
+def _manager_identity_resolver():
+    # Load only the actual trust boundary, without importing scheduler/GPU code.
+    source = (
+        Path(__file__).resolve().parents[5]
+        / "python/sglang/srt/managers/tokenizer_manager.py"
+    )
+    tree = ast.parse(source.read_text())
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TokenizerManager"
+    )
+    method = next(
+        node
+        for node in manager.body
+        if getattr(node, "name", None) == "_resolve_cache_identity"
+    )
+    namespace = {
+        "GenerateReqInput": GenerateReqInput,
+        "DisaggregationMode": SimpleNamespace(PREFILL="prefill"),
+    }
+    code = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(code), str(source), "exec"), namespace)
+    return namespace["_resolve_cache_identity"]
+
+
+class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.generated_identities = []
+        self.stream_counts = (1, 2)
+        self.resolve_identity = _manager_identity_resolver()
+        self.manager = SimpleNamespace(disaggregation_mode="decode")
+
+        async def run_in_request_preprocessor(func, *args):
+            return func(*args)
+
+        async def generate_request(adapted, raw_request):
+            # The real manager preserves the adapter's hash over a shared
+            # Bearer credential, or clears untrusted/missing identities.
+            self.resolve_identity(self.manager, adapted, raw_request)
+            self.generated_identities.append(adapted.api_key)
+            counts = self.stream_counts if adapted.stream else (2,)
+            for count in counts:
+                yield {
+                    "text": "hi"[:count],
+                    "meta_info": {
+                        "id": "anthropic-cache-identity",
+                        "prompt_tokens": 43,
+                        "completion_tokens": count,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 32,
+                        "weight_version": "identity-test-version",
+                        "finish_reason": {"type": "stop"}
+                        if count == counts[-1]
+                        else None,
+                        **(
+                            {
+                                "cache_usage": {
+                                    "ttl_seconds": adapted.cache_ttl_seconds,
+                                    "read_tokens": 16 if adapted.api_key else 32,
+                                    "write_tokens": 16 if adapted.api_key else 0,
+                                }
+                            }
+                            if adapted.cache_ttl_seconds is not None
+                            else {}
+                        ),
+                    },
+                }
+
+        self.chat = object.__new__(OpenAIServingChat)
+        self.chat.tokenizer_manager = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=None),
+            model_config=SimpleNamespace(is_multimodal=False),
+            process_request_preprocessor=None,
+            run_in_request_preprocessor=run_in_request_preprocessor,
+            generate_request=generate_request,
+            create_abort_task=lambda request: None,
+        )
+        self.chat.template_manager = SimpleNamespace(reasoning_config=None)
+        self.chat.chat_encoding_spec = None
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = None
+        self.chat.is_gpt_oss = False
+        self.chat.allowed_custom_labels = None
+        self.chat.default_sampling_params = {}
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.chat._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="hello",
+                prompt_ids=list(range(43)),
+                image_data=None,
+                video_data=None,
+                audio_data=None,
+                modalities=[],
+                stop=[],
+            )
+        )
+        self.config = SimpleNamespace(
+            enable_cache_accounting=True,
+            enable_cache_report=False,
+            incremental_streaming_output=False,
+            stream_response_default_include_usage=False,
+            return_input_ids=False,
+            return_output_ids=False,
+            allow_auto_truncate=False,
+        )
+        self.disagg = SimpleNamespace(disaggregation_mode="decode")
+        for name, value in (
+            ("get_serving", self.config),
+            ("get_disagg", self.disagg),
+            ("get_model", SimpleNamespace(context_length=4096)),
+        ):
+            patcher = patch(
+                "sglang.srt.entrypoints.openai.serving_chat." + name,
+                return_value=value,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.serving = AnthropicServing(self.chat)
+
+    def request(self, *, stream, user=None, options=None):
+        return AnthropicMessagesRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=2,
+            stream=stream,
+            cache_user_id=user,
+            prompt_cache_options=options,
+        )
+
+    def raw_request(self, identity=None):
+        return Request(
+            {
+                "type": "http",
+                "headers": [],
+                "state": {} if identity is None else {"api_key": identity},
+            }
+        )
+
+    async def consume(self, response, stream):
+        self.assertEqual(response.status_code, 200)
+        if stream:
+            events = [
+                json.loads(frame.split("data: ", 1)[1])
+                async for frame in response.body_iterator
+            ]
+            self.assertEqual(events[-1]["type"], "message_stop")
+            self.assertFalse(any(event["type"] == "error" for event in events))
+            return next(
+                event["message"]["usage"]
+                for event in events
+                if event["type"] == "message_start"
+            )
+        return json.loads(response.body)["usage"]
+
+    def test_schema_matches_chat_identity_validation(self):
+        for value in ("", " \t\n", 123, {}, True):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.request(stream=False, user=value)
+        request = self.request(stream=False, user="用户-🧪")
+        converted = self.serving._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.cache_user_id, "用户-🧪")
+        self.assertNotIn("用户-🧪", repr(request))
+
+    async def test_body_identity_reaches_real_manager_in_both_response_modes(self):
+        for stream in (False, True):
+            for options in (None, {"ttl": "5m"}, {"ttl": "1h"}):
+                with self.subTest(stream=stream, options=options):
+                    raw = self.raw_request()
+                    request = self.request(
+                        stream=stream, user="gateway-body-user", options=options
+                    )
+                    response = await self.serving.handle_messages(request, raw)
+                    usage = await self.consume(response, stream)
+                    expected = (
+                        "cache-user-id:" + sha256(b"gateway-body-user").hexdigest()
+                    )
+                    self.assertEqual(raw.state.cache_identity, expected)
+                    self.assertEqual(self.generated_identities[-1], expected)
+                    self.assertEqual(usage["cache_read_input_tokens"], 16)
+                    self.assertEqual(usage["cache_creation_input_tokens"], 16)
+
+    async def test_body_users_override_shared_verified_bearer(self):
+        shared = "api-key:" + sha256(b"shared-gateway-key").hexdigest()
+        for stream in (False, True):
+            identities = []
+            for user in ("gateway-user-a", "gateway-user-b"):
+                raw = self.raw_request(shared)
+                response = await self.serving.handle_messages(
+                    self.request(stream=stream, user=user), raw
+                )
+                await self.consume(response, stream)
+                expected = "cache-user-id:" + sha256(user.encode()).hexdigest()
+                self.assertEqual(raw.state.api_key, shared)
+                self.assertEqual(raw.state.cache_identity, expected)
+                self.assertEqual(self.generated_identities[-1], expected)
+                identities.append(expected)
+            self.assertNotEqual(*identities)
+
+    async def test_real_openai_role_usage_starts_at_zero_and_tail_keeps_full_output(
+        self,
+    ):
+        self.stream_counts = (3, 5)
+        request = self.request(
+            stream=True, user="gateway-role-user", options={"ttl": "1h"}
+        )
+        request.max_tokens = 5
+        response = await self.serving.handle_messages(request, self.raw_request())
+        self.assertEqual(response.status_code, 200)
+        events = [
+            json.loads(frame.split("data: ", 1)[1])
+            async for frame in response.body_iterator
+        ]
+        starts = [event for event in events if event["type"] == "message_start"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            starts[0]["message"]["usage"],
+            {
+                "input_tokens": 11,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 16,
+                "cache_creation_input_tokens": 16,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 16,
+                },
+            },
+        )
+        final = next(event for event in events if event["type"] == "message_delta")
+        self.assertEqual(final["usage"], {"output_tokens": 5})
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    async def test_child_conversion_result_is_published_on_parent_request(self):
+        class ChildPreprocessor:
+            calls = 0
+
+            async def convert(preprocessor, handler, request, raw_request):
+                preprocessor.calls += 1
+                child_request = Request(
+                    {
+                        "type": "http",
+                        "headers": [],
+                        "state": dict(raw_request.state._state),
+                    }
+                )
+                converted = handler._convert_to_internal_request(request, child_request)
+                child_request.state.cache_identity = "child-state-is-not-parent-state"
+                return pickle.loads(pickle.dumps(converted))
+
+        preprocessor = ChildPreprocessor()
+        self.chat.tokenizer_manager.process_request_preprocessor = preprocessor
+        # Exercise the actual parent dispatch branch after a serialized child
+        # result, without creating model workers or OS processes in this unit test.
+        with patch.dict(
+            self.chat._run_request_conversion.__func__.__globals__,
+            {"ProcessRequestPreprocessor": ChildPreprocessor},
+        ):
+            for stream in (False, True):
+                for user in ("process-user", None):
+                    raw = self.raw_request(
+                        "shared-verified-key-digest" if user else None
+                    )
+                    response = await self.serving.handle_messages(
+                        self.request(stream=stream, user=user), raw
+                    )
+                    usage = await self.consume(response, stream)
+                    if user:
+                        expected = (
+                            "cache-user-id:" + sha256(b"process-user").hexdigest()
+                        )
+                        self.assertEqual(raw.state.cache_identity, expected)
+                        self.assertEqual(self.generated_identities[-1], expected)
+                    else:
+                        self.assertFalse(hasattr(raw.state, "cache_identity"))
+                        self.assertIsNone(self.generated_identities[-1])
+                        self.assertEqual(usage["cache_read_input_tokens"], 32)
+                        self.assertEqual(usage["cache_creation_input_tokens"], 0)
+        self.assertEqual(preprocessor.calls, 4)
+
+    async def test_absent_identity_serves_physical_usage_with_no_creation(self):
+        for stream in (False, True):
+            for options in (None, {"ttl": "5m"}, {"ttl": "1h"}):
+                with self.subTest(stream=stream, options=options):
+                    raw = self.raw_request()
+                    response = await self.serving.handle_messages(
+                        self.request(stream=stream, options=options), raw
+                    )
+                    usage = await self.consume(response, stream)
+                    self.assertEqual(usage["cache_read_input_tokens"], 32)
+                    self.assertEqual(usage["cache_creation_input_tokens"], 0)
+                    self.assertEqual(usage["input_tokens"], 11)
+                    self.assertEqual(
+                        usage["cache_creation"],
+                        {
+                            "ephemeral_5m_input_tokens": 0,
+                            "ephemeral_1h_input_tokens": 0,
+                        },
+                    )
+                    self.assertFalse(hasattr(raw.state, "cache_identity"))
+                    self.assertIsNone(self.generated_identities[-1])
+        self.assertEqual(len(self.generated_identities), 6)
+
+    async def test_verified_bearer_fallback_is_preserved(self):
+        identity = "api-key:" + sha256(b"verified-direct-key").hexdigest()
+        for stream in (False, True):
+            raw = self.raw_request(identity)
+            response = await self.serving.handle_messages(
+                self.request(stream=stream), raw
+            )
+            await self.consume(response, stream)
+            self.assertEqual(raw.state.cache_identity, identity)
+            self.assertEqual(self.generated_identities[-1], identity)
+
+    async def test_disabled_and_prefill_requests_do_not_publish_identity(self):
+        for role, enabled in (("decode", False), ("prefill", True)):
+            self.disagg.disaggregation_mode = role
+            self.config.enable_cache_accounting = enabled
+            for stream in (False, True):
+                raw = self.raw_request()
+                response = await self.serving.handle_messages(
+                    self.request(stream=stream, user="unused-body-user"), raw
+                )
+                await self.consume(response, stream)
+                self.assertFalse(hasattr(raw.state, "cache_identity"))
+                self.assertIsNone(self.generated_identities[-1])
+
+
 class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
     def request(self, **kwargs):
         return AnthropicMessagesRequest(
@@ -130,8 +476,7 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
     def usage(self, ttl="1h"):
         snapshot = {
             **SNAPSHOT,
-            "creation_5m_tokens": 16 if ttl == "5m" else 0,
-            "creation_1h_tokens": 16 if ttl == "1h" else 0,
+            "ttl_seconds": 300 if ttl == "5m" else 3600,
         }
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=43,
@@ -198,21 +543,50 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_non_streaming_conversion_carries_both_read_and_write(self):
-        response = ChatCompletionResponse(
-            id="cache-non-stream",
-            model="test",
-            choices=[
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hi"},
-                    "finish_reason": "stop",
-                }
-            ],
-            usage=self.usage(),
+        for ttl in ("5m", "1h"):
+            with self.subTest(ttl=ttl):
+                response = ChatCompletionResponse(
+                    id="cache-non-stream",
+                    model="test",
+                    choices=[
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    usage=self.usage(ttl),
+                )
+                result = AnthropicServing(_FakeChat())._convert_response(response)
+                self.assertEqual(result.usage.input_tokens, 11)
+                self.assertEqual(result.usage.cache_read_input_tokens, 16)
+                self.assertEqual(result.usage.cache_creation_input_tokens, 16)
+                self.assertEqual(
+                    result.usage.cache_creation.model_dump(),
+                    {
+                        "ephemeral_5m_input_tokens": 16 if ttl == "5m" else 0,
+                        "ephemeral_1h_input_tokens": 16 if ttl == "1h" else 0,
+                    },
+                )
+
+    def test_input_tokens_are_derived_and_overreported_cache_is_rejected(self):
+        usage = self.usage()
+        self.assertEqual(
+            usage.cache_usage.model_dump(),
+            {"ttl_seconds": 3600, "read_tokens": 16, "write_tokens": 16},
         )
-        result = AnthropicServing(_FakeChat())._convert_response(response)
-        self.assertEqual(result.usage.cache_read_input_tokens, 16)
-        self.assertEqual(result.usage.cache_creation_input_tokens, 16)
+        result = _anthropic_usage_from_openai(
+            usage.model_copy(update={"prompt_tokens": 32}),
+            include_input=True,
+            include_output=True,
+        )
+        self.assertEqual(result.input_tokens, 0)
+        with self.assertRaisesRegex(ValueError, "exceed prompt_tokens"):
+            _anthropic_usage_from_openai(
+                usage.model_copy(update={"prompt_tokens": 31}),
+                include_input=True,
+                include_output=True,
+            )
 
     async def test_stream_message_start_has_snapshot_and_delta_only_output(self):
         for ttl, delta in (
@@ -221,11 +595,26 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
             for delta in ({"role": "assistant", "content": ""}, {"content": "hi"})
         ):
             with self.subTest(ttl=ttl, delta=delta):
-                public_usage = self.usage(ttl).model_dump()
+                public_usage = (
+                    self.usage(ttl)
+                    .model_copy(update={"completion_tokens": 0, "total_tokens": 43})
+                    .model_dump()
+                )
                 self.assertNotIn("cache_usage", public_usage)
                 frames = [
                     _stream_chunk(delta, public_usage),
                     _stream_chunk(finish_reason="stop"),
+                    "data: "
+                    + json.dumps(
+                        {
+                            "id": "test",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [],
+                            "usage": self.usage(ttl).model_dump(),
+                        }
+                    )
+                    + "\n\n",
                     "data: [DONE]\n\n",
                 ]
                 serving = AnthropicServing(_FakeChat(frames))
@@ -251,6 +640,7 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
                     event for event in events if event["type"] == "message_delta"
                 )
                 self.assertEqual(start["message"]["usage"]["input_tokens"], 11)
+                self.assertEqual(start["message"]["usage"]["output_tokens"], 0)
                 self.assertEqual(
                     start["message"]["usage"]["cache_read_input_tokens"], 16
                 )

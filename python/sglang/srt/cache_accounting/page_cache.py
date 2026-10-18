@@ -32,10 +32,17 @@ class CacheAccountingError(RuntimeError):
 
 @dataclass(frozen=True)
 class CacheUsage:
+    ttl_seconds: int
     read_tokens: int = 0
-    creation_5m_tokens: int = 0
-    creation_1h_tokens: int = 0
-    normal_input_tokens: int = 0
+    write_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.ttl_seconds) is not int or self.ttl_seconds not in _TTLS:
+            raise ValueError("ttl_seconds must be 300 or 3600")
+        for name in ("read_tokens", "write_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -71,9 +78,9 @@ def build_page_cache_plan(
     """Hash complete input pages with a cumulative, fixed-uint32 token encoding.
 
     Production callers pass ``CACHE_BLOCK_SIZE`` as ``page_size``; the low-level
-    parameter remains available for testing. Partial final blocks remain normal
-    input, independently of the engine's physical cache page size. ``namespace``
-    isolates deployments and input interpretation. TTL is part of identity: 5m
+    parameter remains available for testing. Partial final blocks are excluded
+    from read/write counts, independently of the physical cache page size.
+    ``namespace`` isolates deployments and input interpretation. TTL is part of identity: 5m
     and 1h requests have independent pages and expiration timelines. Accounting
     adds no page-count limit. Each first-page prefix defines a Redis Cluster hash
     slot instead of pinning all prefixes for one API key.
@@ -150,10 +157,6 @@ for i = 1, pages do
 end
 local read = hits * page_size
 local written = (pages - hits) * page_size
-local write_5m = 0
-local write_1h = 0
-if ttl == 300 then write_5m = written else write_1h = written end
-local normal = prompt_tokens - pages * page_size
 for i = 1, pages do
     if i <= hits then
         redis.call('EXPIRE', KEYS[i], ttl)
@@ -162,7 +165,7 @@ for i = 1, pages do
         redis.call('SET', KEYS[i], '1', 'EX', ttl)
     end
 end
-return {read, write_5m, write_1h, normal}
+return {read, written}
 """
 
 
@@ -219,6 +222,7 @@ class RedisPageCacheStore:
         timeout_seconds: float = 1.0,
         username: str | None = None,
         password: str | None = None,
+        metrics: Any = None,
     ):
         if not isinstance(redis_url, str) or not redis_url:
             raise ValueError("redis_url must be nonempty")
@@ -233,6 +237,7 @@ class RedisPageCacheStore:
         self._timeout_seconds = timeout_seconds
         self._username = username
         self._password = password
+        self._metrics = metrics
         self._redis: Any = None
 
     def _client(self):
@@ -258,7 +263,7 @@ class RedisPageCacheStore:
     ) -> CacheUsage:
         _validate_plan(plan)
         if not plan.page_keys:
-            return CacheUsage(normal_input_tokens=plan.prompt_tokens)
+            return CacheUsage(ttl_seconds=plan.ttl_seconds)
         request_id = rid if rid is not None else "-"
         started = time.perf_counter()
         timeout_ms = self._timeout_seconds * 1000
@@ -284,16 +289,25 @@ class RedisPageCacheStore:
             )
             if (
                 not isinstance(result, (list, tuple))
-                or len(result) != 4
+                or len(result) != 2
                 or any(type(value) is not int or value < 0 for value in result)
-                or sum(result) != plan.prompt_tokens
-                or result[3] != plan.prompt_tokens % plan.page_size
-                or any(value % plan.page_size for value in result[:3])
-                or (plan.ttl_seconds == 300 and result[2])
-                or (plan.ttl_seconds == 3600 and result[1])
+                or sum(result) != len(plan.page_keys) * plan.page_size
+                or any(value % plan.page_size for value in result)
             ):
                 raise ValueError("Invalid cache Redis result")
-            usage = CacheUsage(*result)
+            usage = CacheUsage(
+                ttl_seconds=plan.ttl_seconds,
+                read_tokens=result[0],
+                write_tokens=result[1],
+            )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Cache Redis EVAL cancelled rid=%s page_count=%d ttl=%d",
+                request_id,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+            )
+            raise
         except Exception as exc:
             is_timeout = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
             if not is_timeout:
@@ -303,30 +317,36 @@ class RedisPageCacheStore:
                     pass
                 else:
                     is_timeout = isinstance(exc, RedisTimeoutError)
+            result = "timeout" if is_timeout else "error"
+            elapsed = time.perf_counter() - started
+            if self._metrics is not None:
+                self._metrics.observe_redis(plan.ttl_seconds, result, elapsed)
             logger.warning(
                 "Cache Redis EVAL failed rid=%s result=%s error_type=%s "
                 "page_count=%d ttl=%d elapsed_ms=%.3f timeout_ms=%.3f",
                 request_id,
-                "timeout" if is_timeout else "error",
+                result,
                 type(exc).__name__,
                 len(plan.page_keys),
                 plan.ttl_seconds,
-                (time.perf_counter() - started) * 1000,
+                elapsed * 1000,
                 timeout_ms,
             )
             raise CacheAccountingError("Redis cache accounting is unconfirmed") from exc
+        elapsed = time.perf_counter() - started
+        if self._metrics is not None:
+            self._metrics.observe_redis(plan.ttl_seconds, "success", elapsed)
         logger.info(
             "Cache Redis EVAL complete rid=%s result=success page_count=%d ttl=%d "
-            "read=%d write_5m=%d write_1h=%d normal=%d elapsed_ms=%.3f "
+            "prompt=%d read=%d write=%d elapsed_ms=%.3f "
             "timeout_ms=%.3f",
             request_id,
             len(plan.page_keys),
             plan.ttl_seconds,
+            plan.prompt_tokens,
             usage.read_tokens,
-            usage.creation_5m_tokens,
-            usage.creation_1h_tokens,
-            usage.normal_input_tokens,
-            (time.perf_counter() - started) * 1000,
+            usage.write_tokens,
+            elapsed * 1000,
             timeout_ms,
         )
         return usage

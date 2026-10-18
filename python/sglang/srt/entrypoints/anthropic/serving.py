@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -127,17 +128,21 @@ def _anthropic_usage_from_openai(
         cache = getattr(usage, "cache_usage", None)
         if cache is not None:
             cache = CacheUsage.model_validate(cache)
-            if cache.total_input_tokens != (getattr(usage, "prompt_tokens", 0) or 0):
-                raise ValueError("Cache usage must sum to prompt_tokens.")
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            cached_input_tokens = cache.read_tokens + cache.write_tokens
+            if cached_input_tokens > prompt_tokens:
+                raise ValueError("Cache read/write tokens exceed prompt_tokens.")
             usage_fields.update(
-                input_tokens=cache.normal_input_tokens,
+                input_tokens=prompt_tokens - cached_input_tokens,
                 cache_read_input_tokens=cache.read_tokens,
-                cache_creation_input_tokens=(
-                    cache.creation_5m_tokens + cache.creation_1h_tokens
-                ),
+                cache_creation_input_tokens=cache.write_tokens,
                 cache_creation=AnthropicCacheCreation(
-                    ephemeral_5m_input_tokens=cache.creation_5m_tokens,
-                    ephemeral_1h_input_tokens=cache.creation_1h_tokens,
+                    ephemeral_5m_input_tokens=(
+                        cache.write_tokens if cache.ttl_seconds == 300 else 0
+                    ),
+                    ephemeral_1h_input_tokens=(
+                        cache.write_tokens if cache.ttl_seconds == 3600 else 0
+                    ),
                 ),
             )
         else:
@@ -575,6 +580,7 @@ class AnthropicServing:
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
             **anthropic_request.pd_routing_kwargs(),
+            "cache_user_id": anthropic_request.cache_user_id,
         }
         if anthropic_request.prompt_cache_options is not None:
             request_data["prompt_cache_options"] = (
@@ -744,6 +750,27 @@ class AnthropicServing:
 
         return chat_request
 
+    async def _run_request_conversion(
+        self, chat_request: ChatCompletionRequest, raw_request: Request
+    ):
+        (
+            adapted_request,
+            processed_request,
+        ) = await self.openai_serving_chat._run_request_conversion(
+            chat_request, raw_request
+        )
+        if (
+            raw_request is not None
+            and isinstance(adapted_request, GenerateReqInput)
+            and adapted_request.cache_ttl_seconds is not None
+            and isinstance(adapted_request.api_key, str)
+            and adapted_request.api_key.strip()
+        ):
+            # Conversion may run in a child process. Publish the validated hash
+            # on the parent's trusted state before TokenizerManager resolves it.
+            raw_request.state.cache_identity = adapted_request.api_key
+        return adapted_request, processed_request
+
     async def _handle_non_streaming(
         self,
         chat_request: ChatCompletionRequest,
@@ -767,10 +794,8 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = await self._run_request_conversion(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
 
@@ -832,10 +857,8 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = await self._run_request_conversion(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
@@ -935,14 +958,10 @@ class AnthropicServing:
                 and write_tokens is not None
             ):
                 read_tokens = details.cached_tokens
-                one_hour = cache_ttl_seconds == 3600
                 snapshot = CacheUsage(
+                    ttl_seconds=cache_ttl_seconds,
                     read_tokens=read_tokens,
-                    creation_5m_tokens=0 if one_hour else write_tokens,
-                    creation_1h_tokens=write_tokens if one_hour else 0,
-                    normal_input_tokens=usage.prompt_tokens
-                    - read_tokens
-                    - write_tokens,
+                    write_tokens=write_tokens,
                 )
                 usage = usage.model_copy(update={"cache_usage": snapshot})
             return MessageStartEvent(
