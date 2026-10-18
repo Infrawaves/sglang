@@ -190,10 +190,10 @@ class TestPrefillAdder(CustomTestCase):
         )
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
-        override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
-        )
+    def create_shortest_prefill_adder(
+        self, *, chunk_tokens=4096, schedule_policy="shortest-prefill-first"
+    ):
+        override = get_context().override_server_args(schedule_policy=schedule_policy)
         override.install()
         self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
@@ -243,6 +243,20 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         req.set_extend_range.assert_not_called()
         self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_hrrn_chunk_limit_guards_single_unfinished_chunk(self):
+        # With a limit applied the capped continuation leaves budget behind; a
+        # second truncated request would trip `assert self.chunked_req is None`.
+        for limit, expect_rejected in [(256, True), (None, False)]:
+            with self.subTest(limit=limit):
+                adder = self.create_shortest_prefill_adder(
+                    chunk_tokens=512, schedule_policy="hrrn"
+                )
+                adder.chunked_req_limit = limit
+                req = self.create_shared_req("second-chunk")
+                req.full_untruncated_fill_ids = list(range(1024))
+                adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+                self.assertEqual(adder.new_chunked_req is None, expect_rejected)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)

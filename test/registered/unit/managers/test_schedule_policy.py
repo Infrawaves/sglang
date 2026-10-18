@@ -227,5 +227,55 @@ class TestShortestPrefillFirst(CustomTestCase):
         )
 
 
+class TestHRRNPrefillChunkLimit(CustomTestCase):
+    def make_policy(self, enabled=True):
+        return SchedulePolicy(
+            policy="hrrn",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            enable_hrrn_prefill_chunk_limit=enabled,
+        )
+
+    def make_req(self, rid, uncached):
+        req = _make_req(rid, "", list(range(uncached)))
+        req.full_untruncated_fill_ids = req.origin_input_ids[:]
+        req.num_matched_prefix_tokens = 0
+        req.prefix_indices = []
+        return req
+
+    def test_reservation_capped_at_half_budget(self):
+        """HRRN aging cannot see the continuation, so the reservation must leave
+        it at least half the chunk budget; SPF reserves more on the same input."""
+        continuation = self.make_req("continuation", 65536)
+        waiting = [self.make_req(f"r{i}", 1024) for i in range(5)]
+        limit = self.make_policy().shortest_prefill_chunk_limit(
+            continuation, waiting, 8192, 256
+        )
+        self.assertEqual(limit, 4096)
+        spf = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        self.assertLess(
+            spf.shortest_prefill_chunk_limit(continuation, waiting, 8192, 256), limit
+        )
+
+    def test_long_head_in_hrrn_order_blocks_reservation(self):
+        # An aged long request at the head goes first under HRRN; do not
+        # reserve for the shorter ones queued behind it.
+        continuation = self.make_req("continuation", 8192)
+        waiting = [self.make_req("aged-long", 16384), self.make_req("short", 256)]
+        self.assertIsNone(
+            self.make_policy().shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

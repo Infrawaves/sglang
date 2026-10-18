@@ -281,3 +281,18 @@ class Schedule(msgspec.Struct):
             "pipeline parallelism."
         ),
     ] = None
+
+    # -------------------------------------------------------------------------
+    # HRRN prefill chunk limit
+    # -------------------------------------------------------------------------
+    enable_hrrn_prefill_chunk_limit: A[
+        bool,
+        (
+            "Under --schedule-policy hrrn, cap the active chunked prefill so the "
+            "next waiting requests in HRRN order that are shorter than its "
+            "remainder can be fully prefilled in the same batch. At most half "
+            "of the chunk budget is reserved, so the long request keeps making "
+            "progress. Requires radix cache and chunked prefill; incompatible "
+            "with --enable-chunked-prefill-round-robin."
+        ),
+    ] = False

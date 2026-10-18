@@ -245,8 +245,16 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_hrrn_prefill_chunk_limit: bool = False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        self.enable_hrrn_prefill_chunk_limit = enable_hrrn_prefill_chunk_limit
+        if enable_hrrn_prefill_chunk_limit and self.policy != CacheAwarePolicy.HRRN:
+            logger.warning(
+                "--enable-hrrn-prefill-chunk-limit has no effect: the active "
+                "policy is %s, not hrrn.",
+                self.policy,
+            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
@@ -453,10 +461,18 @@ class SchedulePolicy:
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
+        if self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            cap = budget - page_size
+        elif (
+            self.policy == CacheAwarePolicy.HRRN
+            and self.enable_hrrn_prefill_chunk_limit
         ):
+            # The continuation is not in waiting_queue, so HRRN aging cannot
+            # protect it; keep at least half the budget for its progress.
+            cap = budget // 2 // page_size * page_size
+        else:
+            return None
+        if budget < 2 * page_size:
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
@@ -465,7 +481,7 @@ class SchedulePolicy:
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining or reserved + charge > cap:
                 break
             reserved += charge
         if not reserved:
@@ -1550,9 +1566,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                self.chunked_req_limit is not None
+                or get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

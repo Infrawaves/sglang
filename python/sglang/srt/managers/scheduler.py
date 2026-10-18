@@ -1450,6 +1450,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_hrrn_prefill_chunk_limit=get_schedule().enable_hrrn_prefill_chunk_limit,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
