@@ -184,9 +184,10 @@ class TestCacheConfiguration(unittest.TestCase):
             cache_redis_url="redis://127.0.0.1:6379/0",
             cache_namespace="cache-test-namespace",
             cache_timeout=0.2,
-            tokenizer_worker_num=1,
+            tokenizer_worker_num=8,
+            detokenizer_worker_num=4,
             disaggregation_mode="null",
-            dcp_size=1,
+            dcp_size=4,
             checkpoint_engine_wait_weights_before_ready=False,
         )
 
@@ -218,8 +219,6 @@ class TestCacheConfiguration(unittest.TestCase):
             ("cache_namespace", " "),
             ("cache_timeout", 0),
             ("cache_timeout", float("nan")),
-            ("tokenizer_worker_num", 2),
-            ("dcp_size", 2),
         ]:
             with self.subTest(field=field, value=value):
                 cfg = SimpleNamespace(**vars(self.config))
