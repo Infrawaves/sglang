@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import importlib.util
 import json
 import sys
 import time
 import unittest
+import uuid
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 # CI registration is parsed statically; avoid importing heavyweight sglang.
 if "sglang.test.ci.ci_register" in sys.modules:
@@ -71,12 +73,19 @@ def _log_message(call):
     return template % tuple(values)
 
 
+class _GenerateReqInput(SimpleNamespace):
+    def regenerate_rid(self):
+        self.rid = uuid.uuid4().hex
+        return self.rid
+
+
 def _load_manager_helpers(
     *,
     serving=None,
     schedule=None,
     disagg=None,
     cache_store_class=None,
+    cache_metrics_class=None,
     cache_logger=None,
 ):
     path = _SRT / "managers" / "tokenizer_manager.py"
@@ -92,6 +101,10 @@ def _load_manager_helpers(
         "_attach_cache_usage",
         "_prepare_cache_plan",
         "_validate_cache_request",
+        "_resolve_cache_identity",
+        "_init_req_state",
+        "_handle_batch_request",
+        "_collect_batch_responses",
     }
     methods = [node for node in manager.body if getattr(node, "name", None) in names]
     found = {node.name for node in methods}
@@ -116,6 +129,7 @@ def _load_manager_helpers(
     )
     namespace = {
         "asyncio": asyncio,
+        "copy": copy,
         "json": json,
         "time": time,
         "os": SimpleNamespace(environ={}),
@@ -126,11 +140,30 @@ def _load_manager_helpers(
         "RedisPageCacheStore": (
             cache_store_class if cache_store_class is not None else Mock()
         ),
+        "CacheAccountingMetrics": (
+            cache_metrics_class if cache_metrics_class is not None else Mock()
+        ),
         "build_page_cache_plan": _CACHE.build_page_cache_plan,
         "CACHE_BLOCK_SIZE": _CACHE.CACHE_BLOCK_SIZE,
         "CacheAccountingError": _CACHE.CacheAccountingError,
         "CacheUsage": _CACHE.CacheUsage,
         "DisaggregationMode": _DISAGG_MODE,
+        "GenerateReqInput": _GenerateReqInput,
+        "APIServerReqTimeStats": lambda **kwargs: SimpleNamespace(
+            set_created_time=Mock(), set_finished_time=Mock()
+        ),
+        "ReqState": lambda out_list, finished, event, obj, time_stats: SimpleNamespace(
+            out_list=out_list,
+            finished=finished,
+            event=event,
+            obj=obj,
+            time_stats=time_stats,
+            cache_plan=None,
+            cache_physical_ttl_seconds=None,
+            cache_metrics_parent=None,
+            cache_task=None,
+            cache_usage=None,
+        ),
     }
     exec(compile(ast.fix_missing_locations(extracted), str(path), "exec"), namespace)
     return namespace["ManagerHelpers"]
@@ -157,6 +190,7 @@ class TestTokenizerCacheInitialization(unittest.TestCase):
                     cache_store_class=store_class,
                     cache_logger=logger,
                 )()
+                manager.enable_metrics = False
                 manager._init_cache_accounting()
                 self.assertEqual(manager._cache_tasks, set())
                 if role == "prefill":
@@ -168,13 +202,15 @@ class TestTokenizerCacheInitialization(unittest.TestCase):
                         timeout_seconds=0.2,
                         username=None,
                         password=None,
+                        metrics=None,
                     )
                     self.assertIs(manager._cache_store, store_class.return_value)
                 logger.info.assert_called_once()
                 self.assertEqual(
                     _log_message(logger.info.call_args),
                     "Cache accounting startup enabled=True "
-                    f"role={logged_role} action={action} block_size=256",
+                    f"role={logged_role} action={action} block_size=256 "
+                    "metrics_enabled=False",
                 )
                 self.assertNotIn(
                     cfg.cache_redis_url, _log_message(logger.info.call_args)
@@ -190,12 +226,139 @@ class TestTokenizerCacheInitialization(unittest.TestCase):
             cache_store_class=store_class,
             cache_logger=logger,
         )()
+        manager.enable_metrics = True
         manager._init_cache_accounting()
         self.assertIsNone(manager._cache_store)
         self.assertEqual(manager._cache_tasks, set())
         store_class.assert_not_called()
         logger.info.assert_not_called()
         logger.warning.assert_not_called()
+
+    def test_metrics_follow_feature_role_and_enable_metrics_switch(self):
+        for role, enabled in (
+            ("decode", True),
+            ("null", True),
+            ("prefill", True),
+            ("decode", False),
+        ):
+            with self.subTest(role=role, enabled=enabled):
+                metrics_class = Mock()
+                store_class = Mock()
+                manager = _load_manager_helpers(
+                    serving=SimpleNamespace(
+                        enable_cache_accounting=True,
+                        cache_redis_url="redis://unused",
+                        cache_timeout=0.2,
+                    ),
+                    disagg=SimpleNamespace(disaggregation_mode=role),
+                    cache_store_class=store_class,
+                    cache_metrics_class=metrics_class,
+                )()
+                manager.enable_metrics = enabled
+                manager._init_cache_accounting()
+                if enabled and role != "prefill":
+                    metrics_class.assert_called_once_with(
+                        role="standalone" if role == "null" else role
+                    )
+                    self.assertIs(manager._cache_metrics, metrics_class.return_value)
+                    self.assertIs(
+                        store_class.call_args.kwargs["metrics"], manager._cache_metrics
+                    )
+                else:
+                    metrics_class.assert_not_called()
+                    self.assertIsNone(manager._cache_metrics)
+
+
+class TestTokenizerCacheIdentity(unittest.TestCase):
+    def setUp(self):
+        self.manager = _load_manager_helpers()()
+        self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
+        self.obj = _GenerateReqInput(
+            cache_ttl_seconds=300, api_key="body-supplied-value"
+        )
+
+    def test_adapter_identity_takes_precedence_over_shared_bearer(self):
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                cache_identity="verified-user-digest", api_key="shared-bearer-digest"
+            )
+        )
+        self.manager._resolve_cache_identity(self.obj, request)
+        self.assertEqual(self.obj.api_key, "verified-user-digest")
+
+    def test_adapter_identity_does_not_require_a_bearer_identity(self):
+        request = SimpleNamespace(
+            state=SimpleNamespace(cache_identity="verified-user-digest")
+        )
+        self.manager._resolve_cache_identity(self.obj, request)
+        self.assertEqual(self.obj.api_key, "verified-user-digest")
+
+    def test_native_generate_body_cannot_supply_trusted_http_identity(self):
+        self.manager._resolve_cache_identity(
+            self.obj, SimpleNamespace(state=SimpleNamespace())
+        )
+        self.assertIsNone(self.obj.api_key)
+        self.assertEqual(self.obj.cache_ttl_seconds, 300)
+
+    def test_native_generate_uses_verified_bearer_instead_of_body_value(self):
+        request = SimpleNamespace(
+            state=SimpleNamespace(api_key="verified-bearer-digest")
+        )
+        self.manager._resolve_cache_identity(self.obj, request)
+        self.assertEqual(self.obj.api_key, "verified-bearer-digest")
+
+    def test_in_process_request_preserves_existing_digest(self):
+        self.manager._resolve_cache_identity(self.obj, None)
+        self.assertEqual(self.obj.api_key, "body-supplied-value")
+
+    def test_prefill_clears_cache_options_and_identity(self):
+        self.manager.disaggregation_mode = _DISAGG_MODE.PREFILL
+        self.manager._resolve_cache_identity(
+            self.obj,
+            SimpleNamespace(
+                state=SimpleNamespace(cache_identity="verified-user-digest")
+            ),
+        )
+        self.assertIsNone(self.obj.api_key)
+        self.assertIsNone(self.obj.cache_ttl_seconds)
+
+    def test_batch_subobjects_and_parallel_clones_keep_physical_mode(self):
+        class Batch(_GenerateReqInput):
+            def __getitem__(self, index):
+                return self.children[index]
+
+        self.manager.enable_trace = False
+        for ttl in (300, 3600):
+            with self.subTest(ttl=ttl):
+                self.manager.rid_to_state = {}
+                child = _GenerateReqInput(
+                    rid="base", received_time=1, return_prompt_token_ids=False
+                )
+                batch = Batch(
+                    rid=["base"],
+                    children=[child],
+                    is_single=False,
+                    bootstrap_room=None,
+                    received_time=1,
+                    api_key=None,
+                    cache_ttl_seconds=ttl,
+                    cache_required=True,
+                )
+                self.manager._init_req_state(batch)
+                self.assertIsNone(child.api_key)
+                self.assertEqual(child.cache_ttl_seconds, ttl)
+                self.assertTrue(child.cache_required)
+                self.assertEqual(
+                    self.manager.rid_to_state["base"].cache_physical_ttl_seconds, ttl
+                )
+                # _handle_batch_request makes parallel samples by shallow copy
+                # and initializes a new state without tokenizing each again.
+                cloned = copy.copy(child)
+                cloned.rid = "choice-1"
+                self.manager._init_req_state(cloned)
+                state = self.manager.rid_to_state[cloned.rid]
+                self.assertEqual(state.cache_physical_ttl_seconds, ttl)
+                self.assertIsNone(state.cache_plan)
 
 
 class TestTokenizerCachePreparation(unittest.TestCase):
@@ -333,7 +496,7 @@ class TestTokenizerCachePreparation(unittest.TestCase):
             self.prepare()
         self.assertIsNone(self.state.cache_plan)
 
-    def test_implicit_unsupported_request_skips_accounting(self):
+    def test_implicit_unsupported_request_with_identity_skips_accounting(self):
         self.obj.cache_required = False
         for name, value in (
             ("lora_id", "adapter"),
@@ -351,6 +514,45 @@ class TestTokenizerCachePreparation(unittest.TestCase):
                 self.assertIsNone(self.obj.api_key)
                 setattr(self.obj, name, original)
 
+    def test_unsupported_request_without_identity_uses_physical_mode(self):
+        for name, value in (
+            ("lora_id", "adapter"),
+            ("session_params", {"id": "s"}),
+            ("sampling_params", {"max_new_tokens": 4, "n": 2}),
+            ("contains_mm_input", lambda: True),
+        ):
+            original = getattr(self.obj, name)
+            for required in (False, True):
+                for identity in (None, "", " "):
+                    with self.subTest(name=name, identity=identity, required=required):
+                        setattr(self.obj, name, value)
+                        self.obj.cache_ttl_seconds = 300
+                        self.obj.cache_required = required
+                        self.obj.api_key = identity
+                        self.assertIsNone(self.prepare())
+                        self.assertEqual(self.obj.cache_ttl_seconds, 300)
+                        self.assertIsNone(self.obj.api_key)
+                        self.assertEqual(self.state.cache_physical_ttl_seconds, 300)
+                        self.assertIsNone(self.state.cache_plan)
+            setattr(self.obj, name, original)
+
+    def test_missing_identity_never_builds_a_hash_or_requires_input_ids(self):
+        builder = Mock(side_effect=AssertionError("must not hash anonymous input"))
+        for ttl in (300, 3600):
+            with (
+                self.subTest(ttl=ttl),
+                patch.dict(
+                    self.manager._prepare_cache_plan.__globals__,
+                    {"build_page_cache_plan": builder},
+                ),
+            ):
+                self.obj.api_key = None
+                self.obj.cache_ttl_seconds = ttl
+                self.manager._prepare_cache_plan(self.obj, None)
+                self.assertEqual(self.state.cache_physical_ttl_seconds, ttl)
+                self.assertIsNone(self.state.cache_plan)
+        builder.assert_not_called()
+
     def test_multimodal_model_accepts_text_only_request(self):
         self.manager.model_config.is_multimodal = True
         self.assertIsNotNone(self.prepare())
@@ -361,6 +563,8 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.logger = Mock()
         self.manager = _load_manager_helpers(cache_logger=self.logger)()
         self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
+        self.metrics = Mock()
+        self.manager._cache_metrics = self.metrics
         self.plan = _CACHE.build_page_cache_plan(
             input_ids=list(range(10)),
             api_key="verified-api-key-hash",
@@ -368,9 +572,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             page_size=4,
             ttl_seconds=300,
         )
-        self.usage = _CACHE.CacheUsage(
-            read_tokens=4, creation_5m_tokens=4, normal_input_tokens=2
-        )
+        self.usage = _CACHE.CacheUsage(ttl_seconds=300, read_tokens=4, write_tokens=4)
         self.account = AsyncMock(return_value=self.usage)
         self.manager._cache_store = SimpleNamespace(account=self.account)
         self.state = SimpleNamespace(
@@ -424,11 +626,12 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         )
         self.logger.info.assert_called_once()
         self.logger.warning.assert_not_called()
+        self.metrics.observe_usage.assert_called_once_with(300, self.usage, "redis")
         message = _log_message(self.logger.info.call_args)
         self.assertRegex(
             message,
             r"^Cache accounting complete rid=cache-request-1 role=decode ttl=300 "
-            r"block_size=4 prompt=10 read=4 write_5m=4 write_1h=0 normal=2 "
+            r"block_size=4 prompt=10 read=4 write=4 "
             r"source=redis elapsed_ms=\d+\.\d{3}$",
         )
 
@@ -445,6 +648,216 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.account.assert_not_awaited()
         self.logger.info.assert_not_called()
         self.logger.warning.assert_not_called()
+        self.metrics.observe_usage.assert_not_called()
+
+    async def test_missing_identity_freezes_physical_read_without_store(self):
+        for ttl in (300, 3600):
+            with self.subTest(ttl=ttl):
+                self.logger.reset_mock()
+                self.metrics.reset_mock()
+                self.state = SimpleNamespace(
+                    obj=SimpleNamespace(rid="anonymous-request"),
+                    cache_plan=None,
+                    cache_physical_ttl_seconds=ttl,
+                    cache_task=None,
+                    cache_usage=None,
+                )
+                self.start(cached_tokens=7)
+                task = self.state.cache_task
+                first = await self.attach(cached_tokens=7)
+                self.state.cache_physical_ttl_seconds = 3600 if ttl == 300 else 300
+                self.start(completion_tokens=2, cached_tokens=9)
+                second = await self.attach(cached_tokens=9)
+                expected = _CACHE.CacheUsage(ttl_seconds=ttl, read_tokens=7)
+                self.assertEqual(first["meta_info"]["cache_usage"], expected.to_dict())
+                self.assertEqual(second["meta_info"]["cache_usage"], expected.to_dict())
+                self.assertIs(self.state.cache_task, task)
+                self.account.assert_not_called()
+                self.logger.warning.assert_not_called()
+                self.logger.info.assert_called_once()
+                self.assertIn(
+                    "source=missing_identity", _log_message(self.logger.info.call_args)
+                )
+                self.metrics.observe_usage.assert_called_once_with(
+                    ttl, expected, "missing_identity"
+                )
+
+    async def test_missing_identity_still_waits_for_first_successful_output(self):
+        self.state.cache_plan = None
+        self.state.cache_physical_ttl_seconds = 300
+        for completion, reason in (
+            (0, None),
+            (0, {}),
+            (-1, {"type": "length"}),
+            (0, {"type": "abort"}),
+            (0, {"type": "error"}),
+            (1, {"type": "abort"}),
+            (1, {"type": "error"}),
+        ):
+            with self.subTest(completion=completion, reason=reason):
+                self.start(completion_tokens=completion, finish_reason=reason)
+                await asyncio.sleep(0)
+                self.assertIsNone(self.state.cache_task)
+        self.account.assert_not_called()
+        self.metrics.observe_usage.assert_not_called()
+
+    async def test_missing_identity_successful_finish_with_no_output_has_usage(self):
+        for ttl in (300, 3600):
+            for finish_type in ("stop", "length"):
+                with self.subTest(ttl=ttl, finish_type=finish_type):
+                    self.metrics.reset_mock()
+                    self.state = SimpleNamespace(
+                        obj=SimpleNamespace(rid="zero-output-request"),
+                        cache_plan=None,
+                        cache_physical_ttl_seconds=ttl,
+                        cache_task=None,
+                        cache_usage=None,
+                    )
+                    self.start(
+                        completion_tokens=0,
+                        finish_reason={"type": finish_type},
+                        cached_tokens=7,
+                    )
+                    out = await self.attach()
+                    usage = _CACHE.CacheUsage(ttl_seconds=ttl, read_tokens=7)
+                    self.assertEqual(out["meta_info"]["cache_usage"], usage.to_dict())
+                    self.metrics.observe_usage.assert_called_once_with(
+                        ttl, usage, "missing_identity"
+                    )
+        self.account.assert_not_called()
+
+    async def test_parallel_internal_warmup_does_not_account_or_change_sample_ttl(self):
+        class Batch(_GenerateReqInput):
+            def __getitem__(self, index):
+                return self.children[index]
+
+        self.manager.enable_trace = False
+        for ttl in (300, 3600):
+            with self.subTest(ttl=ttl):
+                self.metrics.reset_mock()
+                self.manager.rid_to_state = {}
+                child = _GenerateReqInput(
+                    rid="base", received_time=1, return_prompt_token_ids=False
+                )
+                batch = Batch(
+                    rid=["base"],
+                    children=[child],
+                    is_single=False,
+                    bootstrap_room=None,
+                    received_time=1,
+                    api_key=None,
+                    cache_ttl_seconds=ttl,
+                    cache_required=True,
+                    batch_size=1,
+                    parallel_sample_num=2,
+                    stream=False,
+                )
+                self.manager._init_req_state(batch)
+                tokenized = SimpleNamespace(
+                    rid="base",
+                    sampling_params=SimpleNamespace(max_new_tokens=1),
+                    stream=False,
+                    mm_inputs=None,
+                )
+                self.manager._tokenize_one_request = AsyncMock(return_value=tokenized)
+                self.manager._send_one_request = AsyncMock()
+                warmups = []
+
+                async def response(obj, request=None):
+                    state = self.manager.rid_to_state[obj.rid]
+                    if obj.cache_ttl_seconds is None:
+                        warmups.append(obj)
+                        self.assertIsNone(obj.api_key)
+                        self.assertFalse(obj.cache_required)
+                        self.manager._start_cache_accounting(
+                            state, 10, 0, {"type": "length"}, cached_tokens=7
+                        )
+                        self.assertIsNone(state.cache_task)
+                        out = {"meta_info": {}}
+                    else:
+                        self.assertEqual(obj.cache_ttl_seconds, ttl)
+                        self.manager._start_cache_accounting(
+                            state, 10, 1, {"type": "stop"}, cached_tokens=7
+                        )
+                        out = {"meta_info": {}}
+                        await self.manager._attach_cache_usage(state, out)
+                    del self.manager.rid_to_state[obj.rid]
+                    yield out
+
+                self.manager._wait_one_response = response
+                batches = [
+                    out async for out in self.manager._handle_batch_request(batch)
+                ]
+                self.assertEqual(len(warmups), 1)
+                self.assertEqual(child.cache_ttl_seconds, ttl)
+                self.assertTrue(child.cache_required)
+                self.assertEqual(len(batches), 1)
+                self.assertEqual(len(batches[0]), 2)
+                usage = _CACHE.CacheUsage(ttl_seconds=ttl, read_tokens=7)
+                for choice in batches[0]:
+                    self.assertEqual(
+                        choice["meta_info"]["cache_usage"], usage.to_dict()
+                    )
+                self.metrics.observe_usage.assert_called_once_with(
+                    ttl, usage, "missing_identity"
+                )
+        self.account.assert_not_called()
+
+    async def test_missing_identity_keeps_physical_read_within_prompt(self):
+        for physical_read, expected_read in ((-1, 0), (0, 0), (7, 7), (11, 10)):
+            with self.subTest(physical_read=physical_read):
+                self.state = SimpleNamespace(
+                    obj=SimpleNamespace(rid="anonymous-request"),
+                    cache_plan=None,
+                    cache_physical_ttl_seconds=300,
+                    cache_task=None,
+                    cache_usage=None,
+                )
+                self.start(cached_tokens=physical_read)
+                out = await self.attach()
+                self.assertEqual(
+                    out["meta_info"]["cache_usage"],
+                    _CACHE.CacheUsage(
+                        ttl_seconds=300, read_tokens=expected_read
+                    ).to_dict(),
+                )
+        self.account.assert_not_called()
+
+    async def test_missing_identity_parallel_samples_observe_one_input(self):
+        parent = SimpleNamespace(cache_usage=None)
+        samples = []
+        for index, physical_read in enumerate((7, 9)):
+            state = SimpleNamespace(
+                obj=SimpleNamespace(rid=f"choice-{index}"),
+                cache_plan=None,
+                cache_physical_ttl_seconds=300,
+                cache_metrics_parent=parent,
+                cache_task=None,
+                cache_usage=None,
+            )
+            self.manager._start_cache_accounting(
+                state, 10, 1, None, cached_tokens=physical_read
+            )
+            samples.append(state)
+        outputs = [{"meta_info": {}} for _ in samples]
+        await asyncio.gather(
+            *(
+                self.manager._attach_cache_usage(state, out)
+                for state, out in zip(samples, outputs)
+            )
+        )
+        for out, physical_read in zip(outputs, (7, 9)):
+            self.assertEqual(
+                out["meta_info"]["cache_usage"],
+                _CACHE.CacheUsage(ttl_seconds=300, read_tokens=physical_read).to_dict(),
+            )
+        self.assertEqual(
+            parent.cache_usage, _CACHE.CacheUsage(ttl_seconds=300, read_tokens=7)
+        )
+        self.metrics.observe_usage.assert_called_once_with(
+            300, parent.cache_usage, "missing_identity"
+        )
+        self.account.assert_not_called()
 
     async def test_abort_or_error_does_not_create_cache(self):
         for reason in ("abort", "error"):
@@ -471,7 +884,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         first = await self.attach(cached_tokens=7)
         self.start(completion_tokens=2, cached_tokens=9)
         second = await self.attach(cached_tokens=9)
-        expected = _CACHE.CacheUsage(read_tokens=7, normal_input_tokens=3).to_dict()
+        expected = _CACHE.CacheUsage(ttl_seconds=300, read_tokens=7).to_dict()
         self.assertEqual(first["meta_info"]["cache_usage"], expected)
         self.assertEqual(second["meta_info"]["cache_usage"], expected)
         self.assertIs(self.state.cache_task, task)
@@ -501,11 +914,14 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             "Cache accounting Redis fallback rid=cache-request-1 role=decode "
             "ttl=300 error_type=TimeoutError",
         )
-        self.assertIn("read=7 write_5m=0 write_1h=0 normal=3 source=physical", complete)
+        self.assertIn("read=7 write=0 source=physical", complete)
         for secret in secrets:
             self.assertNotIn(secret, warning + complete)
         self.assertEqual(self.logger.warning.call_args.kwargs, {})
         self.assertEqual(self.logger.info.call_args.kwargs, {})
+        self.metrics.observe_usage.assert_called_once_with(
+            300, _CACHE.CacheUsage(ttl_seconds=300, read_tokens=7), "physical"
+        )
 
     async def test_no_complete_block_logs_without_claiming_redis_was_used(self):
         self.state.cache_plan = _CACHE.build_page_cache_plan(
@@ -515,17 +931,18 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             page_size=_CACHE.CACHE_BLOCK_SIZE,
             ttl_seconds=3600,
         )
-        self.account.return_value = _CACHE.CacheUsage(normal_input_tokens=3)
+        self.account.return_value = _CACHE.CacheUsage(ttl_seconds=3600)
         self.manager.disaggregation_mode = _DISAGG_MODE.NULL
         self.start(prompt_tokens=3)
         await self.manager._attach_cache_usage(self.state, {"meta_info": {}})
         self.logger.info.assert_called_once()
         message = _log_message(self.logger.info.call_args)
         self.assertIn("role=standalone ttl=3600 block_size=256 prompt=3", message)
-        self.assertIn(
-            "read=0 write_5m=0 write_1h=0 normal=3 source=no_complete_block", message
-        )
+        self.assertIn("read=0 write=0 source=no_complete_block", message)
         self.logger.warning.assert_not_called()
+        self.metrics.observe_usage.assert_called_once_with(
+            3600, _CACHE.CacheUsage(ttl_seconds=3600), "no_complete_block"
+        )
 
     async def test_redis_failure_keeps_physical_read_within_prompt(self):
         self.account.side_effect = _CACHE.CacheAccountingError("Redis unavailable")
@@ -541,9 +958,9 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
                 out = await self.attach(cached_tokens=physical_read)
                 cache = out["meta_info"]["cache_usage"]
                 self.assertEqual(cache["read_tokens"], expected_read)
-                self.assertEqual(cache["creation_5m_tokens"], 0)
-                self.assertEqual(cache["creation_1h_tokens"], 0)
-                self.assertEqual(sum(cache.values()), self.plan.prompt_tokens)
+                self.assertEqual(cache["write_tokens"], 0)
+                self.assertEqual(cache["ttl_seconds"], self.plan.ttl_seconds)
+                self.assertLessEqual(cache["read_tokens"], self.plan.prompt_tokens)
 
     async def test_prompt_count_mismatch_is_strict_and_never_writes(self):
         self.start(prompt_tokens=9)
@@ -560,13 +977,14 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
         self.logger.info.assert_not_called()
         self.logger.warning.assert_not_called()
+        self.metrics.observe_usage.assert_not_called()
 
-    async def test_tail_partition_and_physical_cache_metric_are_preserved(self):
+    async def test_complete_block_counts_and_physical_cache_metric_are_preserved(self):
         self.start()
         out = await self.attach(cached_tokens=7)
         cache = out["meta_info"]["cache_usage"]
-        self.assertEqual(sum(cache.values()), self.plan.prompt_tokens)
-        self.assertEqual(cache["normal_input_tokens"], 2)
+        self.assertEqual(cache["read_tokens"] + cache["write_tokens"], 8)
+        self.assertEqual(cache["ttl_seconds"], self.plan.ttl_seconds)
         self.assertEqual(out["meta_info"]["cached_tokens"], 7)
 
     async def test_other_request_keeps_its_own_accounting_task(self):

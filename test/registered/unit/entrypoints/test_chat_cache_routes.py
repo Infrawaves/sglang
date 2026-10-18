@@ -108,7 +108,7 @@ class _RecordingHandler:
         self.response = None
 
     async def handle_request(self, request, raw_request):
-        self.calls.append((request, raw_request.state.api_key))
+        self.calls.append((request, getattr(raw_request.state, "api_key", None)))
         return self.response if self.response is not None else {"accepted": True}
 
 
@@ -144,6 +144,30 @@ class TestChatCacheRoutes(unittest.TestCase):
         self.assertEqual(len(routes), 1)
         self.assertIs(routes[0].endpoint, self.endpoint)
         self.assertIn(self.path, self.app.openapi()["paths"])
+
+    def test_gateway_identity_body_passes_without_engine_api_key(self):
+        app = FastAPI()
+        app.state.openai_serving_chat = self.handler
+        _register_production_routes(app)
+        _AUTH.add_api_key_middleware(app, api_key=None, admin_api_key=None)
+        body = {**self.body(), "cache_user_id": "gateway-user-a"}
+        with TestClient(app) as client:
+            response = client.post(self.path, json=body)
+        self.assertEqual(response.status_code, 200)
+        request, api_key = self.handler.calls[-1]
+        self.assertEqual(request.cache_user_id, "gateway-user-a")
+        self.assertIsNone(api_key)
+
+    def test_invalid_gateway_identity_is_rejected_before_dispatch(self):
+        for user_id in ("", " \t\n", 123, [], {}):
+            with self.subTest(identity=user_id):
+                response = self.client.post(
+                    self.path,
+                    json={**self.body(), "cache_user_id": user_id},
+                    headers=self.headers,
+                )
+                self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.handler.calls, [])
 
     def test_both_ttl_tiers_and_authenticated_identity_reach_handler(self):
         for ttl in ("5m", "1h"):
@@ -245,10 +269,9 @@ class TestChatCacheRoutes(unittest.TestCase):
         for ttl, read, write in (("5m", 200, 700), ("1h", 200, 700), ("1h", 900, 0)):
             with self.subTest(ttl=ttl, write=write):
                 snapshot = _PROTOCOL.CacheUsage(
+                    ttl_seconds=300 if ttl == "5m" else 3600,
                     read_tokens=read,
-                    creation_5m_tokens=write if ttl == "5m" else 0,
-                    creation_1h_tokens=write if ttl == "1h" else 0,
-                    normal_input_tokens=100,
+                    write_tokens=write,
                 )
                 self.handler.response = _PROTOCOL.ChatCompletionResponse(
                     id="cache-json",
@@ -280,11 +303,11 @@ class TestChatCacheRoutes(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(
                     response.headers["Msh-Usage-Cache-Write-Tokens-5m"],
-                    str(snapshot.creation_5m_tokens),
+                    str(write if ttl == "5m" else 0),
                 )
                 self.assertEqual(
                     response.headers["Msh-Usage-Cache-Write-Tokens-1h"],
-                    str(snapshot.creation_1h_tokens),
+                    str(write if ttl == "1h" else 0),
                 )
                 usage = response.json()["usage"]
                 self.assertEqual(

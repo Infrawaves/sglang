@@ -373,6 +373,14 @@ class AnthropicMessagesRequest(BaseModel):
     max_tokens: int
     metadata: Optional[dict[str, Any]] = None
     prompt_cache_options: Optional[PromptCacheOptions] = None
+    cache_user_id: Optional[str] = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        pattern=r"\S",
+        repr=False,
+        description="User identity supplied by the authenticating gateway for cache isolation.",
+    )
     stop_sequences: Optional[list[str]] = None
     stream: Optional[bool] = False
     system: Optional[Union[str, list[AnthropicContentBlock]]] = None

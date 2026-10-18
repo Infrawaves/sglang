@@ -9,6 +9,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
+from hashlib import sha256
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -905,14 +906,23 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.prompt_cache_options is None:
                 return {}
             raise ValueError("Cache accounting is not enabled on this server.")
-        # Bearer authentication supplies a digest, never the raw credential.
-        api_key = getattr(getattr(raw_request, "state", None), "api_key", None)
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise ValueError(
-                "prompt_cache_options requires a trusted API key identity."
+        # The gateway supplies its authenticated user's identity independently
+        # of optional engine API authentication. Hash it before dispatch; never
+        # use one shared gateway credential as all users' cache identity.
+        if request.cache_user_id is not None:
+            api_key = (
+                "cache-user-id:"
+                + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
             )
-        # TokenizerManager decides which shapes can use accounting. Unsupported
-        # implicit requests skip accounting; explicit requests get an error.
+        else:
+            # Keep verified Bearer identities supported for direct clients.
+            api_key = getattr(getattr(raw_request, "state", None), "api_key", None)
+        if not isinstance(api_key, str) or not api_key.strip():
+            # Missing identity serves inference using physical cache usage only.
+            # TokenizerManager skips every Redis operation; no shared key is made.
+            api_key = None
+        # TokenizerManager decides which shapes can use Redis accounting for
+        # identified users. Missing identities always use physical usage only.
         return {
             "api_key": api_key,
             "cache_required": request.prompt_cache_options is not None,
@@ -2112,6 +2122,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+
+        initial_input_usage = None
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2220,30 +2232,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    if (
-                        cache_context is not None
-                        and "usage" not in cache_context
-                        and index in cache_usage
-                    ):
-                        # Publish only for a successful first role event,
-                        # independently of the caller's usage options.
-                        cache_context["usage"] = CacheUsage.model_validate(
-                            cache_usage[index]
-                        )
-                    # A stop/EOS token may produce no content chunk. Carry the
-                    # cache snapshot here so Anthropic message_start still
-                    # reports the complete input accounting in that case.
-                    initial_usage = None
-                    if continuous_usage_stats and index in cache_usage:
-                        initial_usage = UsageProcessor.calculate_token_usage(
+                    if initial_input_usage is None and index in cache_usage:
+                        snapshot = CacheUsage.model_validate(cache_usage[index])
+                        initial_input_usage = UsageProcessor.calculate_token_usage(
                             prompt_tokens=prompt_tokens[index],
-                            reasoning_tokens=reasoning_tokens[index],
-                            completion_tokens=completion_tokens[index],
+                            completion_tokens=0,
+                            reasoning_tokens=0,
                             cached_tokens=self._continuous_usage_cached_details(
                                 content
                             ),
-                            cache_usage=cache_usage[index],
-                        ).model_dump()
+                            cache_usage=snapshot,
+                        )
+                        # Publish only for a successful first role event,
+                        # independently of the caller's usage options.
+                        if cache_context is not None:
+                            cache_context["usage"] = snapshot
+                    # The empty role carries frozen input usage even when tail
+                    # usage is disabled. Output/reasoning counts start at zero;
+                    # their tracked engine totals remain intact for later chunks.
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -2251,11 +2257,32 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
-                        usage=initial_usage,
+                        usage=(
+                            initial_input_usage.model_dump()
+                            if initial_input_usage is not None
+                            else None
+                        ),
                     )
                     stream_started = True
 
                 # Generate streaming content (override in subclass for custom behavior)
+                content_prompt_tokens = prompt_tokens
+                if initial_input_usage is not None:
+                    # Multiple choices share one input. Freeze its first
+                    # successful snapshot for all public usage, without waiting
+                    # for or buffering another choice's output.
+                    content = {
+                        **content,
+                        "meta_info": {
+                            **content["meta_info"],
+                            "prompt_tokens": initial_input_usage.prompt_tokens,
+                            "cache_usage": initial_input_usage.cache_usage.model_dump(),
+                        },
+                    }
+                    content_prompt_tokens = {
+                        **prompt_tokens,
+                        index: initial_input_usage.prompt_tokens,
+                    }
                 async for chunk in self._generate_stream_content(
                     content=content,
                     index=index,
@@ -2267,7 +2294,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     choice_logprobs=choice_logprobs,
                     finish_reason_type=finish_reason_type,
                     continuous_usage_stats=continuous_usage_stats,
-                    prompt_tokens=prompt_tokens,
+                    prompt_tokens=content_prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                 ):
@@ -2418,6 +2445,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
                     cache_usage=cache_usage,
+                    input_usage=initial_input_usage,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],

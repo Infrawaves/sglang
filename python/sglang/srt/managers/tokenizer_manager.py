@@ -69,6 +69,7 @@ from sglang.srt.cache_accounting import (
     RedisPageCacheStore,
     build_page_cache_plan,
 )
+from sglang.srt.cache_accounting.metrics import CacheAccountingMetrics
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -264,6 +265,8 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     cache_plan: Optional[PageCachePlan] = None
+    cache_physical_ttl_seconds: Optional[int] = None
+    cache_metrics_parent: Optional[ReqState] = None
     cache_task: Optional[asyncio.Task] = None
     cache_usage: Optional[CacheUsage] = None
     last_completion_tokens: int = 1
@@ -1005,25 +1008,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         cfg = get_serving()
         role = get_disagg().disaggregation_mode
         self._cache_store = None
+        self._cache_metrics = None
         self._cache_tasks: set[asyncio.Task] = set()
         if not cfg.enable_cache_accounting:
             return
         if role == "prefill":
             action = "skip_prefill"
         else:
+            if self.enable_metrics:
+                self._cache_metrics = CacheAccountingMetrics(
+                    role="standalone" if role == "null" else role
+                )
             self._cache_store = RedisPageCacheStore(
                 cfg.cache_redis_url,
                 timeout_seconds=cfg.cache_timeout,
                 username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
                 password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
+                metrics=self._cache_metrics,
             )
             action = "account"
         logger.info(
-            "Cache accounting startup enabled=%s role=%s action=%s block_size=%d",
+            "Cache accounting startup enabled=%s role=%s action=%s block_size=%d "
+            "metrics_enabled=%s",
             cfg.enable_cache_accounting,
             "standalone" if role == "null" else role,
             action,
             CACHE_BLOCK_SIZE,
+            self._cache_metrics is not None,
         )
 
     def _validate_cache_request(self, obj: GenerateReqInput) -> None:
@@ -1038,7 +1049,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.cache_ttl_seconds not in (300, 3600):
             raise ValueError("cache_ttl_seconds must be 300 or 3600")
         if not isinstance(obj.api_key, str) or not obj.api_key.strip():
-            raise ValueError("Cache accounting requires an authenticated API key")
+            # Requests without an identity use physical cache usage and never
+            # access Redis, including shapes unsupported by the Redis plan.
+            obj.api_key = None
+            return
         params = obj.sampling_params or {}
         if isinstance(params, dict):
             params = {
@@ -1064,6 +1078,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not obj.cache_required:
                 # Implicit accounting: serve the request without cache usage
                 # instead of rejecting shapes the accountant cannot price.
+                logger.debug(
+                    "Cache accounting skipped rid=%s role=%s reason=unsupported_request",
+                    obj.rid,
+                    self.disaggregation_mode.value,
+                )
                 obj.cache_ttl_seconds = None
                 obj.api_key = None
                 return
@@ -1079,6 +1098,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         self._validate_cache_request(obj)
         if obj.cache_ttl_seconds is None:
+            return
+        if obj.api_key is None:
+            self.rid_to_state[
+                obj.rid
+            ].cache_physical_ttl_seconds = obj.cache_ttl_seconds
             return
         if input_ids is None:
             raise ValueError("Cache accounting requires final input token IDs")
@@ -1116,10 +1140,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         cached_tokens: int = 0,
     ) -> None:
         plan = state.cache_plan
-        if (
+        physical_ttl = getattr(state, "cache_physical_ttl_seconds", None)
+        physical_finished_without_output = (
             plan is None
+            and physical_ttl is not None
+            and completion_tokens == 0
+            and isinstance(finish_reason, dict)
+            and finish_reason.get("type") in ("stop", "length")
+        )
+        if (
+            (plan is None and physical_ttl is None)
             or state.cache_task is not None
-            or completion_tokens <= 0
+            or (completion_tokens <= 0 and not physical_finished_without_output)
             or (
                 isinstance(finish_reason, dict)
                 and finish_reason.get("type") in ("abort", "error")
@@ -1133,46 +1165,62 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.disaggregation_mode == DisaggregationMode.NULL
             else self.disaggregation_mode.value
         )
+        ttl_seconds = plan.ttl_seconds if plan is not None else physical_ttl
+        block_size = plan.page_size if plan is not None else CACHE_BLOCK_SIZE
+        metrics_parent = getattr(state, "cache_metrics_parent", None)
 
         async def account_once():
             started = time.perf_counter()
-            if prompt_tokens != plan.prompt_tokens:
-                raise CacheAccountingError(
-                    "Cache prompt-token count differs from final input IDs"
-                )
-            source = "redis" if plan.page_keys else "no_complete_block"
-            try:
-                usage = await self._cache_store.account(plan, rid=rid)
-            except CacheAccountingError as exc:
-                # Freeze the engine's actual prefix hit from this output. A
-                # failed Redis operation cannot confirm any cache creation.
-                read_tokens = max(0, min(prompt_tokens, cached_tokens))
+            if plan is None:
                 usage = CacheUsage(
-                    read_tokens=read_tokens,
-                    normal_input_tokens=prompt_tokens - read_tokens,
+                    ttl_seconds=ttl_seconds,
+                    read_tokens=max(0, min(prompt_tokens, cached_tokens)),
                 )
-                source = "physical"
-                logger.warning(
-                    "Cache accounting Redis fallback rid=%s role=%s ttl=%d "
-                    "error_type=%s",
-                    rid,
-                    role,
-                    plan.ttl_seconds,
-                    type(exc.__cause__ if exc.__cause__ is not None else exc).__name__,
-                )
+                source = "missing_identity"
+            else:
+                if prompt_tokens != plan.prompt_tokens:
+                    raise CacheAccountingError(
+                        "Cache prompt-token count differs from final input IDs"
+                    )
+                source = "redis" if plan.page_keys else "no_complete_block"
+                try:
+                    usage = await self._cache_store.account(plan, rid=rid)
+                except CacheAccountingError as exc:
+                    # Freeze the engine's actual prefix hit from this output. A
+                    # failed Redis operation cannot confirm any cache creation.
+                    usage = CacheUsage(
+                        ttl_seconds=ttl_seconds,
+                        read_tokens=max(0, min(prompt_tokens, cached_tokens)),
+                    )
+                    source = "physical"
+                    logger.warning(
+                        "Cache accounting Redis fallback rid=%s role=%s ttl=%d "
+                        "error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(
+                            exc.__cause__ if exc.__cause__ is not None else exc
+                        ).__name__,
+                    )
+            observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
+            if metrics_parent is not None and metrics_parent.cache_usage is None:
+                # Parallel samples share one input; the first successful sample
+                # owns its metric observation while each sample keeps its usage.
+                metrics_parent.cache_usage = usage
+            if self._cache_metrics is not None and observe_usage:
+                self._cache_metrics.observe_usage(ttl_seconds, usage, source)
             logger.info(
                 "Cache accounting complete rid=%s role=%s ttl=%d block_size=%d "
-                "prompt=%d read=%d write_5m=%d write_1h=%d normal=%d source=%s "
+                "prompt=%d read=%d write=%d source=%s "
                 "elapsed_ms=%.3f",
                 rid,
                 role,
-                plan.ttl_seconds,
-                plan.page_size,
+                ttl_seconds,
+                block_size,
                 prompt_tokens,
                 usage.read_tokens,
-                usage.creation_5m_tokens,
-                usage.creation_1h_tokens,
-                usage.normal_input_tokens,
+                usage.write_tokens,
                 source,
                 (time.perf_counter() - started) * 1000,
             )
@@ -1244,6 +1292,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "top_logprobs_num must contain one value per input in a batch."
                 )
 
+    def _resolve_cache_identity(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+    ) -> None:
+        if not isinstance(obj, GenerateReqInput) or obj.cache_ttl_seconds is None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.api_key = None
+            return
+        if request is None:
+            return
+        # API adapters set cache_identity only after validating their public
+        # identity fields. Native /generate bodies cannot populate request.state.
+        state = request.state
+        identity = getattr(state, "cache_identity", None)
+        if not isinstance(identity, str) or not identity.strip():
+            identity = getattr(state, "api_key", None)
+        if not isinstance(identity, str) or not identity.strip():
+            identity = None
+        obj.api_key = identity
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1251,19 +1322,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
-        if isinstance(obj, GenerateReqInput) and obj.cache_ttl_seconds is not None:
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                obj.cache_ttl_seconds = None
-                obj.api_key = None
-            elif request is not None:
-                # /generate also parses GenerateReqInput from the public body.
-                # Override its key field with the verified credential's digest.
-                api_key = getattr(request.state, "api_key", None)
-                if not isinstance(api_key, str) or not api_key.strip():
-                    raise ValueError(
-                        "Cache accounting requires an authenticated API key"
-                    )
-                obj.api_key = api_key
+        self._resolve_cache_identity(obj, request)
 
         # Reject the entire raw batch before expansion or dispatch of any member.
         self.validate_request_params(obj)
@@ -2456,6 +2515,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
+                # This is an internal warmup, not one of the user's samples.
+                tmp_obj.cache_ttl_seconds = None
+                tmp_obj.api_key = None
+                tmp_obj.cache_required = False
                 self._init_req_state(tmp_obj)
                 request_rids.add(tmp_obj.rid)
                 await self._send_one_request(tokenized_obj)
@@ -2476,6 +2539,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
+                    if state.cache_physical_ttl_seconds is not None:
+                        state.cache_metrics_parent = self.rid_to_state[objs[i].rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -4063,6 +4128,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if isinstance(obj, GenerateReqInput) and obj.cache_ttl_seconds is not None:
+                # __getitem__ does not carry cache options. Preserve them on
+                # cached subobjects so parallel-sample clones keep the mode.
+                sub_obj.cache_ttl_seconds = obj.cache_ttl_seconds
+                sub_obj.api_key = obj.api_key
+                sub_obj.cache_required = obj.cache_required
+                if not isinstance(sub_obj.api_key, str) or not sub_obj.api_key.strip():
+                    state.cache_physical_ttl_seconds = obj.cache_ttl_seconds
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)

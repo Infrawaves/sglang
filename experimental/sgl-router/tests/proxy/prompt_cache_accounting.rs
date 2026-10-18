@@ -191,6 +191,7 @@ fn context(
 fn request_body(options: Option<&Value>, streaming: bool) -> Value {
     let mut body = json!({
         "model": MODEL,
+        "cache_user_id": "gateway-user-42",
         "messages": [{"role": "user", "content": "hi"}],
         "rid": "client-cache-request",
         "stream": streaming,
@@ -255,6 +256,7 @@ fn captured(worker: &MockWorker, original: &Value, forward_ids: bool) -> Value {
         forwarded.get("prompt_cache_options"),
         original.get("prompt_cache_options"),
     );
+    assert_eq!(forwarded.get("cache_user_id"), original.get("cache_user_id"));
     assert_eq!(forwarded["messages"], original["messages"]);
     if forward_ids {
         assert!(!forwarded["input_ids"].as_array().unwrap().is_empty());

@@ -230,26 +230,29 @@ class PromptCacheOptions(BaseModel):
 class CacheUsage(BaseModel):
     """A per-request prefix cache accounting snapshot."""
 
-    read_tokens: int = Field(default=0, ge=0)
-    creation_5m_tokens: int = Field(default=0, ge=0)
-    creation_1h_tokens: int = Field(default=0, ge=0)
-    normal_input_tokens: int = Field(default=0, ge=0)
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_seconds: Literal[300, 3600]
+    read_tokens: int = Field(default=0, ge=0, strict=True)
+    write_tokens: int = Field(default=0, ge=0, strict=True)
+
+    @field_validator("ttl_seconds", mode="before")
+    @classmethod
+    def validate_ttl_integer(cls, value):
+        if type(value) is not int:
+            raise ValueError("ttl_seconds must be an integer")
+        return value
 
     def response_headers(self) -> Dict[str, str]:
         """Expose both creation tiers, including zero, from this decision."""
         return {
-            "Msh-Usage-Cache-Write-Tokens-5m": str(self.creation_5m_tokens),
-            "Msh-Usage-Cache-Write-Tokens-1h": str(self.creation_1h_tokens),
+            "Msh-Usage-Cache-Write-Tokens-5m": str(
+                self.write_tokens if self.ttl_seconds == 300 else 0
+            ),
+            "Msh-Usage-Cache-Write-Tokens-1h": str(
+                self.write_tokens if self.ttl_seconds == 3600 else 0
+            ),
         }
-
-    @property
-    def total_input_tokens(self) -> int:
-        return (
-            self.read_tokens
-            + self.creation_5m_tokens
-            + self.creation_1h_tokens
-            + self.normal_input_tokens
-        )
 
 
 class UsageInfo(BaseModel):
@@ -942,6 +945,14 @@ class ChatCompletionRequest(BaseModel):
     prompt_cache_options: Optional[PromptCacheOptions] = Field(
         default=None,
         description="When server cache accounting is enabled, omission uses implicit mode with a 5m TTL.",
+    )
+    cache_user_id: Optional[str] = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        pattern=r"\S",
+        repr=False,
+        description="User identity supplied by the authenticating gateway for cache isolation.",
     )
     tool_choice: Union[
         ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
