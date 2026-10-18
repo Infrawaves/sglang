@@ -530,6 +530,10 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         self.fail_accounting = False
         self.snapshot_override = None
         self.abort_first = False
+        self.output_prompt_tokens = 43
+        self.physical_cached_tokens = 32
+        self.accounting_read_tokens = 16
+        self.accounting_write_tokens = 16
 
         async def run_in_request_preprocessor(func, *args):
             return func(*args)
@@ -544,9 +548,11 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
             snapshot = {
                 **SNAPSHOT,
                 "ttl_seconds": adapted_request.cache_ttl_seconds,
+                "read_tokens": self.accounting_read_tokens,
+                "write_tokens": self.accounting_write_tokens,
             }
             if adapted_request.api_key is None:
-                snapshot.update(read_tokens=32, write_tokens=0)
+                snapshot.update(read_tokens=self.physical_cached_tokens, write_tokens=0)
             if self.snapshot_override is not None:
                 snapshot = dict(self.snapshot_override)
             zero_output = adapted_request.sampling_params.get("max_new_tokens") == 0
@@ -558,9 +564,9 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     "text": "hi"[:count],
                     "meta_info": {
                         "id": "chat-cache-path",
-                        "prompt_tokens": 43,
+                        "prompt_tokens": self.output_prompt_tokens,
                         "completion_tokens": count,
-                        "cached_tokens": 32,
+                        "cached_tokens": self.physical_cached_tokens,
                         **(
                             {"cache_usage": snapshot}
                             if adapted_request.cache_ttl_seconds is not None
@@ -650,13 +656,28 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         self.disagg_patch.start()
         self.addCleanup(self.disagg_patch.stop)
 
-    def request(self, ttl, stream=False, *, omit_options=False):
+    def request(self, ttl, stream=False, *, omit_options=False, multimodal=False):
         options = {"mode": "implicit"}
         if ttl is not None:
             options["ttl"] = ttl
         return ChatCompletionRequest(
             model="test-model",
-            messages=[{"role": "user", "content": "hello"}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        [
+                            {"type": "text", "text": "hello"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,ZmFrZQ=="},
+                            },
+                        ]
+                        if multimodal
+                        else "hello"
+                    ),
+                }
+            ],
             max_completion_tokens=2,
             **({} if omit_options else {"prompt_cache_options": options}),
             user="untrusted-body-user",
@@ -738,6 +759,181 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 **({"cache_usage": dict(snapshot)} if snapshot is not None else {}),
             },
         }
+
+    def configure_multimodal_output(self):
+        # This API fixture simulates final Scheduler metadata. Media processing
+        # and content/page hashing are exercised by the core/manager tests.
+        self.chat.tokenizer_manager.model_config.is_multimodal = True
+        self.chat._process_messages.return_value = MessageProcessingResult(
+            prompt="hello <image>",
+            prompt_ids=list(range(20)),
+            image_data=["fixture-image"],
+            audio_data=None,
+            video_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        self.output_prompt_tokens = 770
+        self.physical_cached_tokens = 333
+        self.accounting_read_tokens = 256
+        self.accounting_write_tokens = 512
+
+    async def test_multimodal_final_input_usage_for_default_and_selected_ttls(self):
+        self.configure_multimodal_output()
+        for ttl, omitted in ((None, True), ("5m", False), ("1h", False)):
+            for stream, include_usage, continuous in (
+                (False, False, False),
+                (True, True, False),
+                (True, True, True),
+                (True, False, False),
+            ):
+                with self.subTest(
+                    ttl=ttl,
+                    stream=stream,
+                    include_usage=include_usage,
+                    continuous=continuous,
+                ):
+                    request = self.request(
+                        ttl, stream=stream, omit_options=omitted, multimodal=True
+                    )
+                    request.cache_user_id = "multimodal-gateway-user"
+                    if stream:
+                        request.stream_options.include_usage = include_usage
+                        request.stream_options.continuous_usage_stats = continuous
+                    response = await self.chat.handle_request(
+                        request, Request({"type": "http", "headers": [], "state": {}})
+                    )
+                    adapted = self.adapted_requests[-1]
+                    self.assertTrue(adapted.contains_mm_input())
+                    self.assertEqual(adapted.image_data, ["fixture-image"])
+                    self.assertEqual(adapted.text, "hello <image>")
+                    self.assertEqual(
+                        adapted.cache_ttl_seconds, 3600 if ttl == "1h" else 300
+                    )
+                    self.assertEqual(adapted.cache_required, not omitted)
+                    expected_headers = {
+                        "Msh-Usage-Cache-Write-Tokens-5m": (
+                            "0" if ttl == "1h" else "512"
+                        ),
+                        "Msh-Usage-Cache-Write-Tokens-1h": (
+                            "512" if ttl == "1h" else "0"
+                        ),
+                    }
+                    if stream:
+                        self.assertEqual(response.status_code, 200)
+                        # Headers must be available before consuming the body.
+                        for header, expected in expected_headers.items():
+                            self.assertEqual(response.headers[header], expected)
+                        frames = [frame async for frame in response.body_iterator]
+                        self.assertEqual(frames[-1], "data: [DONE]\n\n")
+                        chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
+                        self.assert_role_usage(
+                            chunks[0], prompt=770, read=256, write=512
+                        )
+                        content = "".join(
+                            choice["delta"].get("content") or ""
+                            for chunk in chunks
+                            for choice in chunk["choices"]
+                        )
+                        self.assertEqual(content, "hi")
+                        tails = [chunk for chunk in chunks if chunk["choices"] == []]
+                        self.assertEqual(len(tails), int(include_usage))
+                        if not include_usage:
+                            self.assertTrue(
+                                all(chunk.get("usage") is None for chunk in chunks[1:])
+                            )
+                            continue
+                        usage = tails[0]["usage"]
+                        if continuous:
+                            for chunk in chunks:
+                                if chunk.get("usage") is not None:
+                                    self.assertEqual(
+                                        chunk["usage"]["prompt_tokens"], 770
+                                    )
+                                    self.assertEqual(
+                                        chunk["usage"]["prompt_tokens_details"],
+                                        {
+                                            "cached_tokens": 256,
+                                            "cache_write_tokens": 512,
+                                        },
+                                    )
+                    else:
+                        self.assertEqual(response.choices[0].message.content, "hi")
+                        self.assertEqual(
+                            response.usage.cache_usage.response_headers(),
+                            expected_headers,
+                        )
+                        usage = response.model_dump()["usage"]
+                    self.assertEqual(usage["prompt_tokens"], 770)
+                    self.assertEqual(usage["completion_tokens"], 2)
+                    self.assertEqual(usage["total_tokens"], 772)
+                    self.assertEqual(
+                        usage["prompt_tokens_details"],
+                        {"cached_tokens": 256, "cache_write_tokens": 512},
+                    )
+                    self.assertNotIn("cache_usage", usage)
+
+    async def test_multimodal_physical_fallback_keeps_usage_and_headers_consistent(
+        self,
+    ):
+        self.configure_multimodal_output()
+        for source in ("missing_identity", "redis_failure"):
+            for ttl, omitted in ((None, True), ("5m", False), ("1h", False)):
+                for stream in (False, True):
+                    with self.subTest(source=source, ttl=ttl, stream=stream):
+                        request = self.request(
+                            ttl, stream=stream, omit_options=omitted, multimodal=True
+                        )
+                        if source == "redis_failure":
+                            request.cache_user_id = "multimodal-gateway-user"
+                            self.snapshot_override = {
+                                "ttl_seconds": 3600 if ttl == "1h" else 300,
+                                "read_tokens": 333,
+                                "write_tokens": 0,
+                            }
+                        else:
+                            self.snapshot_override = None
+                        raw = Request({"type": "http", "headers": [], "state": {}})
+                        response = await self.chat.handle_request(request, raw)
+                        self.assertTrue(self.adapted_requests[-1].contains_mm_input())
+                        self.assertEqual(
+                            self.adapted_requests[-1].api_key is None,
+                            source == "missing_identity",
+                        )
+                        if stream:
+                            self.assertEqual(response.status_code, 200)
+                            for tier in ("5m", "1h"):
+                                self.assertEqual(
+                                    response.headers[
+                                        f"Msh-Usage-Cache-Write-Tokens-{tier}"
+                                    ],
+                                    "0",
+                                )
+                            frames = [frame async for frame in response.body_iterator]
+                            self.assert_role_usage(
+                                json.loads(frames[0][6:]), prompt=770, read=333, write=0
+                            )
+                            usage = json.loads(frames[-2][6:])["usage"]
+                            self.assertEqual(frames[-1], "data: [DONE]\n\n")
+                        else:
+                            self.assertEqual(
+                                response.usage.cache_usage.response_headers(),
+                                {
+                                    "Msh-Usage-Cache-Write-Tokens-5m": "0",
+                                    "Msh-Usage-Cache-Write-Tokens-1h": "0",
+                                },
+                            )
+                            usage = response.model_dump()["usage"]
+                        self.assertEqual(usage["prompt_tokens"], 770)
+                        self.assertEqual(usage["completion_tokens"], 2)
+                        self.assertEqual(usage["total_tokens"], 772)
+                        self.assertEqual(
+                            usage["prompt_tokens_details"],
+                            {
+                                "cached_tokens": 333,
+                                "cache_write_tokens": 0,
+                            },
+                        )
 
     async def test_non_streaming_response_carries_cache_usage_for_both_ttls(self):
         for ttl in (None, "5m", "1h"):

@@ -4,6 +4,7 @@
 from sglang.srt.cache_accounting.page_cache import (
     CACHE_BLOCK_SIZE,
     CacheAccountingError,
+    CacheMediaSpan,
     CacheUsage,
     PageCachePlan,
     RedisPageCacheStore,
@@ -13,6 +14,7 @@ from sglang.srt.cache_accounting.page_cache import (
 __all__ = [
     "CACHE_BLOCK_SIZE",
     "CacheAccountingError",
+    "CacheMediaSpan",
     "CacheUsage",
     "PageCachePlan",
     "RedisPageCacheStore",

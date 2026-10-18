@@ -1158,6 +1158,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # Internal opt-in for one scheduler-finalized MM accounting input snapshot.
+    # Identity and TTL remain in TokenizerManager, outside scheduler IPC.
+    return_cache_input: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1630,6 +1633,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Internal, RID-aligned, first-success-only accounting input metadata.
+    cache_input_metadata: Optional[List[Optional[dict]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1720,6 +1726,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Passed through unchanged from BatchTokenIDOutput; never public usage.
+    cache_input_metadata: Optional[List[Optional[dict]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

@@ -13,6 +13,7 @@ import copy
 import importlib.util
 import json
 import sys
+import threading
 import time
 import unittest
 import uuid
@@ -87,6 +88,7 @@ def _load_manager_helpers(
     cache_store_class=None,
     cache_metrics_class=None,
     cache_logger=None,
+    prepare_media=None,
 ):
     path = _SRT / "managers" / "tokenizer_manager.py"
     source = ast.parse(path.read_text())
@@ -105,6 +107,7 @@ def _load_manager_helpers(
         "_init_req_state",
         "_handle_batch_request",
         "_collect_batch_responses",
+        "_prepare_cache_media_digests",
     }
     methods = [node for node in manager.body if getattr(node, "name", None) in names]
     found = {node.name for node in methods}
@@ -147,6 +150,8 @@ def _load_manager_helpers(
         "CACHE_BLOCK_SIZE": _CACHE.CACHE_BLOCK_SIZE,
         "CacheAccountingError": _CACHE.CacheAccountingError,
         "CacheUsage": _CACHE.CacheUsage,
+        "CacheMediaSpan": _CACHE.CacheMediaSpan,
+        "prepare_media_digests": prepare_media if prepare_media is not None else Mock(),
         "DisaggregationMode": _DISAGG_MODE,
         "GenerateReqInput": _GenerateReqInput,
         "APIServerReqTimeStats": lambda **kwargs: SimpleNamespace(
@@ -159,6 +164,7 @@ def _load_manager_helpers(
             obj=obj,
             time_stats=time_stats,
             cache_plan=None,
+            cache_plan_context=None,
             cache_physical_ttl_seconds=None,
             cache_metrics_parent=None,
             cache_task=None,
@@ -502,7 +508,6 @@ class TestTokenizerCachePreparation(unittest.TestCase):
             ("lora_id", "adapter"),
             ("session_params", {"id": "s"}),
             ("sampling_params", {"max_new_tokens": 4, "n": 2}),
-            ("contains_mm_input", lambda: True),
         ):
             with self.subTest(name=name):
                 original = getattr(self.obj, name)
@@ -557,6 +562,34 @@ class TestTokenizerCachePreparation(unittest.TestCase):
         self.manager.model_config.is_multimodal = True
         self.assertIsNotNone(self.prepare())
 
+    def test_multimodal_default_and_explicit_ttl_defer_until_final_input(self):
+        self.obj.contains_mm_input = lambda: True
+        for role in (_DISAGG_MODE.NULL, _DISAGG_MODE.DECODE):
+            for ttl in (300, 3600):
+                contexts = []
+                for required in (False, True):
+                    with self.subTest(role=role, ttl=ttl, required=required):
+                        self.manager.disaggregation_mode = role
+                        self.obj.cache_ttl_seconds = ttl
+                        self.obj.cache_required = required
+                        self.state.cache_plan = None
+                        self.state.cache_plan_context = None
+                        self.manager._prepare_cache_plan(self.obj, [1] * 20)
+                        self.assertIsNone(self.state.cache_plan)
+                        self.assertEqual(self.obj.cache_ttl_seconds, ttl)
+                        self.assertEqual(
+                            self.state.cache_plan_context[0], self.obj.api_key
+                        )
+                        self.assertEqual(self.state.cache_plan_context[2], ttl)
+                        contexts.append(self.state.cache_plan_context)
+                self.assertEqual(contexts[0], contexts[1])
+
+    def test_multimodal_waits_for_scheduler_when_processor_has_no_ids_yet(self):
+        self.obj.contains_mm_input = lambda: True
+        self.manager._prepare_cache_plan(self.obj, None)
+        self.assertIsNone(self.state.cache_plan)
+        self.assertIsNotNone(self.state.cache_plan_context)
+
 
 class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -582,6 +615,48 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             cache_usage=None,
         )
 
+    async def test_multimodal_feature_hash_runs_off_the_event_loop(self):
+        threads = []
+        prepared = []
+
+        def prepare(mm_inputs):
+            threads.append(threading.get_ident())
+            prepared.append(mm_inputs)
+
+        manager = _load_manager_helpers(prepare_media=prepare)()
+        obj = _GenerateReqInput(rid="mm", api_key="user", cache_ttl_seconds=300)
+        mm_inputs = SimpleNamespace(mm_items=[object()])
+        await manager._prepare_cache_media_digests(obj, mm_inputs)
+        self.assertEqual(prepared, [mm_inputs])
+        self.assertNotEqual(threads, [threading.get_ident()])
+
+    async def test_missing_identity_disabled_or_absent_media_never_hashes_features(
+        self,
+    ):
+        prepare = Mock(side_effect=AssertionError("Must not hash these features"))
+        manager = _load_manager_helpers(prepare_media=prepare)()
+        for identity, ttl, mm_inputs in (
+            (None, 300, object()),
+            ("user", None, object()),
+            ("user", 300, None),
+        ):
+            obj = _GenerateReqInput(rid="mm", api_key=identity, cache_ttl_seconds=ttl)
+            await manager._prepare_cache_media_digests(obj, mm_inputs)
+        prepare.assert_not_called()
+
+    async def test_multimodal_identity_error_keeps_inference_and_redacts_payload(self):
+        prepare = Mock(side_effect=ValueError("sensitive media content"))
+        logger = Mock()
+        manager = _load_manager_helpers(prepare_media=prepare, cache_logger=logger)()
+        obj = _GenerateReqInput(rid="mm", api_key="user", cache_ttl_seconds=300)
+        await manager._prepare_cache_media_digests(obj, object())
+        self.assertEqual(obj.cache_ttl_seconds, 300)
+        logger.warning.assert_called_once()
+        message = _log_message(logger.warning.call_args)
+        self.assertIn("identity unavailable", message)
+        self.assertIn("ValueError", message)
+        self.assertNotIn("sensitive", message)
+
     def start(
         self,
         *,
@@ -589,6 +664,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         completion_tokens=1,
         finish_reason=None,
         cached_tokens=0,
+        cache_input_metadata=None,
     ):
         self.manager._start_cache_accounting(
             self.state,
@@ -596,6 +672,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             completion_tokens,
             finish_reason,
             cached_tokens=cached_tokens,
+            cache_input_metadata=cache_input_metadata,
         )
 
     async def attach(self, *, text="", cached_tokens=7):
@@ -640,6 +717,150 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         out = await self.attach(text="")
         self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
         self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
+
+    async def test_multimodal_uses_final_expansion_and_reuses_one_snapshot(self):
+        self.state.cache_plan = None
+        self.state.cache_plan_context = ("user", "model-v1", 300)
+        metadata = {
+            "input_ids": [7] * 256 + [1 << 40] * 512 + [8, 9],
+            "media_spans": [(256, 768, "a" * 64)],
+        }
+        usage = _CACHE.CacheUsage(ttl_seconds=300, read_tokens=256, write_tokens=512)
+        self.account.return_value = usage
+        self.start(prompt_tokens=770, cache_input_metadata=metadata)
+        task = self.state.cache_task
+        first = await self.attach()
+        plan = self.account.await_args.args[0]
+        self.assertEqual(plan.prompt_tokens, 770)
+        self.assertEqual(plan.page_size, 256)
+        self.assertEqual(len(plan.page_keys), 3)
+        self.assertIs(self.state.cache_plan, plan)
+        self.assertIsNone(self.state.cache_plan_context)
+        self.start(prompt_tokens=770, completion_tokens=2)
+        second = await self.attach()
+        self.assertIs(self.state.cache_task, task)
+        self.account.assert_awaited_once()
+        self.assertEqual(first["meta_info"]["cache_usage"], usage.to_dict())
+        self.assertEqual(second["meta_info"]["cache_usage"], usage.to_dict())
+
+    async def test_multimodal_identity_ttl_and_prefix_have_real_page_semantics(self):
+        known_pages = set()
+
+        async def account(plan, *, rid):
+            read = 0
+            for key in plan.page_keys:
+                if key not in known_pages:
+                    break
+                read += plan.page_size
+            known_pages.update(plan.page_keys)
+            return _CACHE.CacheUsage(
+                ttl_seconds=plan.ttl_seconds,
+                read_tokens=read,
+                write_tokens=len(plan.page_keys) * plan.page_size - read,
+            )
+
+        self.account.side_effect = account
+
+        async def request(digest, *, ttl=300, user="user", pad=99, extra=0):
+            self.state = SimpleNamespace(
+                obj=SimpleNamespace(rid="mm-request"),
+                cache_plan=None,
+                cache_plan_context=(user, "model-v1", ttl),
+                cache_task=None,
+                cache_usage=None,
+            )
+            ids = [7] * 256 + [pad] * 512 + [8] * (2 + extra)
+            self.start(
+                prompt_tokens=len(ids),
+                cache_input_metadata={
+                    "input_ids": ids,
+                    "media_spans": [(256, 768, digest)],
+                },
+            )
+            return (await self.attach())["meta_info"]["cache_usage"]
+
+        self.assertEqual(
+            await request("a" * 64),
+            {"ttl_seconds": 300, "read_tokens": 0, "write_tokens": 768},
+        )
+        self.assertEqual(
+            await request("a" * 64, pad=1 << 40),
+            {"ttl_seconds": 300, "read_tokens": 768, "write_tokens": 0},
+        )
+        self.assertEqual(
+            await request("b" * 64),
+            {"ttl_seconds": 300, "read_tokens": 256, "write_tokens": 512},
+        )
+        self.assertEqual(
+            await request("a" * 64, extra=256),
+            {"ttl_seconds": 300, "read_tokens": 768, "write_tokens": 256},
+        )
+        self.assertEqual((await request("a" * 64, ttl=3600))["write_tokens"], 768)
+        self.assertEqual((await request("a" * 64, user="other"))["write_tokens"], 768)
+
+    async def test_invalid_multimodal_metadata_falls_back_without_redis(self):
+        for metadata in (
+            None,
+            {"error": "invalid_multimodal_metadata"},
+            {"input_ids": [7] * 770, "media_spans": []},
+            {"input_ids": [7] * 20, "media_spans": [(0, 20, "a" * 64)]},
+            {"input_ids": [7] * 770, "media_spans": [(0, 800, "a" * 64)]},
+            {"input_ids": [7] * 770, "media_spans": [(0, 512, "invalid")]},
+        ):
+            with self.subTest(metadata=metadata):
+                self.metrics.reset_mock()
+                self.state = SimpleNamespace(
+                    obj=SimpleNamespace(rid="mm-invalid"),
+                    cache_plan=None,
+                    cache_plan_context=("user", "model-v1", 300),
+                    cache_task=None,
+                    cache_usage=None,
+                )
+                self.start(
+                    prompt_tokens=770,
+                    cached_tokens=333,
+                    cache_input_metadata=metadata,
+                )
+                out = await self.attach()
+                usage = _CACHE.CacheUsage(ttl_seconds=300, read_tokens=333)
+                self.assertEqual(out["meta_info"]["cache_usage"], usage.to_dict())
+                self.account.assert_not_awaited()
+                self.assertIsNone(self.state.cache_plan_context)
+                self.metrics.observe_usage.assert_called_once_with(
+                    300, usage, "multimodal_unavailable"
+                )
+        self.assertEqual(self.logger.warning.call_count, 6)
+
+    async def test_multimodal_no_successful_output_does_not_hash_or_write(self):
+        self.state.cache_plan = None
+        self.state.cache_plan_context = ("user", "model-v1", 300)
+        for completion, reason in (
+            (0, None),
+            (0, {"type": "length"}),
+            (1, {"type": "abort"}),
+        ):
+            self.start(completion_tokens=completion, finish_reason=reason)
+            await asyncio.sleep(0)
+            self.assertIsNone(self.state.cache_task)
+        self.account.assert_not_awaited()
+
+    async def test_multimodal_redis_failure_preserves_actual_physical_read(self):
+        self.state.cache_plan = None
+        self.state.cache_plan_context = ("user", "model-v1", 3600)
+        self.account.side_effect = _CACHE.CacheAccountingError("unconfirmed")
+        self.start(
+            prompt_tokens=770,
+            cached_tokens=333,
+            cache_input_metadata={
+                "input_ids": [7] * 770,
+                "media_spans": [(256, 768, "a" * 64)],
+            },
+        )
+        out = await self.attach()
+        usage = _CACHE.CacheUsage(ttl_seconds=3600, read_tokens=333)
+        self.assertEqual(out["meta_info"]["cache_usage"], usage.to_dict())
+        self.account.assert_awaited_once()
+        self.metrics.observe_usage.assert_called_once_with(3600, usage, "physical")
 
     async def test_no_generated_token_does_not_touch_store(self):
         self.start(completion_tokens=0, finish_reason={"type": "length"})

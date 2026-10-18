@@ -166,7 +166,13 @@ def _manager_identity_resolver():
 class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.generated_identities = []
+        self.adapted_requests = []
         self.stream_counts = (1, 2)
+        self.output_prompt_tokens = 43
+        self.physical_cached_tokens = 32
+        self.accounting_read_tokens = 16
+        self.accounting_write_tokens = 16
+        self.physical_fallback = False
         self.resolve_identity = _manager_identity_resolver()
         self.manager = SimpleNamespace(disaggregation_mode="decode")
 
@@ -178,26 +184,37 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
             # Bearer credential, or clears untrusted/missing identities.
             self.resolve_identity(self.manager, adapted, raw_request)
             self.generated_identities.append(adapted.api_key)
+            self.adapted_requests.append(adapted)
             counts = self.stream_counts if adapted.stream else (2,)
             for count in counts:
                 yield {
                     "text": "hi"[:count],
                     "meta_info": {
                         "id": "anthropic-cache-identity",
-                        "prompt_tokens": 43,
+                        "prompt_tokens": self.output_prompt_tokens,
                         "completion_tokens": count,
                         "reasoning_tokens": 0,
-                        "cached_tokens": 32,
+                        "cached_tokens": self.physical_cached_tokens,
                         "weight_version": "identity-test-version",
-                        "finish_reason": {"type": "stop"}
-                        if count == counts[-1]
-                        else None,
+                        "finish_reason": (
+                            {"type": "stop"} if count == counts[-1] else None
+                        ),
                         **(
                             {
                                 "cache_usage": {
                                     "ttl_seconds": adapted.cache_ttl_seconds,
-                                    "read_tokens": 16 if adapted.api_key else 32,
-                                    "write_tokens": 16 if adapted.api_key else 0,
+                                    "read_tokens": (
+                                        self.accounting_read_tokens
+                                        if adapted.api_key
+                                        and not self.physical_fallback
+                                        else self.physical_cached_tokens
+                                    ),
+                                    "write_tokens": (
+                                        self.accounting_write_tokens
+                                        if adapted.api_key
+                                        and not self.physical_fallback
+                                        else 0
+                                    ),
                                 }
                             }
                             if adapted.cache_ttl_seconds is not None
@@ -257,10 +274,29 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
         self.serving = AnthropicServing(self.chat)
 
-    def request(self, *, stream, user=None, options=None):
+    def request(self, *, stream, user=None, options=None, multimodal=False):
         return AnthropicMessagesRequest(
             model="test",
-            messages=[{"role": "user", "content": "hello"}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        [
+                            {"type": "text", "text": "hello"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "ZmFrZQ==",
+                                },
+                            },
+                        ]
+                        if multimodal
+                        else "hello"
+                    ),
+                }
+            ],
             max_tokens=2,
             stream=stream,
             cache_user_id=user,
@@ -291,6 +327,139 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "message_start"
             )
         return json.loads(response.body)["usage"]
+
+    def configure_multimodal_output(self):
+        # Exercise the real protocol bridge with simulated final engine
+        # metadata, without decoding media or running a GPU model here.
+        self.chat.tokenizer_manager.model_config.is_multimodal = True
+        self.chat._process_messages.return_value = MessageProcessingResult(
+            prompt="hello <image>",
+            prompt_ids=list(range(20)),
+            image_data=["fixture-image"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        self.output_prompt_tokens = 770
+        self.physical_cached_tokens = 333
+        self.accounting_read_tokens = 256
+        self.accounting_write_tokens = 512
+
+    async def test_multimodal_default_and_selected_ttls_keep_final_input_usage(self):
+        self.configure_multimodal_output()
+        for options in (None, {"ttl": "5m"}, {"ttl": "1h"}):
+            for stream in (False, True):
+                with self.subTest(options=options, stream=stream):
+                    request = self.request(
+                        stream=stream,
+                        user="multimodal-user",
+                        options=options,
+                        multimodal=True,
+                    )
+                    response = await self.serving.handle_messages(
+                        request, self.raw_request()
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    for tier in ("5m", "1h"):
+                        self.assertNotIn(
+                            f"Msh-Usage-Cache-Write-Tokens-{tier}", response.headers
+                        )
+                    adapted = self.adapted_requests[-1]
+                    self.assertTrue(adapted.contains_mm_input())
+                    self.assertEqual(adapted.image_data, ["fixture-image"])
+                    self.assertEqual(adapted.text, "hello <image>")
+                    self.assertEqual(
+                        adapted.cache_ttl_seconds,
+                        3600 if options and options["ttl"] == "1h" else 300,
+                    )
+                    self.assertEqual(adapted.cache_required, options is not None)
+                    if stream:
+                        events = [
+                            json.loads(frame.split("data: ", 1)[1])
+                            async for frame in response.body_iterator
+                        ]
+                        self.assertFalse(
+                            any(event["type"] == "error" for event in events)
+                        )
+                        start = next(
+                            event
+                            for event in events
+                            if event["type"] == "message_start"
+                        )
+                        usage = start["message"]["usage"]
+                        self.assertEqual(usage["output_tokens"], 0)
+                        text = "".join(
+                            event["delta"].get("text", "")
+                            for event in events
+                            if event["type"] == "content_block_delta"
+                        )
+                        self.assertEqual(text, "hi")
+                        final = next(
+                            event
+                            for event in events
+                            if event["type"] == "message_delta"
+                        )
+                        self.assertEqual(final["usage"], {"output_tokens": 2})
+                        self.assertEqual(events[-1]["type"], "message_stop")
+                    else:
+                        body = json.loads(response.body)
+                        self.assertEqual(body["content"][0]["text"], "hi")
+                        usage = body["usage"]
+                        self.assertEqual(usage["output_tokens"], 2)
+                    self.assertEqual(usage["input_tokens"], 2)
+                    self.assertEqual(usage["cache_read_input_tokens"], 256)
+                    self.assertEqual(usage["cache_creation_input_tokens"], 512)
+                    self.assertEqual(
+                        usage["cache_creation"],
+                        {
+                            "ephemeral_5m_input_tokens": (
+                                512 if adapted.cache_ttl_seconds == 300 else 0
+                            ),
+                            "ephemeral_1h_input_tokens": (
+                                512 if adapted.cache_ttl_seconds == 3600 else 0
+                            ),
+                        },
+                    )
+
+    async def test_multimodal_missing_identity_and_redis_failure_use_physical_read(
+        self,
+    ):
+        self.configure_multimodal_output()
+        for source in ("missing_identity", "redis_failure"):
+            self.physical_fallback = source == "redis_failure"
+            for options in (None, {"ttl": "5m"}, {"ttl": "1h"}):
+                for stream in (False, True):
+                    with self.subTest(source=source, options=options, stream=stream):
+                        response = await self.serving.handle_messages(
+                            self.request(
+                                stream=stream,
+                                user=(
+                                    "multimodal-user"
+                                    if self.physical_fallback
+                                    else None
+                                ),
+                                options=options,
+                                multimodal=True,
+                            ),
+                            self.raw_request(),
+                        )
+                        usage = await self.consume(response, stream)
+                        adapted = self.adapted_requests[-1]
+                        self.assertTrue(adapted.contains_mm_input())
+                        self.assertEqual(
+                            adapted.api_key is None, source == "missing_identity"
+                        )
+                        self.assertEqual(usage["input_tokens"], 437)
+                        self.assertEqual(usage["cache_read_input_tokens"], 333)
+                        self.assertEqual(usage["cache_creation_input_tokens"], 0)
+                        self.assertEqual(
+                            usage["cache_creation"],
+                            {
+                                "ephemeral_5m_input_tokens": 0,
+                                "ephemeral_1h_input_tokens": 0,
+                            },
+                        )
 
     def test_schema_matches_chat_identity_validation(self):
         for value in ("", " \t\n", 123, {}, True):
