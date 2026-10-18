@@ -112,6 +112,18 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
+/// What `load_based` measures as a worker's load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum LoadBasedMetric {
+    /// Waiting + running requests (the original behavior).
+    #[default]
+    #[value(name = "requests")]
+    Requests,
+    /// Prompt tokens the worker still has to prefill.
+    #[value(name = "tokens")]
+    Tokens,
+}
+
 /// Role served by a static bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -326,6 +338,8 @@ pub struct ModelConfig {
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
+    /// Load unit for every `load_based` instance of this model.
+    pub load_based_metric: LoadBasedMetric,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,

@@ -52,6 +52,7 @@ class TestSchedulerLoadInquirer(CustomTestCase):
             waiting_queue_prefix_matched=lambda: waiting_queue_prefix_matched,
             get_chunked_req=lambda: chunked_req,
             get_recent_cache_hit_rate=lambda: 0.75,
+            get_round_robin_requests=lambda: (),
         )
 
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):
@@ -68,6 +69,38 @@ class TestSchedulerLoadInquirer(CustomTestCase):
         self.assertEqual(
             SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
             120,
+        )
+
+    def test_prefill_bootstrap_queue_tokens_are_estimated(self):
+        inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
+        inquirer.disaggregation_mode = DisaggregationMode.PREFILL
+        bootstrapping = [SimpleNamespace(seqlen=200), SimpleNamespace(seqlen=40)]
+        inquirer.get_disagg_prefill_bootstrap_queue = lambda: SimpleNamespace(
+            queue=bootstrapping
+        )
+
+        # 120 as above, plus int(200 * 0.25) + int(40 * 0.25) for bootstrap.
+        self.assertEqual(
+            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            180,
+        )
+
+    def test_bootstrap_queue_is_read_only_in_prefill_mode(self):
+        inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
+
+        def unreachable():
+            raise AssertionError("non-prefill modes must not read the bootstrap queue")
+
+        inquirer.get_disagg_prefill_bootstrap_queue = unreachable
+        self.assertEqual(
+            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            120,
+        )
+
+        inquirer.disaggregation_mode = DisaggregationMode.DECODE
+        self.assertEqual(
+            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            0,
         )
 
 

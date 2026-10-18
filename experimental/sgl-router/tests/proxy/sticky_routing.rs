@@ -45,6 +45,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             disable_input_ids_forwarding: false,
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            load_based_metric: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

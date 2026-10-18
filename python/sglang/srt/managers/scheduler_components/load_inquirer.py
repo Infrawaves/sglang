@@ -97,6 +97,12 @@ class SchedulerLoadInquirer:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Bootstrapping requests have not been prefix-matched yet.
+            num_tokens += sum(
+                int(req.seqlen * cache_miss_rate)
+                for req in self.get_disagg_prefill_bootstrap_queue().queue
+            )
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))

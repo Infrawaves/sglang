@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::{
-    Config, FilterKind, ModelConfig, PolicyKind, ScoreTermKind, StickyFallbackKind,
+    Config, FilterKind, LoadBasedMetric, ModelConfig, PolicyKind, ScoreTermKind, StickyFallbackKind,
 };
 use crate::discovery::ModelId;
 use crate::policies::{
@@ -25,12 +25,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Build a dependency-free policy for keyless sticky requests and new pins.
-fn build_sticky_fallback(kind: StickyFallbackKind) -> Arc<dyn Policy> {
+fn build_sticky_fallback(kind: StickyFallbackKind, metric: LoadBasedMetric) -> Arc<dyn Policy> {
     match kind {
         StickyFallbackKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         StickyFallbackKind::Random => Arc::new(RandomPolicy::new()),
         StickyFallbackKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        StickyFallbackKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        StickyFallbackKind::LoadBased => Arc::new(LoadBasedPolicy::with_metric(metric)),
     }
 }
 
@@ -42,7 +42,7 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
     Arc::new(StickyPolicy::new(
         Duration::from_secs(s.idle_secs),
         Duration::from_secs(s.eviction_interval_secs),
-        build_sticky_fallback(s.fallback_policy),
+        build_sticky_fallback(s.fallback_policy, model.load_based_metric),
     ))
 }
 
@@ -96,7 +96,7 @@ fn build_kind(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::with_metric(model.load_based_metric)),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
         )),
@@ -142,12 +142,13 @@ fn build_filter(
 /// Builds one soft scoring term for `--policy fused_score`.
 fn build_score(
     kind: ScoreTermKind,
+    metric: LoadBasedMetric,
     tree: &Arc<HashTree>,
     block_size_oracle: &Arc<BlockSizeOracle>,
 ) -> Arc<dyn Policy> {
     match kind {
         ScoreTermKind::Random => Arc::new(RandomPolicy::new()),
-        ScoreTermKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        ScoreTermKind::LoadBased => Arc::new(LoadBasedPolicy::with_metric(metric)),
         ScoreTermKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
             Arc::clone(tree),
             Arc::clone(block_size_oracle),
@@ -170,7 +171,10 @@ fn build_fused(
     }
     let mut terms: Vec<(Arc<dyn Policy>, Option<f32>)> = Vec::with_capacity(spec.len());
     for t in spec {
-        terms.push((build_score(t.kind, tree, oracle), t.weight));
+        terms.push((
+            build_score(t.kind, model.load_based_metric, tree, oracle),
+            t.weight,
+        ));
     }
     Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
@@ -205,7 +209,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
             Arc::new(StickyPolicy::new(
                 Duration::from_secs(s.idle_secs),
                 Duration::from_secs(s.eviction_interval_secs),
-                build_sticky_fallback(s.fallback_policy),
+                build_sticky_fallback(s.fallback_policy, LoadBasedMetric::default()),
             ))
         }
         PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
@@ -340,6 +344,7 @@ mod tests {
                 disable_input_ids_forwarding: false,
                 policy,
                 decode_policy: Default::default(),
+                load_based_metric: Default::default(),
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -389,6 +394,7 @@ mod tests {
     fn prefix_cache_builds_as_a_score_term() {
         let p = build_score(
             ScoreTermKind::PrefixCache,
+            LoadBasedMetric::default(),
             &Arc::new(HashTree::new()),
             &BlockSizeOracle::new(),
         );
@@ -540,10 +546,14 @@ mod tests {
             StickyFallbackKind::PowerOfTwo,
             StickyFallbackKind::LoadBased,
         ] {
-            assert!(
-                build_sticky_fallback(kind).select(&workers, &ctx).is_some(),
-                "{kind:?}"
-            );
+            for metric in [LoadBasedMetric::Requests, LoadBasedMetric::Tokens] {
+                assert!(
+                    build_sticky_fallback(kind, metric)
+                        .select(&workers, &ctx)
+                        .is_some(),
+                    "{kind:?} {metric:?}"
+                );
+            }
         }
     }
 }

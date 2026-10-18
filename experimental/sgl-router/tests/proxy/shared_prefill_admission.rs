@@ -152,6 +152,7 @@ fn config(policy: PolicyKind) -> Config {
             disable_input_ids_forwarding: false,
             policy,
             decode_policy: Default::default(),
+            load_based_metric: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

@@ -49,6 +49,13 @@ impl Config {
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
+            self.model.load_based_metric == LoadBasedMetric::Requests
+                || uses_load_based(&self.model),
+            "--load-based-metric tokens has no effect: no load_based is configured \
+             (use --policy load_based, --fuse load_based, or \
+             --sticky-fallback-policy load_based)"
+        );
+        ensure!(
             self.proxy.stream_idle_timeout_secs > 0,
             "stream_idle_timeout_secs must be greater than zero"
         );
@@ -108,6 +115,25 @@ impl Config {
             DiscoveryBackend::K8s(_) => {}
         }
         Ok(())
+    }
+}
+
+/// Whether any policy built for `model` is a `load_based` instance, i.e.
+/// whether `--load-based-metric` can take effect.
+fn uses_load_based(model: &ModelConfig) -> bool {
+    match model.policy {
+        PolicyKind::LoadBased => true,
+        PolicyKind::FusedScore | PolicyKind::ScorePolicy => model
+            .fused
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.kind == ScoreTermKind::LoadBased),
+        PolicyKind::Sticky => {
+            model.sticky.clone().unwrap_or_default().fallback_policy
+                == StickyFallbackKind::LoadBased
+        }
+        _ => false,
     }
 }
 
@@ -240,6 +266,7 @@ mod tests {
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
+                load_based_metric: Default::default(),
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,

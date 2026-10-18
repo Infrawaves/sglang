@@ -697,6 +697,7 @@ pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
     basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
+    local_prefill_tokens_by_worker_id: HashMap<String, u64>,
     compare_engine: bool,
     compare_basic_engine: bool,
 }
@@ -710,6 +711,10 @@ impl<'a> FreshLoadLookup<'a> {
         let local_active_by_worker_id: HashMap<String, usize> = workers
             .iter()
             .map(|worker| (worker.id.0.clone(), worker.router_inflight_load()))
+            .collect();
+        let local_prefill_tokens_by_worker_id: HashMap<String, u64> = workers
+            .iter()
+            .map(|worker| (worker.id.0.clone(), worker.router_inflight_prefill_tokens()))
             .collect();
         let by_worker_id = snapshot
             .into_iter()
@@ -739,6 +744,7 @@ impl<'a> FreshLoadLookup<'a> {
             by_worker_id,
             basic_by_worker_id,
             local_active_by_worker_id,
+            local_prefill_tokens_by_worker_id,
             compare_engine,
             compare_basic_engine,
         }
@@ -835,6 +841,30 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
+    /// Returns the prompt tokens this worker still has to prefill, in one
+    /// unit across the candidate set.
+    ///
+    /// A fully covered native set uses the engine's
+    /// `num_waiting_uncached_tokens` (chunked remainder, waiting and PD
+    /// bootstrap queues, unallocated round-robin work) plus prompt tokens the
+    /// router dispatched after that sample, which the engine has not reported
+    /// yet. Otherwise every candidate uses the prompt tokens of its
+    /// router-tracked in-flight requests, so engine and local token gauges
+    /// are never mixed.
+    pub(crate) fn pending_prefill_tokens(&self, worker: &Arc<Worker>) -> u64 {
+        self.comparable_get(&worker.id)
+            .map(|load| {
+                load.num_waiting_uncached_tokens
+                    .saturating_add(worker.prefill_tokens_acquired_since(load.captured_at))
+            })
+            .unwrap_or_else(|| {
+                self.local_prefill_tokens_by_worker_id
+                    .get(worker.id.0.as_str())
+                    .copied()
+                    .unwrap_or(u64::MAX)
+            })
+    }
+
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,

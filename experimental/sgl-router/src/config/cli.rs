@@ -15,7 +15,8 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LoadBasedMetric, LogFormat,
+    ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
     DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
@@ -207,6 +208,11 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Load unit for load_based (--policy, sticky fallback, and --fuse term).
+    /// `tokens` ranks prefill workers by prompt tokens still to prefill.
+    #[arg(long, value_enum, default_value = "requests")]
+    pub load_based_metric: LoadBasedMetric,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -478,6 +484,7 @@ impl Cli {
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                load_based_metric: self.routing.load_based_metric,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -2588,6 +2595,50 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn load_based_metric_defaults_to_requests_and_accepts_tokens() {
+        let default_config = cfg_of("--policy load_based").unwrap();
+        assert_eq!(
+            default_config.model.load_based_metric,
+            LoadBasedMetric::Requests
+        );
+
+        let tokens_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            tokens_config.model.load_based_metric,
+            LoadBasedMetric::Tokens
+        );
+
+        assert!(cfg_of("--load-based-metric blocks").is_err());
+    }
+
+    /// `tokens` only changes `load_based`; a config with no `load_based`
+    /// instance must fail loudly instead of silently ranking by requests.
+    #[test]
+    fn load_based_metric_tokens_requires_a_load_based_instance() {
+        for ok in [
+            "--policy load_based --load-based-metric tokens",
+            "--policy fused_score --fuse load_based --load-based-metric tokens",
+            "--policy score_policy --load-based-metric tokens", // DEFAULT_FUSE has load_based
+            "--policy sticky --sticky-fallback-policy load_based --load-based-metric tokens",
+        ] {
+            assert!(cfg_of(ok).is_ok(), "{ok}: {:?}", cfg_of(ok).err());
+        }
+        for bad in [
+            "--policy power_of_two --load-based-metric tokens",
+            "--policy fused_score --fuse prefix_cache --load-based-metric tokens",
+            "--policy sticky --load-based-metric tokens", // round_robin fallback
+        ] {
+            let err = cfg_of(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("--load-based-metric tokens has no effect"),
+                "{bad}: {err}"
+            );
+        }
+        // `requests` is the default and never needs a load_based instance.
+        assert!(cfg_of("--policy power_of_two --load-based-metric requests").is_ok());
     }
 
     #[test]

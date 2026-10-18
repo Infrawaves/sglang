@@ -19,6 +19,12 @@ use serde_json::{json, Number, Value};
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
+/// Prefill tokens charged per image/video/audio part. The router cannot run
+/// the engine's multimodal processor: the chat template renders a media part
+/// as a placeholder, and a base64 payload sized by bytes would read as
+/// ~250K tokens per MB. A fixed allowance keeps media requests comparable.
+const MEDIA_PART_TOKEN_ESTIMATE: usize = 8192;
+
 /// Validated routing inputs and the original body, ready for worker selection.
 pub(super) struct PreparedChatRequest {
     pub(super) model: ModelId,
@@ -28,6 +34,10 @@ pub(super) struct PreparedChatRequest {
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
+    /// Prefill work charged to the prefill worker's dispatch slot; equals
+    /// `input_token_count` except for multimodal chats (see
+    /// [`estimate_prefill_work`]).
+    pub(super) prefill_token_estimate: usize,
     caller_set_rid: bool,
     fans_out: bool,
     pub(super) endpoint: InferenceEndpoint,
@@ -83,6 +93,12 @@ impl PreparedChatRequest {
             .as_ref()
             .map(|tokens| tokens.ids.len().max(1))
             .unwrap_or_else(|| estimate_prefill_tokens(&body));
+        let prefill_token_estimate = estimate_prefill_work(
+            parsed_body.as_ref(),
+            tokens.as_ref(),
+            body.len(),
+            input_token_count,
+        );
         Ok(Self {
             model,
             streaming: fields.stream.unwrap_or(false),
@@ -90,6 +106,7 @@ impl PreparedChatRequest {
             body,
             tokens,
             input_token_count,
+            prefill_token_estimate,
             caller_set_rid: fields.caller_set_rid,
             // The Responses API has no `n`; one request is one engine generation.
             fans_out: endpoint == InferenceEndpoint::ChatCompletions
@@ -537,6 +554,65 @@ fn requests_multiple_samples(
     }
 }
 
+/// Prefill work of a multimodal chat: its text tokens plus
+/// [`MEDIA_PART_TOKEN_ESTIMATE`] per media part. Text tokens come from the
+/// rendered ids when available (media parts render as placeholders), else
+/// from the body size with the media payload bytes removed. Anything else,
+/// including caller `input_ids` or an unparsed body, keeps `input_token_count`.
+fn estimate_prefill_work(
+    parsed_body: Option<&Value>,
+    tokens: Option<&RequestTokens>,
+    body_len: usize,
+    input_token_count: usize,
+) -> usize {
+    let Some(value) =
+        parsed_body.filter(|v| !has_caller_input_ids(v) && request_has_multimodal_content(v))
+    else {
+        return input_token_count;
+    };
+    let (mut parts, mut payload_bytes) = (0usize, 0usize);
+    for part in media_parts(value) {
+        parts += 1;
+        payload_bytes += string_bytes(part);
+    }
+    let text_tokens = match tokens {
+        Some(t) => t.ids.len(),
+        None => body_len.saturating_sub(payload_bytes) / BYTES_PER_TOKEN_ESTIMATE,
+    };
+    text_tokens
+        .saturating_add(parts.saturating_mul(MEDIA_PART_TOKEN_ESTIMATE))
+        .max(1)
+}
+
+/// Image, video, and audio content parts of every message.
+fn media_parts(value: &Value) -> impl Iterator<Item = &Value> {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|p| is_media_part(p))
+}
+
+fn is_media_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(|t| t.as_str()),
+        Some("image_url" | "video_url" | "audio_url" | "input_audio")
+    )
+}
+
+/// Total length of the strings inside `value` (base64 payloads, URLs).
+fn string_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(string_bytes).sum(),
+        Value::Object(o) => o.values().map(string_bytes).sum(),
+        _ => 0,
+    }
+}
+
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
     (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
@@ -810,14 +886,7 @@ fn request_has_multimodal_content(value: &Value) -> bool {
             msgs.iter().any(|m| {
                 m.get("content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|parts| {
-                        parts.iter().any(|p| {
-                            matches!(
-                                p.get("type").and_then(|t| t.as_str()),
-                                Some("image_url" | "video_url" | "audio_url" | "input_audio")
-                            )
-                        })
-                    })
+                    .is_some_and(|parts| parts.iter().any(is_media_part))
             })
         })
 }
@@ -1046,6 +1115,50 @@ mod tests {
                 "content {content} is not multimodal"
             );
         }
+    }
+
+    /// A media request is charged its text tokens plus a fixed allowance per
+    /// media part, never the size of an inline base64 payload.
+    #[test]
+    fn prefill_work_charges_media_parts_not_payload_bytes() {
+        let payload = "A".repeat(1_000_000); // ~1 MB inline image
+        let value = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{payload}")}},
+            {"type":"image_url","image_url":{"url":"https://x/y.png"}},
+        ]}]});
+        let body_len = value.to_string().len();
+        let by_bytes = body_len / BYTES_PER_TOKEN_ESTIMATE;
+
+        // Body-size fallback: payload bytes removed, two media allowances added.
+        let est = estimate_prefill_work(Some(&value), None, body_len, by_bytes);
+        assert!(est >= 2 * MEDIA_PART_TOKEN_ESTIMATE, "{est}");
+        assert!(
+            est < 2 * MEDIA_PART_TOKEN_ESTIMATE + 1_000,
+            "{est} vs {by_bytes}"
+        );
+
+        // Rendered ids count the text (media render as placeholders).
+        let tokens = RequestTokens {
+            ids: vec![1; 40],
+            rendered_from_chat: true,
+        };
+        assert_eq!(
+            estimate_prefill_work(Some(&value), Some(&tokens), body_len, 40),
+            40 + 2 * MEDIA_PART_TOKEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn prefill_work_is_the_input_count_without_media() {
+        let text = json!({"messages":[{"role":"user","content":"hello"}]});
+        assert_eq!(estimate_prefill_work(Some(&text), None, 999, 123), 123);
+        // Caller input_ids already are the engine's tokens.
+        let ids = json!({"input_ids":[1,2,3],"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"x"}}]}]});
+        assert_eq!(estimate_prefill_work(Some(&ids), None, 999, 3), 3);
+        // Unparsed body keeps the existing estimate.
+        assert_eq!(estimate_prefill_work(None, None, 999, 249), 249);
     }
 
     #[test]
