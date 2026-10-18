@@ -64,12 +64,14 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.cache_accounting import (
     CACHE_BLOCK_SIZE,
     CacheAccountingError,
+    CacheMediaSpan,
     CacheUsage,
     PageCachePlan,
     RedisPageCacheStore,
     build_page_cache_plan,
 )
 from sglang.srt.cache_accounting.metrics import CacheAccountingMetrics
+from sglang.srt.cache_accounting.multimodal import prepare_media_digests
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -291,6 +293,8 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     cache_plan: Optional[PageCachePlan] = None
+    # MM plans need the Scheduler's final expansion, not tokenizer placeholders.
+    cache_plan_context: Optional[tuple[str, str, int]] = None
     cache_physical_ttl_seconds: Optional[int] = None
     cache_metrics_parent: Optional[ReqState] = None
     cache_task: Optional[asyncio.Task] = None
@@ -1114,7 +1118,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.positional_embed_overrides is not None
             or obj.lora_path is not None
             or obj.lora_id is not None
-            or obj.contains_mm_input()
             or not self.is_generation
         ):
             if not obj.cache_required:
@@ -1129,7 +1132,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.api_key = None
                 return
             raise ValueError(
-                "Cache accounting currently supports a single plain-text "
+                "Cache accounting currently supports a single "
                 "generation without sessions, adapters, embeddings, or beam search"
             )
 
@@ -1146,8 +1149,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.rid
             ].cache_physical_ttl_seconds = obj.cache_ttl_seconds
             return
-        if input_ids is None:
-            raise ValueError("Cache accounting requires final input token IDs")
         cfg = get_serving()
         # Accounting uses 256-token blocks independently of GPU KV page size.
         # Keep all namespace inputs fixed before Scheduler dispatch.
@@ -1164,6 +1165,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sort_keys=True,
             separators=(",", ":"),
         )
+        if obj.contains_mm_input():
+            self.rid_to_state[obj.rid].cache_plan_context = (
+                obj.api_key,
+                namespace,
+                obj.cache_ttl_seconds,
+            )
+            return
+        if input_ids is None:
+            raise ValueError("Cache accounting requires final input token IDs")
         plan = build_page_cache_plan(
             input_ids=input_ids,
             api_key=obj.api_key,
@@ -1180,8 +1190,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         completion_tokens: int,
         finish_reason: Any,
         cached_tokens: int = 0,
+        cache_input_metadata: Optional[dict] = None,
     ) -> None:
         plan = state.cache_plan
+        context = getattr(state, "cache_plan_context", None)
         physical_ttl = getattr(state, "cache_physical_ttl_seconds", None)
         physical_finished_without_output = (
             plan is None
@@ -1191,7 +1203,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and finish_reason.get("type") in ("stop", "length")
         )
         if (
-            (plan is None and physical_ttl is None)
+            (plan is None and context is None and physical_ttl is None)
             or state.cache_task is not None
             or (completion_tokens <= 0 and not physical_finished_without_output)
             or (
@@ -1207,26 +1219,76 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.disaggregation_mode == DisaggregationMode.NULL
             else self.disaggregation_mode.value
         )
-        ttl_seconds = plan.ttl_seconds if plan is not None else physical_ttl
+        ttl_seconds = (
+            plan.ttl_seconds
+            if plan is not None
+            else context[2]
+            if context is not None
+            else physical_ttl
+        )
         block_size = plan.page_size if plan is not None else CACHE_BLOCK_SIZE
         metrics_parent = getattr(state, "cache_metrics_parent", None)
 
         async def account_once():
+            nonlocal cache_input_metadata
             started = time.perf_counter()
-            if plan is None:
+            active_plan = plan
+            media_unavailable = False
+            if context is not None:
+                try:
+                    if not isinstance(cache_input_metadata, dict):
+                        raise ValueError("Missing final multimodal input metadata")
+                    spans = [
+                        CacheMediaSpan(*span)
+                        for span in cache_input_metadata["media_spans"]
+                    ]
+                    if not spans:
+                        raise ValueError("Missing multimodal content identities")
+                    active_plan = await asyncio.to_thread(
+                        build_page_cache_plan,
+                        input_ids=cache_input_metadata["input_ids"],
+                        api_key=context[0],
+                        namespace=context[1],
+                        page_size=CACHE_BLOCK_SIZE,
+                        ttl_seconds=ttl_seconds,
+                        media_spans=spans,
+                    )
+                    if active_plan.prompt_tokens != prompt_tokens:
+                        raise ValueError("Final multimodal input length differs")
+                    state.cache_plan = active_plan
+                except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                    active_plan = None
+                    media_unavailable = True
+                    logger.warning(
+                        "Cache accounting multimodal fallback rid=%s role=%s ttl=%d "
+                        "reason=invalid_input_metadata error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(exc).__name__,
+                    )
+                finally:
+                    # The expanded input crosses IPC only once; retain just keys.
+                    cache_input_metadata = None
+                    state.cache_plan_context = None
+            if active_plan is None:
                 usage = CacheUsage(
                     ttl_seconds=ttl_seconds,
                     read_tokens=max(0, min(prompt_tokens, cached_tokens)),
                 )
-                source = "missing_identity"
+                source = (
+                    "multimodal_unavailable"
+                    if media_unavailable
+                    else "missing_identity"
+                )
             else:
-                if prompt_tokens != plan.prompt_tokens:
+                if prompt_tokens != active_plan.prompt_tokens:
                     raise CacheAccountingError(
                         "Cache prompt-token count differs from final input IDs"
                     )
-                source = "redis" if plan.page_keys else "no_complete_block"
+                source = "redis" if active_plan.page_keys else "no_complete_block"
                 try:
-                    usage = await self._cache_store.account(plan, rid=rid)
+                    usage = await self._cache_store.account(active_plan, rid=rid)
                 except CacheAccountingError as exc:
                     # Freeze the engine's actual prefix hit from this output. A
                     # failed Redis operation cannot confirm any cache creation.
@@ -1292,6 +1354,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self._cache_tasks:
                 await asyncio.gather(*tuple(self._cache_tasks), return_exceptions=True)
             await self._cache_store.aclose()
+
+    async def _prepare_cache_media_digests(self, obj, mm_inputs) -> None:
+        if (
+            not isinstance(obj, GenerateReqInput)
+            or obj.cache_ttl_seconds is None
+            or obj.api_key is None
+            or mm_inputs is None
+        ):
+            return
+        try:
+            # Hash real processor payloads before transport/release, off the
+            # event loop. The Scheduler only attaches final token positions.
+            await asyncio.to_thread(prepare_media_digests, mm_inputs)
+        except Exception as exc:
+            logger.warning(
+                "Cache accounting multimodal identity unavailable rid=%s error_type=%s",
+                obj.rid,
+                type(exc).__name__,
+            )
 
     def validate_logprob_params(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1741,6 +1822,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            await self._prepare_cache_media_digests(obj, mm_inputs)
             if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
                 drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
@@ -2064,6 +2146,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
+                return_cache_input=(
+                    self.rid_to_state[obj.rid].cache_plan_context is not None
+                ),
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
                 sampling_params=sampling_params,
@@ -3051,6 +3136,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.completion_tokens[i],
                     recv_obj.finished_reasons[i],
                     cached_tokens=recv_obj.cached_tokens[i],
+                    cache_input_metadata=(
+                        recv_obj.cache_input_metadata[i]
+                        if recv_obj.cache_input_metadata is not None
+                        else None
+                    ),
                 )
                 meta_info.update(
                     {

@@ -25,6 +25,7 @@ import torch
 from fastapi import HTTPException
 from PIL import Image
 
+from sglang.srt.cache_accounting.multimodal import CacheArtifactIdentity
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -526,8 +527,7 @@ def _gpu_preprocess_k3_visual_items(
     # Each frame contributes one (t=1, h, w) grid. Compute the final row
     # count up front so no second full-size torch.cat allocation is needed.
     total_rows = sum(
-        len(item.frames)
-        * math.prod(_grid_thw_from_resize_config(config, patch_size))
+        len(item.frames) * math.prod(_grid_thw_from_resize_config(config, patch_size))
         for item, config in zip(visual_items, resize_configs)
     )
     pixel_values = None
@@ -1526,7 +1526,10 @@ class KimiK3ImageProcessor(
         items = []
         for artifact, offset in zip(artifacts, offsets):
             model_specific_data = {
-                "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64)
+                "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64),
+                "cache_accounting_artifact_key": CacheArtifactIdentity(
+                    artifact.artifact_key
+                ),
             }
             if artifact.deferred is not None:
                 model_specific_data[DEFERRED_PREPROCESSING_KEY] = artifact.deferred

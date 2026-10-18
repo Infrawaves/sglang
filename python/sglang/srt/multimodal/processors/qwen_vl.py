@@ -14,6 +14,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from transformers import BaseImageProcessor
 
+from sglang.srt.cache_accounting.multimodal import CacheArtifactIdentity
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import (
@@ -917,11 +918,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         mm_items = []
         for artifact, offset in zip(artifacts, offsets):
+            metadata = deepcopy(artifact.model_specific_data)
+            metadata["cache_accounting_artifact_key"] = CacheArtifactIdentity(
+                artifact.artifact_key
+            )
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=artifact.feature,
                 offsets=[offset],
-                model_specific_data=deepcopy(artifact.model_specific_data),
+                model_specific_data=metadata,
             )
             item.set_hash(artifact.feature_hash)
             mm_items.append(item)

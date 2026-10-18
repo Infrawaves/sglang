@@ -40,7 +40,7 @@ def _families(registry):
         ),
         "fallbacks": Counter(
             "sglang:cache_accounting_fallbacks_total",
-            "Requests using physical cache usage after an unconfirmed Redis result.",
+            "Requests using physical cache usage after unconfirmed cache accounting.",
             labels,
             registry=registry,
         ),
@@ -92,7 +92,13 @@ class CacheAccountingMetrics:
             )
 
     def observe_usage(self, ttl_seconds, usage, source):
-        if source not in ("redis", "physical", "no_complete_block", "missing_identity"):
+        if source not in (
+            "redis",
+            "physical",
+            "no_complete_block",
+            "missing_identity",
+            "multimodal_unavailable",
+        ):
             raise ValueError("Unsupported cache accounting metric source")
         if usage.ttl_seconds != ttl_seconds:
             raise ValueError("Cache usage TTL differs from metric TTL")
@@ -105,7 +111,7 @@ class CacheAccountingMetrics:
                 "write_tokens",
             ):
                 self._metrics[field].labels(**labels).inc(getattr(usage, field))
-            if source == "physical":
+            if source in ("physical", "multimodal_unavailable"):
                 self._metrics["fallbacks"].labels(**base_labels).inc()
         except Exception as exc:
             logger.warning(

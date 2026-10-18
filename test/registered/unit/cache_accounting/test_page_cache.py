@@ -63,6 +63,98 @@ def plan(ids, *, ttl=300, page_size=4, **kwargs):
 
 
 class TestPageCachePlan(unittest.TestCase):
+    def test_media_preserves_text_prefix_and_changes_only_its_suffix(self):
+        tokens = list(range(1024))
+        span = cache.CacheMediaSpan(300, 700, "a" * 64)
+        original = plan(tokens, page_size=256)
+        first = plan(tokens, page_size=256, media_spans=[span])
+        other = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(300, 700, "b" * 64)],
+        )
+        self.assertEqual(first.page_keys[0], original.page_keys[0])
+        self.assertEqual(first.page_keys[0], other.page_keys[0])
+        for index in range(1, 4):
+            self.assertNotEqual(first.page_keys[index], other.page_keys[index])
+
+    def test_media_pad_projection_does_not_identify_content(self):
+        tokens = [11] * 512
+        span = cache.CacheMediaSpan(255, 300, "a" * 64)
+        first = plan(tokens, page_size=256, media_spans=[span])
+        tokens[255:300] = [1 << 40] * 45
+        second = plan(tokens, page_size=256, media_spans=[span])
+        self.assertEqual(first.page_keys, second.page_keys)
+        with self.assertRaises(ValueError):
+            plan(tokens, page_size=256)
+
+    def test_media_at_block_boundary_and_partial_tail(self):
+        tokens = [1] * 513
+        original = plan(tokens, page_size=256)
+        tail = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(512, 513, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys, tail.page_keys)
+        boundary = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(256, 300, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys[0], boundary.page_keys[0])
+        self.assertNotEqual(original.page_keys[1], boundary.page_keys[1])
+
+    def test_media_span_layout_and_text_after_media_affect_keys(self):
+        tokens = [1] * 512
+        original = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(0, 10, "a" * 64)],
+        )
+        for spans in (
+            [cache.CacheMediaSpan(1, 11, "a" * 64)],
+            [cache.CacheMediaSpan(0, 11, "a" * 64)],
+            [cache.CacheMediaSpan(0, 10, "b" * 64)],
+            [
+                cache.CacheMediaSpan(0, 10, "a" * 64),
+                cache.CacheMediaSpan(10, 20, "a" * 64),
+            ],
+        ):
+            with self.subTest(spans=spans):
+                self.assertNotEqual(
+                    original.page_keys,
+                    plan(tokens, page_size=256, media_spans=spans).page_keys,
+                )
+        tokens[300] = 2
+        changed = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(0, 10, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys[0], changed.page_keys[0])
+        self.assertNotEqual(original.page_keys[1], changed.page_keys[1])
+
+    def test_media_spans_are_validated_even_in_incomplete_tail(self):
+        for spans in (
+            [cache.CacheMediaSpan(-1, 1, "a" * 64)],
+            [cache.CacheMediaSpan(0, 0, "a" * 64)],
+            [cache.CacheMediaSpan(0, 3, "a" * 64)],
+            [cache.CacheMediaSpan(0, 1, "invalid")],
+            [cache.CacheMediaSpan(True, 2, "a" * 64)],
+            [
+                cache.CacheMediaSpan(0, 2, "a" * 64),
+                cache.CacheMediaSpan(1, 2, "b" * 64),
+            ],
+            [
+                cache.CacheMediaSpan(1, 2, "a" * 64),
+                cache.CacheMediaSpan(0, 1, "b" * 64),
+            ],
+            [(0, 1, "a" * 64)],
+        ):
+            with self.subTest(spans=spans), self.assertRaises(ValueError):
+                plan([1, 2], page_size=256, media_spans=spans)
+
     def test_usage_requires_one_valid_ttl_and_nonnegative_integer_counts(self):
         with self.assertRaises(TypeError):
             cache.CacheUsage()
@@ -414,6 +506,7 @@ class TestCacheMetrics(unittest.TestCase):
             ),
             1,
         )
+
         self.assertEqual(
             self.registry.get_sample_value(
                 "sglang:cache_redis_operation_duration_seconds_count",
@@ -466,6 +559,41 @@ class TestCacheMetrics(unittest.TestCase):
         }
         self.assertEqual(
             token_families, {"sglang:cache_read_tokens", "sglang:cache_write_tokens"}
+        )
+
+    def test_multimodal_unavailable_counts_fallback_without_a_redis_operation(self):
+        self.metrics.observe_usage(
+            300,
+            cache.CacheUsage(ttl_seconds=300, read_tokens=333),
+            "multimodal_unavailable",
+        )
+        labels = {"role": "decode", "ttl": "5m", "source": "multimodal_unavailable"}
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_requests_total", labels
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_read_tokens_total", labels),
+            333,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_write_tokens_total", labels),
+            0,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_fallbacks_total",
+                {"role": "decode", "ttl": "5m"},
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.registry.get_sample_value(
+                "sglang:cache_redis_operations_total",
+                {"role": "decode", "ttl": "5m", "result": "success"},
+            )
         )
 
     def test_usage_ttl_mismatch_is_rejected_before_observation(self):

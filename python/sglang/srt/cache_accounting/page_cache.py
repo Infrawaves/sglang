@@ -56,6 +56,35 @@ class PageCachePlan:
     ttl_seconds: int
 
 
+@dataclass(frozen=True)
+class CacheMediaSpan:
+    """One media interval in the final expanded input, with a strong identity."""
+
+    start: int
+    end: int
+    digest: str
+
+
+def _validate_media_spans(
+    media_spans: Sequence[CacheMediaSpan], prompt_tokens: int
+) -> tuple[CacheMediaSpan, ...]:
+    spans = tuple(media_spans)
+    previous_end = 0
+    for span in spans:
+        if (
+            not isinstance(span, CacheMediaSpan)
+            or type(span.start) is not int
+            or type(span.end) is not int
+            or not previous_end <= span.start < span.end <= prompt_tokens
+            or not isinstance(span.digest, str)
+            or len(span.digest) != 64
+            or any(c not in "0123456789abcdefABCDEF" for c in span.digest)
+        ):
+            raise ValueError("Invalid multimodal cache span")
+        previous_end = span.end
+    return spans
+
+
 def _positive_int(name: str, value: int, maximum: int = _MAX_SAFE_INTEGER) -> None:
     if type(value) is not int or not 1 <= value <= maximum:
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
@@ -74,6 +103,7 @@ def build_page_cache_plan(
     namespace: str,
     page_size: int,
     ttl_seconds: int,
+    media_spans: Sequence[CacheMediaSpan] = (),
 ) -> PageCachePlan:
     """Hash complete input pages with a cumulative, fixed-uint32 token encoding.
 
@@ -93,6 +123,7 @@ def build_page_cache_plan(
     if prompt_tokens > _MAX_SAFE_INTEGER:
         raise ValueError("prompt_tokens exceeds Redis Lua integer precision")
     page_count = prompt_tokens // page_size
+    spans = _validate_media_spans(media_spans, prompt_tokens)
 
     previous = hashlib.sha256(
         _DOMAIN + identity + struct.pack(">QQ", page_size, ttl_seconds)
@@ -100,14 +131,41 @@ def build_page_cache_plan(
     digests = []
     # Validate tail tokens too: a plan must describe a valid token sequence.
     page_hash = None
+    span_index = 0
+    media_seen = False
+    typed_page = False
     for index, token in enumerate(input_ids):
-        if type(token) is not int or not 0 <= token <= 0xFFFFFFFF:
+        while span_index < len(spans) and index >= spans[span_index].end:
+            span_index += 1
+        span = spans[span_index] if span_index < len(spans) else None
+        is_media = span is not None and span.start <= index < span.end
+        if type(token) is not int or (not is_media and not 0 <= token <= 0xFFFFFFFF):
             raise ValueError("input_ids must contain unsigned 32-bit integer tokens")
         if index >= page_count * page_size:
             continue
         if index % page_size == 0:
-            page_hash = hashlib.sha256(_DOMAIN + b"page\x00" + previous)
-        page_hash.update(struct.pack(">I", token))
+            # Preserve existing text-only keys, including complete text blocks
+            # before the first media item. Typed media pages cannot alias a
+            # crafted sequence of ordinary uint32 text tokens.
+            typed_page = media_seen or (
+                span is not None and span.start < index + page_size
+            )
+            domain = b"media-page\x00" if typed_page else b"page\x00"
+            page_hash = hashlib.sha256(_DOMAIN + domain + previous)
+        if is_media:
+            media_seen = True
+            if index == span.start:
+                page_hash.update(
+                    b"m"
+                    + struct.pack(">Q", span.end - span.start)
+                    + bytes.fromhex(span.digest)
+                )
+            else:
+                page_hash.update(b"c")
+        elif typed_page:
+            page_hash.update(b"t" + struct.pack(">I", token))
+        else:
+            page_hash.update(struct.pack(">I", token))
         if (index + 1) % page_size == 0:
             previous = page_hash.digest()
             digests.append(previous.hex())
