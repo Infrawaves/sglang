@@ -128,10 +128,8 @@ def validate_cache_accounting(cfg: Any) -> None:
         raise ValueError("Cache accounting requires --cache-namespace")
     if not math.isfinite(cfg.cache_timeout) or cfg.cache_timeout <= 0:
         raise ValueError("--cache-timeout must be finite and positive")
-    if cfg.tokenizer_worker_num != 1:
-        raise ValueError("Cache accounting currently requires one tokenizer worker")
-    if cfg.dcp_size != 1:
-        raise ValueError("Cache accounting does not yet support DCP pages")
+    # The originating tokenizer owns each decision and its Redis client. Cache
+    # accounting uses complete input blocks, independently of physical DCP pages.
 
 
 def validate_response_store(server_args: Any) -> None:
