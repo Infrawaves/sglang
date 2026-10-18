@@ -128,6 +128,18 @@ def _ceil_div(value: int, divisor: int) -> int:
     return -(-value // divisor)
 
 
+def credit_served_prefill_tokens(batch: ScheduleBatch) -> None:
+    """Advance each req's HRRN arrival snapshot by the tokens it prefills now.
+
+    Paired with the scheduler's processed-token counter, this keeps a req's own
+    chunks out of its HRRN wait, so a suspended round-robin request is not aged
+    by being served. Retract/requeue re-snapshots the field, dropping the credit.
+    Only valid for extend batches, where extend_lens aligns with reqs.
+    """
+    for req, extend_len in zip(batch.reqs, batch.extend_lens, strict=True):
+        req.arrival_processed_tokens += extend_len
+
+
 def estimate_prefill_extend_tile_metrics(
     extend_lens: List[int], block_m: int
 ) -> Dict[str, Union[int, float, List[int], None]]:
@@ -262,7 +274,12 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
-    ) -> None:
+    ) -> Optional[Set[str]]:
+        """Sort waiting_queue in place.
+
+        Returns the deprioritized rids when HRRN sorted this pass (possibly an
+        empty set), else None; see order_round_robin_candidates.
+        """
         policy = self._determine_active_policy(waiting_queue)
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
@@ -298,6 +315,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_hrrn(
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
+                return temporary_deprioritized
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
@@ -495,7 +513,7 @@ class SchedulePolicy:
     @staticmethod
     def _sort_by_hrrn(
         waiting_queue: List[Req],
-        temporary_deprioritized: Set[int],
+        temporary_deprioritized: Set[str],
         processed_tokens: int,
     ) -> None:
         """Highest Response Ratio Next, with token-based aging.
@@ -514,19 +532,66 @@ class SchedulePolicy:
         degrade to rid-lexicographic order; those queues carry no prefill work.
         """
 
-        def _key(r: Req):
-            rid = r.rid
-            if rid in temporary_deprioritized:
-                return (float("inf"), rid)
-            uncached = SchedulePolicy._uncached_len(r)
-            if uncached <= 0:
-                # No prefill work; drain immediately.
-                return (-float("inf"), rid)
-            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-            ratio_delta = waited_tokens / uncached
-            return (-ratio_delta, rid)
+        waiting_queue.sort(
+            key=lambda r: SchedulePolicy._hrrn_key(
+                r, temporary_deprioritized, processed_tokens
+            )
+        )
 
-        waiting_queue.sort(key=_key)
+    @staticmethod
+    def _hrrn_key(
+        r: Req,
+        temporary_deprioritized: Set[str],
+        processed_tokens: int,
+        uncached: Optional[int] = None,
+    ):
+        rid = r.rid
+        if rid in temporary_deprioritized:
+            return (float("inf"), rid)
+        if uncached is None:
+            uncached = SchedulePolicy._uncached_len(r)
+        if uncached <= 0:
+            # No prefill work; drain immediately.
+            return (-float("inf"), rid)
+        waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+        ratio_delta = waited_tokens / uncached
+        return (-ratio_delta, rid)
+
+    @staticmethod
+    def order_round_robin_candidates(
+        waiting_queue: List[Req],
+        suspended: List[Req],
+        processed_tokens: int,
+        hrrn_deprioritized: Optional[Set[str]],
+    ) -> List[Req]:
+        """Order round-robin admission candidates.
+
+        When HRRN sorted waiting_queue this pass, suspended requests are ranked
+        into the same order instead of overriding it with prefill_ready_seq.
+        Their prefix match is stale while suspended, so the denominator is the
+        remainder after the last scheduled chunk. Otherwise keep ready order.
+        """
+        if hrrn_deprioritized is None:
+            return sorted(
+                [*waiting_queue, *suspended], key=lambda r: r.prefill_ready_seq
+            )
+
+        def suspended_key(r: Req):
+            uncached = None
+            if r.extend_range is not None:
+                input_len = len(r.origin_input_ids)
+                uncached = input_len - min(r.extend_range.end, input_len)
+            return SchedulePolicy._hrrn_key(
+                r, hrrn_deprioritized, processed_tokens, uncached
+            )
+
+        keyed = [
+            (SchedulePolicy._hrrn_key(r, hrrn_deprioritized, processed_tokens), r)
+            for r in waiting_queue
+        ]
+        keyed += [(suspended_key(r), r) for r in suspended]
+        keyed.sort(key=lambda kr: kr[0])
+        return [r for _, r in keyed]
 
     @staticmethod
     def _sort_by_dfs_weight(

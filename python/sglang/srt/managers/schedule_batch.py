@@ -1412,6 +1412,8 @@ class Req(ReqDllmMixin):
         self.hisparse_staging = False
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        # Under chunked-prefill round-robin it also advances by this req's own prefilled tokens
+        # (credit_served_prefill_tokens), so being served does not count as waiting.
         self.arrival_processed_tokens: int = 0
 
     def advance_cache_request_handle(self) -> None:

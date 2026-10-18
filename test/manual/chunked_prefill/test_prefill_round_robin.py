@@ -74,6 +74,12 @@ PrefillAdder = extract(
     ),
 )
 Result = ADDER_GLOBALS["AddReqResult"]
+SchedulePolicy = extract(
+    "managers/schedule_policy.py",
+    "SchedulePolicy",
+    "order_round_robin_candidates _hrrn_key _uncached_len",
+    {},
+)
 
 
 class Budget:
@@ -379,6 +385,7 @@ class Harness(Scheduler, Prefill):
         self.policy = NS(
             calc_priority=lambda *args, **kwargs: None,
             shortest_prefill_chunk_limit=lambda *args, **kwargs: None,
+            order_round_robin_candidates=SchedulePolicy.order_round_robin_candidates,
         )
         self.processed_tokens_counter = 0
         self.chunked_prefill_size = chunk

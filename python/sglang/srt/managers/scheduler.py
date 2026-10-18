@@ -221,6 +221,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    credit_served_prefill_tokens,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -3961,7 +3962,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(
+        hrrn_deprioritized = self.policy.calc_priority(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
@@ -4048,9 +4049,11 @@ class Scheduler(
         fresh_blocked = False
         candidates = self.waiting_queue
         if round_robin_enabled:
-            candidates = sorted(
-                [*self.waiting_queue, *self.suspended_prefill_queue],
-                key=lambda r: r.prefill_ready_seq,
+            candidates = self.policy.order_round_robin_candidates(
+                self.waiting_queue,
+                self.suspended_prefill_queue,
+                self.processed_tokens_counter,
+                hrrn_deprioritized,
             )
             if self.chunked_req is not None:
                 candidates.insert(0, self.chunked_req)
@@ -4513,6 +4516,11 @@ class Scheduler(
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
+            if (
+                self.enable_chunked_prefill_round_robin
+                and batch.forward_mode.is_extend()
+            ):
+                credit_served_prefill_tokens(batch)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)

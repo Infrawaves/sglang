@@ -3,7 +3,11 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    CacheAwarePolicy,
+    SchedulePolicy,
+    credit_served_prefill_tokens,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -225,6 +229,64 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestRoundRobinHRRNOrder(CustomTestCase):
+    def make_req(self, rid, length, *, arrived=0, ready_seq=0, scheduled_end=None):
+        req = _make_req(rid, "", list(range(length)))
+        req.num_matched_prefix_tokens = 0
+        req.arrival_processed_tokens = arrived
+        req.prefill_ready_seq = ready_seq
+        if scheduled_end is not None:
+            req.set_extend_range(scheduled_end - 1, scheduled_end)
+        return req
+
+    def test_empty_waiting_still_ranks_suspended_by_remainder(self):
+        # Both suspended reqs waited equally. `long` is nearly done (256 left)
+        # while `fresh_tail` has 8192 left; ranking by full length or by
+        # prefill_ready_seq would put `fresh_tail` first.
+        long = self.make_req("long", 16384, ready_seq=1, scheduled_end=16128)
+        fresh_tail = self.make_req("fresh_tail", 8192, ready_seq=0, scheduled_end=1)
+        order = SchedulePolicy.order_round_robin_candidates(
+            [], [fresh_tail, long], processed_tokens=4096, hrrn_deprioritized=set()
+        )
+        self.assertEqual([r.rid for r in order], ["long", "fresh_tail"])
+
+    def test_waiting_order_is_preserved_and_none_keeps_ready_order(self):
+        a = self.make_req("a", 512, arrived=0, ready_seq=2)
+        b = self.make_req("b", 4096, arrived=0, ready_seq=0)
+        waiting = [a, b]
+        SchedulePolicy._sort_by_hrrn(waiting, set(), processed_tokens=1000)
+        order = SchedulePolicy.order_round_robin_candidates(waiting, [], 1000, set())
+        self.assertEqual(order, waiting)
+        fallback = SchedulePolicy.order_round_robin_candidates(waiting, [], 1000, None)
+        self.assertEqual([r.rid for r in fallback], ["b", "a"])
+
+    def test_calc_priority_reports_hrrn_application(self):
+        policy = SchedulePolicy(
+            policy="hrrn",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        queue = [self.make_req("a", 16)]
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            self.assertEqual(policy.calc_priority(queue), set())
+            # >128 waiting falls back to FCFS: no HRRN order to respect.
+            big = [self.make_req(str(i), 16) for i in range(129)]
+            self.assertIsNone(policy.calc_priority(big))
+
+    def test_credit_served_prefill_tokens(self):
+        a, b = self.make_req("a", 16, arrived=10), self.make_req("b", 16, arrived=20)
+        batch = type("Batch", (), {"reqs": [a, b], "extend_lens": [64, 1]})()
+        credit_served_prefill_tokens(batch)
+        self.assertEqual(
+            (a.arrival_processed_tokens, b.arrival_processed_tokens), (74, 21)
+        )
+        batch.extend_lens = [64]
+        with self.assertRaises(ValueError):
+            credit_served_prefill_tokens(batch)
 
 
 if __name__ == "__main__":
