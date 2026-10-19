@@ -102,8 +102,8 @@ class Schedule(msgspec.Struct):
     ] = "fcfs"
     enable_hrrn_prefill_chunk_limit: A[
         bool,
-        "Under hrrn, cap the active chunked prefill (at most half the budget) "
-        "so shorter waiting requests finish in the same batch.",
+        "Under hrrn, cap the active chunked prefill so shorter waiting "
+        "requests finish in the same batch.",
     ] = False
     enable_priority_scheduling: A[
         bool,
