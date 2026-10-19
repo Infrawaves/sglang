@@ -1285,6 +1285,10 @@ def build_hybrid_mamba_stack(
             mtp_draft_device_pools=root.packed_draft_device_pools,
             **(node_leader.host_pool_kwargs() if node_leader is not None else {}),
         )
+    if node_leader is not None:
+        # The Mamba host pool below checks free host memory; wait until the
+        # leader's MLA pin shows up in it.
+        node_leader.wait_until_host_pool_ready()
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
     # pool has no separate K/V buffers, so kv_split does not apply; override

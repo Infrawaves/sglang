@@ -53,12 +53,21 @@ def split_ranks_by_node(group_ranks: list[int], ranks_on_host: int) -> list[list
 class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
     """Broadcast from the first rank of this node's group instead of rank 0."""
 
-    def __init__(self, device_pool, group, node_ranks: list[int], min_node_size: int):
+    def __init__(
+        self,
+        device_pool,
+        group,
+        node_ranks: list[int],
+        min_node_size: int,
+        cpu_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         super().__init__(device_pool, group, src_global_rank=node_ranks[0])
         self.node_ranks = node_ranks
         # Smallest node group in the TP group; the same on every rank.
         self.min_node_size = min_node_size
         self.is_src = torch.distributed.get_rank() == node_ranks[0]
+        # The TP CPU (gloo) group, for startup barriers across all node groups.
+        self.cpu_group = cpu_group
 
     @classmethod
     def build_for_node(
@@ -87,7 +96,7 @@ class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
         min_node_size = min(len(ranks) for ranks in node_groups)
         if min_node_size <= 1:
             return None
-        broadcaster = cls(device_pool, group, node_ranks, min_node_size)
+        broadcaster = cls(device_pool, group, node_ranks, min_node_size, base_group)
         broadcaster._warmup_group()
         return broadcaster
 
@@ -132,6 +141,20 @@ class NodeLeaderMLAContext(msgspec.Struct):
         if self.is_follower:
             return contextlib.nullcontext()
         return host_memory_budget_scope(host_memory_budget_bytes() * self.node_size)
+
+    def wait_until_host_pool_ready(self) -> None:
+        """Block until the leader has pinned its MLA host pool.
+
+        Followers build an allocator-only pool with no memory check and would
+        reach the next host pool's check while the leader is still pinning, so
+        that check would read free memory that is about to be taken. Without
+        a budget snapshot (explicit --hicache-ratio/--hicache-size) nothing
+        else catches it. Gloo, not NCCL: this is a CPU wait, and pinning
+        hundreds of GB can outlast the NCCL watchdog.
+        """
+        if self.broadcaster.cpu_group is None:
+            return
+        torch.distributed.barrier(group=self.broadcaster.cpu_group)
 
     def flush_stale(self, index: int, fence_stream: Any = None) -> None:
         """Finish an unconsumed load left in slot ``index`` before it is reused.
