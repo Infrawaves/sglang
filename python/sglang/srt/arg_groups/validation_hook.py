@@ -340,23 +340,6 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
-    if cfg.enable_hrrn_prefill_chunk_limit and cfg.disaggregation_mode != "decode":
-        # Each of these would silently disable the limit and mislabel an A/B arm.
-        if cfg.schedule_policy != "hrrn":
-            raise ValueError(
-                "--enable-hrrn-prefill-chunk-limit requires --schedule-policy hrrn"
-            )
-        if cfg.enable_chunked_prefill_round_robin:
-            raise ValueError(
-                "--enable-hrrn-prefill-chunk-limit is incompatible with "
-                "--enable-chunked-prefill-round-robin"
-            )
-        if cfg.disable_radix_cache:
-            raise ValueError("--enable-hrrn-prefill-chunk-limit requires radix cache")
-        if cfg.chunked_prefill_size <= 0:
-            raise ValueError(
-                "--enable-hrrn-prefill-chunk-limit requires chunked prefill"
-            )
 
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
