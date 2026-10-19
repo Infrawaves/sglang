@@ -4516,10 +4516,7 @@ class Scheduler(
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
-            if (
-                self.enable_chunked_prefill_round_robin
-                and batch.forward_mode.is_extend()
-            ):
+            if self.enable_chunked_prefill_round_robin:
                 credit_served_prefill_tokens(batch)
 
         if self.scripted_scheduler_hook is not None:
