@@ -228,14 +228,14 @@ class TestShortestPrefillFirst(CustomTestCase):
 
 
 class TestHRRNPrefillChunkLimit(CustomTestCase):
-    def make_policy(self, enabled=True):
+    def make_policy(self):
         return SchedulePolicy(
             policy="hrrn",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
-            enable_hrrn_prefill_chunk_limit=enabled,
+            enable_hrrn_prefill_chunk_limit=True,
         )
 
     def make_req(self, rid, uncached):
