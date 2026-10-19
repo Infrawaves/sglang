@@ -168,6 +168,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
         self.generated_identities = []
         self.adapted_requests = []
         self.stream_counts = (1, 2)
+        self.output_text = "hi"
         self.output_prompt_tokens = 43
         self.physical_cached_tokens = 32
         self.accounting_read_tokens = 16
@@ -188,7 +189,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
             counts = self.stream_counts if adapted.stream else (2,)
             for count in counts:
                 yield {
-                    "text": "hi"[:count],
+                    "text": self.output_text[:count],
                     "meta_info": {
                         "id": "anthropic-cache-identity",
                         "prompt_tokens": self.output_prompt_tokens,
@@ -505,7 +506,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                 identities.append(expected)
             self.assertNotEqual(*identities)
 
-    async def test_real_openai_role_usage_starts_at_zero_and_tail_keeps_full_output(
+    async def test_real_openai_stream_keeps_anthropic_input_and_output_usage(
         self,
     ):
         self.stream_counts = (3, 5)
@@ -537,6 +538,58 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
         final = next(event for event in events if event["type"] == "message_delta")
         self.assertEqual(final["usage"], {"output_tokens": 5})
         self.assertEqual(events[-1]["type"], "message_stop")
+
+    async def test_empty_finished_stream_keeps_cache_and_physical_usage(self):
+        self.output_text = ""
+        for user, completion_tokens in (
+            ("empty-output-user", 1),
+            (None, 1),
+            (None, 0),
+        ):
+            self.stream_counts = (completion_tokens,)
+            for ttl in ("5m", "1h"):
+                with self.subTest(
+                    user=user, completion_tokens=completion_tokens, ttl=ttl
+                ):
+                    response = await self.serving.handle_messages(
+                        self.request(stream=True, user=user, options={"ttl": ttl}),
+                        self.raw_request(),
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    events = [
+                        json.loads(frame.split("data: ", 1)[1])
+                        async for frame in response.body_iterator
+                    ]
+                    self.assertFalse(any(event["type"] == "error" for event in events))
+                    starts = [
+                        event for event in events if event["type"] == "message_start"
+                    ]
+                    self.assertEqual(len(starts), 1)
+                    read_tokens, write_tokens = (16, 16) if user else (32, 0)
+                    self.assertEqual(
+                        starts[0]["message"]["usage"],
+                        {
+                            "input_tokens": 43 - read_tokens - write_tokens,
+                            "output_tokens": 0,
+                            "cache_read_input_tokens": read_tokens,
+                            "cache_creation_input_tokens": write_tokens,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": (
+                                    write_tokens if ttl == "5m" else 0
+                                ),
+                                "ephemeral_1h_input_tokens": (
+                                    write_tokens if ttl == "1h" else 0
+                                ),
+                            },
+                        },
+                    )
+                    final = next(
+                        event for event in events if event["type"] == "message_delta"
+                    )
+                    self.assertEqual(
+                        final["usage"], {"output_tokens": completion_tokens}
+                    )
+                    self.assertEqual(events[-1]["type"], "message_stop")
 
     async def test_child_conversion_result_is_published_on_parent_request(self):
         class ChildPreprocessor:
@@ -758,20 +811,13 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_stream_message_start_has_snapshot_and_delta_only_output(self):
-        for ttl, delta in (
-            (ttl, delta)
-            for ttl in ("5m", "1h")
-            for delta in ({"role": "assistant", "content": ""}, {"content": "hi"})
-        ):
-            with self.subTest(ttl=ttl, delta=delta):
-                public_usage = (
-                    self.usage(ttl)
-                    .model_copy(update={"completion_tokens": 0, "total_tokens": 43})
-                    .model_dump()
-                )
+        for ttl in ("5m", "1h"):
+            with self.subTest(ttl=ttl):
+                public_usage = self.usage(ttl).model_dump()
                 self.assertNotIn("cache_usage", public_usage)
                 frames = [
-                    _stream_chunk(delta, public_usage),
+                    _stream_chunk({"role": "assistant", "content": ""}),
+                    _stream_chunk({"content": "hi"}, public_usage),
                     _stream_chunk(finish_reason="stop"),
                     "data: "
                     + json.dumps(
@@ -825,14 +871,41 @@ class TestAnthropicCacheUsage(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(final["usage"], {"output_tokens": 2})
 
+    async def test_empty_finished_stream_without_usage_still_closes(self):
+        serving = AnthropicServing(
+            _FakeChat(
+                [
+                    _stream_chunk({"role": "assistant", "content": ""}),
+                    _stream_chunk(finish_reason="stop"),
+                    "data: [DONE]\n\n",
+                ]
+            )
+        )
+        response = await serving.handle_messages(self.request(stream=True), None)
+        self.assertEqual(response.status_code, 200)
+        events = [
+            json.loads(frame.split("data: ", 1)[1])
+            async for frame in response.body_iterator
+        ]
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        starts = [event for event in events if event["type"] == "message_start"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            starts[0]["message"]["usage"], {"input_tokens": 0, "output_tokens": 0}
+        )
+        final = next(event for event in events if event["type"] == "message_delta")
+        self.assertEqual(final["usage"], {"output_tokens": 0})
+        self.assertEqual(events[-1]["type"], "message_stop")
+
     async def test_missing_options_default_to_five_minutes_for_both_response_modes(
         self,
     ):
         for stream in (True, False):
             with self.subTest(stream=stream):
                 frames = [
+                    _stream_chunk({"role": "assistant", "content": ""}),
                     _stream_chunk(
-                        {"role": "assistant", "content": ""},
+                        {"content": "hi"},
                         self.usage("5m").model_dump(),
                     ),
                     _stream_chunk(finish_reason="stop"),

@@ -89,15 +89,10 @@ class UsageProcessor:
         video_tokens: int = 0,
         *,
         cache_usage: Optional[Mapping[int, Any]] = None,
-        input_usage: Optional[UsageInfo] = None,
     ) -> UsageInfo:
-        # A published first-role snapshot fixes shared input usage even when
-        # another choice arrived first. Output counts remain cumulative across
-        # choices. Legacy callers still count input from index % n_choices == 0.
-        total_prompt_tokens = (
-            input_usage.prompt_tokens
-            if input_usage is not None
-            else sum(tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0)
+        # index % n_choices == 0 marks the first choice of a prompt
+        total_prompt_tokens = sum(
+            tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0
         )
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
@@ -120,14 +115,10 @@ class UsageProcessor:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
-            cache_usage=(
-                input_usage.cache_usage
-                if input_usage is not None
-                else UsageProcessor._cache_total(
-                    snapshot
-                    for index, snapshot in (cache_usage or {}).items()
-                    if index % n_choices == 0
-                )
+            cache_usage=UsageProcessor._cache_total(
+                snapshot
+                for index, snapshot in (cache_usage or {}).items()
+                if index % n_choices == 0
             ),
         )
 

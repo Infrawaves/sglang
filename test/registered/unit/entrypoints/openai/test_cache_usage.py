@@ -246,13 +246,7 @@ class TestCacheUsage(unittest.TestCase):
                 cache_usage=dict(enumerate(snapshots)),
             )
 
-    def test_streaming_input_anchor_overrides_only_input_counts(self):
-        anchor = UsageProcessor.calculate_token_usage(
-            prompt_tokens=43,
-            completion_tokens=99,
-            reasoning_tokens=88,
-            cache_usage={"ttl_seconds": 300, "read_tokens": 9, "write_tokens": 16},
-        )
+    def test_streaming_choices_use_recorded_input_and_sum_output_counts(self):
         result = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 100, 1: 101},
             reasoning_tokens={0: 2, 1: 4},
@@ -264,21 +258,19 @@ class TestCacheUsage(unittest.TestCase):
                 0: {"ttl_seconds": 300, "read_tokens": 7, "write_tokens": 4},
                 1: {"ttl_seconds": 300, "read_tokens": 8, "write_tokens": 5},
             },
-            input_usage=anchor,
         )
-        self.assertEqual(result.prompt_tokens, 43)
+        self.assertEqual(result.prompt_tokens, 100)
         self.assertEqual(result.completion_tokens, 8)
-        self.assertEqual(result.total_tokens, 51)
+        self.assertEqual(result.total_tokens, 108)
         self.assertEqual(result.completion_tokens_details.reasoning_tokens, 6)
         self.assertEqual(
             result.prompt_tokens_details.model_dump(),
-            {"cached_tokens": 9, "cache_write_tokens": 16},
+            {"cached_tokens": 7, "cache_write_tokens": 4},
         )
         self.assertEqual(
-            result.cache_usage.model_dump(), anchor.cache_usage.model_dump()
+            result.cache_usage.model_dump(),
+            {"ttl_seconds": 300, "read_tokens": 7, "write_tokens": 4},
         )
-        self.assertEqual(anchor.completion_tokens, 99)
-        self.assertEqual(anchor.completion_tokens_details.reasoning_tokens, 88)
 
     def test_old_wire_format_omits_cache_field(self):
         self.assertNotIn("cache_usage", UsageInfo().model_dump())
@@ -471,7 +463,7 @@ class TestCacheRequest(unittest.TestCase):
 
 
 class TestCacheStream(unittest.IsolatedAsyncioTestCase):
-    async def test_empty_completion_has_initial_and_final_usage_snapshot(self):
+    async def test_empty_completion_omits_role_usage_and_keeps_final_usage(self):
         async def generate_request(*args):
             yield {
                 "text": "",
@@ -512,14 +504,12 @@ class TestCacheStream(unittest.IsolatedAsyncioTestCase):
             ]
         chunks = [json.loads(frame[6:]) for frame in frames if "[DONE]" not in frame]
         self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
-        self.assertEqual(chunks[0]["usage"]["completion_tokens"], 0)
-        self.assertEqual(chunks[0]["usage"]["total_tokens"], 43)
-        for chunk in (chunks[0], chunks[-1]):
-            self.assertNotIn("cache_usage", chunk["usage"])
-            self.assertEqual(
-                chunk["usage"]["prompt_tokens_details"],
-                {"cached_tokens": 16, "cache_write_tokens": 16},
-            )
+        self.assertNotIn("usage", chunks[0])
+        self.assertNotIn("cache_usage", chunks[-1]["usage"])
+        self.assertEqual(
+            chunks[-1]["usage"]["prompt_tokens_details"],
+            {"cached_tokens": 16, "cache_write_tokens": 16},
+        )
         self.assertEqual(chunks[-1]["usage"]["prompt_tokens"], 43)
         self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 1)
 
@@ -710,19 +700,10 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(list(adapted_request.input_ids), list(range(43)))
 
-    def assert_role_usage(self, chunk, *, prompt=43, read=16, write=16):
+    def assert_no_usage(self, chunk):
         self.assertEqual(chunk["choices"][0]["delta"]["role"], "assistant")
         self.assertEqual(chunk["choices"][0]["delta"].get("content"), "")
-        usage = chunk["usage"]
-        self.assertEqual(usage["prompt_tokens"], prompt)
-        self.assertEqual(usage["completion_tokens"], 0)
-        self.assertEqual(usage["total_tokens"], prompt)
-        self.assertEqual(usage["completion_tokens_details"]["reasoning_tokens"], 0)
-        self.assertEqual(
-            usage["prompt_tokens_details"],
-            {"cached_tokens": read, "cache_write_tokens": write},
-        )
-        self.assertNotIn("cache_usage", usage)
+        self.assertNotIn("usage", chunk)
 
     def set_stream_outputs(self, outputs):
         self.stream_yielded_indices = []
@@ -827,9 +808,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                         frames = [frame async for frame in response.body_iterator]
                         self.assertEqual(frames[-1], "data: [DONE]\n\n")
                         chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-                        self.assert_role_usage(
-                            chunks[0], prompt=770, read=256, write=512
-                        )
+                        self.assert_no_usage(chunks[0])
                         content = "".join(
                             choice["delta"].get("content") or ""
                             for chunk in chunks
@@ -910,9 +889,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                                     "0",
                                 )
                             frames = [frame async for frame in response.body_iterator]
-                            self.assert_role_usage(
-                                json.loads(frames[0][6:]), prompt=770, read=333, write=0
-                            )
+                            self.assert_no_usage(json.loads(frames[0][6:]))
                             usage = json.loads(frames[-2][6:])["usage"]
                             self.assertEqual(frames[-1], "data: [DONE]\n\n")
                         else:
@@ -1037,7 +1014,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
             )
         frames = [frame async for frame in response.body_iterator]
         self.assertEqual(frames[-1], "data: [DONE]\n\n")
-        self.assert_role_usage(json.loads(frames[0][6:]), read=32, write=0)
+        self.assert_no_usage(json.loads(frames[0][6:]))
         for frame in frames[1:-1]:
             self.assertIsNone(json.loads(frame[6:]).get("usage"))
         self.assertFalse(hasattr(raw.state, "cache_identity"))
@@ -1070,7 +1047,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                         frames = [frame async for frame in response.body_iterator]
                         self.assertEqual(frames[-1], "data: [DONE]\n\n")
                         chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-                        self.assert_role_usage(chunks[0], read=32, write=0)
+                        self.assert_no_usage(chunks[0])
                         self.assertEqual(
                             chunks[0]["choices"][0]["delta"]["role"], "assistant"
                         )
@@ -1183,7 +1160,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 frames = [frame async for frame in response.body_iterator]
                 self.assertEqual(frames[-1], "data: [DONE]\n\n")
                 final = json.loads(frames[-2][6:])
-                self.assert_role_usage(json.loads(frames[0][6:]))
+                self.assert_no_usage(json.loads(frames[0][6:]))
                 self.assertEqual(final["choices"], [])
                 self.assert_cache_usage(final["usage"], ttl)
                 self.assertEqual(
@@ -1223,7 +1200,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     "16" if ttl == "1h" else "0",
                 )
                 frames = [frame async for frame in response.body_iterator]
-                self.assert_role_usage(json.loads(frames[0][6:]))
+                self.assert_no_usage(json.loads(frames[0][6:]))
                 for frame in frames[1:-1]:
                     self.assertIsNone(json.loads(frame[6:]).get("usage"))
 
@@ -1245,7 +1222,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     response.headers["Msh-Usage-Cache-Write-Tokens-1h"], "0"
                 )
                 frames = [frame async for frame in response.body_iterator]
-                self.assert_role_usage(json.loads(frames[0][6:]), read=32, write=0)
+                self.assert_no_usage(json.loads(frames[0][6:]))
                 if include_usage:
                     usage = json.loads(frames[-2][6:])["usage"]
                     self.assertEqual(
@@ -1272,7 +1249,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         for response in responses:
             _ = [frame async for frame in response.body_iterator]
 
-    async def test_role_usage_is_input_only_despite_batched_generation_and_thinking(
+    async def test_streaming_thinking_counts_reach_final_usage(
         self,
     ):
         for include_usage in (False, True):
@@ -1295,7 +1272,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     )
                     frames = [frame async for frame in response.body_iterator]
                     chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-                    self.assert_role_usage(chunks[0])
+                    self.assert_no_usage(chunks[0])
                     self.assertEqual(
                         response.headers["Msh-Usage-Cache-Write-Tokens-5m"], "16"
                     )
@@ -1315,10 +1292,10 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(
                             final["prompt_tokens_details"],
-                            chunks[0]["usage"]["prompt_tokens_details"],
+                            {"cached_tokens": 16, "cache_write_tokens": 16},
                         )
 
-    async def test_default_short_prompt_role_has_zero_cache_usage_without_tail(self):
+    async def test_default_short_prompt_has_no_usage_without_tail(self):
         self.chat._process_messages.return_value = MessageProcessingResult(
             prompt="short",
             prompt_ids=list(range(11)),
@@ -1344,130 +1321,12 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         response = await self.chat.handle_request(request, self.raw_request())
         frames = [frame async for frame in response.body_iterator]
         chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-        self.assert_role_usage(chunks[0], prompt=11, read=0, write=0)
-        self.assertEqual([chunk for chunk in chunks if chunk.get("usage")], [chunks[0]])
+        self.assert_no_usage(chunks[0])
+        self.assertEqual([chunk for chunk in chunks if chunk.get("usage")], [])
         for tier in ("5m", "1h"):
             self.assertEqual(
                 response.headers[f"Msh-Usage-Cache-Write-Tokens-{tier}"], "0"
             )
-        self.assertEqual(frames[-1], "data: [DONE]\n\n")
-
-    async def test_parallel_role_usage_anchors_first_choice_without_reordering(
-        self,
-    ):
-        for continuous in (False, True):
-            with self.subTest(continuous=continuous):
-                snapshots = {
-                    0: {"ttl_seconds": 300, "read_tokens": 7, "write_tokens": 0},
-                    1: {"ttl_seconds": 300, "read_tokens": 9, "write_tokens": 0},
-                }
-                self.set_stream_outputs(
-                    [
-                        self.stream_output("b", 1, index=1, snapshot=snapshots[1]),
-                        self.stream_output(
-                            "bc",
-                            2,
-                            index=1,
-                            snapshot=snapshots[1],
-                            finish={"type": "stop"},
-                        ),
-                        self.stream_output(
-                            "a", 1, index=0, prompt=8, snapshot=snapshots[0]
-                        ),
-                        self.stream_output(
-                            "ad",
-                            2,
-                            index=0,
-                            prompt=8,
-                            snapshot=snapshots[0],
-                            finish={"type": "stop"},
-                        ),
-                    ]
-                )
-                request = self.request("5m", stream=True)
-                request.n = 2
-                request.stream_options.continuous_usage_stats = continuous
-                response = await self.chat.handle_request(
-                    request, Request({"type": "http", "headers": [], "state": {}})
-                )
-                # The first role is ready after only the first backend output;
-                # no waiting for choice 0 or retaining its predecessor chunks.
-                self.assertEqual(self.stream_yielded_indices, [1])
-                frames = [frame async for frame in response.body_iterator]
-                chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-                roles = [
-                    chunk
-                    for chunk in chunks
-                    if any(
-                        choice.get("delta", {}).get("role") == "assistant"
-                        for choice in chunk.get("choices", [])
-                    )
-                ]
-                self.assertEqual(
-                    [chunk["choices"][0]["index"] for chunk in roles], [1, 0]
-                )
-                self.assertIs(chunks[0], roles[0])
-                for role in roles:
-                    self.assert_role_usage(role, read=9, write=0)
-                text_by_choice = {0: "", 1: ""}
-                for chunk in chunks:
-                    for choice in chunk.get("choices", []):
-                        text_by_choice[choice["index"]] += (
-                            choice.get("delta", {}).get("content") or ""
-                        )
-                self.assertEqual(text_by_choice, {0: "ad", 1: "bc"})
-                for chunk in chunks:
-                    if chunk.get("usage") is not None:
-                        self.assertEqual(chunk["usage"]["prompt_tokens"], 43)
-                        self.assertEqual(
-                            chunk["usage"]["prompt_tokens_details"],
-                            {"cached_tokens": 9, "cache_write_tokens": 0},
-                        )
-                final = chunks[-1]["usage"]
-                self.assertEqual(final["prompt_tokens"], 43)
-                self.assertEqual(final["completion_tokens"], 4)
-                self.assertEqual(final["total_tokens"], 47)
-                self.assertEqual(
-                    final["prompt_tokens_details"],
-                    roles[0]["usage"]["prompt_tokens_details"],
-                )
-
-    async def test_parallel_cache_stream_without_choice_zero_keeps_known_input_usage(
-        self,
-    ):
-        self.set_stream_outputs(
-            [
-                self.stream_output(
-                    "b",
-                    1,
-                    index=1,
-                    snapshot={"ttl_seconds": 300, "read_tokens": 9, "write_tokens": 0},
-                    finish={"type": "stop"},
-                ),
-            ]
-        )
-        request = self.request("5m", stream=True)
-        request.n = 2
-        response = await self.chat.handle_request(
-            request, Request({"type": "http", "headers": [], "state": {}})
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.stream_yielded_indices, [1])
-        self.assertEqual(response.headers["Msh-Usage-Cache-Write-Tokens-5m"], "0")
-        self.assertEqual(response.headers["Msh-Usage-Cache-Write-Tokens-1h"], "0")
-        frames = [frame async for frame in response.body_iterator]
-        chunks = [json.loads(frame[6:]) for frame in frames[:-1]]
-        self.assert_role_usage(chunks[0], read=9, write=0)
-        self.assertFalse(any("error" in chunk for chunk in chunks))
-        self.assertEqual(chunks[-1]["choices"], [])
-        final = chunks[-1]["usage"]
-        self.assertEqual(final["prompt_tokens"], 43)
-        self.assertEqual(final["completion_tokens"], 1)
-        self.assertEqual(final["total_tokens"], 44)
-        self.assertEqual(
-            final["prompt_tokens_details"],
-            {"cached_tokens": 9, "cache_write_tokens": 0},
-        )
         self.assertEqual(frames[-1], "data: [DONE]\n\n")
 
     async def test_parallel_first_system_abort_has_no_role_usage_or_cache_headers(
@@ -1527,7 +1386,13 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         frames = [frame async for frame in response.body_iterator]
         first = json.loads(frames[0][6:])
         self.assertEqual(first["choices"][0]["index"], 1)
-        self.assertIsNone(first.get("usage"))
+        for frame in frames[:-1]:
+            chunk = json.loads(frame[6:])
+            if any(
+                choice.get("delta", {}).get("role") == "assistant"
+                for choice in chunk.get("choices", [])
+            ):
+                self.assert_no_usage(chunk)
         self.assertNotIn("Msh-Usage-Cache-Write-Tokens-5m", response.headers)
 
     async def test_disabled_stream_keeps_cache_headers_absent(self):
