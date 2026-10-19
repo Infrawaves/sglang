@@ -96,6 +96,11 @@ class Schedule(msgspec.Struct):
             ],
         ),
     ] = "fcfs"
+    enable_hrrn_prefill_chunk_limit: A[
+        bool,
+        "Under hrrn, cap the active chunked prefill (at most half the budget) "
+        "so shorter waiting requests finish in the same batch.",
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
@@ -277,18 +282,3 @@ class Schedule(msgspec.Struct):
             "pipeline parallelism."
         ),
     ] = None
-
-    # -------------------------------------------------------------------------
-    # HRRN prefill chunk limit
-    # -------------------------------------------------------------------------
-    enable_hrrn_prefill_chunk_limit: A[
-        bool,
-        (
-            "Under --schedule-policy hrrn, cap the active chunked prefill so the "
-            "next waiting requests in HRRN order that are shorter than its "
-            "remainder can be fully prefilled in the same batch. At most half "
-            "of the chunk budget is reserved, so the long request keeps making "
-            "progress. Requires radix cache and chunked prefill; incompatible "
-            "with --enable-chunked-prefill-round-robin."
-        ),
-    ] = False
