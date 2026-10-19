@@ -249,12 +249,6 @@ class SchedulePolicy:
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.enable_hrrn_prefill_chunk_limit = enable_hrrn_prefill_chunk_limit
-        if enable_hrrn_prefill_chunk_limit and self.policy != CacheAwarePolicy.HRRN:
-            logger.warning(
-                "--enable-hrrn-prefill-chunk-limit has no effect: the active "
-                "policy is %s, not hrrn.",
-                self.policy,
-            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
