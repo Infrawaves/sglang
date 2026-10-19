@@ -35,11 +35,67 @@ from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_scope,
     ranks_per_host,
 )
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def local_numa_info() -> tuple[int, Optional[frozenset[int]]]:
+    """(NUMA node this rank is bound to or -1, NUMA nodes it may allocate on).
+
+    The node mirrors the launcher (numa_utils.configure_subprocess and the
+    scheduler's numa_bind_to_node): both bind to get_numa_node_if_available()
+    for the rank's GPU. The allowed set is the cpuset limit, or None if unknown.
+    """
+    from sglang.srt.utils.numa_utils import (
+        get_mems_allowed,
+        get_numa_node_if_available,
+    )
+
+    gpu_id = get_device().gpu_id
+    if gpu_id is None:
+        return -1, None
+    try:
+        node = get_numa_node_if_available(get_server_args(), gpu_id)
+    except Exception:
+        logger.warning("MLA HiCache node leader: NUMA lookup failed", exc_info=True)
+        return -1, None
+    return (-1 if node is None else int(node)), get_mems_allowed()
+
+
+def leader_host_shares(
+    node_ranks: list[int],
+    numa_of: dict[int, int],
+    leader_mems_allowed: Optional[frozenset[int]],
+) -> tuple[int, tuple[int, ...]]:
+    """(per-rank host shares the leader can hold, NUMA nodes to interleave on).
+
+    Each rank's share sits on the NUMA node it is bound to. The leader holds
+    them all by interleaving its pool evenly over the group's nodes; even
+    interleave puts the same amount on every node, so a node holding fewer
+    ranks caps it at (fewest ranks on a node) x (node count). When the group
+    is on one node, or no rank is bound, nothing needs interleaving. When the
+    leader cannot reach every node (cpuset) or binding is mixed, it falls back
+    to the ranks on its own node, which membind keeps it to.
+    """
+    nodes = [numa_of[rank] for rank in node_ranks]
+    span = sorted(set(nodes))
+    if len(span) == 1:
+        return len(node_ranks), ()
+    if -1 not in span and (
+        leader_mems_allowed is not None and set(span) <= leader_mems_allowed
+    ):
+        return min(nodes.count(node) for node in span) * len(span), tuple(span)
+    leader_numa = numa_of[node_ranks[0]]
+    return sum(1 for node in nodes if node == leader_numa), ()
 
 
 def split_ranks_by_node(group_ranks: list[int], ranks_on_host: int) -> list[list[int]]:
@@ -60,11 +116,21 @@ class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
         node_ranks: list[int],
         min_node_size: int,
         cpu_group: Optional[torch.distributed.ProcessGroup] = None,
+        capacity_multiplier: Optional[int] = None,
+        interleave_nodes: tuple[int, ...] = (),
     ):
         super().__init__(device_pool, group, src_global_rank=node_ranks[0])
         self.node_ranks = node_ranks
         # Smallest node group in the TP group; the same on every rank.
         self.min_node_size = min_node_size
+        # Host KV capacity in per-rank shares: the smallest leader_host_shares
+        # in the TP group, so every rank sizes its allocator the same.
+        self.capacity_multiplier = (
+            min_node_size if capacity_multiplier is None else capacity_multiplier
+        )
+        # NUMA nodes the leader interleaves its MLA host pool over; empty
+        # when the group sits on one node.
+        self.interleave_nodes = interleave_nodes
         self.is_src = torch.distributed.get_rank() == node_ranks[0]
         # The TP CPU (gloo) group, for startup barriers across all node groups.
         self.cpu_group = cpu_group
@@ -96,7 +162,29 @@ class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
         min_node_size = min(len(ranks) for ranks in node_groups)
         if min_node_size <= 1:
             return None
-        broadcaster = cls(device_pool, group, node_ranks, min_node_size, base_group)
+        # Only this rank knows its NUMA binding; base_group is the TP CPU
+        # (gloo) group, and all_gather_object orders results by group rank.
+        infos: list[Optional[tuple[int, Optional[frozenset[int]]]]] = [None] * len(
+            group_ranks
+        )
+        torch.distributed.all_gather_object(infos, local_numa_info(), group=base_group)
+        numa_of = {r: info[0] for r, info in zip(group_ranks, infos)}
+        allowed_of = {r: info[1] for r, info in zip(group_ranks, infos)}
+        shares = {
+            tuple(ranks): leader_host_shares(ranks, numa_of, allowed_of[ranks[0]])
+            for ranks in node_groups
+        }
+        capacity_multiplier = min(count for count, _ in shares.values())
+        interleave_nodes = shares[tuple(node_ranks)][1]
+        broadcaster = cls(
+            device_pool,
+            group,
+            node_ranks,
+            min_node_size,
+            base_group,
+            capacity_multiplier,
+            interleave_nodes,
+        )
         broadcaster._warmup_group()
         return broadcaster
 
@@ -127,20 +215,38 @@ class NodeLeaderMLAContext(msgspec.Struct):
         return len(self.broadcaster.node_ranks)
 
     def host_pool_kwargs(self) -> dict:
-        """Every rank sizes the KV allocator for a whole node; only the leader
-        backs it with memory. The smallest node sets the size, so all ranks of
-        the TP group see the same host capacity."""
+        """Every rank sizes the KV allocator for capacity_multiplier ranks; only
+        the leader backs it with memory. The multiplier is the same on every
+        rank of the TP group, so all of them see the same host capacity."""
         return {
             "is_dummy": self.is_follower,
-            "capacity_multiplier": self.broadcaster.min_node_size,
+            "capacity_multiplier": self.broadcaster.capacity_multiplier,
         }
 
+    @contextlib.contextmanager
     def leader_budget_scope(self):
-        """The host budget is split evenly across local ranks. The leader holds
-        the node's only MLA copy, so it may claim the followers' shares too."""
+        """Scope for building this rank's MLA host pool.
+
+        The host budget is split evenly across local ranks, and the leader
+        holds the only MLA copy for capacity_multiplier of them, so it may
+        claim their shares. When those ranks sit on several NUMA nodes, the
+        pool is interleaved over them so each node keeps its own ranks'
+        share instead of the leader's node taking all of it.
+        """
         if self.is_follower:
-            return contextlib.nullcontext()
-        return host_memory_budget_scope(host_memory_budget_bytes() * self.node_size)
+            yield
+            return
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                host_memory_budget_scope(
+                    host_memory_budget_bytes() * self.broadcaster.capacity_multiplier
+                )
+            )
+            if self.broadcaster.interleave_nodes:
+                from sglang.srt.utils.numa_utils import interleave_memory
+
+                stack.enter_context(interleave_memory(self.broadcaster.interleave_nodes))
+            yield
 
     def wait_until_host_pool_ready(self) -> None:
         """Block until the leader has pinned its MLA host pool.
@@ -289,10 +395,13 @@ def maybe_create_node_leader_context(
         draft_pools=tuple(draft_pools),
     )
     logger.info(
-        "MLA HiCache node leader enabled: node_ranks=%s, role=%s, mla_layers=%d, "
+        "MLA HiCache node leader enabled: node_ranks=%s, role=%s, "
+        "capacity_multiplier=%d, interleave_nodes=%s, mla_layers=%d, "
         "draft_layers=%d",
         broadcaster.node_ranks,
         "follower" if context.is_follower else "leader",
+        broadcaster.capacity_multiplier,
+        list(broadcaster.interleave_nodes),
         len(context.mla_layers),
         len(context.draft_pools),
     )
