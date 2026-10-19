@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport import to_compact_cpu
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
@@ -397,7 +398,8 @@ class CudaVmmMemoryPool:
         chunk = self._reserve_for_publish(required_size)
         if chunk is None:
             self._warn_pool_full_once(data_nbytes)
-            return tensor.cpu()
+            # Inline fallback is pickled: never ship a view of a larger batch.
+            return to_compact_cpu(tensor)
 
         producer_stream = None
         copy_synchronized = False

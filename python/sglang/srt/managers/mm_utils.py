@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
+    to_compact_cpu,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1446,7 +1447,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
             f"({e}); falling back to inline transport. "
             f"Consider increasing /dev/shm size."
         )
-        return tensor
+        return to_compact_cpu(tensor)
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1467,12 +1468,45 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
+def _compact_cpu_tensor_or_list(value):
+    """``to_compact_cpu`` for every CPU tensor in a feature field."""
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        return to_compact_cpu(value)
+    if isinstance(value, (list, tuple)):
+        compacted = [
+            to_compact_cpu(t) if isinstance(t, torch.Tensor) and t.is_cpu else t
+            for t in value
+        ]
+        return type(value)(compacted) if isinstance(value, tuple) else compacted
+    return value
+
+
+def compact_inline_features(obj):
+    """Compact CPU features that will be pickled inline to the scheduler.
+
+    Default (multi-node) transport has no shared memory, and transport proxies
+    leave behind any feature they could not take (a full CUDA VMM / IPC pool).
+    Those tensors are pickled with the request -- and re-pickled by the
+    scheduler's TP broadcast -- so each must own only its own bytes.
+    """
+    if obj.mm_inputs:
+        for item in obj.mm_inputs.mm_items:
+            if item.feature is not None:
+                item.feature = _compact_cpu_tensor_or_list(item.feature)
+            if item.precomputed_embeddings is not None:
+                item.precomputed_embeddings = _compact_cpu_tensor_or_list(
+                    item.precomputed_embeddings
+                )
+    return obj
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
     if _get_is_default_transport() or get_serving().skip_tokenizer_init:
-        return obj
+        # No SHM hop: CPU features travel inside the pickled request.
+        return compact_inline_features(obj)
 
     if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:

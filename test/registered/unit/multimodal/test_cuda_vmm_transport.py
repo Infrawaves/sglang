@@ -283,6 +283,34 @@ class TestCudaVmmTransport(CustomTestCase):
         finally:
             pool.shutdown()
 
+    def test_full_pool_fallback_compacts_cpu_views(self):
+        """A CPU feature split from a batch must not pickle the whole batch.
+
+        ``tensor.cpu()`` is a no-op for a CPU view, so the old fallback handed
+        pickle a view whose storage is the entire batched ``pixel_values``.
+        """
+        pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
+        try:
+            rows = pool.allocation_size // (4 * 1024) + 1
+            batch = torch.arange(4 * rows * 1024, dtype=torch.float32).view(-1, 1024)
+            view = batch[rows : 2 * rows]
+
+            fallback = pool.wrap_tensor(view)
+
+            self.assertIsInstance(fallback, torch.Tensor)
+            self.assertTrue(fallback.is_cpu)
+            self.assertEqual(
+                fallback.untyped_storage().nbytes(),
+                view.numel() * view.element_size(),
+            )
+            torch.testing.assert_close(fallback, view)
+            self.assertLess(
+                len(pickle.dumps(fallback)),
+                batch.numel() * batch.element_size() // 2,
+            )
+        finally:
+            pool.shutdown()
+
     def test_oversized_tensor_falls_back_to_cpu(self):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
         try:

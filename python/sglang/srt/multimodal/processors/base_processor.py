@@ -37,6 +37,7 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.multimodal.transport import to_compact_cpu
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -1707,7 +1708,8 @@ class BaseMultimodalProcessor(ABC):
             tensor,
             use_pool_handle_cache=self.use_ipc_pool_handle_cache,
         )
-        return proxy if proxy is not None else tensor.cpu()
+        # A full pool falls back to inline (pickled) CPU transport.
+        return proxy if proxy is not None else to_compact_cpu(tensor)
 
     @staticmethod
     def _move_feature_to_cpu(value):
