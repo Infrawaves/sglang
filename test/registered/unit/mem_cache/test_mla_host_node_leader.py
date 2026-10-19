@@ -19,6 +19,7 @@ def _context(mla_layers, *, is_src=True, node_ranks=(0, 1, 2, 3), draft_pools=()
         is_src=is_src,
         node_ranks=list(node_ranks),
         min_node_size=len(node_ranks),
+        capacity_multiplier=len(node_ranks),
         device=torch.device("cpu"),
         device_pool=SimpleNamespace(host_transfer_translate=None),
         kv_staging=torch.empty(8),
