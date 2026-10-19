@@ -2122,8 +2122,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
-
-        initial_input_usage = None
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2232,24 +2230,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    if initial_input_usage is None and index in cache_usage:
-                        snapshot = CacheUsage.model_validate(cache_usage[index])
-                        initial_input_usage = UsageProcessor.calculate_token_usage(
-                            prompt_tokens=prompt_tokens[index],
-                            completion_tokens=0,
-                            reasoning_tokens=0,
-                            cached_tokens=self._continuous_usage_cached_details(
-                                content
-                            ),
-                            cache_usage=snapshot,
-                        )
+                    if (
+                        cache_context is not None
+                        and "usage" not in cache_context
+                        and index in cache_usage
+                    ):
                         # Publish only for a successful first role event,
                         # independently of the caller's usage options.
-                        if cache_context is not None:
-                            cache_context["usage"] = snapshot
-                    # The empty role carries frozen input usage even when tail
-                    # usage is disabled. Output/reasoning counts start at zero;
-                    # their tracked engine totals remain intact for later chunks.
+                        cache_context["usage"] = CacheUsage.model_validate(
+                            cache_usage[index]
+                        )
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -2257,32 +2247,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
-                        usage=(
-                            initial_input_usage.model_dump()
-                            if initial_input_usage is not None
-                            else None
-                        ),
                     )
                     stream_started = True
 
                 # Generate streaming content (override in subclass for custom behavior)
-                content_prompt_tokens = prompt_tokens
-                if initial_input_usage is not None:
-                    # Multiple choices share one input. Freeze its first
-                    # successful snapshot for all public usage, without waiting
-                    # for or buffering another choice's output.
-                    content = {
-                        **content,
-                        "meta_info": {
-                            **content["meta_info"],
-                            "prompt_tokens": initial_input_usage.prompt_tokens,
-                            "cache_usage": initial_input_usage.cache_usage.model_dump(),
-                        },
-                    }
-                    content_prompt_tokens = {
-                        **prompt_tokens,
-                        index: initial_input_usage.prompt_tokens,
-                    }
                 async for chunk in self._generate_stream_content(
                     content=content,
                     index=index,
@@ -2294,7 +2262,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     choice_logprobs=choice_logprobs,
                     finish_reason_type=finish_reason_type,
                     continuous_usage_stats=continuous_usage_stats,
-                    prompt_tokens=content_prompt_tokens,
+                    prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                 ):
@@ -2445,7 +2413,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
                     cache_usage=cache_usage,
-                    input_usage=initial_input_usage,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
