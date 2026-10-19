@@ -4082,7 +4082,10 @@ class Scheduler(
                 ):
                     break
                 if id(req) in resume_ids:
-                    req.init_next_round_input(self.tree_cache)
+                    # Like the baseline chunked path, keep the prefix set by
+                    # cache_unfinished_req: a rematch drops the unaligned tail
+                    # page this req owns, and the next extend leaks it.
+                    req.init_next_round_input()
                     previous_size = len(adder.can_run_list)
                     chunked_req = adder.add_chunked_req(req)
                     if len(adder.can_run_list) == previous_size:

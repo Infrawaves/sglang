@@ -641,7 +641,8 @@ class RoundRobinTests(unittest.TestCase):
         batch = s.batch()
         self.assertEqual(batch.reqs, [b, a])
         self.assertIs(batch.chunked_req, a)
-        self.assertEqual(a.matches, [s.tree_cache, s.tree_cache])
+        # Fresh admission matches the tree; the resume keeps its own prefix.
+        self.assertEqual(a.matches, [s.tree_cache, None])
         self.assertEqual(a.inflight_middle_chunks, 1)
 
     def test_resumed_and_fresh_requests_keep_pooling_modes_separate(self):
