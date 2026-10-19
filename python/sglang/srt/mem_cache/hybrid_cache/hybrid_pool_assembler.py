@@ -1180,6 +1180,10 @@ def build_hybrid_mamba_stack(
             mtp_draft_device_pools=mtp_draft_device_pools,
             **(node_leader.host_pool_kwargs() if node_leader is not None else {}),
         )
+    if node_leader is not None:
+        # The Mamba host pool below checks free host memory; wait until the
+        # leader's MLA pin shows up in it.
+        node_leader.wait_until_host_pool_ready()
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,

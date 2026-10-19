@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
+from sglang.srt.utils.common import is_mnnvl_fabric_device
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -94,6 +95,10 @@ def auto_size_hicache(
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
     budget = int(host_memory_budget_bytes() * fraction)
+    if get_memory().enable_mla_hicache_per_node and is_mnnvl_fabric_device():
+        # A GB200/GB300 tray has two Graces, each its own NUMA node. The MLA node
+        # leader is membind-ed to one of them but holds the whole tray's copy.
+        budget //= 2
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
