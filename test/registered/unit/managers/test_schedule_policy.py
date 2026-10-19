@@ -245,24 +245,14 @@ class TestHRRNPrefillChunkLimit(CustomTestCase):
         req.prefix_indices = []
         return req
 
-    def test_reservation_capped_at_half_budget(self):
-        """HRRN aging cannot see the continuation, so the reservation must leave
-        it at least half the chunk budget; SPF reserves more on the same input."""
-        continuation = self.make_req("continuation", 65536)
-        waiting = [self.make_req(f"r{i}", 1024) for i in range(5)]
-        limit = self.make_policy().shortest_prefill_chunk_limit(
-            continuation, waiting, 8192, 256
-        )
-        self.assertEqual(limit, 4096)
-        spf = SchedulePolicy(
-            policy="shortest-prefill-first",
-            tree_cache=RadixCache.create_simulated(),
-            enable_hierarchical_cache=True,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
-        self.assertLess(
-            spf.shortest_prefill_chunk_limit(continuation, waiting, 8192, 256), limit
+    def test_flag_enables_reservation(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.make_policy().shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256
+            ),
+            2560,
         )
 
     def test_long_head_in_hrrn_order_blocks_reservation(self):

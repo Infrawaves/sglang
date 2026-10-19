@@ -455,18 +455,16 @@ class SchedulePolicy:
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-            cap = budget - page_size
-        elif (
-            self.policy == CacheAwarePolicy.HRRN
-            and self.enable_hrrn_prefill_chunk_limit
+        if (
+            not (
+                self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                or (
+                    self.policy == CacheAwarePolicy.HRRN
+                    and self.enable_hrrn_prefill_chunk_limit
+                )
+            )
+            or budget < 2 * page_size
         ):
-            # The continuation is not in waiting_queue, so HRRN aging cannot
-            # protect it; keep at least half the budget for its progress.
-            cap = budget // 2 // page_size * page_size
-        else:
-            return None
-        if budget < 2 * page_size:
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
@@ -475,7 +473,7 @@ class SchedulePolicy:
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > cap:
+            if work >= remaining or reserved + charge > budget - page_size:
                 break
             reserved += charge
         if not reserved:
