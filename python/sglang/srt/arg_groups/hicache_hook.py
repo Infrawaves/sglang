@@ -11,8 +11,16 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+# Write-back eviction syncs locally: a follower could load shared pages before
+# the leader's D2H into them finishes. Also enforced on runtime attach-storage.
+MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR = (
+    "SGLANG_MLA_HICACHE_PER_NODE_MODE=shm does not support "
+    "--hicache-write-policy write_back."
+)
 
 
 def handle_hicache(server_args: Any):
@@ -53,6 +61,14 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    if cfg.enable_mla_hicache_per_node:
+        mode = envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.get()
+        if mode not in ("broadcast", "shm"):
+            raise ValueError(
+                f"SGLANG_MLA_HICACHE_PER_NODE_MODE must be broadcast or shm, got {mode!r}."
+            )
+        if mode == "shm" and cfg.hicache_write_policy == "write_back":
+            raise ValueError(MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR)
 
     if cfg.disaggregation_decode_host_receive_threshold > 0:
         # The shared host pool must match KV transfer's per-layer buffers.

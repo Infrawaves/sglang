@@ -706,6 +706,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            # Only the rank that owns the shared MLA host copy reads L3 into it.
+            return
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
                 super().register_buffer(buffer)

@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -84,10 +85,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        host_allocator: Optional[HostTensorAllocator] = None,
+        host_buffer_read_only: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        # This rank does not own the MLA host data; the node leader writes it.
+        self.host_buffer_read_only = host_buffer_read_only
 
         if is_dummy:
             self._init_dummy(
@@ -117,6 +122,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             pool_label=pool_label,
+            host_allocator=host_allocator,
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged

@@ -813,6 +813,9 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # --enable-mla-hicache-per-node: "broadcast" (leader H2D, NCCL to local GPUs)
+    # or "shm" (one host copy in shared memory, every GPU does its own H2D).
+    SGLANG_MLA_HICACHE_PER_NODE_MODE = EnvStr("broadcast")
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)

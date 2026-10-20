@@ -168,6 +168,21 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
+def map_shm(fd: int, dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """Map a host tensor that another process allocated with ``alloc_shm``."""
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+    # Both sides derive dims from their own config; a mismatch must not map.
+    actual_bytes = os.fstat(fd).st_size
+    if actual_bytes != alloc_bytes:
+        raise ValueError(
+            f"Shared host buffer is {actual_bytes} bytes, expected {alloc_bytes} "
+            f"for dims={dims} dtype={dtype}."
+        )
+    mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
+    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+
+
 def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
     """Allocate a host tensor via shared memory (/dev/shm).
 

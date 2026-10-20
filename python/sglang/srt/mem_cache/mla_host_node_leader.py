@@ -1,16 +1,25 @@
-"""One MLA KV host copy per node, broadcast to local GPUs over NVLink.
+"""One MLA KV HiCache host copy per node, shared by the local GPUs.
 
 MLA latent KV is identical on every attention-TP rank. With this mode only the
-first rank on each node (the leader) keeps MLA KV in its HiCache host pool and
-loads it from L3; the other local ranks (followers) keep an allocator-only
-(#36800 ``is_dummy``) host pool. After the leader's H2D copy, the forward's
-layer-wait hook broadcasts the MLA layers (and packed MTP draft layers) to
-the followers over NCCL, layer by layer, so later layers keep loading while
-earlier ones compute.
+first rank on each node (the leader) writes MLA KV to host and reads it from
+L3; the other local ranks (followers) skip D2H backup, L3 prefetch into host
+and Mooncake registration. SGLANG_MLA_HICACHE_PER_NODE_MODE picks how
+followers get the KV:
 
-PD decode is not supported: its load-back has no forward that waits on the
-layers, so nothing would trigger the broadcast. A decode server falls back to
-the per-rank host copies.
+  broadcast: followers keep an allocator-only (#36800 ``is_dummy``) host pool.
+    After the leader's H2D copy, the forward's layer-wait hook broadcasts the
+    MLA layers (and packed MTP draft layers) to the followers over NCCL, layer
+    by layer, so later layers keep loading while earlier ones compute.
+  shm: the leader allocates the pool in a memfd and sends the fd to the
+    followers over an abstract Unix socket (SCM_RIGHTS). Every rank maps and
+    pins the same pages and does its own H2D.
+
+In both modes the leader's pool is interleaved over the NUMA nodes its local
+ranks are bound to when it can reach them all (leader_host_shares).
+
+PD decode is not supported: broadcast needs a forward that waits on the
+layers, and shm is not validated there. A decode server falls back to
+per-rank host copies.
 
 L3 data, L3 keys and the host page layout are unchanged. KDA/Mamba state is
 not touched: it differs per rank and keeps its own host pool on every rank.
@@ -20,11 +29,15 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import socket
+import uuid
 from typing import Any, Optional
 
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
@@ -35,6 +48,8 @@ from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_scope,
     ranks_per_host,
 )
+from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_shm, map_shm
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -106,6 +121,108 @@ def split_ranks_by_node(group_ranks: list[int], ranks_on_host: int) -> list[list
     return [nodes[node] for node in sorted(nodes)]
 
 
+class NodeSharedHostTensorAllocator(HostTensorAllocator):
+    """The leader allocates a memfd and sends it to every follower; a follower
+    maps the fd it receives. Each side pins its own mapping afterwards."""
+
+    def __init__(
+        self,
+        *,
+        is_follower: bool,
+        peer_sockets: list[socket.socket],
+    ):
+        super().__init__()
+        self.is_follower = is_follower
+        # Leader: one connection per follower. Follower: the leader connection.
+        self.peer_sockets = peer_sockets
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert device == "cpu", device
+        self.dims = dims
+        self.dtype = dtype
+        if self.is_follower:
+            return self._receive(dims, dtype)
+        # Faulted in this thread, so leader_budget_scope's interleave applies.
+        tensor, fd, _ = alloc_shm(dims, dtype)
+        for sock in self.peer_sockets:
+            socket.send_fds(sock, [b"\0"], [fd])
+        # The mapping keeps the memory alive; the fd was only needed to share it.
+        os.close(fd)
+        return tensor
+
+    def _receive(self, dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+        # Blocks until the leader has faulted in the pool, which can take minutes.
+        _, fds, _, _ = socket.recv_fds(self.peer_sockets[0], 1, 1)
+        if not fds:
+            raise RuntimeError(
+                "MLA HiCache node leader closed its socket before sending the "
+                "shared host buffer; see the leader's log."
+            )
+        tensor = map_shm(fds[0], dims, dtype)
+        os.close(fds[0])
+        return tensor
+
+
+def _socket_address(token: str) -> str:
+    # Abstract namespace: nothing on disk, visible only in this network namespace.
+    return f"\0sglang-mla-hicache-{token}"
+
+
+def _connect_node(
+    *,
+    is_follower: bool,
+    node_ranks: list[int],
+    tp_cache_group: torch.distributed.ProcessGroup,
+) -> list[socket.socket]:
+    """Collective over ``tp_cache_group``: connect each follower to its node
+    leader. Any failure raises on every rank of the group."""
+    rank = torch.distributed.get_rank()
+    server = None
+    token = None
+    error = None
+    if not is_follower:
+        # Any failure must still reach the all_reduce below, or followers hang.
+        try:
+            token = uuid.uuid4().hex
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(_socket_address(token))
+            server.listen(len(node_ranks))
+        except Exception as e:
+            error = f"leader setup failed ({e!r})"
+
+    group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+    tokens = [None] * len(group_ranks)
+    torch.distributed.all_gather_object(tokens, token, group=tp_cache_group)
+
+    peer_sockets = []
+    if is_follower:
+        leader_token = tokens[group_ranks.index(node_ranks[0])]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(_socket_address(leader_token))
+        except OSError as e:
+            error = f"cannot reach rank {node_ranks[0]}'s socket ({e})"
+        peer_sockets.append(sock)
+
+    ok = torch.tensor([0 if error else 1], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        ok, op=torch.distributed.ReduceOp.MIN, group=tp_cache_group
+    )
+    if error is not None:
+        logger.error("MLA HiCache node leader: rank %d: %s.", rank, error)
+    if ok.item() == 0:
+        raise RuntimeError(
+            "--enable-mla-hicache-per-node: host-local setup failed on some rank "
+            "(see the error logs). Ranks on one host must share a network "
+            "namespace (one pod)."
+        )
+    if server is not None:
+        # Every follower connected before the all_reduce, so none of these blocks.
+        peer_sockets = [server.accept()[0] for _ in node_ranks[1:]]
+        server.close()
+    return peer_sockets
+
+
 class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
     """Broadcast from the first rank of this node's group instead of rank 0."""
 
@@ -114,79 +231,12 @@ class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
         device_pool,
         group,
         node_ranks: list[int],
-        min_node_size: int,
         cpu_group: Optional[torch.distributed.ProcessGroup] = None,
-        capacity_multiplier: Optional[int] = None,
-        interleave_nodes: tuple[int, ...] = (),
     ):
         super().__init__(device_pool, group, src_global_rank=node_ranks[0])
-        self.node_ranks = node_ranks
-        # Smallest node group in the TP group; the same on every rank.
-        self.min_node_size = min_node_size
-        # Host KV capacity in per-rank shares: the smallest leader_host_shares
-        # in the TP group, so every rank sizes its allocator the same.
-        self.capacity_multiplier = (
-            min_node_size if capacity_multiplier is None else capacity_multiplier
-        )
-        # NUMA nodes the leader interleaves its MLA host pool over; empty
-        # when the group sits on one node.
-        self.interleave_nodes = interleave_nodes
         self.is_src = torch.distributed.get_rank() == node_ranks[0]
         # The TP CPU (gloo) group, for startup barriers across all node groups.
         self.cpu_group = cpu_group
-
-    @classmethod
-    def build_for_node(
-        cls,
-        device_pool,
-        tp_group: torch.distributed.ProcessGroup,
-        attn_tp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> Optional[NodeLeaderMLABroadcaster]:
-        """World-collective: every rank must call this, in the same order."""
-        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
-
-        base_group = tp_group
-        if is_dp_attention_enabled() and attn_tp_group is not None:
-            base_group = attn_tp_group
-        group_ranks = torch.distributed.get_process_group_ranks(base_group)
-        rank = torch.distributed.get_rank()
-        node_groups = split_ranks_by_node(list(group_ranks), ranks_per_host())
-        node_ranks = next(ranks for ranks in node_groups if rank in ranks)
-        # Each rank passes its own node group. The CUDA path all-gathers every
-        # rank's group and builds all of them in the same order, so differing
-        # lists across nodes are expected here.
-        group = create_custom_parallel_group(group_ranks=node_ranks, backend="nccl")
-        # Every rank sees every node group, so all ranks decide together: a
-        # one-rank node would otherwise leave its rank with a different host
-        # capacity from the rest of the TP group.
-        min_node_size = min(len(ranks) for ranks in node_groups)
-        if min_node_size <= 1:
-            return None
-        # Only this rank knows its NUMA binding; base_group is the TP CPU
-        # (gloo) group, and all_gather_object orders results by group rank.
-        infos: list[Optional[tuple[int, Optional[frozenset[int]]]]] = [None] * len(
-            group_ranks
-        )
-        torch.distributed.all_gather_object(infos, local_numa_info(), group=base_group)
-        numa_of = {r: info[0] for r, info in zip(group_ranks, infos)}
-        allowed_of = {r: info[1] for r, info in zip(group_ranks, infos)}
-        shares = {
-            tuple(ranks): leader_host_shares(ranks, numa_of, allowed_of[ranks[0]])
-            for ranks in node_groups
-        }
-        capacity_multiplier = min(count for count, _ in shares.values())
-        interleave_nodes = shares[tuple(node_ranks)][1]
-        broadcaster = cls(
-            device_pool,
-            group,
-            node_ranks,
-            min_node_size,
-            base_group,
-            capacity_multiplier,
-            interleave_nodes,
-        )
-        broadcaster._warmup_group()
-        return broadcaster
 
 
 class _PendingLoad(msgspec.Struct):
@@ -196,8 +246,8 @@ class _PendingLoad(msgspec.Struct):
     next_slot: int = 0
 
 
-class NodeLeaderMLAContext(msgspec.Struct):
-    """State of the node-leader path; ``None`` everywhere when it is off."""
+class NodeLeaderMLABroadcast(msgspec.Struct):
+    """Broadcast-mode state; the controller's ``mla_dedup_context``."""
 
     broadcaster: NodeLeaderMLABroadcaster
     # (transfer layer id, MLA device layer id), sorted by transfer layer id.
@@ -209,44 +259,6 @@ class NodeLeaderMLAContext(msgspec.Struct):
     @property
     def is_follower(self) -> bool:
         return not self.broadcaster.is_src
-
-    @property
-    def node_size(self) -> int:
-        return len(self.broadcaster.node_ranks)
-
-    def host_pool_kwargs(self) -> dict:
-        """Every rank sizes the KV allocator for capacity_multiplier ranks; only
-        the leader backs it with memory. The multiplier is the same on every
-        rank of the TP group, so all of them see the same host capacity."""
-        return {
-            "is_dummy": self.is_follower,
-            "capacity_multiplier": self.broadcaster.capacity_multiplier,
-        }
-
-    @contextlib.contextmanager
-    def leader_budget_scope(self):
-        """Scope for building this rank's MLA host pool.
-
-        The host budget is split evenly across local ranks, and the leader
-        holds the only MLA copy for capacity_multiplier of them, so it may
-        claim their shares. When those ranks sit on several NUMA nodes, the
-        pool is interleaved over them so each node keeps its own ranks'
-        share instead of the leader's node taking all of it.
-        """
-        if self.is_follower:
-            yield
-            return
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                host_memory_budget_scope(
-                    host_memory_budget_bytes() * self.broadcaster.capacity_multiplier
-                )
-            )
-            if self.broadcaster.interleave_nodes:
-                from sglang.srt.utils.numa_utils import interleave_memory
-
-                stack.enter_context(interleave_memory(self.broadcaster.interleave_nodes))
-            yield
 
     def wait_until_host_pool_ready(self) -> None:
         """Block until the leader has pinned its MLA host pool.
@@ -353,6 +365,55 @@ class NodeLeaderMLAContext(msgspec.Struct):
         return translate(indices)
 
 
+class NodeLeaderMLAContext(msgspec.Struct, frozen=True):
+    """State of the per-node MLA host copy; ``None`` everywhere when it is off.
+    Exactly one of ``broadcast`` and ``shared_allocator`` is set."""
+
+    is_follower: bool
+    # Host KV capacity in per-rank shares: the smallest leader_host_shares in
+    # the TP group, so every rank sizes its allocator the same.
+    capacity_multiplier: int
+    # NUMA nodes the leader interleaves its MLA host pool over; empty when its
+    # node group sits on one node or cannot be interleaved.
+    interleave_nodes: tuple[int, ...]
+    broadcast: Optional[NodeLeaderMLABroadcast]
+    shared_allocator: Optional[NodeSharedHostTensorAllocator]
+
+    def host_pool_kwargs(self) -> dict:
+        """Every rank sizes the KV pool for capacity_multiplier ranks, so all
+        ranks of the TP group see the same host capacity."""
+        return {
+            "capacity_multiplier": self.capacity_multiplier,
+            "is_dummy": self.is_follower and self.broadcast is not None,
+            "host_allocator": self.shared_allocator,
+            "host_buffer_read_only": self.is_follower,
+        }
+
+    @contextlib.contextmanager
+    def leader_budget_scope(self):
+        """Scope for building this rank's MLA host pool.
+
+        The host budget is split evenly across local ranks; the node's one MLA
+        copy may claim capacity_multiplier ranks' shares. The leader faults
+        its pool in here, so interleaving it over the ranks' NUMA nodes keeps
+        each node at its own ranks' share.
+        """
+        if self.is_follower:
+            yield
+            return
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                host_memory_budget_scope(
+                    host_memory_budget_bytes() * self.capacity_multiplier
+                )
+            )
+            if self.interleave_nodes:
+                from sglang.srt.utils.numa_utils import interleave_memory
+
+                stack.enter_context(interleave_memory(self.interleave_nodes))
+            yield
+
+
 def maybe_create_node_leader_context(
     kv_pool,
     full_layer_mapping: dict[int, int],
@@ -363,7 +424,7 @@ def maybe_create_node_leader_context(
     """Create the context before host-pool allocation, or return ``None``."""
     if not get_memory().enable_mla_hicache_per_node:
         return None
-    # Rank-independent, so every rank skips the collective below together.
+    # Rank-independent, so every rank skips the collectives below together.
     if not mla_host_dedup_eligible(kv_pool, None) or not all(
         mla_host_dedup_eligible(pool, None) for pool in draft_pools
     ):
@@ -372,7 +433,7 @@ def maybe_create_node_leader_context(
         )
         return None
     if get_disagg().disaggregation_mode == "decode":
-        # Decode load-back has no forward to run the layer-wait hook.
+        # Broadcast needs a forward to run the layer-wait hook; shm is unvalidated.
         logger.warning("MLA HiCache node leader inactive: not supported on PD decode.")
         return None
     if get_parallel().dcp_enabled:
@@ -380,29 +441,94 @@ def maybe_create_node_leader_context(
         # same MLA KV. Rank-independent, checked before the collective.
         logger.warning("MLA HiCache node leader inactive: not supported with DCP.")
         return None
-    broadcaster = NodeLeaderMLABroadcaster.build_for_node(
-        kv_pool, tp_group, attn_tp_group
-    )
-    if broadcaster is None:
+    mode = envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.get()
+    base_group = tp_group
+    if is_dp_attention_enabled() and attn_tp_group is not None:
+        base_group = attn_tp_group
+    group_ranks = list(torch.distributed.get_process_group_ranks(base_group))
+    node_groups = split_ranks_by_node(group_ranks, ranks_per_host())
+    rank = torch.distributed.get_rank()
+    node_ranks = next(ranks for ranks in node_groups if rank in ranks)
+    nccl_group = None
+    if mode == "broadcast":
+        from sglang.srt.distributed.parallel_state import (
+            create_custom_parallel_group,
+        )
+
+        # World-collective, so it runs before the size check below. Each rank
+        # passes its own node group; the CUDA path all-gathers every rank's
+        # group and builds all of them in the same order.
+        nccl_group = create_custom_parallel_group(
+            group_ranks=node_ranks, backend="nccl"
+        )
+    # Every rank sees every node group, so all ranks decide together: a
+    # one-rank node would otherwise leave its rank with a different host
+    # capacity from the rest of the TP group.
+    min_node_size = min(len(ranks) for ranks in node_groups)
+    if min_node_size <= 1:
         logger.info("MLA HiCache node leader inactive: one rank on this node.")
         return None
-    for pool in draft_pools:
-        # Drafts reuse the target's staging buffer.
-        assert pool.kv_buffer[0].dtype == broadcaster.kv_staging.dtype
-    context = NodeLeaderMLAContext(
-        broadcaster=broadcaster,
-        mla_layers=sorted(full_layer_mapping.items()),
-        draft_pools=tuple(draft_pools),
+    # Only this rank knows its NUMA binding; all_gather_object orders results
+    # by group rank. Runs in both modes, before any mode-specific collective.
+    infos: list[Optional[tuple[int, Optional[frozenset[int]]]]] = [None] * len(
+        group_ranks
+    )
+    torch.distributed.all_gather_object(infos, local_numa_info(), group=base_group)
+    numa_of = {r: info[0] for r, info in zip(group_ranks, infos)}
+    allowed_of = {r: info[1] for r, info in zip(group_ranks, infos)}
+    shares = {
+        tuple(ranks): leader_host_shares(ranks, numa_of, allowed_of[ranks[0]])
+        for ranks in node_groups
+    }
+    capacity_multiplier = min(count for count, _ in shares.values())
+    interleave_nodes = shares[tuple(node_ranks)][1]
+    is_follower = rank != node_ranks[0]
+    broadcast = shared_allocator = None
+    if mode == "broadcast":
+        broadcaster = NodeLeaderMLABroadcaster(
+            device_pool=kv_pool,
+            group=nccl_group,
+            node_ranks=node_ranks,
+            cpu_group=base_group,
+        )
+        broadcaster._warmup_group()
+        for pool in draft_pools:
+            # Drafts reuse the target's staging buffer.
+            assert pool.kv_buffer[0].dtype == broadcaster.kv_staging.dtype
+        broadcast = NodeLeaderMLABroadcast(
+            broadcaster=broadcaster,
+            mla_layers=sorted(full_layer_mapping.items()),
+            draft_pools=tuple(draft_pools),
+        )
+    else:
+        peer_sockets = _connect_node(
+            is_follower=is_follower,
+            node_ranks=node_ranks,
+            tp_cache_group=base_group,
+        )
+        shared_allocator = NodeSharedHostTensorAllocator(
+            is_follower=is_follower, peer_sockets=peer_sockets
+        )
+    layer_counts = (
+        ""
+        if broadcast is None
+        else f", mla_layers={len(broadcast.mla_layers)}, "
+        f"draft_layers={len(broadcast.draft_pools)}"
     )
     logger.info(
-        "MLA HiCache node leader enabled: node_ranks=%s, role=%s, "
-        "capacity_multiplier=%d, interleave_nodes=%s, mla_layers=%d, "
-        "draft_layers=%d",
-        broadcaster.node_ranks,
-        "follower" if context.is_follower else "leader",
-        broadcaster.capacity_multiplier,
-        list(broadcaster.interleave_nodes),
-        len(context.mla_layers),
-        len(context.draft_pools),
+        "MLA HiCache node leader enabled: mode=%s, node_ranks=%s, role=%s, "
+        "capacity_multiplier=%d, interleave_nodes=%s%s",
+        mode,
+        node_ranks,
+        "follower" if is_follower else "leader",
+        capacity_multiplier,
+        list(interleave_nodes),
+        layer_counts,
     )
-    return context
+    return NodeLeaderMLAContext(
+        is_follower=is_follower,
+        capacity_multiplier=capacity_multiplier,
+        interleave_nodes=interleave_nodes,
+        broadcast=broadcast,
+        shared_allocator=shared_allocator,
+    )

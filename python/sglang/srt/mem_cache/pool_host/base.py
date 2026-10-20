@@ -14,6 +14,7 @@ import torch
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
@@ -157,6 +158,7 @@ class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
     shared_allocation_domain = None
+    host_buffer_read_only = False
 
     def __init__(
         self,
@@ -172,6 +174,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
         *,
         pool_label: str = "kv",
+        host_allocator: Optional[HostTensorAllocator] = None,
     ):
         self.device_pool = device_pool
         self.pool_label = pool_label
@@ -187,7 +190,11 @@ class HostKVCache(abc.ABC):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = (
+            get_allocator_from_storage(allocator_type)
+            if host_allocator is None
+            else host_allocator
+        )
         self.can_use_write_back_jit = False
 
         self.dtype = device_pool.store_dtype
@@ -219,9 +226,14 @@ class HostKVCache(abc.ABC):
                 device_capacity,
             )
 
-        # Verify there is enough available host memory.
+        # Verify there is enough available host memory. A read-only pool maps
+        # the node leader's copy and allocates nothing, so it skips the check.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
+        available_bytes = (
+            requested_bytes
+            if self.host_buffer_read_only
+            else host_memory_budget_bytes(requested_bytes)
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

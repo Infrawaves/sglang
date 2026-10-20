@@ -150,6 +150,8 @@ def build_kv_host_pool(
     pool_label: str = "kv",
     is_dummy: bool = False,
     capacity_multiplier: int = 1,
+    host_allocator: Optional[Any] = None,
+    host_buffer_read_only: bool = False,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -158,6 +160,10 @@ def build_kv_host_pool(
     if is_dummy:
         # Allocator-only MLA host pool (#36800): same token capacity, no memory.
         kwargs["is_dummy"] = True
+    if host_allocator is not None:
+        kwargs["host_allocator"] = host_allocator
+    if host_buffer_read_only:
+        kwargs["host_buffer_read_only"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if mtp_draft_device_pools:
@@ -1154,8 +1160,9 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
-    # Built before host allocation (world-collective): it decides whether this
-    # rank's MLA host pool is real (node leader) or allocator-only (follower).
+    # Built before host allocation (world-collective in broadcast mode): it
+    # decides whether this rank's MLA host pool is real, allocator-only or
+    # mapped from the leader.
     from sglang.srt.mem_cache.mla_host_node_leader import (
         maybe_create_node_leader_context,
     )
@@ -1180,10 +1187,10 @@ def build_hybrid_mamba_stack(
             mtp_draft_device_pools=mtp_draft_device_pools,
             **(node_leader.host_pool_kwargs() if node_leader is not None else {}),
         )
-    if node_leader is not None:
+    if node_leader is not None and node_leader.broadcast is not None:
         # The Mamba host pool below checks free host memory; wait until the
         # leader's MLA pin shows up in it.
-        node_leader.wait_until_host_pool_ready()
+        node_leader.broadcast.wait_until_host_pool_ready()
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
@@ -1248,7 +1255,8 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
-        mla_dedup_context=node_leader,
+        mla_host_read_only=node_leader is not None and node_leader.is_follower,
+        mla_dedup_context=None if node_leader is None else node_leader.broadcast,
     )
     return host_pool_group, cache_controller
 

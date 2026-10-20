@@ -225,8 +225,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             op.pool_transfers,
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
-        controller._l2_transfers.side_effect = lambda *args: (
-            HybridCacheController._l2_transfers(controller, *args)
+        controller.mla_host_read_only = False
+        controller.mla_dedup = None
+        controller._l2_transfers.side_effect = lambda *args, **kwargs: (
+            HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
@@ -362,6 +364,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
         host_pool.load_to_device_per_layer = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_host_read_only = False
+        controller.mla_dedup = None
         entry = PoolEntry(
             name=PoolName.KV,
             host_pool=host_pool,
@@ -1118,6 +1122,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         captured = []
 
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_host_read_only = False
         controller.write_queue = [
             CacheOperation(
                 host_indices=_indices(0, 4),
@@ -1165,6 +1170,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ],
         )
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_host_read_only = False
         controller.write_queue = [op]
         controller.io_backend = "kernel"
         controller.mem_pool_host = _host_group_stub(
@@ -1214,6 +1220,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 captured.append((host_indices, device_indices))
 
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_host_read_only = False
         controller.write_queue = []
         controller.io_backend = "kernel"
         controller.mem_pool_host = HostPoolGroup(
