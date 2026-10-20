@@ -75,18 +75,9 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        // `--no-tokenizer`: leave the registry empty. Consumers treat a missing
-        // entry as untokenizable: no input_ids forwarding, size-estimated load,
-        // and ModelNotFound from `/v1/tokenize`.
-        let Some(tokenizer_path) = m.tokenizer_path.as_deref() else {
-            tracing::info!(model = %m.id,
-                "--no-tokenizer: routing without tokenization; /v1/tokenize and \
-                 /v1/detokenize are unavailable and prompts are tokenized by the engine");
-            return Ok(me);
-        };
-        let t = adapter::load(tokenizer_path)?;
+        let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
-        match ChatFormatter::load(&m.id, tokenizer_path) {
+        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
@@ -208,7 +199,7 @@ mod tests {
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
-                tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
@@ -353,18 +344,9 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.model.tokenizer_path = Some("/nonexistent.json".into());
+        c.model.tokenizer_path = "/nonexistent.json".into();
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
-    }
-
-    #[test]
-    fn no_tokenizer_leaves_registry_empty() {
-        let mut c = cfg();
-        c.model.tokenizer_path = None;
-        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
-        assert!(reg.get(&c.model.id).is_none());
-        assert!(!reg.has_chat_formatter(&c.model.id));
     }
 
     #[test]
@@ -426,7 +408,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "{% invalid %}").unwrap();
         let mut cfg = cfg();
-        cfg.model.tokenizer_path = Some(tok.to_str().unwrap().to_owned());
+        cfg.model.tokenizer_path = tok.to_str().unwrap().to_owned();
 
         let reg = TokenizerRegistry::load_from_config(&cfg).unwrap();
         let tokenizer = reg.get(&cfg.model.id).unwrap();

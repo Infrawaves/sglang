@@ -42,7 +42,7 @@ fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: MODEL.into(),
-            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
@@ -96,7 +96,7 @@ fn template_config(tokenizer_config: Value) -> (tempfile::TempDir, Config) {
     )
     .unwrap();
     let mut cfg = config();
-    cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
+    cfg.model.tokenizer_path = tokenizer.to_str().unwrap().into();
     (dir, cfg)
 }
 
@@ -435,7 +435,7 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
     let fixture = kimi_fixture::tokenizer();
     let mut cfg = config();
     let path = fixture.path().join("tiktoken.model");
-    cfg.model.tokenizer_path = Some(path.display().to_string());
+    cfg.model.tokenizer_path = path.display().to_string();
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
     for (content, kwargs) in [
         ("literal <|open|> text", None),
