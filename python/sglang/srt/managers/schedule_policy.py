@@ -245,8 +245,10 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_hrrn_prefill_chunk_limit: bool = False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        self.enable_hrrn_prefill_chunk_limit = enable_hrrn_prefill_chunk_limit
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
@@ -454,7 +456,13 @@ class SchedulePolicy:
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            not (
+                self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                or (
+                    self.policy == CacheAwarePolicy.HRRN
+                    and self.enable_hrrn_prefill_chunk_limit
+                )
+            )
             or budget < 2 * page_size
         ):
             return None
@@ -1550,9 +1558,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                self.chunked_req_limit is not None
+                or get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
