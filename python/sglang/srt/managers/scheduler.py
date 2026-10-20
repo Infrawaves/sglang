@@ -4061,13 +4061,19 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        chunk_limit_budget = adder.rem_chunk_tokens or 0
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
+                chunk_limit_budget,
                 self.page_size,
+                max_reqs=adder.reservable_new_reqs(
+                    self.get_num_allocatable_reqs(
+                        len(running_batch.reqs), running_batch=running_batch
+                    )
+                ),
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4188,6 +4194,12 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        self.policy.record_chunk_limit_outcome(
+            limit=adder.chunked_req_limit,
+            budget=chunk_limit_budget,
+            leftover_tokens=adder.rem_chunk_tokens or 0,
+        )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
