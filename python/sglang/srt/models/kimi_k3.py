@@ -11,6 +11,7 @@ import os
 import re
 from array import array
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -617,6 +618,24 @@ class KimiK3MoE(nn.Module):
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
+        # When the shared-expert group is its own communicator (shared TP <
+        # attn TP), the subgroup AG/RS can leave the critical path too: the
+        # whole AG -> MLP -> RS chain runs on the side stream. A communicator
+        # shared with the SP RS/AG (attn TP / full TP) stays on the current
+        # stream, since NCCL gives no ordering across streams on one comm.
+        # Fences keep the side NCCL kernels off MegaMoE: AG must land before
+        # the routed experts start, RS is issued only after they are enqueued,
+        # so the persistent cross-rank MegaMoE never co-runs with a cross-rank
+        # collective. The Shared MLP GEMMs still overlap MegaMoE, as in SBO.
+        # NPU keeps HCCL collectives on the current stream (or uses the
+        # fine-grained dispatch hooks), so side comm is CUDA-only.
+        self._shared_experts_side_comm = not _is_npu and (
+            self._uses_shared_experts_side_comm(
+                self._sbo_shared_overlap and self._shared_experts_tp_comm,
+                self._shared_experts_tp_group,
+                (parallel.attn_tp_group, parallel.tp_group),
+            )
+        )
 
         if self.use_latent_moe:
             latent_quant_config = (
@@ -974,12 +993,8 @@ class KimiK3MoE(nn.Module):
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
-        # Top-k tensors were allocated on alt_stream but are consumed by the
-        # routed experts on current_stream. Tell the caching allocator about
-        # that lifetime before alt_stream is reused for the shared experts.
-        for value in topk_output:
-            if isinstance(value, torch.Tensor):
-                value.record_stream(current_stream)
+        # No record_stream on the top-k tensors (see _forward_unfused): every
+        # later alt_stream allocation follows an alt.wait_stream(current).
         return topk_output, routed_input
 
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
@@ -989,29 +1004,77 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _uses_shared_experts_side_comm(eligible, shared_group, sp_groups) -> bool:
+        """Side-stream Shared AG/RS needs its own communicator: one shared
+        with the SP RS/AG would see collectives from two streams."""
+        return bool(eligible) and all(shared_group is not g for g in sp_groups)
+
+    def _gather_shared_expert_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        gathered_hidden_states = self._alloc_shared_gather_output(hidden_states)
+        return self._gather_shared_expert_inputs_into(
+            gathered_hidden_states, hidden_states
+        )
+
+    # With side comm the Shared AG/RS buffers stay plain allocations on
+    # purpose. Registered as symmetric memory, NCCL 2.29 on a size-2 comm (no
+    # NVLS multicast) moves the AG to a copy-engine path (~320 us vs ~170 us
+    # RING_LL per layer, with pageable HtoD flag copies) and the RS to the LD
+    # symmetric kernel (~290 us vs ~95 us), both on the critical path. Groups
+    # aliased to attn TP / TP keep the symmetric allocation they always had.
+    def _alloc_shared_gather_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         group = self._shared_experts_tp_group
+        assert group is not None
+        shape = (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
+        if self._shared_experts_side_comm:
+            return hidden_states.new_empty(shape)
         # The attention DP buffer spans the entire attention-TP replica.
         # Size this buffer from the subgroup's actual token shards instead.
         with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-            gathered = hidden_states.new_empty(
-                (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
-            )
-        group.all_gather_into_tensor(gathered, hidden_states)
-        return gathered
+            return hidden_states.new_empty(shape)
+
+    def _gather_shared_expert_inputs_into(
+        self, gathered_hidden_states: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        group = self._shared_experts_tp_group
+        assert group is not None
+        with self._shared_experts_pynccl():
+            group.all_gather_into_tensor(gathered_hidden_states, hidden_states)
+        return gathered_hidden_states
 
     def _reduce_scatter_shared_experts(
-        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        local_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output = torch.empty_like(hidden_states)
-        self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
-        return output
+        group = self._shared_experts_tp_group
+        assert group is not None
+        if local_output is None:
+            local_output = torch.empty_like(hidden_states)
+        with self._shared_experts_pynccl():
+            group.reduce_scatter_tensor(local_output, shared_output)
+        return local_output
+
+    def _shared_experts_pynccl(self):
+        # pynccl is disabled outside graph capture unless --enable-symm-mem;
+        # force it so eager Shared AG/RS skip the c10d CPU overhead too. Only
+        # for the shared group's own communicator: when it aliases attn TP /
+        # TP (tp8), its backend choice stays whatever the SP collectives use.
+        pynccl_comm = self._shared_experts_tp_group.pynccl_comm
+        if not self._shared_experts_side_comm or pynccl_comm is None:
+            return nullcontext()
+        return pynccl_comm.change_state(enable=True)
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
+        """Run shared experts while EP-A2A tokens stay rank-local."""
         if not self._shared_experts_tp_comm:
             return self.shared_experts(hidden_states)
 
+        # The Shared MLP returns TP partials for the subgroup's gathered rows.
+        # Only the subgroup RS completes them and restores local row ownership.
         gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
         return self._reduce_scatter_shared_experts(
@@ -1066,9 +1129,49 @@ class KimiK3MoE(nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
+        shared_gather_event = None
+        # Side-comm collective buffers: allocated on the current stream and
+        # kept alive here until the tail join, so they need no record_stream.
+        shared_comm_buffers = None
+        # SBO input read on the side stream, held until the tail join for the
+        # same reason (it may be a gathered tensor local to issue_shared).
+        shared_input_keepalive = None
+        # Nothing in this MoE block is record_stream'd (except the NPU
+        # fine-grained path, which never uses symm mem). Under --enable-symm-mem
+        # the Shared MLP output (down_proj) and the top-k tensors are allocated
+        # from the symmetric pool on alt_stream, and record_stream makes their
+        # reuse wait on event completion, which differs per rank. One rank then
+        # ncclMemAlloc's a new segment while another reuses a block, and the
+        # collective ncclCommWindowRegister on the next symm-context exit
+        # mismatches (hang / "remote process exited"). Lifetimes are ordered
+        # instead: the current stream joins shared_event before these tensors
+        # can be freed, and every alt_stream use first waits on the current
+        # stream, so a freed alt_stream block is reused only after its readers.
+
+        def wait_shared_gather():
+            # Fence before the routed experts: the side-stream AG must not
+            # co-run with MegaMoE (see _shared_experts_side_comm).
+            if shared_gather_event is not None:
+                torch.cuda.current_stream().wait_event(shared_gather_event)
+
+        def issue_shared_reduce_scatter():
+            # Issued after the routed experts are enqueued, so the side RS
+            # waits for both the Shared MLP and MegaMoE, then overlaps the
+            # latent norm / up-proj tail on the current stream.
+            nonlocal shared_output, shared_event
+            if shared_gather_event is None:
+                return
+            local_output = shared_comm_buffers[1]
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._reduce_scatter_shared_experts(
+                    shared_output, hidden_states, local_output
+                )
+                shared_event = self.alt_stream.record_event()
 
         def issue_shared():
-            nonlocal shared_input, shared_output, shared_event
+            nonlocal shared_input, shared_output, shared_event, shared_gather_event
+            nonlocal shared_comm_buffers, shared_input_keepalive
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if fine_grained_overlap:
@@ -1080,14 +1183,30 @@ class KimiK3MoE(nn.Module):
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
                     shared_input.record_stream(self.alt_stream)
                 return
-            if self._sbo_shared_overlap:
+            if self._shared_experts_side_comm:
+                # AG -> MLP on the side stream; RS follows in
+                # issue_shared_reduce_scatter once the routed experts are in.
+                # The current stream joins shared_event before these buffers
+                # (and the caller-owned hidden_states read by the AG) can be
+                # freed, so they need no record_stream.
+                gathered = self._alloc_shared_gather_output(hidden_states)
+                local_output = torch.empty_like(hidden_states)
+                shared_comm_buffers = (gathered, local_output)
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_input = self._gather_shared_expert_inputs_into(
+                        gathered, hidden_states
+                    )
+                    shared_gather_event = self.alt_stream.record_event()
+                    shared_output = self.shared_experts(shared_input)
+            elif self._sbo_shared_overlap:
                 current_stream = torch.cuda.current_stream()
                 # Keep HCCL collectives on the current stream. The alternate
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                shared_input.record_stream(self.alt_stream)
+                shared_input_keepalive = shared_input
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1097,11 +1216,14 @@ class KimiK3MoE(nn.Module):
 
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
-                return (
+                wait_shared_gather()
+                expert_output = (
                     self._forward_mega_experts(expert_input, topk_output)
                     if self._use_mega_moe
                     else self.experts(expert_input, topk_output)
                 )
+                issue_shared_reduce_scatter()
+                return expert_output
 
             def pre_dispatch(dispatcher, dispatch_input, dispatch_topk):
                 nonlocal shared_output, shared_compute_event
@@ -1147,8 +1269,11 @@ class KimiK3MoE(nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
-            if self._shared_experts_tp_comm and not fine_grained_overlap:
+            if (
+                self._shared_experts_tp_comm
+                and not fine_grained_overlap
+                and not self._shared_experts_side_comm
+            ):
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
                 )
@@ -1176,7 +1301,9 @@ class KimiK3MoE(nn.Module):
             issue_shared()
 
         if not self.use_latent_moe:
+            wait_shared_gather()
             expert_output = self.experts(hidden_states, topk_output)
+            issue_shared_reduce_scatter()
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output

@@ -283,3 +283,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local dev notes, traces and PR drafts
+dev-notes/
