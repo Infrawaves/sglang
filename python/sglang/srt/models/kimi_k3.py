@@ -1052,17 +1052,22 @@ class KimiK3MoE(nn.Module):
             gathered_hidden_states, hidden_states
         )
 
-    # The Shared AG/RS buffers stay plain allocations on purpose. Registered
-    # as symmetric memory, NCCL 2.29 on a size-2 comm (no NVLS multicast)
-    # moves the AG to a copy-engine path (~320 us vs ~170 us RING_LL per
-    # layer, with pageable HtoD flag copies) and the RS to the LD symmetric
-    # kernel (~290 us vs ~95 us), both on the critical path.
+    # With side comm the Shared AG/RS buffers stay plain allocations on
+    # purpose. Registered as symmetric memory, NCCL 2.29 on a size-2 comm (no
+    # NVLS multicast) moves the AG to a copy-engine path (~320 us vs ~170 us
+    # RING_LL per layer, with pageable HtoD flag copies) and the RS to the LD
+    # symmetric kernel (~290 us vs ~95 us), both on the critical path. Groups
+    # aliased to attn TP / TP keep the symmetric allocation they always had.
     def _alloc_shared_gather_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         group = self._shared_experts_tp_group
         assert group is not None
-        return hidden_states.new_empty(
-            (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
-        )
+        shape = (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
+        if self._shared_experts_side_comm:
+            return hidden_states.new_empty(shape)
+        # The attention DP buffer spans the entire attention-TP replica.
+        # Size this buffer from the subgroup's actual token shards instead.
+        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+            return hidden_states.new_empty(shape)
 
     def _gather_shared_expert_inputs_into(
         self, gathered_hidden_states: torch.Tensor, hidden_states: torch.Tensor
