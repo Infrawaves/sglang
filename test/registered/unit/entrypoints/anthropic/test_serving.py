@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -371,6 +372,59 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.usage.input_tokens, 6)
         self.assertEqual(anthropic_response.usage.output_tokens, 2)
         self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 4)
+
+    def test_message_handlers_do_not_inherit_chat_cache_accounting(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                serving = self._serving()
+                request = self._anthropic_request(
+                    stream=streaming,
+                    cache_user_id="gateway-user",
+                    prompt_cache_options={"mode": "implicit", "ttl": "1h"},
+                )
+                chat_request = serving._convert_to_chat_completion_request(request)
+                self.assertIsNone(chat_request.cache_user_id)
+                self.assertIsNone(chat_request.prompt_cache_options)
+
+                # The shared Chat converter supplies the 5m default when
+                # accounting is enabled. Neither Messages handler may keep it.
+                adapted_request = SimpleNamespace(cache_ttl_seconds=300)
+                chat = serving.openai_serving_chat
+                chat._validate_request = Mock(return_value=None)
+                chat._convert_to_internal_request = Mock(
+                    return_value=(adapted_request, chat_request)
+                )
+                chat.tokenizer_manager.create_abort_task = Mock(return_value=None)
+                chat._handle_non_streaming_request = AsyncMock(
+                    return_value=ChatCompletionResponse(
+                        id="chatcmpl-test",
+                        model="test-model",
+                        choices=[
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        usage={"prompt_tokens": 10, "completion_tokens": 1},
+                    )
+                )
+
+                async def handle():
+                    if streaming:
+                        response = await serving._handle_streaming(
+                            chat_request, request, object()
+                        )
+                        await response.body_iterator.aclose()
+                    else:
+                        response = await serving._handle_non_streaming(
+                            chat_request, request, object()
+                        )
+                    return response
+
+                response = asyncio.run(handle())
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNone(adapted_request.cache_ttl_seconds)
 
     def test_tool_result_search_result_content_is_flattened(self):
         request = AnthropicMessagesRequest.model_validate(

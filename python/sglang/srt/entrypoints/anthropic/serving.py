@@ -12,12 +12,11 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.anthropic.protocol import (
-    AnthropicCacheCreation,
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
@@ -45,7 +44,6 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     is_server_tool,
 )
 from sglang.srt.entrypoints.openai.protocol import (
-    CacheUsage,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
@@ -54,7 +52,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.template_detection import detect_inline_system_support
 
@@ -123,33 +120,12 @@ def _anthropic_usage_from_openai(
             output_tokens=0 if include_output else None,
         )
 
-    usage_fields: dict[str, Any] = {}
+    usage_fields: dict[str, int] = {}
     cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
-        cache = getattr(usage, "cache_usage", None)
-        if cache is not None:
-            cache = CacheUsage.model_validate(cache)
-            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-            cached_input_tokens = cache.read_tokens + cache.write_tokens
-            if cached_input_tokens > prompt_tokens:
-                raise ValueError("Cache read/write tokens exceed prompt_tokens.")
-            usage_fields.update(
-                input_tokens=prompt_tokens - cached_input_tokens,
-                cache_read_input_tokens=cache.read_tokens,
-                cache_creation_input_tokens=cache.write_tokens,
-                cache_creation=AnthropicCacheCreation(
-                    ephemeral_5m_input_tokens=(
-                        cache.write_tokens if cache.ttl_seconds == 300 else 0
-                    ),
-                    ephemeral_1h_input_tokens=(
-                        cache.write_tokens if cache.ttl_seconds == 3600 else 0
-                    ),
-                ),
-            )
-        else:
-            usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-            if cached_tokens:
-                usage_fields["cache_read_input_tokens"] = cached_tokens
+        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+        if cached_tokens:
+            usage_fields["cache_read_input_tokens"] = cached_tokens
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -591,12 +567,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
-            "cache_user_id": anthropic_request.cache_user_id,
         }
-        if anthropic_request.prompt_cache_options is not None:
-            request_data["prompt_cache_options"] = (
-                anthropic_request.prompt_cache_options
-            )
 
         if anthropic_request.temperature is not None:
             request_data["temperature"] = anthropic_request.temperature
@@ -761,27 +732,6 @@ class AnthropicServing:
 
         return chat_request
 
-    async def _run_request_conversion(
-        self, chat_request: ChatCompletionRequest, raw_request: Request
-    ):
-        (
-            adapted_request,
-            processed_request,
-        ) = await self.openai_serving_chat._run_request_conversion(
-            chat_request, raw_request
-        )
-        if (
-            raw_request is not None
-            and isinstance(adapted_request, GenerateReqInput)
-            and adapted_request.cache_ttl_seconds is not None
-            and isinstance(adapted_request.cache_user_id, str)
-            and adapted_request.cache_user_id.strip()
-        ):
-            # Conversion may run in a child process. Publish the validated hash
-            # on the parent's trusted state before TokenizerManager resolves it.
-            raw_request.state.cache_identity = adapted_request.cache_user_id
-        return adapted_request, processed_request
-
     async def _handle_non_streaming(
         self,
         chat_request: ChatCompletionRequest,
@@ -805,9 +755,13 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = await self._run_request_conversion(
-                chat_request, raw_request
+            adapted_request, processed_request = (
+                self.openai_serving_chat._convert_to_internal_request(
+                    chat_request, raw_request
+                )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
@@ -816,18 +770,6 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
-        except HTTPException as e:
-            return self._error_response(
-                status_code=e.status_code,
-                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
-                message=str(e.detail),
-            )
-        except ValueError as e:
-            return self._error_response(
-                status_code=400,
-                error_type="invalid_request_error",
-                message=str(e),
-            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -865,18 +807,16 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = await self._run_request_conversion(
-                chat_request, raw_request
+            adapted_request, processed_request = (
+                self.openai_serving_chat._convert_to_internal_request(
+                    chat_request, raw_request
+                )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
-        except ValueError as e:
-            return self._error_response(
-                status_code=400,
-                error_type="invalid_request_error",
-                message=str(e),
-            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -886,43 +826,13 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
-        generator = self._generate_anthropic_stream(
-            adapted_request, processed_request, anthropic_request, raw_request
-        )
-        stream = generator
-        if getattr(adapted_request, "cache_ttl_seconds", None) is not None:
-            try:
-                # Resolve cache accounting before committing HTTP 200.
-                first_event = await generator.__anext__()
-            except asyncio.CancelledError:
-                await generator.aclose()
-                raise
-            except HTTPException as e:
-                await generator.aclose()
-                return self._error_response(
-                    status_code=e.status_code,
-                    error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
-                    message=str(e.detail),
-                )
-            except StopAsyncIteration:
-                return self._error_response(
-                    status_code=500,
-                    error_type="api_error",
-                    message="Backend produced no events",
-                )
-
-            async def prepend_first_event():
-                try:
-                    yield first_event
-                    async for event in generator:
-                        yield event
-                finally:
-                    await generator.aclose()
-
-            stream = prepend_first_event()
-
         return StreamingResponse(
-            stream,
+            self._generate_anthropic_stream(
+                adapted_request,
+                processed_request,
+                anthropic_request,
+                raw_request,
+            ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
                 adapted_request
@@ -951,27 +861,8 @@ class AnthropicServing:
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
-        cache_ttl_seconds = getattr(adapted_request, "cache_ttl_seconds", None)
 
         def _message_start_event(usage) -> MessageStartEvent:
-            # OpenAI exposes aggregate read/write counts. This endpoint has one
-            # TTL per request, so recover its creation tier without adding
-            # private accounting fields to the public OpenAI stream.
-            details = getattr(usage, "prompt_tokens_details", None)
-            write_tokens = getattr(details, "cache_write_tokens", None)
-            if (
-                usage is not None
-                and getattr(usage, "cache_usage", None) is None
-                and cache_ttl_seconds is not None
-                and write_tokens is not None
-            ):
-                read_tokens = details.cached_tokens
-                snapshot = CacheUsage(
-                    ttl_seconds=cache_ttl_seconds,
-                    read_tokens=read_tokens,
-                    write_tokens=write_tokens,
-                )
-                usage = usage.model_copy(update={"cache_usage": snapshot})
             return MessageStartEvent(
                 message=AnthropicMessagesResponse(
                     id=message_id,
@@ -1130,14 +1021,6 @@ class AnthropicServing:
                 break
             except asyncio.CancelledError:
                 raise
-            except HTTPException as e:
-                if not message_started and cache_ttl_seconds is not None:
-                    raise
-                for frame in _flush_on_error(
-                    ERROR_TYPE_MAP.get(e.status_code, "api_error"), str(e.detail)
-                ):
-                    yield frame
-                return
             except ValueError as e:
                 # _generate_chat_stream re-raises ValueError when its own
                 # ``stream_started`` flag is still False — surface as a
@@ -1244,8 +1127,6 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
-                for frame in _ensure_message_started(chunk.usage):
-                    yield frame
                 continue
 
             if not chunk.choices:
@@ -1274,9 +1155,13 @@ class AnthropicServing:
                 or (delta.content is not None and delta.content != "")
                 or chunk.usage
             )
-            # Empty completions wait for the usage-only chunk so message_start
-            # can report their input usage. [DONE] handles streams without usage.
-            if has_delta_payload and not message_started:
+            # The finish_reason chunk should also flip message_started so a
+            # zero-content completion (the path that previously fired the
+            # 'Backend produced no content' error) emits the standard
+            # message_start before [DONE] closes the stream.
+            if (
+                has_delta_payload or choice.finish_reason is not None
+            ) and not message_started:
                 yield _emit(_message_start_event(chunk.usage))
                 message_started = True
 
