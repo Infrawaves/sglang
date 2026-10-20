@@ -910,9 +910,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
 
-    def _cache_request_params(
-        self, request: ChatCompletionRequest, raw_request: Optional[Request]
-    ) -> dict[str, Any]:
+    def _cache_request_params(self, request: ChatCompletionRequest) -> dict[str, Any]:
         # The gateway sends the same options to both PD workers. Only decode
         # accounts the request; prefill accepts and ignores these options.
         if get_disagg().disaggregation_mode == "prefill":
@@ -924,22 +922,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # The gateway supplies its authenticated user's identity independently
         # of optional engine API authentication. Hash it before dispatch; never
         # use one shared gateway credential as all users' cache identity.
+        cache_user_id = None
         if request.cache_user_id is not None:
-            api_key = (
+            cache_user_id = (
                 "cache-user-id:"
                 + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
             )
-        else:
-            # Keep verified Bearer identities supported for direct clients.
-            api_key = getattr(getattr(raw_request, "state", None), "api_key", None)
-        if not isinstance(api_key, str) or not api_key.strip():
-            # Missing identity serves inference using physical cache usage only.
-            # TokenizerManager skips every Redis operation; no shared key is made.
-            api_key = None
         # TokenizerManager decides which shapes can use Redis accounting for
-        # identified users. Missing identities always use physical usage only.
+        # identified users. Missing cache_user_id always uses physical usage
+        # only, regardless of the request's interface authentication credential.
         return {
-            "api_key": api_key,
+            "cache_user_id": cache_user_id,
             "cache_required": request.prompt_cache_options is not None,
             "cache_ttl_seconds": (
                 3600
@@ -1372,7 +1365,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        cache_params = self._cache_request_params(request, raw_request)
+        cache_params = self._cache_request_params(request)
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":

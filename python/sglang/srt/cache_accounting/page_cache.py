@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prompt-cache accounting in 256-token blocks, isolated by API key in Redis.
+"""Prompt-cache accounting in 256-token blocks, isolated by user identity in Redis.
 
 The caller supplies a model/tokenizer/template/adapter namespace
 and calls ``account`` once, at the first successful output event. Redis operations
@@ -99,7 +99,7 @@ def _text(name: str, value: str) -> bytes:
 
 def build_page_cache_plan(
     input_ids: Sequence[int],
-    api_key: str,
+    cache_user_id: str,
     namespace: str,
     page_size: int,
     ttl_seconds: int,
@@ -113,12 +113,12 @@ def build_page_cache_plan(
     ``namespace`` isolates deployments and input interpretation. TTL is part of identity: 5m
     and 1h requests have independent pages and expiration timelines. Accounting
     adds no page-count limit. Each first-page prefix defines a Redis Cluster hash
-    slot instead of pinning all prefixes for one API key.
+    slot instead of pinning all prefixes for one user identity.
     """
     _positive_int("page_size", page_size)
     if type(ttl_seconds) is not int or ttl_seconds not in _TTLS:
         raise ValueError("ttl_seconds must be 300 (5m) or 3600 (1h)")
-    identity = _text("api_key", api_key) + _text("namespace", namespace)
+    identity = _text("cache_user_id", cache_user_id) + _text("namespace", namespace)
     prompt_tokens = len(input_ids)
     if prompt_tokens > _MAX_SAFE_INTEGER:
         raise ValueError("prompt_tokens exceeds Redis Lua integer precision")
@@ -224,6 +224,27 @@ for i = 1, pages do
     end
 end
 return {read, written}
+"""
+
+
+_RENEW_LUA = r"""
+local ttl = tonumber(ARGV[1])
+if #ARGV ~= 1 or (ttl ~= 300 and ttl ~= 3600) or #KEYS < 1 then
+    return redis.error_reply('invalid cache renewal arguments')
+end
+local durations = {}
+for i = 1, #KEYS do
+    local kind = redis.call('TYPE', KEYS[i]).ok
+    if kind ~= 'none' and kind ~= 'string' then
+        return redis.error_reply('invalid cache key type')
+    end
+    durations[i] = math.max(ttl * 1000, redis.call('PTTL', KEYS[i]))
+end
+for i = 1, #KEYS do
+    -- Restore missing pages without making another accounting decision.
+    redis.call('SET', KEYS[i], '1', 'PX', durations[i])
+end
+return #KEYS
 """
 
 
@@ -408,6 +429,82 @@ class RedisPageCacheStore:
             timeout_ms,
         )
         return usage
+
+    async def renew(self, plan: PageCachePlan, *, rid: str | None = None) -> None:
+        """Restore or extend confirmed pages without recording another usage."""
+        _validate_plan(plan)
+        if not plan.page_keys:
+            return
+        request_id = rid if rid is not None else "-"
+        started = time.perf_counter()
+        timeout_ms = self._timeout_seconds * 1000
+        try:
+            client = self._client()
+            logger.info(
+                "Cache Redis renew start rid=%s page_count=%d ttl=%d timeout_ms=%.3f",
+                request_id,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+                timeout_ms,
+            )
+            result = await asyncio.wait_for(
+                client.eval(
+                    _RENEW_LUA,
+                    len(plan.page_keys),
+                    *plan.page_keys,
+                    plan.ttl_seconds,
+                ),
+                timeout=self._timeout_seconds,
+            )
+            if type(result) is not int or result != len(plan.page_keys):
+                raise ValueError("Invalid cache Redis renewal result")
+        except asyncio.CancelledError:
+            logger.debug(
+                "Cache Redis renew cancelled rid=%s page_count=%d ttl=%d "
+                "elapsed_ms=%.3f",
+                request_id,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
+        except Exception as exc:
+            is_timeout = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+            if not is_timeout:
+                try:
+                    from redis.exceptions import TimeoutError as RedisTimeoutError
+                except ImportError:
+                    pass
+                else:
+                    is_timeout = isinstance(exc, RedisTimeoutError)
+            result = "timeout" if is_timeout else "error"
+            elapsed = time.perf_counter() - started
+            if self._metrics is not None:
+                self._metrics.observe_redis(plan.ttl_seconds, result, elapsed)
+            logger.warning(
+                "Cache Redis renew failed rid=%s result=%s error_type=%s "
+                "page_count=%d ttl=%d elapsed_ms=%.3f timeout_ms=%.3f",
+                request_id,
+                result,
+                type(exc).__name__,
+                len(plan.page_keys),
+                plan.ttl_seconds,
+                elapsed * 1000,
+                timeout_ms,
+            )
+            raise CacheAccountingError("Redis cache renewal is unconfirmed") from exc
+        elapsed = time.perf_counter() - started
+        if self._metrics is not None:
+            self._metrics.observe_redis(plan.ttl_seconds, "success", elapsed)
+        logger.info(
+            "Cache Redis renew complete rid=%s result=success page_count=%d ttl=%d "
+            "elapsed_ms=%.3f timeout_ms=%.3f",
+            request_id,
+            len(plan.page_keys),
+            plan.ttl_seconds,
+            elapsed * 1000,
+            timeout_ms,
+        )
 
     async def aclose(self) -> None:
         client, self._redis = self._redis, None

@@ -7,7 +7,6 @@ import importlib.util
 import json
 import sys
 import unittest
-from hashlib import sha256
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -169,19 +168,20 @@ class TestChatCacheRoutes(unittest.TestCase):
                 self.assertEqual(response.status_code, 422)
         self.assertEqual(self.handler.calls, [])
 
-    def test_both_ttl_tiers_and_authenticated_identity_reach_handler(self):
+    def test_both_ttl_tiers_and_body_identity_reach_handler(self):
         for ttl in ("5m", "1h"):
             with self.subTest(ttl=ttl):
                 response = self.client.post(
-                    self.path, json=self.body(ttl), headers=self.headers
+                    self.path,
+                    json={**self.body(ttl), "cache_user_id": "gateway-user-a"},
+                    headers=self.headers,
                 )
                 self.assertEqual(response.status_code, 200)
                 request, api_key = self.handler.calls[-1]
                 self.assertEqual(request.prompt_cache_options.mode, "implicit")
                 self.assertEqual(request.prompt_cache_options.ttl, ttl)
-                self.assertEqual(
-                    api_key, "api-key:" + sha256(b"verified-key").hexdigest()
-                )
+                self.assertEqual(request.cache_user_id, "gateway-user-a")
+                self.assertIsNone(api_key)
 
     def test_missing_ttl_defaults_to_five_minutes(self):
         response = self.client.post(
@@ -221,7 +221,7 @@ class TestChatCacheRoutes(unittest.TestCase):
                 self.assertEqual(response.status_code, 401)
         self.assertEqual(self.handler.calls, [])
 
-    def test_bearer_scheme_is_case_insensitive_and_preserves_digest_identity(self):
+    def test_bearer_scheme_is_case_insensitive_without_creating_cache_identity(self):
         for headers in (
             {"Authorization": "Bearer verified-key"},
             {"Authorization": "bearer verified-key"},
@@ -232,9 +232,7 @@ class TestChatCacheRoutes(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 _, api_key = self.handler.calls[-1]
-                self.assertEqual(
-                    api_key, "api-key:" + sha256(b"verified-key").hexdigest()
-                )
+                self.assertIsNone(api_key)
 
     def test_missing_cache_options_are_preserved_for_server_default(self):
         body = self.body()
@@ -244,14 +242,14 @@ class TestChatCacheRoutes(unittest.TestCase):
         request, _ = self.handler.calls[-1]
         self.assertIsNone(request.prompt_cache_options)
 
-    def test_body_api_key_cannot_override_authenticated_identity(self):
+    def test_body_api_key_cannot_create_cache_identity(self):
         body = self.body()
         body["api_key"] = "untrusted-body-key"
         body["user"] = "another-user"
         response = self.client.post(self.path, json=body, headers=self.headers)
         self.assertEqual(response.status_code, 200)
         _, api_key = self.handler.calls[-1]
-        self.assertEqual(api_key, "api-key:" + sha256(b"verified-key").hexdigest())
+        self.assertIsNone(api_key)
 
     def test_invalid_cache_options_are_rejected_before_handler(self):
         for options in (

@@ -181,10 +181,10 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
             return func(*args)
 
         async def generate_request(adapted, raw_request):
-            # The real manager preserves the adapter's hash over a shared
-            # Bearer credential, or clears untrusted/missing identities.
+            # The real manager accepts only the adapter's body identity hash;
+            # interface authentication never supplies a cache identity.
             self.resolve_identity(self.manager, adapted, raw_request)
-            self.generated_identities.append(adapted.api_key)
+            self.generated_identities.append(adapted.cache_user_id)
             self.adapted_requests.append(adapted)
             counts = self.stream_counts if adapted.stream else (2,)
             for count in counts:
@@ -206,13 +206,13 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                                     "ttl_seconds": adapted.cache_ttl_seconds,
                                     "read_tokens": (
                                         self.accounting_read_tokens
-                                        if adapted.api_key
+                                        if adapted.cache_user_id
                                         and not self.physical_fallback
                                         else self.physical_cached_tokens
                                     ),
                                     "write_tokens": (
                                         self.accounting_write_tokens
-                                        if adapted.api_key
+                                        if adapted.cache_user_id
                                         and not self.physical_fallback
                                         else 0
                                     ),
@@ -308,7 +308,11 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
         return Request(
             {
                 "type": "http",
-                "headers": [],
+                "headers": (
+                    [(b"authorization", b"Bearer shared-gateway-key")]
+                    if identity is not None
+                    else []
+                ),
                 "state": {} if identity is None else {"api_key": identity},
             }
         )
@@ -449,7 +453,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                         adapted = self.adapted_requests[-1]
                         self.assertTrue(adapted.contains_mm_input())
                         self.assertEqual(
-                            adapted.api_key is None, source == "missing_identity"
+                            adapted.cache_user_id is None, source == "missing_identity"
                         )
                         self.assertEqual(usage["input_tokens"], 437)
                         self.assertEqual(usage["cache_read_input_tokens"], 333)
@@ -489,7 +493,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(usage["cache_read_input_tokens"], 16)
                     self.assertEqual(usage["cache_creation_input_tokens"], 16)
 
-    async def test_body_users_override_shared_verified_bearer(self):
+    async def test_body_users_are_isolated_with_shared_verified_bearer(self):
         shared = "api-key:" + sha256(b"shared-gateway-key").hexdigest()
         for stream in (False, True):
             identities = []
@@ -618,9 +622,7 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
         ):
             for stream in (False, True):
                 for user in ("process-user", None):
-                    raw = self.raw_request(
-                        "shared-verified-key-digest" if user else None
-                    )
+                    raw = self.raw_request("shared-verified-key-digest")
                     response = await self.serving.handle_messages(
                         self.request(stream=stream, user=user), raw
                     )
@@ -661,16 +663,29 @@ class TestAnthropicCacheIdentity(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(self.generated_identities[-1])
         self.assertEqual(len(self.generated_identities), 6)
 
-    async def test_verified_bearer_fallback_is_preserved(self):
+    async def test_verified_bearer_without_body_identity_uses_physical_usage(self):
         identity = "api-key:" + sha256(b"verified-direct-key").hexdigest()
         for stream in (False, True):
-            raw = self.raw_request(identity)
-            response = await self.serving.handle_messages(
-                self.request(stream=stream), raw
-            )
-            await self.consume(response, stream)
-            self.assertEqual(raw.state.cache_identity, identity)
-            self.assertEqual(self.generated_identities[-1], identity)
+            for options in (None, {"ttl": "5m"}, {"ttl": "1h"}):
+                with self.subTest(stream=stream, options=options):
+                    raw = self.raw_request(identity)
+                    response = await self.serving.handle_messages(
+                        self.request(stream=stream, options=options), raw
+                    )
+                    usage = await self.consume(response, stream)
+                    self.assertFalse(hasattr(raw.state, "cache_identity"))
+                    self.assertIsNone(self.generated_identities[-1])
+                    self.assertEqual(raw.state.api_key, identity)
+                    self.assertEqual(usage["input_tokens"], 11)
+                    self.assertEqual(usage["cache_read_input_tokens"], 32)
+                    self.assertEqual(usage["cache_creation_input_tokens"], 0)
+                    self.assertEqual(
+                        usage["cache_creation"],
+                        {
+                            "ephemeral_5m_input_tokens": 0,
+                            "ephemeral_1h_input_tokens": 0,
+                        },
+                    )
 
     async def test_disabled_and_prefill_requests_do_not_publish_identity(self):
         for role, enabled in (("decode", False), ("prefill", True)):

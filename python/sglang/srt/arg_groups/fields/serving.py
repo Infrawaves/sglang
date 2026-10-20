@@ -194,8 +194,8 @@ class Serving(msgspec.Struct):
     enable_cache_accounting: A[
         bool,
         "Enable Redis input-cache accounting in 256-token blocks on decode/standalone "
-        "workers (default implicit 5m). Use gateway cache_user_id (preferred) or a "
-        "verified Bearer key for user isolation. Without either identity, serve "
+        "workers (default implicit 5m). Use gateway cache_user_id for user "
+        "isolation. Without cache_user_id, serve "
         "normally without Redis reads, writes, or renewals; report physical cache "
         "reads and zero writes, even with explicit cache options. Prefill ignores accounting.",
     ] = False

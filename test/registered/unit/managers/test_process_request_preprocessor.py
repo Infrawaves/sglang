@@ -64,14 +64,12 @@ class ClientReadingServingChat(OpenAIServingChat):
         return super()._convert_to_internal_request(request, raw_request)
 
 
-class IdentityReadingServingChat(OpenAIServingChat):
-    """Reads the verified digest without requiring a thread fallback."""
+class StateReadingServingChat(OpenAIServingChat):
+    """Reads request state, which a preprocessor child does not have."""
 
     def _convert_to_internal_request(self, request, raw_request=None):
-        api_key = raw_request.state.api_key
-        adapted, processed = super()._convert_to_internal_request(request, raw_request)
-        adapted.api_key = api_key
-        return adapted, processed
+        _ = raw_request.state
+        return super()._convert_to_internal_request(request, raw_request)
 
 
 _GIL_PATTERN = re.compile(r" ?\w+| ?[^\s\w]+|\s+")
@@ -127,64 +125,27 @@ class TestHelpers(CustomTestCase):
         self.assertEqual(prp.snapshot_headers(mapping), [(b"x-smg-routing-key", b"k")])
         self.assertEqual(prp.snapshot_headers(object()), [])
 
-    def test_snapshot_copies_only_authenticated_digest(self):
-        digest = "api-key:" + sha256(b"verified-secret").hexdigest()
-        request = SimpleNamespace(
-            state=SimpleNamespace(api_key=digest, secret="must-not-cross")
-        )
-        snapshot = prp._snapshot_api_key(request)
-        self.assertEqual(snapshot, digest)
-        self.assertNotIn("verified-secret", snapshot)
-        self.assertNotIn("must-not-cross", snapshot)
-        self.assertIsNone(prp._snapshot_api_key(None))
-        self.assertIsNone(prp._snapshot_api_key(object()))
-        for value in (None, "verified-secret", "api-key:short", "api-key:" + "z" * 64):
-            with self.subTest(value=value):
-                request.state.api_key = value
-                self.assertIsNone(prp._snapshot_api_key(request))
-
-    def test_child_state_access_is_whitelisted_and_read_only(self):
-        digest = "api-key:" + sha256(b"verified-secret").hexdigest()
-
+    def test_child_request_state_access_falls_back(self):
         class Handler:
-            operation = None
+            attribute = "api_key"
 
             def _convert_to_internal_request(self, request, raw_request):
-                operation = self.operation
-                if operation == "unknown":
-                    _ = getattr(raw_request.state, "unknown", None)
-                elif operation == "write":
-                    raw_request.state.api_key = "changed"
-                elif operation == "delete":
-                    del raw_request.state.api_key
-                elif operation == "replace":
-                    raw_request.state = SimpleNamespace(api_key="changed")
-                api_key = getattr(raw_request.state, "api_key", None)
-                return SimpleNamespace(api_key=api_key), request
+                _ = getattr(raw_request.state, self.attribute, None)
+                return SimpleNamespace(), request
 
         state = SimpleNamespace(handler=lambda cls: Handler())
         with mock.patch.object(prp, "_CHILD_STATE", state):
-            result = prp._child_convert(Handler, _chat_request(), [], digest)
-            self.assertEqual(result[0], "ok")
-            self.assertEqual(result[1].api_key, digest)
-            result = prp._child_convert(Handler, _chat_request(), [])
-            self.assertEqual(result[0], "fallback")
-            self.assertIn("raw_request.state.api_key", result[1])
-            for operation in ("unknown", "write", "delete", "replace"):
-                with self.subTest(operation=operation):
-                    Handler.operation = operation
-                    result = prp._child_convert(Handler, _chat_request(), [], digest)
+            for attribute in ("api_key", "cache_identity", "unknown"):
+                with self.subTest(attribute=attribute):
+                    Handler.attribute = attribute
+                    result = prp._child_convert(Handler, _chat_request(), [])
                     self.assertEqual(result[0], "fallback")
                     self.assertIn("raw_request.state", result[1])
 
-    def test_enabled_cache_conversion_reads_digest_without_fallback(self):
-        digest = "api-key:" + sha256(b"verified-secret").hexdigest()
-
+    def test_cache_conversion_uses_body_identity_without_request_state(self):
         class Handler:
             def _convert_to_internal_request(self, request, raw_request):
-                params = OpenAIServingChat._cache_request_params(
-                    self, request, raw_request
-                )
+                params = OpenAIServingChat._cache_request_params(self, request)
                 return SimpleNamespace(**params), request
 
         with (
@@ -200,17 +161,26 @@ class TestHelpers(CustomTestCase):
                 return_value=SimpleNamespace(disaggregation_mode="decode"),
             ),
         ):
-            result = prp._child_convert(Handler, _chat_request(), [], digest)
-        self.assertEqual(result[0], "ok")
-        self.assertEqual(result[1].api_key, digest)
-        self.assertEqual(result[1].cache_ttl_seconds, 300)
+            for user in (None, "gateway-user"):
+                with self.subTest(user=user):
+                    result = prp._child_convert(
+                        Handler, _chat_request(cache_user_id=user), []
+                    )
+                    self.assertEqual(result[0], "ok")
+                    self.assertEqual(
+                        result[1].cache_user_id,
+                        (
+                            "cache-user-id:" + sha256(user.encode()).hexdigest()
+                            if user
+                            else None
+                        ),
+                    )
+                    self.assertEqual(result[1].cache_ttl_seconds, 300)
 
-    def test_parent_submits_digest_and_keeps_header_snapshot(self):
-        digest = "api-key:" + sha256(b"verified-secret").hexdigest()
-
+    def test_parent_submits_body_and_headers_without_request_state(self):
         class Handler:
             def _convert_to_internal_request(self, request, raw_request):
-                return SimpleNamespace(api_key=raw_request.state.api_key), request
+                return SimpleNamespace(cache_user_id=request.cache_user_id), request
 
         state = SimpleNamespace(handler=lambda cls: Handler())
         pre = prp.ProcessRequestPreprocessor.__new__(prp.ProcessRequestPreprocessor)
@@ -219,8 +189,10 @@ class TestHelpers(CustomTestCase):
         pre._handler_classes = (Handler,)
         pre._warned = set()
         raw_request = _RawRequest({"Authorization": "Bearer verified-secret"})
-        raw_request.state = SimpleNamespace(api_key=digest, secret="must-not-cross")
-        request = _chat_request()
+        raw_request.state = SimpleNamespace(
+            api_key="retired-bearer-identity", secret="must-not-cross"
+        )
+        request = _chat_request(cache_user_id="gateway-user")
         with (
             ThreadPoolExecutor(max_workers=1) as pool,
             mock.patch.object(prp, "_CHILD_STATE", state),
@@ -233,9 +205,9 @@ class TestHelpers(CustomTestCase):
                 pre.convert(Handler(), request, raw_request)
             )
         self.assertIs(processed, request)
-        self.assertEqual(adapted.api_key, digest)
+        self.assertEqual(adapted.cache_user_id, "gateway-user")
         self.assertEqual(convert.call_args.args[2], list(raw_request.headers.raw))
-        self.assertEqual(convert.call_args.args[3], digest)
+        self.assertEqual(len(convert.call_args.args), 3)
 
     def test_request_changes_replay(self):
         request = _chat_request(
@@ -450,7 +422,7 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
         cls.handler_classes = (
             OpenAIServingChat,
             ClientReadingServingChat,
-            IdentityReadingServingChat,
+            StateReadingServingChat,
             GilHeavyServingChat,
         )
         cls.tokenizer_manager.maybe_start_process_request_preprocessor(
@@ -540,20 +512,21 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
         adapted = asyncio.run(run())
         self.assertGreater(len(adapted.input_ids), 0)
 
-    def test_authenticated_identity_stays_in_child_process(self):
-        handler = self._handler(IdentityReadingServingChat)
+    def test_request_state_access_falls_back_to_thread(self):
+        handler = self._handler(StateReadingServingChat)
         raw_request = _RawRequest({})
-        digest = "api-key:" + sha256(b"verified-secret").hexdigest()
-        raw_request.state = SimpleNamespace(api_key=digest, secret="must-not-cross")
+        raw_request.state = SimpleNamespace(cache_identity="parent-only")
 
-        result = asyncio.run(
-            self.preprocessor.convert(handler, _chat_request(), raw_request)
-        )
-        self.assertIsNotNone(result)
-        adapted, _ = result
-        self.assertEqual(adapted.api_key, digest)
-        self.assertNotIn("verified-secret", repr(adapted.__dict__))
-        self.assertNotIn("must-not-cross", repr(adapted.__dict__))
+        async def run():
+            with self.assertLogs(prp.logger, level="WARNING") as logs:
+                adapted, _ = await handler._run_request_conversion(
+                    _chat_request(), raw_request
+                )
+            self.assertTrue(any("raw_request.state" in m for m in logs.output))
+            return adapted
+
+        adapted = asyncio.run(run())
+        self.assertGreater(len(adapted.input_ids), 0)
 
     def test_event_loop_stays_responsive(self):
         handler = self._handler(GilHeavyServingChat)
@@ -661,7 +634,7 @@ class TestProcessRequestPreprocessorDisables(TestProcessRequestPreprocessorEndTo
     test_matches_in_process_conversion = None
     test_conversion_errors_keep_their_type = None
     test_non_header_access_falls_back_to_thread = None
-    test_authenticated_identity_stays_in_child_process = None
+    test_request_state_access_falls_back_to_thread = None
     test_event_loop_stays_responsive = None
     test_broken_pool_restarts = None
 

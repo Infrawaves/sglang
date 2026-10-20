@@ -7,7 +7,6 @@ import importlib.util
 import math
 import sys
 import unittest
-from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -69,25 +68,25 @@ class TestCacheIdentity(unittest.TestCase):
         @app.post("/metrics")
         @app.post("/identity")
         async def identity(request: Request):
-            return {"account": getattr(request.state, "api_key", None)}
+            return {
+                "account": getattr(request.state, "api_key", None),
+                "cache_identity": getattr(request.state, "cache_identity", None),
+            }
 
         load_auth().add_api_key_middleware(
             app, api_key="verified-secret", admin_api_key=None
         )
         self.client = TestClient(app)
 
-    def test_verified_credential_maps_to_stable_nonsecret_identity(self):
+    def test_verified_credential_authenticates_without_cache_identity(self):
         response = self.client.post(
             "/identity", headers={"Authorization": "Bearer verified-secret"}
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["account"],
-            "api-key:" + sha256(b"verified-secret").hexdigest(),
-        )
+        self.assertEqual(response.json(), {"account": None, "cache_identity": None})
         self.assertNotIn("verified-secret", response.text)
 
-    def test_body_and_untrusted_identity_header_cannot_override_principal(self):
+    def test_body_and_untrusted_identity_header_do_not_create_state_identity(self):
         response = self.client.post(
             "/identity",
             headers={
@@ -97,7 +96,7 @@ class TestCacheIdentity(unittest.TestCase):
             json={"api_key": "victim", "user": "victim"},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertNotEqual(response.json()["account"], "victim")
+        self.assertEqual(response.json(), {"account": None, "cache_identity": None})
 
     def test_invalid_credential_does_not_reach_handler(self):
         for credential in ("Bearer unknown", "Basic verified-secret", None):
@@ -139,7 +138,7 @@ class TestCacheIdentity(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.json()["account"])
 
-    def test_admin_bearer_maps_to_verified_identity(self):
+    def test_admin_bearer_authenticates_without_cache_identity(self):
         app = FastAPI()
         auth = load_auth()
 
@@ -154,22 +153,21 @@ class TestCacheIdentity(unittest.TestCase):
                 "/identity", headers={"Authorization": "Bearer admin-secret"}
             )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["account"],
-            "api-key:" + sha256(b"admin-secret").hexdigest(),
-        )
+        self.assertIsNone(response.json()["account"])
 
     def test_trusted_upstream_state_identity_is_preserved(self):
         @self.app.middleware("http")
         async def trusted_upstream(request, call_next):
-            request.state.api_key = "trusted-tenant"
+            request.state.cache_identity = "trusted-tenant"
             return await call_next(request)
 
         response = self.client.post(
             "/identity", headers={"Authorization": "Bearer verified-secret"}
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["account"], "trusted-tenant")
+        self.assertEqual(
+            response.json(), {"account": None, "cache_identity": "trusted-tenant"}
+        )
 
 
 class TestCacheConfiguration(unittest.TestCase):
@@ -227,15 +225,15 @@ class TestCacheConfiguration(unittest.TestCase):
                     self.validate(cfg)
 
 
-class TestNativeAccountBoundary(unittest.IsolatedAsyncioTestCase):
+class TestNativeAccountBoundary(unittest.TestCase):
     def setUp(self):
         class GenerateReqInput:
             pass
 
         self.input_class = GenerateReqInput
-        self.generate = extract(
+        self.resolve_identity = extract(
             _SRT / "managers/tokenizer_manager.py",
-            "generate_request",
+            "_resolve_cache_identity",
             {
                 "GenerateReqInput": GenerateReqInput,
                 "DisaggregationMode": SimpleNamespace(PREFILL="prefill"),
@@ -244,34 +242,46 @@ class TestNativeAccountBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.obj = GenerateReqInput()
         self.obj.cache_ttl_seconds = 300
-        self.obj.api_key = "spoofed-from-body"
+        self.obj.cache_user_id = "spoofed-from-body"
+        self.manager = SimpleNamespace(disaggregation_mode="decode")
 
-    async def test_native_http_body_identity_is_replaced_before_validation(self):
-        seen = []
-
-        def stop_after_validation(obj):
-            seen.append(obj.api_key)
-            raise ValueError("validation reached")
-
-        manager = SimpleNamespace(
-            auto_create_handle_loop=lambda: None,
-            disaggregation_mode="decode",
-            validate_request_params=stop_after_validation,
+    def test_api_adapter_identity_replaces_native_body_identity(self):
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                cache_identity="trusted-body-user", api_key="retired-bearer-identity"
+            )
         )
-        request = SimpleNamespace(state=SimpleNamespace(api_key="authenticated-user"))
-        response = self.generate(manager, self.obj, request)
-        with self.assertRaisesRegex(ValueError, "validation reached"):
-            await response.__anext__()
-        self.assertEqual(seen, ["authenticated-user"])
+        self.resolve_identity(self.manager, self.obj, request)
+        self.assertEqual(self.obj.cache_user_id, "trusted-body-user")
 
-    async def test_native_http_cannot_supply_identity_without_authentication(self):
-        manager = SimpleNamespace(
-            auto_create_handle_loop=lambda: None, disaggregation_mode="decode"
-        )
+    def test_native_http_body_cannot_supply_cache_identity(self):
         request = SimpleNamespace(state=SimpleNamespace())
-        response = self.generate(manager, self.obj, request)
-        with self.assertRaisesRegex(ValueError, "authenticated API key"):
-            await response.__anext__()
+        self.resolve_identity(self.manager, self.obj, request)
+        self.assertIsNone(self.obj.cache_user_id)
+
+    def test_legacy_bearer_state_does_not_replace_missing_body_identity(self):
+        for identity in (None, "", 123):
+            with self.subTest(identity=identity):
+                self.obj.cache_user_id = "spoofed-from-body"
+                request = SimpleNamespace(
+                    state=SimpleNamespace(
+                        cache_identity=identity, api_key="retired-bearer-identity"
+                    )
+                )
+                self.resolve_identity(self.manager, self.obj, request)
+                self.assertIsNone(self.obj.cache_user_id)
+
+    def test_trusted_in_process_identity_is_preserved(self):
+        self.obj.cache_user_id = "trusted-in-process-user"
+        self.resolve_identity(self.manager, self.obj, None)
+        self.assertEqual(self.obj.cache_user_id, "trusted-in-process-user")
+
+    def test_prefill_ignores_cache_identity(self):
+        self.manager.disaggregation_mode = "prefill"
+        request = SimpleNamespace(state=SimpleNamespace(cache_identity="body-user"))
+        self.resolve_identity(self.manager, self.obj, request)
+        self.assertIsNone(self.obj.cache_user_id)
+        self.assertIsNone(self.obj.cache_ttl_seconds)
 
 
 if __name__ == "__main__":

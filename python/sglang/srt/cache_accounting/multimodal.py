@@ -198,8 +198,6 @@ def _hash_value(hasher, value) -> None:
     elif _is_torch_tensor(value):
         import torch
 
-        if not isinstance(value, torch.Tensor):
-            raise ValueError("Unsupported torch media metadata")
         snapshot = value.detach().to("cpu").contiguous()
         hasher.update(b"torch[")
         _hash_value(hasher, str(snapshot.dtype))
