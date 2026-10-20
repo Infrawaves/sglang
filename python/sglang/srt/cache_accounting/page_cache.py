@@ -251,9 +251,13 @@ return #KEYS
 def _validate_plan(plan: PageCachePlan) -> None:
     """Check caller-constructed plans before accessing Redis."""
     _positive_int("page_size", plan.page_size)
-    _positive_int("prompt_tokens + 1", plan.prompt_tokens + 1)
-    if type(plan.prompt_tokens) is not int or plan.prompt_tokens < 0:
-        raise ValueError("prompt_tokens must be a nonnegative integer")
+    if (
+        type(plan.prompt_tokens) is not int
+        or not 0 <= plan.prompt_tokens <= _MAX_SAFE_INTEGER
+    ):
+        raise ValueError(
+            f"prompt_tokens must be an integer between 0 and {_MAX_SAFE_INTEGER}"
+        )
     if type(plan.ttl_seconds) is not int or plan.ttl_seconds not in _TTLS:
         raise ValueError("ttl_seconds must be 300 or 3600")
     if not isinstance(plan.page_keys, tuple):

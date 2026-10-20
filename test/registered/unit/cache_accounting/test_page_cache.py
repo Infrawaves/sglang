@@ -302,6 +302,15 @@ class TestPageCachePlan(unittest.TestCase):
         self.assertEqual(result.prompt_tokens, 4097)
         self.assertIsNone(cache._validate_plan(result))
 
+    def test_prompt_token_validation_accepts_zero_and_safe_integer_limit(self):
+        self.assertIsNone(cache._validate_plan(plan([])))
+        largest = replace(
+            plan([1], page_size=1),
+            prompt_tokens=cache._MAX_SAFE_INTEGER,
+            page_size=cache._MAX_SAFE_INTEGER,
+        )
+        self.assertIsNone(cache._validate_plan(largest))
+
 
 class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -618,15 +627,22 @@ class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_plan_is_rejected_before_redis(self):
         original = plan(list(range(8)))
-        malformed = replace(original, page_keys=(original.page_keys[0], "wrong-slot"))
+        malformed_plans = [
+            replace(original, page_keys=(original.page_keys[0], "wrong-slot"))
+        ]
+        malformed_plans.extend(
+            replace(original, prompt_tokens=value)
+            for value in (None, "8", 8.0, True, False, -1, cache._MAX_SAFE_INTEGER + 1)
+        )
         store = cache.RedisPageCacheStore("redis://unused")
         with patch.object(
             store, "_client", side_effect=AssertionError("must not connect")
         ) as client:
-            for operation in (store.account, store.renew):
-                with self.subTest(operation=operation.__name__):
-                    with self.assertRaises(ValueError):
-                        await operation(malformed)
+            for malformed in malformed_plans:
+                for operation in (store.account, store.renew):
+                    with self.subTest(operation=operation.__name__, plan=malformed):
+                        with self.assertRaises(ValueError):
+                            await operation(malformed)
         client.assert_not_called()
         self.logger.info.assert_not_called()
         self.logger.warning.assert_not_called()
