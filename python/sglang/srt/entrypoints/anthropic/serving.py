@@ -774,12 +774,12 @@ class AnthropicServing:
             raw_request is not None
             and isinstance(adapted_request, GenerateReqInput)
             and adapted_request.cache_ttl_seconds is not None
-            and isinstance(adapted_request.api_key, str)
-            and adapted_request.api_key.strip()
+            and isinstance(adapted_request.cache_user_id, str)
+            and adapted_request.cache_user_id.strip()
         ):
             # Conversion may run in a child process. Publish the validated hash
             # on the parent's trusted state before TokenizerManager resolves it.
-            raw_request.state.cache_identity = adapted_request.api_key
+            raw_request.state.cache_identity = adapted_request.cache_user_id
         return adapted_request, processed_request
 
     async def _handle_non_streaming(

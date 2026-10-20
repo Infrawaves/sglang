@@ -273,6 +273,8 @@ class ReqState:
     cache_metrics_parent: Optional[ReqState] = None
     cache_task: Optional[asyncio.Task] = None
     cache_usage: Optional[CacheUsage] = None
+    cache_finished_event: Optional[asyncio.Event] = None
+    cache_renewal_task: Optional[asyncio.Task] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1014,6 +1016,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._cache_store = None
         self._cache_metrics = None
         self._cache_tasks: set[asyncio.Task] = set()
+        self._cache_renewal_tasks: dict[asyncio.Task, asyncio.Event] = {}
+        self._cache_accounting_closing = False
         if not cfg.enable_cache_accounting:
             return
         if role == "prefill":
@@ -1044,7 +1048,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_cache_request(self, obj: GenerateReqInput) -> None:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             obj.cache_ttl_seconds = None
-            obj.api_key = None
+            obj.cache_user_id = None
             return
         if obj.cache_ttl_seconds is None:
             return
@@ -1052,10 +1056,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError("Cache accounting is not enabled on this server")
         if obj.cache_ttl_seconds not in (300, 3600):
             raise ValueError("cache_ttl_seconds must be 300 or 3600")
-        if not isinstance(obj.api_key, str) or not obj.api_key.strip():
+        if not isinstance(obj.cache_user_id, str) or not obj.cache_user_id.strip():
             # Requests without an identity use physical cache usage and never
             # access Redis, including shapes unsupported by the Redis plan.
-            obj.api_key = None
+            obj.cache_user_id = None
             return
         params = obj.sampling_params or {}
         if isinstance(params, dict):
@@ -1087,7 +1091,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.disaggregation_mode.value,
                 )
                 obj.cache_ttl_seconds = None
-                obj.api_key = None
+                obj.cache_user_id = None
                 return
             raise ValueError(
                 "Cache accounting currently supports a single "
@@ -1102,7 +1106,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._validate_cache_request(obj)
         if obj.cache_ttl_seconds is None:
             return
-        if obj.api_key is None:
+        if obj.cache_user_id is None:
             self.rid_to_state[
                 obj.rid
             ].cache_physical_ttl_seconds = obj.cache_ttl_seconds
@@ -1125,7 +1129,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         if obj.contains_mm_input():
             self.rid_to_state[obj.rid].cache_plan_context = (
-                obj.api_key,
+                obj.cache_user_id,
                 namespace,
                 obj.cache_ttl_seconds,
             )
@@ -1134,7 +1138,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError("Cache accounting requires final input token IDs")
         plan = build_page_cache_plan(
             input_ids=input_ids,
-            api_key=obj.api_key,
+            cache_user_id=obj.cache_user_id,
             namespace=namespace,
             page_size=CACHE_BLOCK_SIZE,
             ttl_seconds=obj.cache_ttl_seconds,
@@ -1150,6 +1154,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         cached_tokens: int = 0,
         cache_input_metadata: Optional[dict] = None,
     ) -> None:
+        if getattr(self, "_cache_accounting_closing", False):
+            return
         plan = state.cache_plan
         context = getattr(state, "cache_plan_context", None)
         physical_ttl = getattr(state, "cache_physical_ttl_seconds", None)
@@ -1186,6 +1192,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         block_size = plan.page_size if plan is not None else CACHE_BLOCK_SIZE
         metrics_parent = getattr(state, "cache_metrics_parent", None)
+        finished_event = asyncio.Event()
+        state.cache_finished_event = finished_event
 
         async def account_once():
             nonlocal cache_input_metadata
@@ -1205,7 +1213,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     active_plan = await asyncio.to_thread(
                         build_page_cache_plan,
                         input_ids=cache_input_metadata["input_ids"],
-                        api_key=context[0],
+                        cache_user_id=context[0],
                         namespace=context[1],
                         page_size=CACHE_BLOCK_SIZE,
                         ttl_seconds=ttl_seconds,
@@ -1245,6 +1253,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "Cache prompt-token count differs from final input IDs"
                     )
                 source = "redis" if active_plan.page_keys else "no_complete_block"
+                # A terminal-only output can finish before this task runs. In
+                # that case the initial EVAL already sets the TTL after finish.
+                finished_before_account = finished_event.is_set()
                 try:
                     usage = await self._cache_store.account(active_plan, rid=rid)
                 except CacheAccountingError as exc:
@@ -1265,6 +1276,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             exc.__cause__ if exc.__cause__ is not None else exc
                         ).__name__,
                     )
+                if source == "redis" and not finished_before_account:
+                    self._start_cache_renewal(state, active_plan)
             observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
             if metrics_parent is not None and metrics_parent.cache_usage is None:
                 # Parallel samples share one input; the first successful sample
@@ -1300,24 +1313,87 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             lambda done: done.exception() if not done.cancelled() else None
         )
 
+    def _start_cache_renewal(self, state: ReqState, plan: PageCachePlan) -> None:
+        finished_event = getattr(state, "cache_finished_event", None)
+        if (
+            not plan.page_keys
+            or finished_event is None
+            or getattr(state, "cache_renewal_task", None) is not None
+        ):
+            return
+
+        async def renew_on_finish() -> None:
+            await finished_event.wait()
+            try:
+                await self._cache_store.renew(plan, rid=state.obj.rid)
+            except Exception as exc:
+                # Maintenance cannot revise the read/write decision already
+                # returned in HTTP headers or usage.
+                logger.warning(
+                    "Cache accounting renewal failed rid=%s ttl=%d phase=finish "
+                    "error_type=%s",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                    type(exc).__name__,
+                )
+            else:
+                logger.info(
+                    "Cache accounting TTL renewed rid=%s ttl=%d phase=finish",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                )
+
+        task = asyncio.create_task(renew_on_finish())
+        state.cache_renewal_task = task
+        tasks = getattr(self, "_cache_renewal_tasks", None)
+        if tasks is None:
+            tasks = self._cache_renewal_tasks = {}
+        tasks[task] = finished_event
+        task.add_done_callback(lambda done: tasks.pop(done, None))
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    def _finish_cache_accounting(self, state: ReqState) -> None:
+        # The output owner signals completion even if the HTTP consumer left.
+        finished_event = getattr(state, "cache_finished_event", None)
+        if finished_event is not None:
+            finished_event.set()
+
     async def _attach_cache_usage(self, state: ReqState, out: dict) -> None:
         if state.cache_task is None:
             return
         if state.cache_usage is None:
             state.cache_usage = await asyncio.shield(state.cache_task)
+        finished_event = getattr(state, "cache_finished_event", None)
+        renewal_task = getattr(state, "cache_renewal_task", None)
+        if finished_event is not None and finished_event.is_set() and renewal_task:
+            await asyncio.shield(renewal_task)
         out["meta_info"]["cache_usage"] = state.cache_usage.to_dict()
 
     async def close_cache_accounting(self) -> None:
         if self._cache_store is not None:
+            self._cache_accounting_closing = True
             if self._cache_tasks:
+                # In-flight confirmations may still register a final renewal.
                 await asyncio.gather(*tuple(self._cache_tasks), return_exceptions=True)
+            renewals = getattr(self, "_cache_renewal_tasks", {})
+            renewal_tasks = tuple(renewals)
+            # Let a terminal response finish its bounded Redis renewal. Cancelling
+            # it would also interrupt a response awaiting that task via shield.
+            # Signal active maintainers too, so forced shutdown never waits for
+            # another engine output.
+            for finished_event in tuple(renewals.values()):
+                finished_event.set()
+            if renewal_tasks:
+                await asyncio.gather(*renewal_tasks, return_exceptions=True)
             await self._cache_store.aclose()
 
     async def _prepare_cache_media_digests(self, obj, mm_inputs) -> None:
         if (
             not isinstance(obj, GenerateReqInput)
             or obj.cache_ttl_seconds is None
-            or obj.api_key is None
+            or obj.cache_user_id is None
             or mm_inputs is None
         ):
             return
@@ -1382,7 +1458,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             obj.cache_ttl_seconds = None
-            obj.api_key = None
+            obj.cache_user_id = None
             return
         if request is None:
             return
@@ -1391,10 +1467,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = request.state
         identity = getattr(state, "cache_identity", None)
         if not isinstance(identity, str) or not identity.strip():
-            identity = getattr(state, "api_key", None)
-        if not isinstance(identity, str) or not identity.strip():
             identity = None
-        obj.api_key = identity
+        obj.cache_user_id = identity
 
     async def generate_request(
         self,
@@ -2602,7 +2676,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 # This is an internal warmup, not one of the user's samples.
                 tmp_obj.cache_ttl_seconds = None
-                tmp_obj.api_key = None
+                tmp_obj.cache_user_id = None
                 tmp_obj.cache_required = False
                 self._init_req_state(tmp_obj)
                 request_rids.add(tmp_obj.rid)
@@ -3192,6 +3266,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_first_token_time()
 
             if state.finished:
+                self._finish_cache_accounting(state)
                 span_attrs = (
                     self.convert_to_span_attrs(state, recv_obj, i)
                     if state.time_stats.trace_ctx.tracing_enable
@@ -3979,6 +4054,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
+        self._finish_cache_accounting(state)
         state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
@@ -4222,9 +4298,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # __getitem__ does not carry cache options. Preserve them on
                 # cached subobjects so parallel-sample clones keep the mode.
                 sub_obj.cache_ttl_seconds = obj.cache_ttl_seconds
-                sub_obj.api_key = obj.api_key
+                sub_obj.cache_user_id = obj.cache_user_id
                 sub_obj.cache_required = obj.cache_required
-                if not isinstance(sub_obj.api_key, str) or not sub_obj.api_key.strip():
+                if (
+                    not isinstance(sub_obj.cache_user_id, str)
+                    or not sub_obj.cache_user_id.strip()
+                ):
                     state.cache_physical_ttl_seconds = obj.cache_ttl_seconds
             self.rid_to_state[rid] = state
             if self.enable_trace:

@@ -28,9 +28,9 @@ request over and taking the result back.
 
 Fallbacks keep requests working rather than failing them: handlers that do not
 opt in (``supports_process_preprocessing``), a conversion that reads more of the
-HTTP request than its headers and authenticated key digest, a pool that fails to
-start or breaks, and a child with a different tokenizer/template fingerprint all
-use the in-process thread path. Children replay the config overrides the parent had
+HTTP request than its headers, a pool that fails to start or breaks, and a child
+whose tokenizer/template fingerprint differs from the parent's all use the
+in-process thread path. Children replay the config overrides the parent had
 recorded when the pool started (e.g. parsers resolved from the chat template);
 later overrides are not propagated.
 """
@@ -134,18 +134,6 @@ def _header_bytes(value: str) -> bytes:
         return value.encode("latin-1")
     except UnicodeEncodeError:
         return value.encode("utf-8")
-
-
-def _snapshot_api_key(raw_request: Any) -> Optional[str]:
-    """Copy only the authenticated key digest, never other request state."""
-    state = getattr(raw_request, "state", None)
-    api_key = getattr(state, "api_key", None)
-    if not isinstance(api_key, str) or not api_key.startswith("api-key:"):
-        return None
-    digest = api_key[len("api-key:") :]
-    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        return None
-    return api_key
 
 
 def pack_token_ids(ids: Any) -> Tuple[str, Any]:
@@ -284,56 +272,15 @@ def _local_exception(exc: BaseException) -> BaseException:
 # ----------------------------------------------------------------------------
 
 
-class _ReadOnlyRequestState:
-    """Only the parent's authenticated key digest is available in a child."""
-
-    __slots__ = ("_api_key",)
-
-    def __init__(self, api_key: Optional[str]):
-        object.__setattr__(self, "_api_key", api_key)
-
-    def __getattr__(self, name: str):
-        if name == "api_key" and self._api_key is not None:
-            return self._api_key
-        raise NeedsInProcessConversion(
-            f"request conversion read raw_request.state.{name}"
-        )
-
-    def __setattr__(self, name: str, value: Any):
-        raise NeedsInProcessConversion(
-            f"request conversion wrote raw_request.state.{name}"
-        )
-
-    def __delattr__(self, name: str):
-        raise NeedsInProcessConversion(
-            f"request conversion deleted raw_request.state.{name}"
-        )
-
-
 class _HeadersOnlyRequest:
-    """Child HTTP request exposing headers and a read-only authentication digest."""
+    """Stands in for the HTTP request inside a child: conversion reads headers only."""
 
-    __slots__ = ("headers", "_state")
+    __slots__ = ("headers",)
 
-    def __init__(
-        self, raw_headers: List[Tuple[bytes, bytes]], api_key: Optional[str] = None
-    ):
+    def __init__(self, raw_headers: List[Tuple[bytes, bytes]]):
         from starlette.datastructures import Headers
 
         self.headers = Headers(raw=raw_headers)
-        self._state = _ReadOnlyRequestState(api_key)
-
-    @property
-    def state(self):
-        return self._state
-
-    @state.setter
-    def state(self, value):
-        raise NeedsInProcessConversion("request conversion wrote raw_request.state")
-
-    @state.deleter
-    def state(self):
-        raise NeedsInProcessConversion("request conversion deleted raw_request.state")
 
     def __getattr__(self, name: str):
         raise NeedsInProcessConversion(f"request conversion read raw_request.{name}")
@@ -428,13 +375,9 @@ def _child_warmup(handler_classes: Sequence[type]):
     return fingerprint, os.getpid()
 
 
-def _child_convert(
-    handler_cls: type, request: Any, raw_headers, api_key: Optional[str] = None
-):
+def _child_convert(handler_cls: type, request: Any, raw_headers):
     handler = _CHILD_STATE.handler(handler_cls)
-    raw_request = (
-        None if raw_headers is None else _HeadersOnlyRequest(raw_headers, api_key)
-    )
+    raw_request = None if raw_headers is None else _HeadersOnlyRequest(raw_headers)
     snapshot = _snapshot_request_state(request)
     try:
         adapted, processed = handler._convert_to_internal_request(request, raw_request)
@@ -631,9 +574,8 @@ class ProcessRequestPreprocessor:
             return None
         try:
             headers = snapshot_headers(raw_request)
-            api_key = _snapshot_api_key(raw_request)
             result = await asyncio.get_running_loop().run_in_executor(
-                pool, _child_convert, type(handler), request, headers, api_key
+                pool, _child_convert, type(handler), request, headers
             )
         except BrokenProcessPool as e:
             self._handle_broken_pool(pool, e)

@@ -108,6 +108,9 @@ def _load_manager_helpers(
         "_handle_batch_request",
         "_collect_batch_responses",
         "_prepare_cache_media_digests",
+        "_start_cache_renewal",
+        "_finish_cache_accounting",
+        "close_cache_accounting",
     }
     methods = [node for node in manager.body if getattr(node, "name", None) in names]
     found = {node.name for node in methods}
@@ -169,6 +172,8 @@ def _load_manager_helpers(
             cache_metrics_parent=None,
             cache_task=None,
             cache_usage=None,
+            cache_finished_event=None,
+            cache_renewal_task=None,
         ),
     }
     exec(compile(ast.fix_missing_locations(extracted), str(path), "exec"), namespace)
@@ -280,7 +285,7 @@ class TestTokenizerCacheIdentity(unittest.TestCase):
         self.manager = _load_manager_helpers()()
         self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
         self.obj = _GenerateReqInput(
-            cache_ttl_seconds=300, api_key="body-supplied-value"
+            cache_ttl_seconds=300, cache_user_id="body-supplied-value"
         )
 
     def test_adapter_identity_takes_precedence_over_shared_bearer(self):
@@ -290,32 +295,33 @@ class TestTokenizerCacheIdentity(unittest.TestCase):
             )
         )
         self.manager._resolve_cache_identity(self.obj, request)
-        self.assertEqual(self.obj.api_key, "verified-user-digest")
+        self.assertEqual(self.obj.cache_user_id, "verified-user-digest")
 
     def test_adapter_identity_does_not_require_a_bearer_identity(self):
         request = SimpleNamespace(
             state=SimpleNamespace(cache_identity="verified-user-digest")
         )
         self.manager._resolve_cache_identity(self.obj, request)
-        self.assertEqual(self.obj.api_key, "verified-user-digest")
+        self.assertEqual(self.obj.cache_user_id, "verified-user-digest")
 
     def test_native_generate_body_cannot_supply_trusted_http_identity(self):
         self.manager._resolve_cache_identity(
             self.obj, SimpleNamespace(state=SimpleNamespace())
         )
-        self.assertIsNone(self.obj.api_key)
+        self.assertIsNone(self.obj.cache_user_id)
         self.assertEqual(self.obj.cache_ttl_seconds, 300)
 
-    def test_native_generate_uses_verified_bearer_instead_of_body_value(self):
+    def test_native_generate_ignores_bearer_identity_and_body_value(self):
         request = SimpleNamespace(
             state=SimpleNamespace(api_key="verified-bearer-digest")
         )
         self.manager._resolve_cache_identity(self.obj, request)
-        self.assertEqual(self.obj.api_key, "verified-bearer-digest")
+        self.assertIsNone(self.obj.cache_user_id)
+        self.assertEqual(self.obj.cache_ttl_seconds, 300)
 
     def test_in_process_request_preserves_existing_digest(self):
         self.manager._resolve_cache_identity(self.obj, None)
-        self.assertEqual(self.obj.api_key, "body-supplied-value")
+        self.assertEqual(self.obj.cache_user_id, "body-supplied-value")
 
     def test_prefill_clears_cache_options_and_identity(self):
         self.manager.disaggregation_mode = _DISAGG_MODE.PREFILL
@@ -325,7 +331,7 @@ class TestTokenizerCacheIdentity(unittest.TestCase):
                 state=SimpleNamespace(cache_identity="verified-user-digest")
             ),
         )
-        self.assertIsNone(self.obj.api_key)
+        self.assertIsNone(self.obj.cache_user_id)
         self.assertIsNone(self.obj.cache_ttl_seconds)
 
     def test_batch_subobjects_and_parallel_clones_keep_physical_mode(self):
@@ -346,12 +352,12 @@ class TestTokenizerCacheIdentity(unittest.TestCase):
                     is_single=False,
                     bootstrap_room=None,
                     received_time=1,
-                    api_key=None,
+                    cache_user_id=None,
                     cache_ttl_seconds=ttl,
                     cache_required=True,
                 )
                 self.manager._init_req_state(batch)
-                self.assertIsNone(child.api_key)
+                self.assertIsNone(child.cache_user_id)
                 self.assertEqual(child.cache_ttl_seconds, ttl)
                 self.assertTrue(child.cache_required)
                 self.assertEqual(
@@ -393,7 +399,7 @@ class TestTokenizerCachePreparation(unittest.TestCase):
         self.obj = SimpleNamespace(
             rid="r1",
             cache_ttl_seconds=300,
-            api_key="verified-api-key-hash",
+            cache_user_id="verified-api-key-hash",
             cache_required=True,
             sampling_params={"max_new_tokens": 4},
             text="text deliberately differs from final token IDs",
@@ -425,11 +431,11 @@ class TestTokenizerCachePreparation(unittest.TestCase):
     def test_prefill_ignores_cache_options_before_configuration_and_identity(self):
         self.manager.disaggregation_mode = _DISAGG_MODE.PREFILL
         self.serving.enable_cache_accounting = False
-        self.obj.api_key = None
+        self.obj.cache_user_id = None
         self.obj.cache_ttl_seconds = 3600
         self.assertIsNone(self.prepare())
         self.assertIsNone(self.obj.cache_ttl_seconds)
-        self.assertIsNone(self.obj.api_key)
+        self.assertIsNone(self.obj.cache_user_id)
         self.assertIsNone(self.state.cache_plan)
 
     def test_decode_uses_selected_ttl_and_256_token_blocks(self):
@@ -513,10 +519,10 @@ class TestTokenizerCachePreparation(unittest.TestCase):
                 original = getattr(self.obj, name)
                 setattr(self.obj, name, value)
                 self.obj.cache_ttl_seconds = 300
-                self.obj.api_key = "verified-api-key-hash"
+                self.obj.cache_user_id = "verified-api-key-hash"
                 self.assertIsNone(self.prepare())
                 self.assertIsNone(self.obj.cache_ttl_seconds)
-                self.assertIsNone(self.obj.api_key)
+                self.assertIsNone(self.obj.cache_user_id)
                 setattr(self.obj, name, original)
 
     def test_unsupported_request_without_identity_uses_physical_mode(self):
@@ -533,10 +539,10 @@ class TestTokenizerCachePreparation(unittest.TestCase):
                         setattr(self.obj, name, value)
                         self.obj.cache_ttl_seconds = 300
                         self.obj.cache_required = required
-                        self.obj.api_key = identity
+                        self.obj.cache_user_id = identity
                         self.assertIsNone(self.prepare())
                         self.assertEqual(self.obj.cache_ttl_seconds, 300)
-                        self.assertIsNone(self.obj.api_key)
+                        self.assertIsNone(self.obj.cache_user_id)
                         self.assertEqual(self.state.cache_physical_ttl_seconds, 300)
                         self.assertIsNone(self.state.cache_plan)
             setattr(self.obj, name, original)
@@ -551,7 +557,7 @@ class TestTokenizerCachePreparation(unittest.TestCase):
                     {"build_page_cache_plan": builder},
                 ),
             ):
-                self.obj.api_key = None
+                self.obj.cache_user_id = None
                 self.obj.cache_ttl_seconds = ttl
                 self.manager._prepare_cache_plan(self.obj, None)
                 self.assertEqual(self.state.cache_physical_ttl_seconds, ttl)
@@ -578,7 +584,7 @@ class TestTokenizerCachePreparation(unittest.TestCase):
                         self.assertIsNone(self.state.cache_plan)
                         self.assertEqual(self.obj.cache_ttl_seconds, ttl)
                         self.assertEqual(
-                            self.state.cache_plan_context[0], self.obj.api_key
+                            self.state.cache_plan_context[0], self.obj.cache_user_id
                         )
                         self.assertEqual(self.state.cache_plan_context[2], ttl)
                         contexts.append(self.state.cache_plan_context)
@@ -598,22 +604,35 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         self.manager.disaggregation_mode = _DISAGG_MODE.DECODE
         self.metrics = Mock()
         self.manager._cache_metrics = self.metrics
+        self.manager._cache_tasks = set()
+        self.manager._cache_renewal_tasks = {}
+        self.manager._cache_accounting_closing = False
+        self.release_events = []
         self.plan = _CACHE.build_page_cache_plan(
             input_ids=list(range(10)),
-            api_key="verified-api-key-hash",
+            cache_user_id="verified-api-key-hash",
             namespace="weights-v1/tokenizer-v1",
             page_size=4,
             ttl_seconds=300,
         )
         self.usage = _CACHE.CacheUsage(ttl_seconds=300, read_tokens=4, write_tokens=4)
         self.account = AsyncMock(return_value=self.usage)
-        self.manager._cache_store = SimpleNamespace(account=self.account)
+        self.renew = AsyncMock()
+        self.close_store = AsyncMock()
+        self.manager._cache_store = SimpleNamespace(
+            account=self.account, renew=self.renew, aclose=self.close_store
+        )
         self.state = SimpleNamespace(
             obj=SimpleNamespace(rid="cache-request-1"),
             cache_plan=self.plan,
             cache_task=None,
             cache_usage=None,
         )
+
+    async def asyncTearDown(self):
+        for event in self.release_events:
+            event.set()
+        await asyncio.wait_for(self.manager.close_cache_accounting(), timeout=1)
 
     async def test_multimodal_feature_hash_runs_off_the_event_loop(self):
         threads = []
@@ -624,7 +643,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             prepared.append(mm_inputs)
 
         manager = _load_manager_helpers(prepare_media=prepare)()
-        obj = _GenerateReqInput(rid="mm", api_key="user", cache_ttl_seconds=300)
+        obj = _GenerateReqInput(rid="mm", cache_user_id="user", cache_ttl_seconds=300)
         mm_inputs = SimpleNamespace(mm_items=[object()])
         await manager._prepare_cache_media_digests(obj, mm_inputs)
         self.assertEqual(prepared, [mm_inputs])
@@ -640,7 +659,9 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
             ("user", None, object()),
             ("user", 300, None),
         ):
-            obj = _GenerateReqInput(rid="mm", api_key=identity, cache_ttl_seconds=ttl)
+            obj = _GenerateReqInput(
+                rid="mm", cache_user_id=identity, cache_ttl_seconds=ttl
+            )
             await manager._prepare_cache_media_digests(obj, mm_inputs)
         prepare.assert_not_called()
 
@@ -648,7 +669,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         prepare = Mock(side_effect=ValueError("sensitive media content"))
         logger = Mock()
         manager = _load_manager_helpers(prepare_media=prepare, cache_logger=logger)()
-        obj = _GenerateReqInput(rid="mm", api_key="user", cache_ttl_seconds=300)
+        obj = _GenerateReqInput(rid="mm", cache_user_id="user", cache_ttl_seconds=300)
         await manager._prepare_cache_media_digests(obj, object())
         self.assertEqual(obj.cache_ttl_seconds, 300)
         logger.warning.assert_called_once()
@@ -966,7 +987,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
                     is_single=False,
                     bootstrap_room=None,
                     received_time=1,
-                    api_key=None,
+                    cache_user_id=None,
                     cache_ttl_seconds=ttl,
                     cache_required=True,
                     batch_size=1,
@@ -988,7 +1009,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
                     state = self.manager.rid_to_state[obj.rid]
                     if obj.cache_ttl_seconds is None:
                         warmups.append(obj)
-                        self.assertIsNone(obj.api_key)
+                        self.assertIsNone(obj.cache_user_id)
                         self.assertFalse(obj.cache_required)
                         self.manager._start_cache_accounting(
                             state, 10, 0, {"type": "length"}, cached_tokens=7
@@ -1147,7 +1168,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
     async def test_no_complete_block_logs_without_claiming_redis_was_used(self):
         self.state.cache_plan = _CACHE.build_page_cache_plan(
             input_ids=[1, 2, 3],
-            api_key="verified-api-key-hash",
+            cache_user_id="verified-api-key-hash",
             namespace="weights-v1",
             page_size=_CACHE.CACHE_BLOCK_SIZE,
             ttl_seconds=3600,
@@ -1211,7 +1232,7 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
     async def test_other_request_keeps_its_own_accounting_task(self):
         other_plan = _CACHE.build_page_cache_plan(
             input_ids=list(range(10)),
-            api_key="verified-api-key-hash",
+            cache_user_id="verified-api-key-hash",
             namespace="weights-v1/tokenizer-v1",
             page_size=4,
             ttl_seconds=300,
@@ -1250,6 +1271,245 @@ class TestTokenizerCache(unittest.IsolatedAsyncioTestCase):
         release.set()
         self.assertEqual(await self.state.cache_task, self.usage)
         self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
+
+    async def test_renewal_runs_once_only_after_owner_finish(self):
+        self.start()
+        initial = await self.attach()
+        renewal = self.state.cache_renewal_task
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertFalse(renewal.done())
+        self.renew.assert_not_awaited()
+        self.manager._finish_cache_accounting(self.state)
+        final = await self.attach()
+        self.manager._finish_cache_accounting(self.state)
+        await self.attach()
+        self.assertTrue(renewal.done())
+        self.renew.assert_awaited_once_with(self.plan, rid="cache-request-1")
+        self.assertEqual(initial["meta_info"]["cache_usage"], self.usage.to_dict())
+        self.assertEqual(final["meta_info"]["cache_usage"], self.usage.to_dict())
+        self.account.assert_awaited_once()
+        self.metrics.observe_usage.assert_called_once_with(300, self.usage, "redis")
+
+    async def test_finish_before_account_uses_initial_eval_without_extra_renewal(self):
+        self.start()
+        self.manager._finish_cache_accounting(self.state)
+        out = await self.attach()
+        self.assertTrue(self.state.cache_finished_event.is_set())
+        self.assertIsNone(getattr(self.state, "cache_renewal_task", None))
+        self.renew.assert_not_awaited()
+        self.account.assert_awaited_once_with(self.plan, rid="cache-request-1")
+        self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
+
+    async def test_finish_during_account_waits_for_final_renewal_before_response(self):
+        entered, account_release = asyncio.Event(), asyncio.Event()
+        renew_entered, renew_release = asyncio.Event(), asyncio.Event()
+        self.release_events.extend((account_release, renew_release))
+
+        async def account(plan, *, rid):
+            entered.set()
+            await account_release.wait()
+            return self.usage
+
+        async def renew(plan, *, rid):
+            renew_entered.set()
+            await renew_release.wait()
+
+        self.account.side_effect = account
+        self.renew.side_effect = renew
+        self.start()
+        await asyncio.wait_for(entered.wait(), 1)
+        self.manager._finish_cache_accounting(self.state)
+        response = asyncio.create_task(self.attach())
+        account_release.set()
+        await asyncio.wait_for(renew_entered.wait(), 1)
+        self.assertFalse(response.done())
+        renew_release.set()
+        out = await asyncio.wait_for(response, 1)
+        self.renew.assert_awaited_once_with(self.plan, rid="cache-request-1")
+        self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
+
+    async def test_cancelled_consumer_still_renews_when_owner_finishes(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.release_events.append(release)
+
+        async def account(plan, *, rid):
+            entered.set()
+            await release.wait()
+            return self.usage
+
+        self.account.side_effect = account
+        self.start()
+        await asyncio.wait_for(entered.wait(), 1)
+        response = asyncio.create_task(self.attach())
+        await asyncio.sleep(0)
+        response.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await response
+        self.assertFalse(self.state.cache_task.cancelled())
+        self.manager._finish_cache_accounting(self.state)
+        release.set()
+        await asyncio.wait_for(self.state.cache_task, 1)
+        await asyncio.wait_for(self.state.cache_renewal_task, 1)
+        self.renew.assert_awaited_once_with(self.plan, rid="cache-request-1")
+        out = await self.attach()
+        self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
+
+    async def test_fallback_missing_identity_and_short_input_never_renew(self):
+        for source in ("physical", "missing_identity", "no_complete_block", "media"):
+            with self.subTest(source=source):
+                state = SimpleNamespace(
+                    obj=SimpleNamespace(rid=source),
+                    cache_plan=self.plan,
+                    cache_task=None,
+                    cache_usage=None,
+                )
+                self.account.reset_mock(side_effect=True)
+                self.account.return_value = self.usage
+                if source == "physical":
+                    self.account.side_effect = _CACHE.CacheAccountingError("offline")
+                elif source == "missing_identity":
+                    state.cache_plan = None
+                    state.cache_physical_ttl_seconds = 300
+                elif source == "media":
+                    state.cache_plan = None
+                    state.cache_plan_context = ("user", "model", 300)
+                else:
+                    state.cache_plan = _CACHE.build_page_cache_plan(
+                        [1, 2], "user", "model", 256, 300
+                    )
+                    self.account.return_value = _CACHE.CacheUsage(ttl_seconds=300)
+                self.manager._start_cache_accounting(
+                    state,
+                    2 if source == "no_complete_block" else 10,
+                    1,
+                    None,
+                    cached_tokens=1,
+                )
+                await self.manager._attach_cache_usage(state, {"meta_info": {}})
+                self.manager._finish_cache_accounting(state)
+                self.assertIsNone(getattr(state, "cache_renewal_task", None))
+                self.renew.assert_not_awaited()
+
+    async def test_failed_final_renewal_keeps_usage_and_redacts_error(self):
+        self.renew.side_effect = _CACHE.CacheAccountingError("private credential")
+        self.start()
+        initial = await self.attach()
+        self.manager._finish_cache_accounting(self.state)
+        final = await self.attach()
+        self.assertEqual(final["meta_info"], initial["meta_info"])
+        self.metrics.observe_usage.assert_called_once()
+        warning = _log_message(self.logger.warning.call_args)
+        self.assertIn("phase=finish", warning)
+        self.assertIn("error_type=CacheAccountingError", warning)
+        self.assertNotIn("private credential", warning)
+
+    async def test_close_waits_for_final_renewal_without_cancelling_response(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.release_events.append(release)
+        order = []
+
+        async def renew(plan, *, rid):
+            order.append("renew-start")
+            entered.set()
+            await release.wait()
+            order.append("renew-end")
+
+        async def close():
+            order.append("close")
+
+        self.renew.side_effect = renew
+        self.close_store.side_effect = close
+        self.start()
+        await self.attach()
+        self.manager._finish_cache_accounting(self.state)
+        response = asyncio.create_task(self.attach())
+        await asyncio.wait_for(entered.wait(), 1)
+        closing = asyncio.create_task(self.manager.close_cache_accounting())
+        await asyncio.sleep(0)
+        self.assertFalse(closing.done())
+        self.assertFalse(self.state.cache_renewal_task.cancelled())
+        self.close_store.assert_not_awaited()
+        release.set()
+        out, _ = await asyncio.wait_for(asyncio.gather(response, closing), 1)
+        self.assertEqual(order, ["renew-start", "renew-end", "close"])
+        self.assertEqual(out["meta_info"]["cache_usage"], self.usage.to_dict())
+        self.assertEqual(self.manager._cache_tasks, set())
+        self.assertEqual(self.manager._cache_renewal_tasks, {})
+
+    async def test_close_finishes_concurrent_renewals_and_blocks_new_accounting(self):
+        states = []
+        for index in range(6):
+            state = SimpleNamespace(
+                obj=SimpleNamespace(rid=f"shutdown-{index}"),
+                cache_plan=self.plan,
+                cache_task=None,
+                cache_usage=None,
+            )
+            self.manager._start_cache_accounting(state, 10, 1, None)
+            states.append(state)
+        await asyncio.gather(*(state.cache_task for state in states))
+        self.renew.assert_not_awaited()
+        await asyncio.wait_for(self.manager.close_cache_accounting(), 1)
+        self.assertEqual(self.renew.await_count, len(states))
+        self.assertTrue(all(state.cache_finished_event.is_set() for state in states))
+        self.assertTrue(all(state.cache_renewal_task.done() for state in states))
+        self.assertEqual(self.manager._cache_tasks, set())
+        self.assertEqual(self.manager._cache_renewal_tasks, {})
+        self.start()
+        self.assertIsNone(self.state.cache_task)
+        self.assertEqual(self.account.await_count, len(states))
+
+    def test_real_output_and_abort_owners_signal_finish(self):
+        source = ast.parse((_SRT / "managers/tokenizer_manager.py").read_text())
+        manager = next(
+            node
+            for node in source.body
+            if isinstance(node, ast.ClassDef) and node.name == "TokenizerManager"
+        )
+
+        def signals(node):
+            return any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "_finish_cache_accounting"
+                for call in ast.walk(node)
+            )
+
+        output = next(
+            node
+            for node in manager.body
+            if getattr(node, "name", None) == "_handle_batch_output"
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Attribute)
+                and node.test.attr == "finished"
+                and any(signals(statement) for statement in node.body)
+                for node in ast.walk(output)
+            )
+        )
+        abort = next(
+            node
+            for node in manager.body
+            if getattr(node, "name", None) == "_handle_abort_req"
+        )
+        finished_index = next(
+            index
+            for index, node in enumerate(abort.body)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute) and target.attr == "finished"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        )
+        signal_index = next(
+            index for index, node in enumerate(abort.body) if signals(node)
+        )
+        self.assertGreater(signal_index, finished_index)
 
 
 if __name__ == "__main__":

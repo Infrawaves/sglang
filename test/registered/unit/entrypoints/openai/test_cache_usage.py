@@ -29,6 +29,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 API_KEY_IDENTITY = "api-key:" + sha256(b"verified-key").hexdigest()
+CACHE_USER_ID = "gateway-body-user"
+CACHE_USER_IDENTITY = "cache-user-id:" + sha256(CACHE_USER_ID.encode()).hexdigest()
 
 
 SNAPSHOT = {
@@ -314,9 +316,6 @@ class TestCacheRequest(unittest.TestCase):
             **kwargs,
         )
 
-    def trusted_request(self):
-        return SimpleNamespace(state=SimpleNamespace(api_key=API_KEY_IDENTITY))
-
     def test_ttl_defaults_and_validation(self):
         self.assertEqual(PromptCacheOptions().mode, "implicit")
         self.assertEqual(PromptCacheOptions(mode="implicit").ttl, "5m")
@@ -330,35 +329,23 @@ class TestCacheRequest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 PromptCacheOptions(**invalid)
 
-    def test_trusted_identity_applies_to_explicit_and_default_options(self):
-        request = self.request(user="spoofed", api_key="spoofed")
-        self.assertIsNone(self.chat._cache_request_params(request, None)["api_key"])
-        params = self.chat._cache_request_params(request, self.trusted_request())
-        self.assertEqual(
-            params,
-            {
-                "api_key": API_KEY_IDENTITY,
-                "cache_required": True,
-                "cache_ttl_seconds": 300,
-            },
-        )
-        request.prompt_cache_options = PromptCacheOptions(ttl="1h")
-        self.assertEqual(
-            self.chat._cache_request_params(request, self.trusted_request())[
-                "cache_ttl_seconds"
-            ],
-            3600,
-        )
-        request.prompt_cache_options = None
-        self.assertIsNone(self.chat._cache_request_params(request, None)["api_key"])
-        self.assertEqual(
-            self.chat._cache_request_params(request, self.trusted_request()),
-            {
-                "api_key": API_KEY_IDENTITY,
-                "cache_required": False,
-                "cache_ttl_seconds": 300,
-            },
-        )
+    def test_unrelated_body_identity_fields_do_not_enable_cache_for_any_ttl(self):
+        for options, ttl_seconds in (
+            (None, 300),
+            (PromptCacheOptions(), 300),
+            (PromptCacheOptions(ttl="1h"), 3600),
+        ):
+            with self.subTest(options=options):
+                request = self.request(user="spoofed", api_key="spoofed")
+                request.prompt_cache_options = options
+                self.assertEqual(
+                    self.chat._cache_request_params(request),
+                    {
+                        "cache_user_id": None,
+                        "cache_required": options is not None,
+                        "cache_ttl_seconds": ttl_seconds,
+                    },
+                )
 
     def test_missing_identity_keeps_ttl_for_physical_usage_only(self):
         for options, ttl_seconds in (
@@ -366,30 +353,25 @@ class TestCacheRequest(unittest.TestCase):
             (PromptCacheOptions(), 300),
             (PromptCacheOptions(ttl="1h"), 3600),
         ):
-            for identity in (None, "", " \t", 123):
-                with self.subTest(options=options, identity=identity):
-                    request = self.request(
-                        user="untrusted-openai-user", api_key="body-key"
-                    )
-                    request.prompt_cache_options = options
-                    raw = SimpleNamespace(state=SimpleNamespace(api_key=identity))
-                    self.assertEqual(
-                        self.chat._cache_request_params(request, raw),
-                        {
-                            "api_key": None,
-                            "cache_required": options is not None,
-                            "cache_ttl_seconds": ttl_seconds,
-                        },
-                    )
+            with self.subTest(options=options):
+                request = self.request()
+                request.prompt_cache_options = options
+                self.assertEqual(
+                    self.chat._cache_request_params(request),
+                    {
+                        "cache_user_id": None,
+                        "cache_required": options is not None,
+                        "cache_ttl_seconds": ttl_seconds,
+                    },
+                )
 
     def test_disabled_server_rejects_explicit_options(self):
-        raw_request = self.trusted_request()
         self.config.enable_cache_accounting = False
         omitted = self.request()
         omitted.prompt_cache_options = None
-        self.assertEqual(self.chat._cache_request_params(omitted, None), {})
+        self.assertEqual(self.chat._cache_request_params(omitted), {})
         with self.assertRaisesRegex(ValueError, "not enabled"):
-            self.chat._cache_request_params(self.request(), raw_request)
+            self.chat._cache_request_params(self.request())
 
     def test_gateway_user_identity_works_without_engine_authentication(self):
         request = self.request(cache_user_id="gateway-user-a")
@@ -401,16 +383,16 @@ class TestCacheRequest(unittest.TestCase):
         ):
             with self.subTest(options=options):
                 request.prompt_cache_options = options
-                params = self.chat._cache_request_params(request, None)
-                self.assertEqual(params["api_key"], identity)
+                params = self.chat._cache_request_params(request)
+                self.assertEqual(params["cache_user_id"], identity)
                 self.assertEqual(params["cache_ttl_seconds"], ttl)
                 self.assertEqual(params["cache_required"], options is not None)
 
-    def test_gateway_users_are_isolated_under_one_engine_credential(self):
+    def test_gateway_users_are_isolated(self):
         identities = [
-            self.chat._cache_request_params(
-                self.request(cache_user_id=user), self.trusted_request()
-            )["api_key"]
+            self.chat._cache_request_params(self.request(cache_user_id=user))[
+                "cache_user_id"
+            ]
             for user in ("gateway-user-a", "gateway-user-b", "gateway-user-a")
         ]
         self.assertEqual(identities[0], identities[2])
@@ -427,7 +409,6 @@ class TestCacheRequest(unittest.TestCase):
 
     def test_request_shape_is_left_to_tokenizer_manager(self):
         # The chat layer no longer rejects shapes; TokenizerManager decides.
-        raw_request = self.trusted_request()
         self.chat.tokenizer_manager.model_config.is_multimodal = True
         for overrides in (
             {"n": 2},
@@ -436,9 +417,7 @@ class TestCacheRequest(unittest.TestCase):
             {"custom_params": {"beam_width": 2}},
         ):
             with self.subTest(overrides=overrides):
-                params = self.chat._cache_request_params(
-                    self.request(**overrides), raw_request
-                )
+                params = self.chat._cache_request_params(self.request(**overrides))
                 self.assertEqual(params["cache_ttl_seconds"], 300)
 
     def test_prefill_ignores_options_before_config_and_identity_checks(self):
@@ -449,7 +428,7 @@ class TestCacheRequest(unittest.TestCase):
             for options in (None, PromptCacheOptions(), PromptCacheOptions(ttl="1h")):
                 with self.subTest(enabled=enabled, options=options):
                     request.prompt_cache_options = options
-                    self.assertEqual(self.chat._cache_request_params(request, None), {})
+                    self.assertEqual(self.chat._cache_request_params(request), {})
 
     def test_cache_k3_count_uses_complete_model_input(self):
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -541,7 +520,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 "read_tokens": self.accounting_read_tokens,
                 "write_tokens": self.accounting_write_tokens,
             }
-            if adapted_request.api_key is None:
+            if adapted_request.cache_user_id is None:
                 snapshot.update(read_tokens=self.physical_cached_tokens, write_tokens=0)
             if self.snapshot_override is not None:
                 snapshot = dict(self.snapshot_override)
@@ -646,7 +625,15 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         self.disagg_patch.start()
         self.addCleanup(self.disagg_patch.stop)
 
-    def request(self, ttl, stream=False, *, omit_options=False, multimodal=False):
+    def request(
+        self,
+        ttl,
+        stream=False,
+        *,
+        omit_options=False,
+        multimodal=False,
+        cache_user_id=CACHE_USER_ID,
+    ):
         options = {"mode": "implicit"}
         if ttl is not None:
             options["ttl"] = ttl
@@ -670,6 +657,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
             ],
             max_completion_tokens=2,
             **({} if omit_options else {"prompt_cache_options": options}),
+            cache_user_id=cache_user_id,
             user="untrusted-body-user",
             stream=stream,
             stream_options={"include_usage": True} if stream else None,
@@ -679,7 +667,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         return Request(
             {
                 "type": "http",
-                "headers": [],
+                "headers": [(b"authorization", b"Bearer verified-key")],
                 "state": {"api_key": API_KEY_IDENTITY},
             }
         )
@@ -694,7 +682,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
             {"cached_tokens": 16, "cache_write_tokens": 16},
         )
         adapted_request = self.adapted_requests[-1]
-        self.assertEqual(adapted_request.api_key, API_KEY_IDENTITY)
+        self.assertEqual(adapted_request.cache_user_id, CACHE_USER_IDENTITY)
         self.assertEqual(
             adapted_request.cache_ttl_seconds, 300 if ttl in (None, "5m") else 3600
         )
@@ -861,7 +849,11 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 for stream in (False, True):
                     with self.subTest(source=source, ttl=ttl, stream=stream):
                         request = self.request(
-                            ttl, stream=stream, omit_options=omitted, multimodal=True
+                            ttl,
+                            stream=stream,
+                            omit_options=omitted,
+                            multimodal=True,
+                            cache_user_id=None,
                         )
                         if source == "redis_failure":
                             request.cache_user_id = "multimodal-gateway-user"
@@ -876,7 +868,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                         response = await self.chat.handle_request(request, raw)
                         self.assertTrue(self.adapted_requests[-1].contains_mm_input())
                         self.assertEqual(
-                            self.adapted_requests[-1].api_key is None,
+                            self.adapted_requests[-1].cache_user_id is None,
                             source == "missing_identity",
                         )
                         if stream:
@@ -931,7 +923,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 response = await self.chat.handle_request(request, raw_request)
                 expected = "cache-user-id:" + sha256(b"gateway-body-user").hexdigest()
                 self.assertEqual(raw_request.state.cache_identity, expected)
-                self.assertEqual(self.adapted_requests[-1].api_key, expected)
+                self.assertEqual(self.adapted_requests[-1].cache_user_id, expected)
                 if stream:
                     async for _ in response.body_iterator:
                         pass
@@ -939,14 +931,27 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.usage.prompt_tokens, 43)
 
     async def test_missing_identity_serves_physical_usage_with_zero_write_headers(self):
-        for stream in (False, True):
+        for stream, bearer in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
             for ttl, omitted in ((None, True), ("5m", False), ("1h", False)):
-                with self.subTest(stream=stream, ttl=ttl, omitted=omitted):
-                    request = self.request(ttl, stream=stream, omit_options=omitted)
-                    raw = Request({"type": "http", "headers": [], "state": {}})
+                with self.subTest(
+                    stream=stream, bearer=bearer, ttl=ttl, omitted=omitted
+                ):
+                    request = self.request(
+                        ttl, stream=stream, omit_options=omitted, cache_user_id=None
+                    )
+                    raw = (
+                        self.raw_request()
+                        if bearer
+                        else Request({"type": "http", "headers": [], "state": {}})
+                    )
                     response = await self.chat.handle_request(request, raw)
                     self.assertFalse(hasattr(raw.state, "cache_identity"))
-                    self.assertIsNone(self.adapted_requests[-1].api_key)
+                    self.assertIsNone(self.adapted_requests[-1].cache_user_id)
                     self.assertEqual(
                         self.adapted_requests[-1].cache_ttl_seconds,
                         3600 if ttl == "1h" else 300,
@@ -961,6 +966,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                                 "0",
                             )
                         frames = [frame async for frame in response.body_iterator]
+                        self.assert_no_usage(json.loads(frames[0][6:]))
                         usage = json.loads(frames[-2][6:])["usage"]
                     else:
                         self.assertEqual(
@@ -982,12 +988,14 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         for stream in (False, True):
             for omitted in (False, True):
                 with self.subTest(stream=stream, omitted=omitted):
-                    request = self.request("5m", stream=stream, omit_options=omitted)
+                    request = self.request(
+                        "5m", stream=stream, omit_options=omitted, cache_user_id=None
+                    )
                     request.n = 2
                     raw = Request({"type": "http", "headers": [], "state": {}})
                     response = await self.chat.handle_request(request, raw)
                     self.assertFalse(hasattr(raw.state, "cache_identity"))
-                    self.assertIsNone(self.adapted_requests[-1].api_key)
+                    self.assertIsNone(self.adapted_requests[-1].cache_user_id)
                     if stream:
                         frames = [frame async for frame in response.body_iterator]
                         usage = json.loads(frames[-2][6:])["usage"]
@@ -1003,7 +1011,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     )
 
     async def test_missing_identity_stream_headers_do_not_require_usage_chunks(self):
-        request = self.request(None, stream=True, omit_options=True)
+        request = self.request(None, stream=True, omit_options=True, cache_user_id=None)
         request.stream_options = None
         raw = Request({"type": "http", "headers": [], "state": {}})
         response = await self.chat.handle_request(request, raw)
@@ -1018,13 +1026,13 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         for frame in frames[1:-1]:
             self.assertIsNone(json.loads(frame[6:]).get("usage"))
         self.assertFalse(hasattr(raw.state, "cache_identity"))
-        self.assertIsNone(self.adapted_requests[-1].api_key)
+        self.assertIsNone(self.adapted_requests[-1].cache_user_id)
 
     async def test_missing_identity_zero_output_keeps_physical_snapshot(self):
         for stream, include_usage in ((False, True), (True, True), (True, False)):
             for ttl in ("5m", "1h"):
                 with self.subTest(stream=stream, include_usage=include_usage, ttl=ttl):
-                    request = self.request(ttl, stream=stream)
+                    request = self.request(ttl, stream=stream, cache_user_id=None)
                     request.max_completion_tokens = 0
                     request.max_tokens = 0
                     if stream:
@@ -1032,7 +1040,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                     raw = Request({"type": "http", "headers": [], "state": {}})
                     response = await self.chat.handle_request(request, raw)
                     adapted = self.adapted_requests[-1]
-                    self.assertIsNone(adapted.api_key)
+                    self.assertIsNone(adapted.cache_user_id)
                     self.assertTrue(adapted.cache_required)
                     self.assertEqual(adapted.sampling_params["max_new_tokens"], 0)
                     self.assertFalse(hasattr(raw.state, "cache_identity"))
@@ -1105,7 +1113,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(response.usage.cache_usage)
         self.assertIsNone(response.usage.prompt_tokens_details)
-        self.assertIsNone(self.adapted_requests[-1].api_key)
+        self.assertIsNone(self.adapted_requests[-1].cache_user_id)
         self.assertIsNone(self.adapted_requests[-1].cache_ttl_seconds)
 
     async def test_prefill_ignores_explicit_options_for_both_response_modes(self):
@@ -1123,7 +1131,7 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                 else:
                     usage = response.model_dump()["usage"]
                 self.assertIsNone(usage.get("prompt_tokens_details"))
-                self.assertIsNone(self.adapted_requests[-1].api_key)
+                self.assertIsNone(self.adapted_requests[-1].cache_user_id)
                 self.assertIsNone(self.adapted_requests[-1].cache_ttl_seconds)
 
     async def test_debug_meta_info_does_not_expose_internal_cache_snapshot(self):
