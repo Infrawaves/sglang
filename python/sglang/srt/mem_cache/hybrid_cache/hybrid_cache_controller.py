@@ -170,6 +170,14 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        # Observability only, all on the IO / prefetch threads' monotonic clock:
+        # when the existence query finished, when the last KV batch and the
+        # non-KV pool read started, and why the non-KV read was skipped
+        # ("terminated" or "kv_short"; None if it ran).
+        self.query_done_ts: Optional[float] = None
+        self.kv_last_ts: Optional[float] = None
+        self.sidecar_ts: Optional[float] = None
+        self.skip_reason: Optional[str] = None
 
     def mark_terminate(self):
         with self._lock:
@@ -1202,6 +1210,7 @@ class HybridCacheController(BaseHiCacheController):
             # are prefix-covered, so re-querying only adds a round trip.
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+            operation.query_done_ts = time.monotonic()
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -1220,6 +1229,7 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.query_done_ts = time.monotonic()
 
         return (
             hash_value[:kv_hit_pages],
@@ -1289,9 +1299,11 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
-        ):
+        if operation.is_terminated():
+            operation.skip_reason = "terminated"
+        elif kv_completed_pages != len(operation.hash_value):
+            operation.skip_reason = "kv_short"
+        if operation.skip_reason is None:
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
             transfers_nonkv = [
@@ -1307,6 +1319,7 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            operation.sidecar_ts = time.monotonic()
             results = {}
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys,

@@ -1097,6 +1097,8 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
+                operation.kv_last_ts = time.monotonic()
+
                 hit_pages = self._page_transfer_kv_batch(
                     operation,
                     batch_hashes,
@@ -1236,15 +1238,29 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                # [x, -x] under MIN yields [min x, -max x] in one collective, so
+                # the cross-rank spread costs no extra communication. PP-ticket
+                # mode reduces a scalar on these groups elsewhere, so keep the
+                # scalar shape there to avoid mismatched collectives.
+                pack_spread = getattr(self, "pp_prefetch_command_group", None) is None
                 storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                    [storage_hit_count, -storage_hit_count]
+                    if pack_spread
+                    else storage_hit_count,
+                    dtype=torch.int,
                 )
                 self._all_reduce(
                     storage_hit_count_tensor,
                     torch.distributed.ReduceOp.MIN,
                     self.prefetch_hits_sync_groups,
                 )
-                storage_hit_count = storage_hit_count_tensor.item()
+                if pack_spread:
+                    storage_hit_count = int(storage_hit_count_tensor[0].item())
+                    operation.query_rank_spread = (
+                        -int(storage_hit_count_tensor[1].item()) - storage_hit_count
+                    )
+                else:
+                    storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

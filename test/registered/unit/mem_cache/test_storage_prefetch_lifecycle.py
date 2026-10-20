@@ -1,6 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import defaultdict, deque
@@ -11,6 +12,7 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -30,7 +32,9 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -493,6 +497,190 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+
+class _FakeMetric:
+    """Records label sets like prometheus_client, so a label typo fails loudly."""
+
+    def __init__(self, name, documentation, labelnames=(), **kwargs):
+        self.labelnames = set(labelnames)
+        self.values = {}
+
+    def labels(self, **kwargs):
+        assert set(kwargs) == self.labelnames, (kwargs, self.labelnames)
+        values, key = self.values, tuple(sorted(kwargs.items()))
+
+        class _Child:
+            def inc(self, n=1):
+                values[key] = values.get(key, 0) + n
+
+            def observe(self, v):
+                values.setdefault(key, []).append(v)
+
+            def set(self, v):
+                values[key] = v
+
+        return _Child()
+
+
+class _FakeStorageCollector(StorageMetricsCollector):
+    _counter_cls = _FakeMetric
+    _gauge_cls = _FakeMetric
+    _histogram_cls = _FakeMetric
+
+
+def _label_hits(metric, **labels):
+    return [
+        v
+        for k, v in metric.values.items()
+        if all(dict(k).get(a) == b for a, b in labels.items())
+    ]
+
+
+class TestHybridPrefetchOutcomeMetrics(CustomTestCase):
+    def _run_outcome(self, completed, expected, ok, **op):
+        collector = _FakeStorageCollector({"model_name": "m"})
+        fake_self = SimpleNamespace(
+            enable_storage_metrics=True, storage_metrics_collector=collector
+        )
+        fields = dict(
+            assume_stored=False,
+            skip_reason=None,
+            query_done_ts=None,
+            kv_last_ts=None,
+            sidecar_ts=None,
+        )
+        fields.update(op)
+        UnifiedRadixCache._log_hybrid_prefetch_outcome(
+            fake_self, SimpleNamespace(**fields), completed, expected, ok
+        )
+        return collector
+
+    def test_kind_classification_and_precedence(self):
+        """Every kind the radix cache can emit has a pre-built collector child
+        (a typo would raise KeyError on the scheduler thread), a terminated
+        prefetch is never reported as a short KV read even though its
+        completed_tokens is short too."""
+        cases = [
+            ("success", dict(completed=1024, expected=1024, ok=True)),
+            (
+                "discard_terminated",
+                dict(completed=0, expected=2048, ok=False, skip_reason="terminated"),
+            ),
+            (
+                "discard_kv_short",
+                dict(completed=512, expected=2048, ok=False, skip_reason="kv_short"),
+            ),
+            ("discard_pool_short", dict(completed=2048, expected=2048, ok=False)),
+        ]
+        for kind, kwargs in cases:
+            with self.subTest(kind=kind):
+                collector = self._run_outcome(**kwargs)
+                self.assertEqual(
+                    _label_hits(collector.hybrid_prefetch_result_total, kind=kind),
+                    [1],
+                )
+
+    def test_read_age_uses_the_last_read_started(self):
+        """One age per prefetch, from the query to the last read that started:
+        the non-KV pool read when it ran, else the last KV batch."""
+        collector = self._run_outcome(
+            2048,
+            2048,
+            False,
+            assume_stored=True,
+            query_done_ts=100.0,
+            kv_last_ts=102.0,
+            sidecar_ts=None,
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(
+            _label_hits(ages, outcome="discard", assume_stored="1"), [[2.0]]
+        )
+
+        collector = self._run_outcome(
+            2048, 2048, True, query_done_ts=100.0, kv_last_ts=102.0, sidecar_ts=103.5
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(_label_hits(ages, outcome="ok", assume_stored="0"), [[3.5]])
+
+        # No existence query timestamp (e.g. the query path raised): no age.
+        collector = self._run_outcome(
+            0, 2048, False, query_done_ts=None, kv_last_ts=5.0
+        )
+        self.assertEqual(collector.storage_read_age_seconds.values, {})
+
+
+def _peer_min(peers):
+    """_all_reduce stand-in for a two-rank group: elementwise MIN with a peer."""
+
+    def reduce(tensor, op, groups):
+        assert op == torch.distributed.ReduceOp.MIN
+        peer = peers.pop(0)
+        assert tensor.shape == peer.shape, "ranks must pack identically"
+        tensor.copy_(torch.minimum(tensor, peer))
+
+    return reduce
+
+
+class TestPrefetchRankSpread(CustomTestCase):
+    def test_ack_reduction_keeps_scalar_shape(self):
+        """The completion-sync collectives carry no spread: completed_tokens is
+        a scalar and pool hits one int per pool, as before."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.prefetch_completion_sync_groups = []
+        pools = list(PoolName)
+        peer_hits = [0] * len(pools)
+        peer_hits[pools.index(PoolName.MAMBA)] = 3
+        ctrl._all_reduce = _peer_min(
+            [
+                torch.tensor(60, dtype=torch.int),
+                torch.tensor(peer_hits, dtype=torch.int),
+            ]
+        )
+        ack = PrefetchAck(
+            rid="r",
+            operation=None,
+            completed_tokens=100,
+            pool_hits={PoolName.MAMBA.value: 5},
+        )
+        ctrl._reduce_prefetch_ack(ack)
+        self.assertEqual(ack.completed_tokens, 60)
+        self.assertEqual(ack.pool_hits[PoolName.MAMBA.value], 3)
+
+    def _query(self, ctrl, peer_tensor):
+        ctrl.storage_stop_event = threading.Event()
+        ctrl.prefetch_queue = Queue()
+        ctrl.prefetch_hit_queue = Queue()
+        ctrl.prefetch_hits_sync_groups = []
+        ctrl.page_size = 64
+        ctrl._storage_hit_query = lambda op: (["h"] * 4, 256)
+        reduce = _peer_min([peer_tensor])
+
+        def reduce_then_stop(tensor, op, groups):
+            reduce(tensor, op, groups)
+            ctrl.storage_stop_event.set()
+
+        ctrl._all_reduce = reduce_then_stop
+        ctrl.prefetch_queue.put(SimpleNamespace(is_terminated=lambda: False))
+        HiCacheController.prefetch_thread_func(ctrl)
+        return ctrl.prefetch_hit_queue.get_nowait()
+
+    def test_query_reduction_shape_matches_the_other_collective_users(self):
+        """The hit-sync groups are also reduced as a scalar by the PP prefetch
+        ticket path; a rank that packs a different shape deadlocks the group.
+        Packing is therefore enabled only when the PP ticket group is absent."""
+        ctrl = object.__new__(HiCacheController)
+        ctrl.pp_prefetch_command_group = None
+        op = self._query(ctrl, torch.tensor([128, -128], dtype=torch.int))
+        self.assertEqual((op.storage_hit_count, op.query_rank_spread), (128, 128))
+        self.assertEqual(op.hash_value, ["h"] * 2)
+
+        ctrl = object.__new__(HiCacheController)
+        ctrl.pp_prefetch_command_group = object()
+        op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
+        self.assertEqual(op.storage_hit_count, 128)
+        self.assertFalse(hasattr(op, "query_rank_spread"))
 
 
 if __name__ == "__main__":
