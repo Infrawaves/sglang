@@ -19,10 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
-    PDRoutingFields,
-    PromptCacheOptions,
-)
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
 
 
 class AnthropicError(BaseModel):
@@ -39,11 +36,6 @@ class AnthropicErrorResponse(BaseModel):
     error: AnthropicError
 
 
-class AnthropicCacheCreation(BaseModel):
-    ephemeral_5m_input_tokens: NonNegativeInt = 0
-    ephemeral_1h_input_tokens: NonNegativeInt = 0
-
-
 class AnthropicUsage(BaseModel):
     """Token usage information.
 
@@ -56,7 +48,6 @@ class AnthropicUsage(BaseModel):
     output_tokens: Optional[NonNegativeInt] = None
     cache_creation_input_tokens: Optional[NonNegativeInt] = None
     cache_read_input_tokens: Optional[NonNegativeInt] = None
-    cache_creation: Optional[AnthropicCacheCreation] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
@@ -375,15 +366,6 @@ class AnthropicMessagesRequest(PDRoutingFields):
     messages: list[AnthropicMessage]
     max_tokens: int
     metadata: Optional[dict[str, Any]] = None
-    prompt_cache_options: Optional[PromptCacheOptions] = None
-    cache_user_id: Optional[str] = Field(
-        default=None,
-        strict=True,
-        min_length=1,
-        pattern=r"\S",
-        repr=False,
-        description="User identity supplied by the authenticating gateway for cache isolation.",
-    )
     stop_sequences: Optional[list[str]] = None
     stream: Optional[bool] = False
     system: Optional[Union[str, list[AnthropicContentBlock]]] = None
