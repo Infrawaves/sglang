@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -228,13 +229,16 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
-        mla_host_read_only: bool = False,
         mla_dedup_context: Optional[Any] = None,
     ):
         startup_storage_backend = storage_backend
         # The MLA anchor host buffer is another rank's copy (shared or none):
         # this rank never writes it (D2H backup, L3 prefetch).
-        self.mla_host_read_only = mla_host_read_only
+        anchor_host_pool = mem_pool_host.anchor_entry.host_pool
+        self.mla_host_read_only = (
+            isinstance(anchor_host_pool, MLATokenToKVPoolHost)
+            and anchor_host_pool.host_buffer_read_only
+        )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None

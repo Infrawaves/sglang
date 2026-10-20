@@ -1,4 +1,5 @@
 import contextlib
+import os
 import socket
 import sys
 import unittest
@@ -7,18 +8,23 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.mla_host_node_leader import (
     NodeLeaderMLABroadcast,
     NodeLeaderMLAContext,
     NodeSharedHostTensorAllocator,
+    _connect_node,
+    maybe_create_node_leader_context,
     split_ranks_by_node,
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -172,6 +178,170 @@ class TestNodeLeaderModes(CustomTestCase):
                 self.assertEqual(kwargs["host_buffer_read_only"], is_follower)
 
 
+class TestNodeLeaderStartup(CustomTestCase):
+    @contextlib.contextmanager
+    def _startup(self, modes, *, enabled=True):
+        module = "sglang.srt.mem_cache.mla_host_node_leader"
+        world_cpu = object()
+
+        def gather(output, value, *, group):
+            self.assertIs(group, world_cpu)
+            output[:] = modes
+
+        with (
+            mock.patch(
+                f"{module}.get_memory",
+                return_value=SimpleNamespace(enable_mla_hicache_per_node=enabled),
+            ),
+            mock.patch(f"{module}.mla_host_dedup_eligible", return_value=True),
+            mock.patch(
+                f"{module}.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="null"),
+            ),
+            mock.patch(
+                f"{module}.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+            mock.patch(f"{module}.is_dp_attention_enabled", return_value=False),
+            mock.patch(f"{module}.ranks_per_host", return_value=2),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=SimpleNamespace(cpu_group=world_cpu),
+            ),
+            mock.patch("torch.distributed.get_world_size", return_value=len(modes)),
+            mock.patch(
+                "torch.distributed.all_gather_object", side_effect=gather
+            ) as agreed,
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.get_process_group_ranks", return_value=[0]),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
+            ) as create,
+        ):
+            yield agreed, create
+
+    def test_mode_mismatch_across_tp_groups_precedes_branching(self):
+        """TP-local agreement must not let different WORLD ranks diverge at NCCL setup."""
+        for mode in ("broadcast", "shm"):
+            with (
+                envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.override(mode),
+                self._startup(["broadcast", "broadcast", "shm", "shm"]) as (_, create),
+            ):
+                with self.assertRaisesRegex(ValueError, "must agree across WORLD"):
+                    maybe_create_node_leader_context(object(), {}, object(), None)
+                create.assert_not_called()
+
+    def test_flag_off_and_size_one_keep_collective_order(self):
+        """Flag-off is inert; size-one ranks still join WORLD setup before returning."""
+        for enabled in (False, True):
+            for mode in ("broadcast", "shm"):
+                with (
+                    envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.override(mode),
+                    self._startup([mode] * 4, enabled=enabled) as (agreed, create),
+                ):
+                    result = maybe_create_node_leader_context(
+                        object(), {}, object(), None
+                    )
+                    self.assertIsNone(result)
+                    self.assertEqual(agreed.call_count, int(enabled))
+                    self.assertEqual(
+                        create.call_count, int(enabled and mode == "broadcast")
+                    )
+
+    def test_bootstrap_setup_failure_closes_local_sockets(self):
+        """Aggregated bind/connect failure must not retain bootstrap sockets."""
+        for follower in (False, True):
+            sock = mock.Mock()
+            sock.bind.side_effect = OSError("bind failed")
+            sock.connect.side_effect = OSError("connect failed")
+            with (
+                mock.patch("socket.socket", return_value=sock),
+                mock.patch("torch.distributed.get_rank", return_value=int(follower)),
+                mock.patch(
+                    "torch.distributed.get_process_group_ranks", return_value=[0, 1]
+                ),
+                mock.patch("torch.distributed.all_gather_object"),
+                mock.patch("torch.distributed.all_reduce"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "host-local setup failed"):
+                    _connect_node(
+                        is_follower=follower, node_ranks=[0, 1], tp_cache_group=object()
+                    )
+            sock.close.assert_called_once()
+
+
+class TestNodeSharedHostTensorCleanup(CustomTestCase):
+    def test_exchange_closes_fds_and_sockets_on_success_and_failure(self):
+        """Failed allocation/send/map must release bootstrap resources as success does."""
+        module = "sglang.srt.mem_cache.mla_host_node_leader"
+        for failure in (None, "allocate", "send", "map", "receive"):
+            for follower in (False, True):
+                if (failure in ("allocate", "send") and follower) or (
+                    failure in ("map", "receive") and not follower
+                ):
+                    continue
+                with (
+                    self.subTest(failure=failure, follower=follower),
+                    contextlib.ExitStack() as resources,
+                ):
+                    read_fd, write_fd = os.pipe()
+                    os.close(write_fd)
+                    resources.callback(self._close_if_open, read_fd)
+                    sock, peer = socket.socketpair()
+                    resources.callback(sock.close)
+                    resources.callback(peer.close)
+                    allocator = NodeSharedHostTensorAllocator(
+                        is_follower=follower, peer_sockets=[sock]
+                    )
+                    tensor = object()
+                    with (
+                        mock.patch(
+                            f"{module}.alloc_shm",
+                            return_value=(tensor, read_fd, None),
+                            side_effect=OSError("allocate")
+                            if failure == "allocate"
+                            else None,
+                        ),
+                        mock.patch(
+                            "socket.send_fds",
+                            create=True,
+                            side_effect=OSError("send") if failure == "send" else None,
+                        ),
+                        mock.patch(
+                            "socket.recv_fds",
+                            create=True,
+                            return_value=(b"x", [read_fd], None, None),
+                            side_effect=OSError("receive")
+                            if failure == "receive"
+                            else None,
+                        ),
+                        mock.patch(
+                            f"{module}.map_shm",
+                            return_value=tensor,
+                            side_effect=ValueError("map") if failure == "map" else None,
+                        ),
+                    ):
+                        if failure:
+                            with self.assertRaisesRegex((OSError, ValueError), failure):
+                                allocator.allocate((1,), torch.uint8, "cpu")
+                        else:
+                            self.assertIs(
+                                allocator.allocate((1,), torch.uint8, "cpu"), tensor
+                            )
+                    self.assertEqual(sock.fileno(), -1)
+                    self.assertEqual(allocator.peer_sockets, [])
+                    if failure not in ("allocate", "receive"):
+                        with self.assertRaises(OSError):
+                            os.fstat(read_fd)
+
+    @staticmethod
+    def _close_if_open(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 @unittest.skipUnless(sys.platform == "linux", "memfd and SCM_RIGHTS need Linux")
 class TestNodeSharedHostTensorAllocator(CustomTestCase):
     def _pair(self):
@@ -209,9 +379,11 @@ class TestReadOnlyAnchorTransfers(CustomTestCase):
     def _controller(
         self, *, mla_host_read_only: bool, mla_dedup=None
     ) -> HybridCacheController:
+        host_pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host_pool.host_buffer_read_only = mla_host_read_only
         kv = PoolEntry(
             name=PoolName.KV,
-            host_pool=object(),
+            host_pool=host_pool,
             device_pool=object(),
             layer_mapper=lambda layer_id: layer_id,
             is_primary_index_anchor=True,
@@ -222,14 +394,23 @@ class TestReadOnlyAnchorTransfers(CustomTestCase):
             device_pool=object(),
             layer_mapper=lambda layer_id: layer_id,
         )
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.mla_host_read_only = mla_host_read_only
-        controller.mla_dedup = mla_dedup
-        controller.transfer_layer_id_max = 2
-        controller.mem_pool_host = SimpleNamespace(
+        host_group = SimpleNamespace(
             anchor_entry=kv, entry_map={kv.name: kv, mamba.name: mamba}
         )
+        with mock.patch.object(HiCacheController, "__init__", return_value=None):
+            controller = HybridCacheController(None, host_group, 1, None, mock.Mock())
+        controller.mla_dedup = mla_dedup
+        controller.transfer_layer_id_max = 2
+        controller.mem_pool_host = host_group
         return controller
+
+    def test_logical_anchor_has_no_mla_role(self):
+        """A logical anchor has no MLA ownership field and must retain its transfers."""
+        host = LogicalHostPool.__new__(LogicalHostPool)
+        group = SimpleNamespace(anchor_entry=SimpleNamespace(host_pool=host))
+        with mock.patch.object(HiCacheController, "__init__", return_value=None):
+            controller = HybridCacheController(None, group, 1, None, mock.Mock())
+        self.assertFalse(controller.mla_host_read_only)
 
     def test_read_only_anchor_is_loaded_but_never_written(self):
         """A follower must skip D2H into the shared MLA buffer (only the leader
@@ -288,9 +469,10 @@ class TestReadOnlyAnchorTransfers(CustomTestCase):
                 controller.attach_storage_backend("mooncake")
             roles[read_only] = controller.page_get_func
 
-        self.assertEqual(
-            roles[True].__func__, HybridCacheController._page_get_shared_by_leader
-        )
+        follower = roles[True].__self__
+        follower.storage_backend = mock.Mock()
+        self.assertEqual(roles[True](None, ["page0", "page1"], torch.arange(2)), 2)
+        self.assertEqual(follower.storage_backend.mock_calls, [])
         self.assertEqual(roles[False].__func__, HiCacheController._page_get_zero_copy)
 
 

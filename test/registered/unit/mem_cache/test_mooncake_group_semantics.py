@@ -1,11 +1,13 @@
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -246,6 +248,7 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    mla_host_read_only=None,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -267,15 +270,76 @@ def _make_store(
         },
     ):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MLATokenToKVPoolHost,
             MooncakeStore,
         )
 
         store = MooncakeStore(cfg)
+        if mla_host_read_only is not None:
+            # Use the class bound by this store's module before its mock imports expire.
+            host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+            host.host_buffer_read_only = mla_host_read_only
+            store.mem_pool_host = host
 
     return store, fake_store_cls.instances[-1]
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_mla_exists_before_registration_and_on_leader(self):
+        """Ordinary MLA queries work before registration; leader misses remain real misses."""
+        for host_read_only in (None, False):
+            store, backend = _make_store(
+                is_mla_model=True, mla_host_read_only=host_read_only
+            )
+            keys = ["page0", "page1"]
+            backend.existing_keys.add(f"page0_{store.mla_suffix}_k")
+            self.assertEqual(store.batch_exists(keys), 1)
+            backend.existing_keys.clear()
+            self.assertEqual(store.batch_exists(keys), 0)
+
+    def test_follower_exists_skips_only_mla_and_preserves_mamba_stop_points(self):
+        """Follower MLA is assumed present, but missing rank-sharded state still limits restore."""
+        for dummy in (False, True):
+            store, backend = _make_store(
+                is_mla_model=True, tp_rank=1, tp_size=2, mla_host_read_only=True
+            )
+            store.mem_pool_host.kv_buffer = None if dummy else torch.empty(1)
+            store.registered_pools[PoolName.MAMBA] = SimpleNamespace(
+                conv_buffer=[torch.empty(1)], temporal_state_elem_size=1
+            )
+            keys = ["page0", "page1", "page2"]
+            for page in ("page0", "page2"):
+                backend.existing_keys.update(
+                    [
+                        f"{page}_{store.mha_suffix}_temporal",
+                        f"{page}_{store.mha_suffix}_conv_0",
+                    ]
+                )
+            with patch.object(
+                backend, "batch_is_exist", wraps=backend.batch_is_exist
+            ) as queries:
+                self.assertEqual(store.batch_exists(keys), 3)
+                queries.assert_not_called()
+                for policy, expected_pages, stop_points in (
+                    (PoolHitPolicy.ALL_PAGES, 1, [1]),
+                    (PoolHitPolicy.TRAILING_PAGES, 3, [1, 3]),
+                ):
+                    transfer = PoolTransfer(
+                        name=PoolName.MAMBA, keys=["page2"], hit_policy=policy
+                    )
+                    result = store.batch_exists_v2(keys, [transfer])
+                    self.assertEqual(result.kv_hit_pages, expected_pages)
+                    self.assertEqual(result.restorable_prefix_pages, stop_points)
+                backend.existing_keys.clear()
+                self.assertEqual(
+                    store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 0
+                )
+            self.assertTrue(queries.call_args_list)
+            for call in queries.call_args_list:
+                self.assertTrue(
+                    all(key.endswith(("_temporal", "_conv_0")) for key in call.args[0])
+                )
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(

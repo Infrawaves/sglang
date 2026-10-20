@@ -389,6 +389,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.mem_pool_host: Optional[HostKVCache] = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -1435,6 +1436,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            return len(keys)
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 

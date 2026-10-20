@@ -376,7 +376,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = False
         # The staged kernel reads whole device pages, so it needs packed rows.
         if (
-            self.layout != "page_first"
+            self.host_buffer_read_only
+            or self.layout != "page_first"
             or not self.device_rows_packed
             or not current_platform.capabilities.hicache_device_kernels
         ):
