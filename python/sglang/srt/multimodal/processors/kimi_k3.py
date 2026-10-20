@@ -70,7 +70,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.utils import is_cuda, load_image
 from sglang.srt.utils.common import CORRUPT_VIDEO_MESSAGE, is_corrupt_video_error
 
@@ -126,6 +126,32 @@ def _probe_encoded_image(data: bytes) -> Optional[_K3EncodedImage]:
     except Exception:
         return None
     return _K3EncodedImage(data, int(width), int(height), 4 if has_alpha else 3)
+
+
+def _snapshot_image_size(media) -> Optional[tuple[tuple[int, int], str]]:
+    """``((width, height), content_digest)`` for one image, without decoding it.
+
+    Mirrors the size prefill feeds ``navit_resize_config``: the stored image
+    size for raw bytes (the K3 load path applies no EXIF transpose), and
+    ``_get_image_dimensions`` for already-decoded PIL / tensor inputs. Returns
+    None when the header cannot be read, so the caller takes the full path.
+    """
+    try:
+        snapshot = snapshot_media(media)
+    except Exception:
+        return None
+    data = snapshot.data
+    if isinstance(data, (bytes, bytearray)):
+        encoded = _probe_encoded_image(bytes(data))
+        if encoded is None:
+            return None
+        size = (encoded.width, encoded.height)
+    elif isinstance(data, (Image.Image, torch.Tensor)):
+        width, height = _get_image_dimensions(data)
+        size = (int(width), int(height))
+    else:
+        return None
+    return size, snapshot.content_digest
 
 
 def _image_geometry(image) -> tuple[int, int, int]:
@@ -1028,6 +1054,16 @@ class KimiK3ImageProcessor(
         # Reserved from processor worker threads and the event loop alike.
         self._gpu_preprocess_lock = threading.Lock()
         self._log_preprocess_backend = envs.SGLANG_K3_IMAGE_PREPROCESS_LOG.get()
+        # PD decode never runs the vision encoder; see SGLANG_K3_DECODE_MM_LENGTH_ONLY.
+        self._decode_mm_length_only = (
+            get_disagg().disaggregation_mode == "decode"
+            and envs.SGLANG_K3_DECODE_MM_LENGTH_ONLY.get()
+        )
+        if self._decode_mm_length_only:
+            logger.info(
+                "Kimi-K3 PD decode: image requests are built from image headers "
+                "only (no pixel preprocessing; SGLANG_K3_DECODE_MM_LENGTH_ONLY=1)."
+            )
         if self._gpu_preprocess_budget_bytes is not None:
             # GPU and CPU features for one image differ slightly, and a request
             # may now land on either; see artifact_feature_hash_is_backend_stable.
@@ -1549,6 +1585,95 @@ class KimiK3ImageProcessor(
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    async def _process_mm_data_length_only(
+        self, image_data, input_text
+    ) -> Optional[MultimodalProcessorOutput]:
+        """Build a PD-decode image request from image headers alone.
+
+        Decode receives the prompt KV from prefill and never runs the vision
+        encoder; what it needs is the prompt prefill built, token for token in
+        length: each image's ``num_tokens`` and ``WxH`` header both come from
+        the image size through ``navit_resize_config``, exactly as on prefill.
+        Pixels are never decoded, resized or patchified, and no feature is
+        hashed: with the decode radix cache off, ``pad_value`` only has to be a
+        stable placeholder, so it comes from the source bytes' digest.
+
+        The image fetch and header read run on the IO pool. Returns None when
+        any image's size cannot be read from its header, so the caller falls
+        back to the full path and keeps its error semantics.
+        """
+        loop = asyncio.get_running_loop()
+        probes = await asyncio.gather(
+            *(
+                loop.run_in_executor(self.io_executor, _snapshot_image_size, item)
+                for item in image_data
+            )
+        )
+        if any(probe is None for probe in probes):
+            return None
+
+        config = self._processor.preprocess_config
+        sizes, resize_configs, digests = [], [], []
+        for (width, height), digest in probes:
+            sizes.append((width, height))
+            resize_configs.append(
+                navit_resize_config(
+                    width,
+                    height,
+                    config.patch_size,
+                    config.merge_kernel_size,
+                    config.in_patch_limit,
+                    config.patch_limit_on_one_side,
+                    config.fixed_output_tokens,
+                )
+            )
+            digests.append(digest)
+
+        original_ids = (
+            input_text
+            if isinstance(input_text, (list, torch.Tensor))
+            else _encode_k3_special_tokens(self._tokenizer, input_text)
+        )
+        input_ids = _expand_k3_image_prompt_token_ids(
+            original_ids,
+            self.mm_tokens.image_token_id,
+            [resize["num_tokens"] for resize in resize_configs],
+            sizes,
+            self._tokenizer,
+        ).flatten()
+        offsets = self.get_mm_items_offset(input_ids, self.mm_tokens.image_token_id)
+        if len(offsets) != len(resize_configs):
+            raise ValueError("Expected one Kimi-K3 image span for each image")
+
+        items = []
+        for resize, offset, digest in zip(resize_configs, offsets, digests):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=None,
+                offsets=[offset],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor(
+                        [_grid_thw_from_resize_config(resize, config.patch_size)],
+                        dtype=torch.int64,
+                    )
+                },
+            )
+            # "sha256:<hex>": the leading 64 bits are a stable placeholder hash.
+            item.set_hash(int(digest.split(":", 1)[-1][:16], 16))
+            items.append(item)
+        if self._log_preprocess_backend:
+            logger.info(
+                "Kimi-K3 preprocess: backend=decode-length-only items=%d "
+                "visual_tokens=%d",
+                len(items),
+                sum(resize["num_tokens"] for resize in resize_configs),
+            )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=items,
+            im_token_id=self.mm_tokens.image_token_id,
+        )
+
     async def _stage_raw_images(self, image_data) -> Optional[list]:
         """Fetch each raw image once and read its header, without decoding.
 
@@ -1817,6 +1942,18 @@ class KimiK3ImageProcessor(
             self._resolve_visual_modalities(
                 request_obj, expected_image_count, len(video_data)
             )
+        if (
+            self._decode_mm_length_only
+            and image_data
+            and not video_data
+            and not any(self._is_preprocessed_input(item) for item in image_data)
+        ):
+            length_only = await self._process_mm_data_length_only(
+                image_data, input_text
+            )
+            if length_only is not None:
+                return length_only
+
         if (
             video_data
             or any(self._is_preprocessed_input(item) for item in image_data)

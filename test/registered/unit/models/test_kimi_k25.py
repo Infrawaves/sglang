@@ -64,8 +64,10 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _ensure_chw_rgb,
     _expand_image_token_ids,
+    _grid_thw_from_resize_config,
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
+    navit_resize_config,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -1738,6 +1740,127 @@ def test_kimi_k3_rejects_audio_input():
             )
         )
     processor.load_mm_data.assert_not_awaited()
+
+
+# --- PD decode: image requests built from headers only ------------------------
+
+
+def _png_bytes(width, height):
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color=(10, 20, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _length_only_processor(config):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99, image_token="<|media_pad|>")
+    processor._tokenizer = _Tokenizer()
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    processor._processor = SimpleNamespace(preprocess_config=config)
+    processor._log_preprocess_backend = False
+    processor.io_executor = ThreadPoolExecutor(max_workers=2)
+    return processor
+
+
+def test_kimi_k3_decode_length_only_matches_the_full_prompt():
+    """Decode must build the same prompt as prefill, from headers alone."""
+    config = _k3_preprocess_config()
+    processor = _length_only_processor(config)
+    try:
+        sizes = [(1536, 1024), (1024, 1536)]
+        images = [_png_bytes(w, h) for w, h in sizes]
+        prompt = [1, 99, 2, 99, 3]
+
+        with patch(
+            "sglang.srt.multimodal.processors.kimi_k3.load_image",
+            side_effect=AssertionError("decode must not decode pixels"),
+        ):
+            got = asyncio.run(processor._process_mm_data_length_only(images, prompt))
+
+        artifacts = []
+        for (width, height), data in zip(sizes, images):
+            resize = navit_resize_config(
+                width,
+                height,
+                config.patch_size,
+                config.merge_kernel_size,
+                config.in_patch_limit,
+                config.patch_limit_on_one_side,
+                config.fixed_output_tokens,
+            )
+            artifacts.append(
+                KimiK3ImagePreprocessArtifact(
+                    content_digest=snapshot_media(data).content_digest,
+                    artifact_key="artifact",
+                    feature_hash=123,
+                    original_size=(width, height),
+                    resize_config=KimiK3ResizeConfig.from_dict(resize),
+                    grid_thw=_grid_thw_from_resize_config(resize, config.patch_size),
+                    feature=torch.zeros(1),
+                )
+            )
+        want = processor.compose_request(prompt, artifacts)
+    finally:
+        processor.io_executor.shutdown()
+
+    assert got.input_ids == want.input_ids
+    assert [item.offsets for item in got.mm_items] == [
+        item.offsets for item in want.mm_items
+    ]
+    for got_item, want_item in zip(got.mm_items, want.mm_items):
+        assert got_item.feature is None
+        assert got_item.pad_value is not None
+        torch.testing.assert_close(
+            got_item.model_specific_data["image_grid_thw"],
+            want_item.model_specific_data["image_grid_thw"],
+        )
+    # Distinct images get distinct placeholders; the same bytes, the same one.
+    assert got.mm_items[0].pad_value != got.mm_items[1].pad_value
+    again = _length_only_processor(config)
+    try:
+        repeat = asyncio.run(again._process_mm_data_length_only(images[:1], [1, 99, 2]))
+    finally:
+        again.io_executor.shutdown()
+    assert repeat.mm_items[0].pad_value == got.mm_items[0].pad_value
+
+
+def test_kimi_k3_decode_length_only_falls_back_on_an_unreadable_header():
+    processor = _length_only_processor(_k3_preprocess_config())
+    try:
+        out = asyncio.run(
+            processor._process_mm_data_length_only([b"not an image"], [1, 99, 2])
+        )
+    finally:
+        processor.io_executor.shutdown()
+    assert out is None
+
+
+def test_kimi_k3_decode_length_only_is_routed_only_for_plain_images():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99, image_token="<|media_pad|>")
+    processor._decode_mm_length_only = True
+    processor.mm_preprocess_cache = SimpleNamespace(enabled=True)
+    sentinel = object()
+    processor._process_mm_data_length_only = AsyncMock(return_value=sentinel)
+    processor._process_mm_data_uncached = AsyncMock(return_value="uncached")
+    processor.count_image_placeholders = lambda text, token_id: 1
+
+    image_req = SimpleNamespace(video_data=None, audio_data=None, mm_content_hashes=None)
+    assert (
+        asyncio.run(processor.process_mm_data_async([b"img"], [1, 99, 2], image_req))
+        is sentinel
+    )
+
+    processor._decode_mm_length_only = False
+    processor._process_mm_data_length_only.reset_mock()
+    processor.prepare_media_artifacts = AsyncMock(return_value=[])
+    processor.compose_request = Mock(return_value="full")
+    assert (
+        asyncio.run(processor.process_mm_data_async([b"img"], [1, 99, 2], image_req))
+        == "full"
+    )
+    processor._process_mm_data_length_only.assert_not_awaited()
 
 
 if __name__ == "__main__":

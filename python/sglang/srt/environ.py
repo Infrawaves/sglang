@@ -1979,6 +1979,15 @@ class Envs:
     # one line per request, matching the always-on video logs; turn it off to
     # silence it entirely.
     SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
+    # On a PD decode server, build Kimi-K3 image requests from image headers
+    # only: prompt token expansion, offsets and grids, with no pixel decode,
+    # resize/patchify or feature hashing. Decode receives the prompt KV from
+    # prefill and never runs the vision encoder, and with its radix cache off
+    # it needs only the same prompt length as prefill. Leaving that work on
+    # the tokenizer's event loop stalls token streaming for every request the
+    # worker serves (ITL max). Video requests and preprocessed inputs keep the
+    # full path. No effect outside --disaggregation-mode decode.
+    SGLANG_K3_DECODE_MM_LENGTH_ONLY = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
