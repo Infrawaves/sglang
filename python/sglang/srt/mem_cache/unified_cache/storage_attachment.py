@@ -14,6 +14,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.hicache_hook import (
+    MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR,
+)
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -24,6 +28,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -369,6 +374,13 @@ class StorageAttachment:
                 f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                 f"Expected one of {list(_WRITE_POLICIES)}."
             )
+        # Keyed on config, not mla_host_read_only, so leader and followers agree.
+        if (
+            hicache_write_policy == "write_back"
+            and get_memory().enable_mla_hicache_per_node
+            and envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.get() == "shm"
+        ):
+            return MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR
         return None
 
     def _apply_policies(
