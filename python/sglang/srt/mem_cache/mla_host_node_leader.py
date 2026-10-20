@@ -140,15 +140,22 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
         assert device == "cpu", device
         self.dims = dims
         self.dtype = dtype
-        if self.is_follower:
-            return self._receive(dims, dtype)
-        # Faulted in this thread, so leader_budget_scope's interleave applies.
-        tensor, fd, _ = alloc_shm(dims, dtype)
-        for sock in self.peer_sockets:
-            socket.send_fds(sock, [b"\0"], [fd])
-        # The mapping keeps the memory alive; the fd was only needed to share it.
-        os.close(fd)
-        return tensor
+        try:
+            if self.is_follower:
+                return self._receive(dims, dtype)
+            # Faulted in this thread, so leader_budget_scope's interleave applies.
+            tensor, fd, _ = alloc_shm(dims, dtype)
+            try:
+                for sock in self.peer_sockets:
+                    socket.send_fds(sock, [b"\0"], [fd])
+                return tensor
+            finally:
+                # The mapping owns the pages after this one-buffer exchange.
+                os.close(fd)
+        finally:
+            for sock in self.peer_sockets:
+                sock.close()
+            self.peer_sockets.clear()
 
     def _receive(self, dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         # Blocks until the leader has faulted in the pool, which can take minutes.
@@ -158,9 +165,11 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
                 "MLA HiCache node leader closed its socket before sending the "
                 "shared host buffer; see the leader's log."
             )
-        tensor = map_shm(fds[0], dims, dtype)
-        os.close(fds[0])
-        return tensor
+        try:
+            return map_shm(fds[0], dims, dtype)
+        finally:
+            for fd in fds:
+                os.close(fd)
 
 
 def _socket_address(token: str) -> str:
@@ -175,52 +184,60 @@ def _connect_node(
     tp_cache_group: torch.distributed.ProcessGroup,
 ) -> list[socket.socket]:
     """Collective over ``tp_cache_group``: connect each follower to its node
-    leader. Any failure raises on every rank of the group."""
+    leader. Bind/connect errors are aggregated before accepting peers."""
     rank = torch.distributed.get_rank()
     server = None
     token = None
     error = None
-    if not is_follower:
-        # Any failure must still reach the all_reduce below, or followers hang.
-        try:
-            token = uuid.uuid4().hex
-            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(_socket_address(token))
-            server.listen(len(node_ranks))
-        except Exception as e:
-            error = f"leader setup failed ({e!r})"
-
-    group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
-    tokens = [None] * len(group_ranks)
-    torch.distributed.all_gather_object(tokens, token, group=tp_cache_group)
-
     peer_sockets = []
-    if is_follower:
-        leader_token = tokens[group_ranks.index(node_ranks[0])]
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.connect(_socket_address(leader_token))
-        except OSError as e:
-            error = f"cannot reach rank {node_ranks[0]}'s socket ({e})"
-        peer_sockets.append(sock)
+    try:
+        if not is_follower:
+            # Any failure must still reach the all_reduce below, or followers hang.
+            try:
+                token = uuid.uuid4().hex
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                server.bind(_socket_address(token))
+                server.listen(len(node_ranks))
+            except Exception as e:
+                error = f"leader setup failed ({e!r})"
 
-    ok = torch.tensor([0 if error else 1], dtype=torch.int32)
-    torch.distributed.all_reduce(
-        ok, op=torch.distributed.ReduceOp.MIN, group=tp_cache_group
-    )
-    if error is not None:
-        logger.error("MLA HiCache node leader: rank %d: %s.", rank, error)
-    if ok.item() == 0:
-        raise RuntimeError(
-            "--enable-mla-hicache-per-node: host-local setup failed on some rank "
-            "(see the error logs). Ranks on one host must share a network "
-            "namespace (one pod)."
+        group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+        tokens = [None] * len(group_ranks)
+        torch.distributed.all_gather_object(tokens, token, group=tp_cache_group)
+
+        if is_follower:
+            leader_token = tokens[group_ranks.index(node_ranks[0])]
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(_socket_address(leader_token))
+            except OSError as e:
+                error = f"cannot reach rank {node_ranks[0]}'s socket ({e})"
+            peer_sockets.append(sock)
+
+        ok = torch.tensor([0 if error else 1], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            ok, op=torch.distributed.ReduceOp.MIN, group=tp_cache_group
         )
-    if server is not None:
-        # Every follower connected before the all_reduce, so none of these blocks.
-        peer_sockets = [server.accept()[0] for _ in node_ranks[1:]]
-        server.close()
-    return peer_sockets
+        if error is not None:
+            logger.error("MLA HiCache node leader: rank %d: %s.", rank, error)
+        if ok.item() == 0:
+            raise RuntimeError(
+                "--enable-mla-hicache-per-node: host-local setup failed on some rank "
+                "(see the error logs). Ranks on one host must share a network "
+                "namespace (one pod)."
+            )
+        if server is not None:
+            # Every follower connected before the all_reduce, so none of these blocks.
+            for _ in node_ranks[1:]:
+                peer_sockets.append(server.accept()[0])
+        return peer_sockets
+    except Exception:
+        for sock in peer_sockets:
+            sock.close()
+        raise
+    finally:
+        if server is not None:
+            server.close()
 
 
 class NodeLeaderMLABroadcaster(MLAHostDedupBroadcaster):
@@ -441,7 +458,19 @@ def maybe_create_node_leader_context(
         # same MLA KV. Rank-independent, checked before the collective.
         logger.warning("MLA HiCache node leader inactive: not supported with DCP.")
         return None
+    from sglang.srt.distributed.parallel_state import get_world_group
+
     mode = envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.get()
+    # PP=1 and the rank-independent gates above put every WORLD rank here.
+    # Agreement must precede create_custom_parallel_group, even for size-one TP.
+    world_group = get_world_group().cpu_group
+    modes = [None] * torch.distributed.get_world_size(group=world_group)
+    torch.distributed.all_gather_object(modes, mode, group=world_group)
+    if any(value != mode for value in modes):
+        raise ValueError(
+            "SGLANG_MLA_HICACHE_PER_NODE_MODE must agree across WORLD ranks; "
+            f"got {modes!r}."
+        )
     base_group = tp_group
     if is_dp_attention_enabled() and attn_tp_group is not None:
         base_group = attn_tp_group

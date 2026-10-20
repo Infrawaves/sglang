@@ -2070,6 +2070,38 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_mla_hicache_per_node_requires_pp_size_one(self):
+        """Per-node MLA HiCache must reject PP even on inactive or linker paths."""
+        for mode in ("broadcast", "shm"):
+            for cache_path in (
+                {"enable_hierarchical_cache": True},
+                {},
+                {"enable_unified_cache_external_linker": True},
+            ):
+                for enabled, pp_size in ((True, 2), (True, 1), (False, 2)):
+                    with (
+                        self.subTest(
+                            mode=mode,
+                            cache_path=cache_path,
+                            enabled=enabled,
+                            pp_size=pp_size,
+                        ),
+                        envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.override(mode),
+                    ):
+                        args = self._make_args(
+                            enable_mla_hicache_per_node=enabled,
+                            pp_size=pp_size,
+                            **cache_path,
+                        )
+                        if enabled and pp_size > 1:
+                            with self.assertRaisesRegex(
+                                ValueError,
+                                "--enable-mla-hicache-per-node requires --pp-size 1",
+                            ):
+                                handle_hicache(args)
+                        else:
+                            handle_hicache(args)
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):

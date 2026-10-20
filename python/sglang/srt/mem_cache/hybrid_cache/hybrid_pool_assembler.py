@@ -1255,7 +1255,6 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
-        mla_host_read_only=node_leader is not None and node_leader.is_follower,
         mla_dedup_context=None if node_leader is None else node_leader.broadcast,
     )
     return host_pool_group, cache_controller

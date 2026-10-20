@@ -31,6 +31,11 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_mla_hicache_per_node and cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-mla-hicache-per-node requires --pp-size 1; "
+            "pipeline parallelism is not supported in broadcast or shm mode."
+        )
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"

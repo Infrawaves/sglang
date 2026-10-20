@@ -220,7 +220,7 @@ class Memory(msgspec.Struct):
     ] = False
     enable_mla_hicache_per_node: A[
         bool,
-        "Keep one HiCache host copy of replicated MLA KV per node; only the first rank on each node writes it and reads L3 into it. The copy takes the whole node's share (--hicache-ratio/--hicache-size times the local rank count); when the local ranks are bound to several NUMA nodes it is interleaved over them, so no NUMA node holds more host memory than without this flag. SGLANG_MLA_HICACHE_PER_NODE_MODE=broadcast (default): the leader loads and broadcasts each layer to the other local GPUs over NVLink; the other local ranks allocate no MLA host memory. SGLANG_MLA_HICACHE_PER_NODE_MODE=shm: the copy sits in shared memory and every local rank loads from it with its own H2D copy; all ranks of a node must run in one pod (network namespace).",
+        "Keep one HiCache host copy of replicated MLA KV per node; only the first rank on each node writes it and reads L3 into it. Requires --pp-size 1 (no pipeline parallelism) in both modes. The copy takes the whole node's share (--hicache-ratio/--hicache-size times the local rank count); when the local ranks are bound to several NUMA nodes it is interleaved over them, so no NUMA node holds more host memory than without this flag. SGLANG_MLA_HICACHE_PER_NODE_MODE=broadcast (default): the leader loads and broadcasts each layer to the other local GPUs over NVLink; the other local ranks allocate no MLA host memory. SGLANG_MLA_HICACHE_PER_NODE_MODE=shm: the copy sits in shared memory and every local rank loads from it with its own H2D copy; all ranks of a node must run in one pod (network namespace).",
     ] = False
 
     # -------------------------------------------------------------------------

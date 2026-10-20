@@ -408,7 +408,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.host_buffer_read_only
+            or self.layout != "page_first"
+            or (_is_npu or _is_xpu or _is_mps)
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
