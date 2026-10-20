@@ -217,7 +217,9 @@ class TestNodeLeaderStartup(CustomTestCase):
             mock.patch(
                 "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
             ) as create,
+            mock.patch("torch.distributed.destroy_process_group") as destroy,
         ):
+            self.destroy = destroy
             yield agreed, create
 
     def test_mode_mismatch_across_tp_groups_precedes_branching(self):
@@ -247,6 +249,21 @@ class TestNodeLeaderStartup(CustomTestCase):
                     self.assertEqual(
                         create.call_count, int(enabled and mode == "broadcast")
                     )
+
+    def test_size_one_destroys_the_unused_broadcast_group(self):
+        """The early return must not leak the NCCL group it just created."""
+        for mode in ("broadcast", "shm"):
+            with (
+                envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.override(mode),
+                self._startup([mode] * 4) as (_, create),
+            ):
+                self.assertIsNone(
+                    maybe_create_node_leader_context(object(), {}, object(), None)
+                )
+                if mode == "broadcast":
+                    self.destroy.assert_called_once_with(create.return_value)
+                else:
+                    self.destroy.assert_not_called()
 
     def test_bootstrap_setup_failure_closes_local_sockets(self):
         """Aggregated bind/connect failure must not retain bootstrap sockets."""
@@ -333,6 +350,48 @@ class TestNodeSharedHostTensorCleanup(CustomTestCase):
                     if failure not in ("allocate", "receive"):
                         with self.assertRaises(OSError):
                             os.fstat(read_fd)
+
+    def test_second_allocate_is_rejected(self):
+        """A second buffer would be unshared on the leader and crash a follower."""
+        module = "sglang.srt.mem_cache.mla_host_node_leader"
+        for follower in (False, True):
+            with self.subTest(follower=follower):
+                sock, peer = socket.socketpair()
+                self.addCleanup(sock.close)
+                self.addCleanup(peer.close)
+                read_fd, write_fd = os.pipe()
+                os.close(write_fd)
+                self.addCleanup(self._close_if_open, read_fd)
+                allocator = NodeSharedHostTensorAllocator(
+                    is_follower=follower, peer_sockets=[sock]
+                )
+                with (
+                    mock.patch(
+                        f"{module}.alloc_shm", return_value=(object(), read_fd, None)
+                    ),
+                    mock.patch("socket.send_fds", create=True),
+                    mock.patch(
+                        "socket.recv_fds",
+                        create=True,
+                        return_value=(b"x", [read_fd], None, None),
+                    ),
+                    mock.patch(f"{module}.map_shm", return_value=object()),
+                ):
+                    allocator.allocate((1,), torch.uint8, "cpu")
+                    with self.assertRaisesRegex(RuntimeError, "more than once"):
+                        allocator.allocate((1,), torch.uint8, "cpu")
+
+    @unittest.skipUnless(sys.platform == "linux", "recv_fds needs Linux")
+    def test_follower_times_out_when_the_leader_never_sends(self):
+        """A stuck leader must surface as an error, not hang the follower."""
+        sock, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        allocator = NodeSharedHostTensorAllocator(
+            is_follower=True, peer_sockets=[sock], timeout_s=0.05
+        )
+        with self.assertRaisesRegex(RuntimeError, "Timed out after 0.05s"):
+            allocator.allocate((1,), torch.uint8, "cpu")
+        self.assertEqual(sock.fileno(), -1)
 
     @staticmethod
     def _close_if_open(fd):

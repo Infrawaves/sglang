@@ -121,6 +121,11 @@ def split_ranks_by_node(group_ranks: list[int], ranks_on_host: int) -> list[list
     return [nodes[node] for node in sorted(nodes)]
 
 
+# Follower wait for the leader's fd when --dist-timeout is unset; matches the
+# gloo group default, so it is no tighter than the broadcast-mode barrier.
+_FD_EXCHANGE_TIMEOUT_S = 120 * 60
+
+
 class NodeSharedHostTensorAllocator(HostTensorAllocator):
     """The leader allocates a memfd and sends it to every follower; a follower
     maps the fd it receives. Each side pins its own mapping afterwards."""
@@ -130,14 +135,26 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
         *,
         is_follower: bool,
         peer_sockets: list[socket.socket],
+        timeout_s: float = _FD_EXCHANGE_TIMEOUT_S,
     ):
         super().__init__()
         self.is_follower = is_follower
         # Leader: one connection per follower. Follower: the leader connection.
         self.peer_sockets = peer_sockets
+        # How long a follower waits for the leader to fault in and send the pool.
+        self.timeout_s = timeout_s
+        self._allocated = False
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert device == "cpu", device
+        if self._allocated:
+            # The sockets are gone after the first exchange: a second buffer
+            # would fail on a follower and be silently unshared on the leader.
+            raise RuntimeError(
+                "NodeSharedHostTensorAllocator shares exactly one buffer; "
+                "allocate() was called more than once."
+            )
+        self._allocated = True
         self.dims = dims
         self.dtype = dtype
         try:
@@ -159,7 +176,15 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
 
     def _receive(self, dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         # Blocks until the leader has faulted in the pool, which can take minutes.
-        _, fds, _, _ = socket.recv_fds(self.peer_sockets[0], 1, 1)
+        sock = self.peer_sockets[0]
+        sock.settimeout(self.timeout_s)
+        try:
+            _, fds, _, _ = socket.recv_fds(sock, 1, 1)
+        except socket.timeout as e:
+            raise RuntimeError(
+                f"Timed out after {self.timeout_s}s waiting for the MLA HiCache "
+                "node leader's shared host buffer; see the leader's log."
+            ) from e
         if not fds:
             raise RuntimeError(
                 "MLA HiCache node leader closed its socket before sending the "
@@ -495,6 +520,12 @@ def maybe_create_node_leader_context(
     # capacity from the rest of the TP group.
     min_node_size = min(len(ranks) for ranks in node_groups)
     if min_node_size <= 1:
+        if nccl_group is not None:
+            # Every rank returns here together, so each drops only its own handle.
+            try:
+                torch.distributed.destroy_process_group(nccl_group)
+            except Exception:
+                pass
         logger.info("MLA HiCache node leader inactive: one rank on this node.")
         return None
     # Only this rank knows its NUMA binding; all_gather_object orders results
@@ -536,7 +567,9 @@ def maybe_create_node_leader_context(
             tp_cache_group=base_group,
         )
         shared_allocator = NodeSharedHostTensorAllocator(
-            is_follower=is_follower, peer_sockets=peer_sockets
+            is_follower=is_follower,
+            peer_sockets=peer_sockets,
+            timeout_s=get_parallel().dist_timeout or _FD_EXCHANGE_TIMEOUT_S,
         )
     layer_counts = (
         ""
