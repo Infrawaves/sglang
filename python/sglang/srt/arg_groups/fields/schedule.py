@@ -104,7 +104,10 @@ class Schedule(msgspec.Struct):
         bool,
         "Enable the shortest-prefill-first chunk budget control under hrrn: "
         "a long request being chunk-prefilled gives part of each batch to "
-        "shorter waiting requests.",
+        "shorter waiting requests, at most half of the chunk budget and only as "
+        "many requests as the batch can still admit. With more than 128 waiting "
+        "requests hrrn sorting falls back to fcfs and the reservation follows "
+        "arrival order. No effect with --enable-chunked-prefill-round-robin.",
     ] = False
     enable_priority_scheduling: A[
         bool,

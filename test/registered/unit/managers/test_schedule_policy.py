@@ -266,6 +266,46 @@ class TestHRRNPrefillChunkLimit(CustomTestCase):
             )
         )
 
+    def test_hrrn_keeps_half_of_the_chunk_for_the_continuation(self):
+        # HRRN aging never ranks the chunked request, so a stream of short
+        # requests must not squeeze it below half a chunk; SPF keeps one page.
+        continuation = self.make_req("continuation", 65536)
+        waiting = [self.make_req(f"s{i}", 512) for i in range(8)]
+        spf = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        self.assertEqual(
+            self.make_policy().shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256
+            ),
+            2048,
+        )
+        self.assertEqual(
+            spf.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256), 512
+        )
+
+    def test_reservation_stops_at_admittable_requests(self):
+        # Rows or state slots that are not free must not hold back the
+        # continuation; reserved budget nobody can use is lost for the batch.
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req(f"s{i}", 512) for i in range(3)]
+        policy = self.make_policy()
+        self.assertEqual(
+            policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, max_reqs=1
+            ),
+            3584,
+        )
+        self.assertIsNone(
+            policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, max_reqs=0
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
