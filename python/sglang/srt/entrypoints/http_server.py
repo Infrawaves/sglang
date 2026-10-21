@@ -97,6 +97,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelCard,
     ModelList,
     ResponsesRequest,
+    ResponsesResponse,
     ScoringRequest,
     TokenizeRequest,
     V1RerankReqInput,
@@ -2034,6 +2035,16 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             result,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    if (
+        isinstance(result, ResponsesResponse)
+        and result.usage is not None
+        and result.usage.cache_usage is not None
+    ):
+        return ORJSONResponse(
+            content=result.model_dump(mode="json"),
+            headers=result.usage.cache_usage.response_headers(),
         )
 
     return result
