@@ -1950,6 +1950,18 @@ class ResponsesRequest(PDRoutingFields):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    prompt_cache_options: Optional[PromptCacheOptions] = Field(
+        default=None,
+        description="When server cache accounting is enabled, omission uses implicit mode with a 5m TTL.",
+    )
+    cache_user_id: Optional[str] = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        pattern=r"\S",
+        repr=False,
+        description="User identity supplied by the authenticating gateway for cache isolation.",
+    )
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
@@ -2275,6 +2287,11 @@ class ResponsesResponse(BaseModel):
             if usage.prompt_tokens_details
             else 0
         )
+        cache_write_tokens = (
+            usage.prompt_tokens_details.cache_write_tokens or 0
+            if usage.prompt_tokens_details
+            else 0
+        )
         reasoning_tokens = (
             usage.completion_tokens_details.reasoning_tokens
             if usage.completion_tokens_details
@@ -2285,7 +2302,7 @@ class ResponsesResponse(BaseModel):
             "input_tokens_details": {
                 "cached_tokens": cached,
                 # required (no default) in the SDK's InputTokensDetails model
-                "cache_write_tokens": 0,
+                "cache_write_tokens": cache_write_tokens,
             },
             "output_tokens": usage.completion_tokens or 0,
             "output_tokens_details": {"reasoning_tokens": reasoning_tokens},

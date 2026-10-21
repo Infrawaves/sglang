@@ -71,6 +71,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokensDetails,
     ResponseParserProtocol,
+    ResponsesRequest,
     SglExt,
     Tool,
     ToolCall,
@@ -910,7 +911,9 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
 
-    def _cache_request_params(self, request: ChatCompletionRequest) -> dict[str, Any]:
+    def _cache_request_params(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> dict[str, Any]:
         # The gateway sends the same options to both PD workers. Only decode
         # accounts the request; prefill accepts and ignores these options.
         if get_disagg().disaggregation_mode == "prefill":
