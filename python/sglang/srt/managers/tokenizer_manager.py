@@ -1277,21 +1277,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         ).__name__,
                     )
                 if source == "redis" and not finished_before_account:
-                    self._start_cache_renewal(state, active_plan)
+                    # A hit inherits the first writer's TTL. Renew that confirmed
+                    # generation rather than the requesting caller's preference.
+                    self._start_cache_renewal(
+                        state,
+                        dataclasses.replace(active_plan, ttl_seconds=usage.ttl_seconds),
+                        generation=usage.generation,
+                    )
             observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
             if metrics_parent is not None and metrics_parent.cache_usage is None:
                 # Parallel samples share one input; the first successful sample
                 # owns its metric observation while each sample keeps its usage.
                 metrics_parent.cache_usage = usage
             if self._cache_metrics is not None and observe_usage:
-                self._cache_metrics.observe_usage(ttl_seconds, usage, source)
+                self._cache_metrics.observe_usage(usage.ttl_seconds, usage, source)
             logger.info(
                 "Cache accounting complete rid=%s role=%s ttl=%d block_size=%d "
                 "prompt=%d read=%d write=%d source=%s "
                 "elapsed_ms=%.3f",
                 rid,
                 role,
-                ttl_seconds,
+                usage.ttl_seconds,
                 block_size,
                 prompt_tokens,
                 usage.read_tokens,
@@ -1313,10 +1319,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             lambda done: done.exception() if not done.cancelled() else None
         )
 
-    def _start_cache_renewal(self, state: ReqState, plan: PageCachePlan) -> None:
+    def _start_cache_renewal(
+        self, state: ReqState, plan: PageCachePlan, *, generation: str | None
+    ) -> None:
         finished_event = getattr(state, "cache_finished_event", None)
         if (
             not plan.page_keys
+            or generation is None
             or finished_event is None
             or getattr(state, "cache_renewal_task", None) is not None
         ):
@@ -1325,7 +1334,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def renew_on_finish() -> None:
             await finished_event.wait()
             try:
-                await self._cache_store.renew(plan, rid=state.obj.rid)
+                await self._cache_store.renew(
+                    plan, generation=generation, rid=state.obj.rid
+                )
             except Exception as exc:
                 # Maintenance cannot revise the read/write decision already
                 # returned in HTTP headers or usage.
@@ -1338,7 +1349,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             else:
                 logger.info(
-                    "Cache accounting TTL renewed rid=%s ttl=%d phase=finish",
+                    "Cache accounting TTL renewal complete rid=%s ttl=%d phase=finish",
                     state.obj.rid,
                     plan.ttl_seconds,
                 )

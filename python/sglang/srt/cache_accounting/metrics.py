@@ -79,7 +79,7 @@ class CacheAccountingMetrics:
         return {"role": self.role, "ttl": "5m" if ttl_seconds == 300 else "1h"}
 
     def observe_redis(self, ttl_seconds, result, elapsed_seconds):
-        if result not in ("success", "timeout", "error"):
+        if result not in ("success", "skipped", "timeout", "error"):
             raise ValueError("Unsupported cache Redis metric result")
         labels = {**self._labels(ttl_seconds), "result": result}
         try:
