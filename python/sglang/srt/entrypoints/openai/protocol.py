@@ -223,7 +223,7 @@ class PromptCacheOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["implicit"] = "implicit"
+    mode: Literal["implicit", "explicit"] = "implicit"
     ttl: Literal["5m", "1h"] = "5m"
 
 

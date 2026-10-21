@@ -1098,6 +1098,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError("Cache accounting is not enabled on this server")
         if obj.cache_ttl_seconds not in (300, 3600):
             raise ValueError("cache_ttl_seconds must be 300 or 3600")
+        if obj.cache_mode not in ("implicit", "explicit"):
+            raise ValueError("cache_mode must be implicit or explicit")
         if not isinstance(obj.cache_user_id, str) or not obj.cache_user_id.strip():
             # Requests without an identity use physical cache usage and never
             # access Redis, including shapes unsupported by the Redis plan.
@@ -1125,7 +1127,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or not self.is_generation
         ):
             if not obj.cache_required:
-                # Implicit accounting: serve the request without cache usage
+                # Optional accounting: serve the request without cache usage
                 # instead of rejecting shapes the accountant cannot price.
                 logger.debug(
                     "Cache accounting skipped rid=%s role=%s reason=unsupported_request",
@@ -1184,6 +1186,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             namespace=namespace,
             page_size=CACHE_BLOCK_SIZE,
             ttl_seconds=obj.cache_ttl_seconds,
+            mode=obj.cache_mode,
         )
         self.rid_to_state[obj.rid].cache_plan = plan
 
@@ -1260,6 +1263,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         page_size=CACHE_BLOCK_SIZE,
                         ttl_seconds=ttl_seconds,
                         media_spans=spans,
+                        mode=getattr(state.obj, "cache_mode", "implicit"),
                     )
                     if active_plan.prompt_tokens != prompt_tokens:
                         raise ValueError("Final multimodal input length differs")
@@ -1321,10 +1325,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if source == "redis" and not finished_before_account:
                     # A hit inherits the first writer's TTL. Renew that confirmed
                     # generation rather than the requesting caller's preference.
+                    renewal_plan = dataclasses.replace(
+                        active_plan, ttl_seconds=usage.ttl_seconds
+                    )
+                    if active_plan.mode == "explicit":
+                        renewal_plan = dataclasses.replace(
+                            renewal_plan,
+                            page_keys=active_plan.page_keys[
+                                : usage.read_tokens // active_plan.page_size
+                            ],
+                            prompt_tokens=usage.read_tokens,
+                        )
                     self._start_cache_renewal(
-                        state,
-                        dataclasses.replace(active_plan, ttl_seconds=usage.ttl_seconds),
-                        generation=usage.generation,
+                        state, renewal_plan, generation=usage.generation
                     )
             observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
             if metrics_parent is not None and metrics_parent.cache_usage is None:
@@ -4521,6 +4534,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # __getitem__ does not carry cache options. Preserve them on
                 # cached subobjects so parallel-sample clones keep the mode.
                 sub_obj.cache_ttl_seconds = obj.cache_ttl_seconds
+                sub_obj.cache_mode = obj.cache_mode
                 sub_obj.cache_user_id = obj.cache_user_id
                 sub_obj.cache_required = obj.cache_required
                 if (

@@ -916,7 +916,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if get_disagg().disaggregation_mode == "prefill":
             return {}
         if not getattr(get_serving(), "enable_cache_accounting", False):
-            if request.prompt_cache_options is None:
+            if (
+                request.prompt_cache_options is None
+                or request.prompt_cache_options.mode == "explicit"
+            ):
                 return {}
             raise ValueError("Cache accounting is not enabled on this server.")
         # The gateway supplies its authenticated user's identity independently
@@ -933,7 +936,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # only, regardless of the request's interface authentication credential.
         return {
             "cache_user_id": cache_user_id,
-            "cache_required": request.prompt_cache_options is not None,
+            "cache_required": (
+                request.prompt_cache_options is not None
+                and request.prompt_cache_options.mode == "implicit"
+            ),
+            "cache_mode": (
+                request.prompt_cache_options.mode
+                if request.prompt_cache_options is not None
+                else "implicit"
+            ),
             "cache_ttl_seconds": (
                 3600
                 if request.prompt_cache_options is not None

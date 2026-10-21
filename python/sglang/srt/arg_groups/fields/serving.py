@@ -196,6 +196,7 @@ class Serving(msgspec.Struct):
         "Enable Redis input-cache accounting in 256-token blocks on decode/standalone "
         "workers (default implicit 5m). The first write locks the prefix TTL; "
         "matching prefixes and appended blocks retain it until expiration. "
+        "Explicit mode only reads and renews existing prefix blocks. "
         "Use gateway cache_user_id for user "
         "isolation. Without cache_user_id, serve "
         "normally without Redis reads, writes, or renewals; report physical cache "

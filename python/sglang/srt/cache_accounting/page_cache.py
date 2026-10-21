@@ -62,6 +62,7 @@ class PageCachePlan:
     prompt_tokens: int
     page_size: int
     ttl_seconds: int
+    mode: str = "implicit"
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,7 @@ def build_page_cache_plan(
     page_size: int,
     ttl_seconds: int,
     media_spans: Sequence[CacheMediaSpan] = (),
+    mode: str = "implicit",
 ) -> PageCachePlan:
     """Hash complete input pages with a cumulative, fixed-uint32 token encoding.
 
@@ -133,10 +135,13 @@ def build_page_cache_plan(
     expires; the next writer can then select another TTL. Accounting adds no
     page-count limit. Each first-page prefix defines a Redis Cluster hash slot
     instead of pinning all prefixes for one user identity.
+    ``mode`` controls whether misses may be written and does not change identity.
     """
     _positive_int("page_size", page_size)
     if type(ttl_seconds) is not int or ttl_seconds not in _TTLS:
         raise ValueError("ttl_seconds must be 300 (5m) or 3600 (1h)")
+    if mode not in ("implicit", "explicit"):
+        raise ValueError("mode must be implicit or explicit")
     identity = _text("cache_user_id", cache_user_id) + _text("namespace", namespace)
     prompt_tokens = len(input_ids)
     if prompt_tokens > _MAX_SAFE_INTEGER:
@@ -199,6 +204,7 @@ def build_page_cache_plan(
         prompt_tokens=prompt_tokens,
         page_size=page_size,
         ttl_seconds=ttl_seconds,
+        mode=mode,
     )
 
 
@@ -210,11 +216,13 @@ local ttl = tonumber(ARGV[1])
 local page_size = tonumber(ARGV[2])
 local prompt_tokens = tonumber(ARGV[3])
 local generation = ARGV[4]
+local mode = ARGV[5]
 local pages = #KEYS
 local function integer(n, minimum)
     return n and n >= minimum and n <= 9007199254740991 and n == math.floor(n)
 end
-if #ARGV ~= 4 or (ttl ~= 300 and ttl ~= 3600)
+if #ARGV ~= 5 or (ttl ~= 300 and ttl ~= 3600)
+    or (mode ~= 'implicit' and mode ~= 'explicit')
     or not integer(page_size, 1) or not integer(prompt_tokens, 0)
     or not integer(pages, 1)
     or not generation or #generation ~= 32
@@ -240,6 +248,9 @@ for i = 1, pages do
 end
 -- The root outlives every descendant touched by this prefix. A missing root
 -- invalidates any old suffix, including otherwise unexpired page remnants.
+if mode == 'explicit' and not values[1] then
+    return {0, 0, ttl, false}
+end
 if values[1] then
     local locked_ttl, token = string.match(values[1], '^(%d+):([0-9a-f]+)$')
     ttl = tonumber(locked_ttl)
@@ -254,18 +265,28 @@ for i = 1, pages do
     hits = hits + 1
 end
 local read = hits * page_size
-local written = (pages - hits) * page_size
+local written = 0
+local touched_pages = hits
+if mode == 'implicit' then
+    written = (pages - hits) * page_size
+    touched_pages = pages
+end
 local durations = {}
-for i = 1, pages do
+for i = 1, touched_pages do
     durations[i] = ttl * 1000
     if values[i] == lock then
         durations[i] = math.max(durations[i], redis.call('PTTL', KEYS[i]))
     end
     durations[1] = math.max(durations[1], durations[i])
 end
-for i = 1, pages do
-    -- Existing pages after a hole are written again, under the same lock.
-    redis.call('SET', KEYS[i], lock, 'PX', durations[i])
+for i = 1, touched_pages do
+    if mode == 'explicit' then
+        -- Read-only requests refresh the hit prefix without creating pages.
+        redis.call('PEXPIRE', KEYS[i], durations[i])
+    else
+        -- Existing pages after a hole are written again, under the same lock.
+        redis.call('SET', KEYS[i], lock, 'PX', durations[i])
+    end
 end
 return {read, written, ttl, generation}
 """
@@ -274,7 +295,9 @@ return {read, written, ttl, generation}
 _RENEW_LUA = r"""
 local ttl = tonumber(ARGV[1])
 local generation = ARGV[2]
-if #ARGV ~= 2 or (ttl ~= 300 and ttl ~= 3600) or #KEYS < 1
+local mode = ARGV[3]
+if #ARGV ~= 3 or (ttl ~= 300 and ttl ~= 3600) or #KEYS < 1
+    or (mode ~= 'implicit' and mode ~= 'explicit')
     or not generation or #generation ~= 32
     or not string.match(generation, '^[0-9a-f]+$') then
     return redis.error_reply('invalid cache renewal arguments')
@@ -296,6 +319,10 @@ for i = 1, #KEYS do
     end
     values[i] = value
 end
+-- An explicit request cannot resurrect an expired root or its descendants.
+if mode == 'explicit' and values[1] ~= lock then
+    return 0
+end
 for i = 1, #KEYS do
     -- A later writer may have established a new generation during a long
     -- request. Its pages and TTL must not be replaced by stale maintenance.
@@ -304,15 +331,25 @@ for i = 1, #KEYS do
     end
 end
 local durations = {}
+local renewed = 0
 for i = 1, #KEYS do
-    durations[i] = math.max(ttl * 1000, redis.call('PTTL', KEYS[i]))
-    durations[1] = math.max(durations[1], durations[i])
+    if mode == 'implicit' or values[i] == lock then
+        durations[i] = math.max(ttl * 1000, redis.call('PTTL', KEYS[i]))
+        durations[1] = math.max(durations[1], durations[i])
+    end
 end
 for i = 1, #KEYS do
-    -- Restore missing pages without making another accounting decision.
-    redis.call('SET', KEYS[i], lock, 'PX', durations[i])
+    if durations[i] then
+        if mode == 'explicit' then
+            redis.call('PEXPIRE', KEYS[i], durations[i])
+        else
+            -- Restore missing pages without making another accounting decision.
+            redis.call('SET', KEYS[i], lock, 'PX', durations[i])
+        end
+        renewed = renewed + 1
+    end
 end
-return #KEYS
+return renewed
 """
 
 
@@ -328,6 +365,8 @@ def _validate_plan(plan: PageCachePlan) -> None:
         )
     if type(plan.ttl_seconds) is not int or plan.ttl_seconds not in _TTLS:
         raise ValueError("ttl_seconds must be 300 or 3600")
+    if plan.mode not in ("implicit", "explicit"):
+        raise ValueError("mode must be implicit or explicit")
     if not isinstance(plan.page_keys, tuple):
         raise ValueError("page_keys must be a tuple")
     pages = len(plan.page_keys)
@@ -422,10 +461,12 @@ class RedisPageCacheStore:
         try:
             client = self._client()
             logger.info(
-                "Cache Redis EVAL start rid=%s page_count=%d ttl=%d timeout_ms=%.3f",
+                "Cache Redis EVAL start rid=%s page_count=%d ttl=%d mode=%s "
+                "timeout_ms=%.3f",
                 request_id,
                 len(plan.page_keys),
                 plan.ttl_seconds,
+                plan.mode,
                 timeout_ms,
             )
             result = await asyncio.wait_for(
@@ -437,6 +478,7 @@ class RedisPageCacheStore:
                     plan.page_size,
                     plan.prompt_tokens,
                     generation,
+                    plan.mode,
                 ),
                 timeout=self._timeout_seconds,
             )
@@ -446,14 +488,23 @@ class RedisPageCacheStore:
                 or any(type(value) is not int or value < 0 for value in result[:2])
                 or type(result[2]) is not int
                 or result[2] not in _TTLS
-                or sum(result[:2]) != len(plan.page_keys) * plan.page_size
                 or any(value % plan.page_size for value in result[:2])
             ):
+                raise ValueError("Invalid cache Redis result")
+            complete_tokens = len(plan.page_keys) * plan.page_size
+            if plan.mode == "explicit":
+                if result[1] != 0 or result[0] > complete_tokens:
+                    raise ValueError("Invalid read-only cache Redis result")
+            elif sum(result[:2]) != complete_tokens:
                 raise ValueError("Invalid cache Redis result")
             generation = result[3]
             if isinstance(generation, bytes):
                 generation = generation.decode("ascii")
-            _validate_generation(generation)
+            if generation is None:
+                if plan.mode != "explicit" or result[0] != 0:
+                    raise ValueError("Invalid cache Redis generation")
+            else:
+                _validate_generation(generation)
             usage = CacheUsage(
                 ttl_seconds=result[2],
                 read_tokens=result[0],
@@ -514,7 +565,7 @@ class RedisPageCacheStore:
     async def renew(
         self, plan: PageCachePlan, *, generation: str, rid: str | None = None
     ) -> None:
-        """Restore or extend confirmed pages without recording another usage."""
+        """Extend confirmed pages; only implicit requests may restore missing pages."""
         _validate_plan(plan)
         _validate_generation(generation)
         if not plan.page_keys:
@@ -525,10 +576,12 @@ class RedisPageCacheStore:
         try:
             client = self._client()
             logger.info(
-                "Cache Redis renew start rid=%s page_count=%d ttl=%d timeout_ms=%.3f",
+                "Cache Redis renew start rid=%s page_count=%d ttl=%d mode=%s "
+                "timeout_ms=%.3f",
                 request_id,
                 len(plan.page_keys),
                 plan.ttl_seconds,
+                plan.mode,
                 timeout_ms,
             )
             result = await asyncio.wait_for(
@@ -538,10 +591,15 @@ class RedisPageCacheStore:
                     *plan.page_keys,
                     plan.ttl_seconds,
                     generation,
+                    plan.mode,
                 ),
                 timeout=self._timeout_seconds,
             )
-            if type(result) is not int or result not in (0, len(plan.page_keys)):
+            if (
+                type(result) is not int
+                or not 0 <= result <= len(plan.page_keys)
+                or (plan.mode == "implicit" and result not in (0, len(plan.page_keys)))
+            ):
                 raise ValueError("Invalid cache Redis renewal result")
         except asyncio.CancelledError:
             logger.debug(
@@ -579,7 +637,7 @@ class RedisPageCacheStore:
             )
             raise CacheAccountingError("Redis cache renewal is unconfirmed") from exc
         elapsed = time.perf_counter() - started
-        # 0 means a newer generation owns the pages, so nothing was renewed.
+        # Expiration or a newer generation may leave no pages eligible to renew.
         outcome = "success" if result else "skipped"
         if self._metrics is not None:
             self._metrics.observe_redis(plan.ttl_seconds, outcome, elapsed)
