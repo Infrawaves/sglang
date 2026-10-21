@@ -13,15 +13,16 @@ import logging
 import math
 import struct
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 CACHE_BLOCK_SIZE = 256
 
-_KEY_PREFIX = "sglang:cache:v1"
-_DOMAIN = b"sglang:cache:v1\x00"
+_KEY_PREFIX = "sglang:cache:v2"
+_DOMAIN = b"sglang:cache:v2\x00"
 _MAX_SAFE_INTEGER = (1 << 53) - 1
 _TTLS = (300, 3600)
 
@@ -35,6 +36,7 @@ class CacheUsage:
     ttl_seconds: int
     read_tokens: int = 0
     write_tokens: int = 0
+    generation: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.ttl_seconds) is not int or self.ttl_seconds not in _TTLS:
@@ -43,9 +45,15 @@ class CacheUsage:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
+        if self.generation is not None:
+            _validate_generation(self.generation)
 
     def to_dict(self) -> dict[str, int]:
-        return asdict(self)
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "read_tokens": self.read_tokens,
+            "write_tokens": self.write_tokens,
+        }
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,15 @@ def _positive_int(name: str, value: int, maximum: int = _MAX_SAFE_INTEGER) -> No
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
 
 
+def _validate_generation(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or any(c not in "0123456789abcdef" for c in value)
+    ):
+        raise ValueError("generation must contain 32 lowercase hexadecimal characters")
+
+
 def _text(name: str, value: str) -> bytes:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a nonempty string")
@@ -110,10 +127,12 @@ def build_page_cache_plan(
     Production callers pass ``CACHE_BLOCK_SIZE`` as ``page_size``; the low-level
     parameter remains available for testing. Partial final blocks are excluded
     from read/write counts, independently of the physical cache page size.
-    ``namespace`` isolates deployments and input interpretation. TTL is part of identity: 5m
-    and 1h requests have independent pages and expiration timelines. Accounting
-    adds no page-count limit. Each first-page prefix defines a Redis Cluster hash
-    slot instead of pinning all prefixes for one user identity.
+    ``namespace`` isolates deployments and input interpretation. TTL is selected
+    by the first writer of a prefix, independently of its page identity. Branches
+    sharing the first complete page inherit that root's TTL until its generation
+    expires; the next writer can then select another TTL. Accounting adds no
+    page-count limit. Each first-page prefix defines a Redis Cluster hash slot
+    instead of pinning all prefixes for one user identity.
     """
     _positive_int("page_size", page_size)
     if type(ttl_seconds) is not int or ttl_seconds not in _TTLS:
@@ -126,7 +145,7 @@ def build_page_cache_plan(
     spans = _validate_media_spans(media_spans, prompt_tokens)
 
     previous = hashlib.sha256(
-        _DOMAIN + identity + struct.pack(">QQ", page_size, ttl_seconds)
+        _DOMAIN + identity + struct.pack(">Q", page_size)
     ).digest()
     digests = []
     # Validate tail tokens too: a plan must describe a valid token sequence.
@@ -190,59 +209,108 @@ _ACCOUNT_LUA = r"""
 local ttl = tonumber(ARGV[1])
 local page_size = tonumber(ARGV[2])
 local prompt_tokens = tonumber(ARGV[3])
+local generation = ARGV[4]
 local pages = #KEYS
 local function integer(n, minimum)
     return n and n >= minimum and n <= 9007199254740991 and n == math.floor(n)
 end
-if #ARGV ~= 3 or (ttl ~= 300 and ttl ~= 3600)
+if #ARGV ~= 4 or (ttl ~= 300 and ttl ~= 3600)
     or not integer(page_size, 1) or not integer(prompt_tokens, 0)
     or not integer(pages, 1)
+    or not generation or #generation ~= 32
+    or not string.match(generation, '^[0-9a-f]+$')
     or math.floor(prompt_tokens / page_size) ~= pages then
     return redis.error_reply('invalid cache accounting arguments')
 end
-for i = 1, #KEYS do
+local values = {}
+for i = 1, pages do
     local kind = redis.call('TYPE', KEYS[i]).ok
     if kind ~= 'none' and kind ~= 'string' then
         return redis.error_reply('invalid cache key type')
     end
+    local value = redis.call('GET', KEYS[i])
+    if value then
+        local locked_ttl, token = string.match(value, '^(%d+):([0-9a-f]+)$')
+        if (locked_ttl ~= '300' and locked_ttl ~= '3600')
+            or not token or #token ~= 32 then
+            return redis.error_reply('invalid cache lock value')
+        end
+    end
+    values[i] = value
 end
+-- The root outlives every descendant touched by this prefix. A missing root
+-- invalidates any old suffix, including otherwise unexpired page remnants.
+if values[1] then
+    local locked_ttl, token = string.match(values[1], '^(%d+):([0-9a-f]+)$')
+    ttl = tonumber(locked_ttl)
+    generation = token
+end
+local lock = tostring(ttl) .. ':' .. generation
 local hits = 0
 for i = 1, pages do
-    if redis.call('EXISTS', KEYS[i]) == 0 then
+    if values[i] ~= lock then
         break
     end
     hits = hits + 1
 end
 local read = hits * page_size
 local written = (pages - hits) * page_size
+local durations = {}
 for i = 1, pages do
-    if i <= hits then
-        redis.call('EXPIRE', KEYS[i], ttl)
-    else
-        -- Existing pages after a hole cannot be used as a continuous prefix.
-        redis.call('SET', KEYS[i], '1', 'EX', ttl)
+    durations[i] = ttl * 1000
+    if values[i] == lock then
+        durations[i] = math.max(durations[i], redis.call('PTTL', KEYS[i]))
     end
+    durations[1] = math.max(durations[1], durations[i])
 end
-return {read, written}
+for i = 1, pages do
+    -- Existing pages after a hole are written again, under the same lock.
+    redis.call('SET', KEYS[i], lock, 'PX', durations[i])
+end
+return {read, written, ttl, generation}
 """
 
 
 _RENEW_LUA = r"""
 local ttl = tonumber(ARGV[1])
-if #ARGV ~= 1 or (ttl ~= 300 and ttl ~= 3600) or #KEYS < 1 then
+local generation = ARGV[2]
+if #ARGV ~= 2 or (ttl ~= 300 and ttl ~= 3600) or #KEYS < 1
+    or not generation or #generation ~= 32
+    or not string.match(generation, '^[0-9a-f]+$') then
     return redis.error_reply('invalid cache renewal arguments')
 end
-local durations = {}
+local lock = tostring(ttl) .. ':' .. generation
+local values = {}
 for i = 1, #KEYS do
     local kind = redis.call('TYPE', KEYS[i]).ok
     if kind ~= 'none' and kind ~= 'string' then
         return redis.error_reply('invalid cache key type')
     end
+    local value = redis.call('GET', KEYS[i])
+    if value then
+        local locked_ttl, token = string.match(value, '^(%d+):([0-9a-f]+)$')
+        if (locked_ttl ~= '300' and locked_ttl ~= '3600')
+            or not token or #token ~= 32 then
+            return redis.error_reply('invalid cache lock value')
+        end
+    end
+    values[i] = value
+end
+for i = 1, #KEYS do
+    -- A later writer may have established a new generation during a long
+    -- request. Its pages and TTL must not be replaced by stale maintenance.
+    if values[i] and values[i] ~= lock then
+        return 0
+    end
+end
+local durations = {}
+for i = 1, #KEYS do
     durations[i] = math.max(ttl * 1000, redis.call('PTTL', KEYS[i]))
+    durations[1] = math.max(durations[1], durations[i])
 end
 for i = 1, #KEYS do
     -- Restore missing pages without making another accounting decision.
-    redis.call('SET', KEYS[i], '1', 'PX', durations[i])
+    redis.call('SET', KEYS[i], lock, 'PX', durations[i])
 end
 return #KEYS
 """
@@ -347,6 +415,7 @@ class RedisPageCacheStore:
         _validate_plan(plan)
         if not plan.page_keys:
             return CacheUsage(ttl_seconds=plan.ttl_seconds)
+        generation = uuid4().hex
         request_id = rid if rid is not None else "-"
         started = time.perf_counter()
         timeout_ms = self._timeout_seconds * 1000
@@ -367,21 +436,29 @@ class RedisPageCacheStore:
                     plan.ttl_seconds,
                     plan.page_size,
                     plan.prompt_tokens,
+                    generation,
                 ),
                 timeout=self._timeout_seconds,
             )
             if (
                 not isinstance(result, (list, tuple))
-                or len(result) != 2
-                or any(type(value) is not int or value < 0 for value in result)
-                or sum(result) != len(plan.page_keys) * plan.page_size
-                or any(value % plan.page_size for value in result)
+                or len(result) != 4
+                or any(type(value) is not int or value < 0 for value in result[:2])
+                or type(result[2]) is not int
+                or result[2] not in _TTLS
+                or sum(result[:2]) != len(plan.page_keys) * plan.page_size
+                or any(value % plan.page_size for value in result[:2])
             ):
                 raise ValueError("Invalid cache Redis result")
+            generation = result[3]
+            if isinstance(generation, bytes):
+                generation = generation.decode("ascii")
+            _validate_generation(generation)
             usage = CacheUsage(
-                ttl_seconds=plan.ttl_seconds,
+                ttl_seconds=result[2],
                 read_tokens=result[0],
                 write_tokens=result[1],
+                generation=generation,
             )
         except asyncio.CancelledError:
             logger.debug(
@@ -418,14 +495,14 @@ class RedisPageCacheStore:
             raise CacheAccountingError("Redis cache accounting is unconfirmed") from exc
         elapsed = time.perf_counter() - started
         if self._metrics is not None:
-            self._metrics.observe_redis(plan.ttl_seconds, "success", elapsed)
+            self._metrics.observe_redis(usage.ttl_seconds, "success", elapsed)
         logger.info(
             "Cache Redis EVAL complete rid=%s result=success page_count=%d ttl=%d "
             "prompt=%d read=%d write=%d elapsed_ms=%.3f "
             "timeout_ms=%.3f",
             request_id,
             len(plan.page_keys),
-            plan.ttl_seconds,
+            usage.ttl_seconds,
             plan.prompt_tokens,
             usage.read_tokens,
             usage.write_tokens,
@@ -434,9 +511,12 @@ class RedisPageCacheStore:
         )
         return usage
 
-    async def renew(self, plan: PageCachePlan, *, rid: str | None = None) -> None:
+    async def renew(
+        self, plan: PageCachePlan, *, generation: str, rid: str | None = None
+    ) -> None:
         """Restore or extend confirmed pages without recording another usage."""
         _validate_plan(plan)
+        _validate_generation(generation)
         if not plan.page_keys:
             return
         request_id = rid if rid is not None else "-"
@@ -457,10 +537,11 @@ class RedisPageCacheStore:
                     len(plan.page_keys),
                     *plan.page_keys,
                     plan.ttl_seconds,
+                    generation,
                 ),
                 timeout=self._timeout_seconds,
             )
-            if type(result) is not int or result != len(plan.page_keys):
+            if type(result) is not int or result not in (0, len(plan.page_keys)):
                 raise ValueError("Invalid cache Redis renewal result")
         except asyncio.CancelledError:
             logger.debug(
@@ -498,12 +579,15 @@ class RedisPageCacheStore:
             )
             raise CacheAccountingError("Redis cache renewal is unconfirmed") from exc
         elapsed = time.perf_counter() - started
+        # 0 means a newer generation owns the pages, so nothing was renewed.
+        outcome = "success" if result else "skipped"
         if self._metrics is not None:
-            self._metrics.observe_redis(plan.ttl_seconds, "success", elapsed)
+            self._metrics.observe_redis(plan.ttl_seconds, outcome, elapsed)
         logger.info(
-            "Cache Redis renew complete rid=%s result=success page_count=%d ttl=%d "
+            "Cache Redis renew complete rid=%s result=%s page_count=%d ttl=%d "
             "elapsed_ms=%.3f timeout_ms=%.3f",
             request_id,
+            outcome,
             len(plan.page_keys),
             plan.ttl_seconds,
             elapsed * 1000,
