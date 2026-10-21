@@ -185,6 +185,7 @@ class GenerateReqInput:
     # never the raw user identity or an interface authentication credential.
     cache_user_id: Optional[str] = field(default=None, kw_only=True)
     cache_ttl_seconds: Optional[int] = field(default=None, kw_only=True)
+    cache_mode: str = field(default="implicit", kw_only=True)
     # True when the client explicitly asked for accounting; unsupported
     # request shapes are then rejected instead of silently skipped.
     cache_required: bool = field(default=False, kw_only=True)
