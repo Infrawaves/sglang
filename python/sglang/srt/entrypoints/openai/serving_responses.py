@@ -1350,21 +1350,32 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = []
         for tool in request.tools:
             if tool.type == "function":
-                description, parameters = tool.description, tool.parameters
+                # K3 renders tools with exclude_unset=True. Preserve omitted
+                # fields so equivalent Chat and Responses tools have the same
+                # prompt prefix instead of injecting defaults such as strict=False.
+                function = Function(
+                    **tool.model_dump(
+                        include={"name", "description", "parameters", "strict"},
+                        exclude_unset=True,
+                    )
+                )
             elif tool.type == "custom" and tool.name:
-                description = custom_tool_description(tool.description, tool.format)
-                parameters = custom_tool_parameters()
+                function = Function(
+                    name=tool.name,
+                    description=custom_tool_description(tool.description, tool.format),
+                    parameters=custom_tool_parameters(),
+                    **(
+                        {"strict": tool.strict}
+                        if "strict" in tool.model_fields_set
+                        else {}
+                    ),
+                )
             else:
                 continue
             chat_tools.append(
                 Tool(
                     type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=description,
-                        parameters=parameters,
-                        strict=tool.strict,
-                    ),
+                    function=function,
                 )
             )
         return chat_tools
@@ -2002,6 +2013,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             output=[],
             status="in_progress",
             usage=None,
+            cache_usage=(cache_context or {}).get("usage"),
         ).model_dump()
         initial_response["tools"] = []
         yield _send_event("response.created", response=initial_response)
@@ -2125,6 +2137,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         created_time = created_time or int(time.time())
         sequence_number = 0
+        response_cache_options = None
 
         def _send_event(event):
             nonlocal sequence_number
@@ -2133,15 +2146,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
             payload = event.model_dump()
+            if isinstance(payload.get("response"), dict):
+                if response_cache_options is not None:
+                    payload["response"]["prompt_cache_options"] = response_cache_options
+                else:
+                    payload["response"].pop("prompt_cache_options", None)
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
             return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
-        # The streaming Response* event models echo ``tools`` through a
-        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
-        # validation failures on extended tool types.
+        # The SDK narrows tools and may restrict cache TTLs to values that
+        # differ from our protocol. Restore cache options after validation.
         def _sanitize_response_dict(d: dict) -> dict:
+            nonlocal response_cache_options
             d["tools"] = []
+            response_cache_options = d.pop("prompt_cache_options", None)
             return d
 
         initial_response = _sanitize_response_dict(
@@ -2153,6 +2172,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 output=[],
                 status="in_progress",
                 usage=None,
+                cache_usage=(cache_context or {}).get("usage"),
             ).model_dump()
         )
         yield _send_event(
@@ -2774,6 +2794,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     output=[],
                     status="failed",
                     usage=None,
+                    cache_usage=(cache_context or {}).get("usage"),
                 ).model_dump()
             )
             failed["error"] = {"code": "server_error", "message": str(e)}

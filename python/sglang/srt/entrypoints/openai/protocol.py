@@ -2204,6 +2204,7 @@ class ResponsesResponse(BaseModel):
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]
     usage: Optional[UsageInfo] = None
+    prompt_cache_options: Optional[PromptCacheOptions] = None
     parallel_tool_calls: bool = True
     tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
@@ -2227,6 +2228,13 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_response(self, handler):
+        data = handler(self)
+        if self.prompt_cache_options is None:
+            data.pop("prompt_cache_options", None)
+        return data
 
     @field_serializer("usage")
     def _serialize_usage(self, usage: Optional[UsageInfo], _info):
@@ -2277,8 +2285,24 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
+        *,
+        cache_usage: Optional[CacheUsage] = None,
     ) -> ResponsesResponse:
         """Create a response from a request."""
+
+        if cache_usage is None and usage is not None:
+            cache_usage = usage.cache_usage
+        prompt_cache_options = None
+        if cache_usage is not None:
+            cache_usage = CacheUsage.model_validate(cache_usage)
+            prompt_cache_options = PromptCacheOptions(
+                mode=(
+                    request.prompt_cache_options.mode
+                    if request.prompt_cache_options is not None
+                    else "implicit"
+                ),
+                ttl="1h" if cache_usage.ttl_seconds == 3600 else "5m",
+            )
 
         # Determine if the output is plain text only to set text.format
         def _is_text_only(
@@ -2327,6 +2351,7 @@ class ResponsesResponse(BaseModel):
             output=output,
             status=status,
             usage=usage,
+            prompt_cache_options=prompt_cache_options,
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
