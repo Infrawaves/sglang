@@ -130,6 +130,8 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.transfer_infos = {}
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
+        mgr._deferred_abort_ack_tracker = {}
+        mgr._deferred_abort_generation = 0
         mgr.required_prefill_response_num_table = {}
         mgr.prefill_response_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker = defaultdict(set)

@@ -97,36 +97,10 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
 
         return ServerArgs(model_path="dummy")
 
-    def test_server_args_delegates_to_the_backend_predicate(self):
-        args = self._server_args()
-        for supported in (True, False):
-            with self.subTest(supported=supported):
-                with (
-                    patch.object(
-                        args,
-                        "_resolved_attention_backends",
-                        return_value=("trtllm_mla", "trtllm_mla"),
-                    ),
-                    patch(
-                        f"{self._BACKEND}.varlen_absorbed_mla_supported",
-                        return_value=supported,
-                    ) as helper,
-                ):
-                    has = args._trtllm_mla_has_varlen_absorbed()
-                self.assertEqual(has, supported)
-                helper.assert_called_once_with(args.kv_cache_dtype)
-
-    def test_other_backends_are_never_excluded(self):
-        args = self._server_args()
-        with patch.object(
-            args, "_resolved_attention_backends", return_value=("fa3", "fa3")
-        ):
-            self.assertTrue(args._trtllm_mla_has_varlen_absorbed())
-
     def test_fp4_kv_spellings_match_the_dtype_resolver(self):
         # A --kv-cache-dtype spelling that resolves to the packed 4-bit dtype but
-        # is missing from FP4_KV_CACHE_DTYPES would let ServerArgs upgrade to
-        # tc_piecewise for a config forward_extend refuses to serve.
+        # is missing from FP4_KV_CACHE_DTYPES would route a captured prefill to
+        # the absorbed path that forward_extend refuses to serve.
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
         _skip_unless_fp4_dtype_available(self)

@@ -20,7 +20,12 @@ from disagg_test_utils import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import AbortNotification, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    AbortNotification,
+    CommonKVReceiver,
+    KVTransferError,
+)
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 from sglang.test.test_utils import CustomTestCase
 
 ADDR = "prefill:8998"
@@ -684,6 +689,163 @@ class TestReceiverConnectionPool(CustomTestCase):
             mgr._handle_node_failure("host:80")
 
         self.assertEqual(list(mgr.connection_pool), ["host:8000_0_0_0"])
+
+    def test_prealloc_abort_then_clear_drops_its_ack_tracker_entry(self):
+        """A request aborted before KV pre-allocation never reaches the deferred
+        release, so its own clear() must drop the ACK state it armed."""
+        mgr, receiver = self._abort_receiver(room=1234)
+        self._cached_abort_socket(Mock())
+        receiver.abort()
+        self.assertTrue(_armed(mgr, receiver, 1234))
+
+        receiver.clear()
+
+        self.assertNotIn(1234, mgr._deferred_abort_ack_tracker)
+
+    def test_stale_receiver_clear_keeps_newer_owners_ack_state(self):
+        """clear() drops only the ACK state of the generation it armed."""
+        mgr, old = self._abort_receiver(room=7)
+        self._cached_abort_socket(Mock())
+        old.abort()
+        old_generation = old._abort_generation
+        # The room's tracker now belongs to a later generation (armed through
+        # the manager; a second receiver could not take a held room).
+        mgr.clear_deferred_abort_state(7)
+        newer_generation = mgr.register_deferred_abort_room(7)
+
+        old.clear()
+
+        self.assertNotEqual(old_generation, newer_generation)
+        self.assertTrue(mgr.is_deferred_abort_generation_armed(7, newer_generation))
+
+    def _held_room(self, room=7):
+        """An aborted receiver that still holds its room awaiting the drain ACK."""
+        mgr, owner = self._abort_receiver(room=room)
+        self._cached_abort_socket(Mock())
+        owner.abort()
+        self.assertTrue(_armed(mgr, owner, room))
+        return mgr, owner
+
+    def test_held_room_rejects_a_new_receiver_without_touching_the_owner(self):
+        mgr, owner = self._held_room()
+        owner_reason = mgr.failure_records[7]
+        owner_generation = owner._abort_generation
+
+        newer = _FetchingReceiver(mgr, ADDR, 7)
+        newer.init(0)
+        newer.abort()
+        newer.clear()
+
+        self.assertEqual(newer._poll(), KVPoll.Failed)
+        self.assertIsNotNone(newer._local_failure_reason)
+        self.assertIsNone(newer.bootstrap_infos)
+        self.assertIsNone(newer._abort_generation)
+        self.assertEqual(_FetchingReceiver.fetch_count, 0)
+        # The owner keeps the room, its status, its root cause and its ACK state.
+        self.assertIs(mgr.room_generations[7], owner._room_generation)
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+        self.assertEqual(mgr.failure_records[7], owner_reason)
+        self.assertTrue(mgr.is_deferred_abort_generation_armed(7, owner_generation))
+
+    def test_owner_still_resends_abort_and_releases_after_a_rejected_reuse(self):
+        mgr, owner = self._held_room()
+        owner_generation = owner._abort_generation
+        _FetchingReceiver(mgr, ADDR, 7).init(0)
+
+        # The owner's first ABORT may not have gone out; it can still resend.
+        self.assertTrue(owner.retry_abort())
+        self.assertEqual(owner._abort_generation, owner_generation)
+
+        mgr.note_abort_ack(7, 0, owner_generation)
+        self.assertTrue(mgr.is_abort_release_safe(7, 1, generation=owner_generation))
+        owner.clear()
+        self.assertNotIn(7, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn(7, mgr.room_generations)
+
+        # Once released, the room is usable again.
+        fresh = _FetchingReceiver(mgr, ADDR, 7)
+        fresh.init(0)
+        self.assertIsNone(fresh._local_failure_reason)
+        self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
+
+    def test_room_is_reusable_after_a_successful_receiver_clears(self):
+        """PD retraction rebootstrap reuses the room of a concluded transfer."""
+        mgr = self._decode_manager(
+            enable_deferred_decode_kv_release=True, requires_transfer_drain=True
+        )
+        mgr.connection_pool[f"{ADDR}_0_0_0"] = [
+            {"rank_ip": "127.0.0.1", "rank_port": 2001},
+        ]
+        first = _FetchingReceiver(mgr, ADDR, 7)
+        first.init(0)
+        mgr.update_status(7, KVPoll.Success)
+        first.clear()
+
+        again = _FetchingReceiver(mgr, ADDR, 7)
+        again.init(0)
+
+        self.assertIsNone(again._local_failure_reason)
+        self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
+
+    def test_non_drain_backend_still_lets_a_reused_room_be_taken_over(self):
+        mgr = self._decode_manager(enable_deferred_decode_kv_release=True)
+        old = _ConcreteReceiver(mgr, ADDR, 7)
+        newer = _ConcreteReceiver(mgr, ADDR, 7)
+
+        self.assertIsNone(newer._local_failure_reason)
+        self.assertIs(mgr.room_generations[7], newer._room_generation)
+        self.assertIsNot(old._room_generation, newer._room_generation)
+
+    def test_arm_keeps_own_generation_and_refuses_another_undrained_one(self):
+        mgr = self._decode_manager(requires_transfer_drain=True)
+        generation = mgr.arm_deferred_abort_room(7, None)
+
+        self.assertEqual(mgr.arm_deferred_abort_room(7, generation), generation)
+        self.assertIsNone(mgr.arm_deferred_abort_room(7, None))
+        self.assertIsNone(mgr.arm_deferred_abort_room(7, generation + 1))
+        mgr.note_abort_ack(7, 0, generation)
+        self.assertEqual(mgr._deferred_abort_ack_tracker[7].prefill_ranks, {0})
+
+        non_drain = self._decode_manager()
+        first = non_drain.arm_deferred_abort_room(7, None)
+        self.assertNotEqual(non_drain.arm_deferred_abort_room(7, None), first)
+
+    def test_release_check_counts_only_the_callers_generation(self):
+        mgr = self._decode_manager(requires_transfer_drain=True)
+        generation = mgr.register_deferred_abort_room(7)
+        mgr.note_abort_ack(7, 0, generation)
+
+        self.assertTrue(mgr.is_abort_release_safe(7, 1, generation=generation))
+        self.assertFalse(mgr.is_abort_release_safe(7, 1, generation=generation + 1))
+        self.assertFalse(mgr.is_abort_release_safe(7, 1, generation=None))
+        # Without a generation the check keeps upstream's room-wide behavior.
+        self.assertTrue(mgr.is_abort_release_safe(7, 1))
+
+    def test_scoped_clear_leaves_a_newer_generation_alone(self):
+        mgr, receiver = self._abort_receiver(room=7)
+        self._cached_abort_socket(Mock())
+        receiver.abort()
+        armed = receiver._abort_generation
+
+        mgr.clear_deferred_abort_state(7, generation=armed + 1)
+        mgr.clear_deferred_abort_state(7, generation=None)
+        self.assertTrue(mgr.is_deferred_abort_generation_armed(7, armed))
+
+        mgr.clear_deferred_abort_state(7, generation=armed)
+        self.assertNotIn(7, mgr._deferred_abort_ack_tracker)
+
+    def test_mooncake_rejected_receiver_reports_its_own_reason(self):
+        mgr = self._decode_manager(failure_records={7: "the owner's root cause"})
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 7
+        receiver.conclude_state = None
+        receiver._local_failure_reason = "held by an undrained receiver"
+
+        with self.assertRaisesRegex(KVTransferError, "undrained receiver"):
+            receiver.failure_exception()
+        self.assertEqual(mgr.failure_records[7], "the owner's root cause")
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
 
     def test_stale_receiver_cannot_arm_or_notify_reused_room(self):
         mgr = self._decode_manager(enable_deferred_decode_kv_release=True)

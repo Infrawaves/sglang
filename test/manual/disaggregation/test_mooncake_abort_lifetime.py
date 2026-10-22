@@ -15,7 +15,7 @@ This is fault injection at the transport-call boundary: a lease is admitted,
 then a thread Event pauses immediately before the real synchronous native write
 and again after its successful return, before production chunk completion. It
 checks the production admission tracker, Mooncake ABORT/ACK/completion methods,
-and decode token/rank ACK accounting over real ZMQ. It does NOT exercise a full
+and decode generation ACK accounting over real ZMQ. It does NOT exercise a full
 Scheduler/model/cache allocator, measure online incidence, or prove that a
 native timeout/error cancels RDMA. Native failure deliberately never releases
 the lease. A supervisor bounds the entire process group, including native hangs.
@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import defaultdict
 from types import SimpleNamespace
 
 
@@ -94,8 +95,11 @@ def _source(args, pipe):
     # or scheduler threads are needed for these methods.
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
     manager._transfer_lifetime = TransferLifetimeTracker()
-    manager._abort_drain_lock = threading.Lock()
-    manager._drain_ack_targets = {}
+    manager._abort_drain_lock = threading.RLock()
+    manager.enable_deferred_decode_kv_release = True
+    manager._deferred_ack_targets = {}
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._staging_outstanding = defaultdict(int)
     manager.request_status = {args.room: KVPoll.Transferring}
     manager._zmq_ctx = context
     manager._socket_cache = {}
@@ -120,7 +124,7 @@ def _source(args, pipe):
     allow_complete = threading.Event()
     completed = threading.Event()
     outcome = {}
-    chunk = SimpleNamespace(room=args.room, staging_counted=True)
+    chunk = SimpleNamespace(room=args.room, lease_held=True)
 
     def write():
         try:
@@ -144,7 +148,9 @@ def _source(args, pipe):
                 raise RuntimeError(
                     f"Native write failed: {outcome['rc']}; lease retained"
                 )
-            manager._complete_transfer_chunk(chunk)
+            # What transfer_worker does after a chunk's I/O has ended.
+            manager._release_transfer_lease(chunk)
+            manager._maybe_ack_drained_abort(chunk.room)
             completed.set()
         except BaseException:
             outcome["error"] = traceback.format_exc()
@@ -214,7 +220,11 @@ def _probe(args):
     import torch
     import zmq
 
-    from sglang.srt.disaggregation.common.conn import CommonKVManager
+    from sglang.srt.disaggregation.common.conn import (
+        AbortAck,
+        AbortNotification,
+        CommonKVManager,
+    )
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         MooncakeTransferEngine,
     )
@@ -228,10 +238,8 @@ def _probe(args):
     manager = CommonKVManager.__new__(CommonKVManager)
     manager.requires_transfer_drain = True
     manager._deferred_abort_ack_tracker = {}
-    manager._deferred_abort_tokens = {}
-    manager._deferred_abort_expected = {}
-    token = os.urandom(16).hex()
-    manager.register_deferred_abort_room(args.room, token=token, expected_ranks={0})
+    manager._deferred_abort_generation = 0
+    generation = manager.arm_deferred_abort_room(args.room, None)
     context = zmq.Context()
     ack = context.socket(zmq.PULL)
     ack.setsockopt(zmq.LINGER, 0)
@@ -261,7 +269,7 @@ def _probe(args):
 
     def assert_held(stage):
         assert not ack.poll(args.quiet_ms), f"Premature abort ACK at {stage}"
-        assert not manager.is_abort_release_safe(args.room, 1), (
+        assert not manager.is_abort_release_safe(args.room, 1, generation=generation), (
             f"Premature reuse at {stage}"
         )
         observe(stage, ack=False, reuse_allowed=False)
@@ -277,13 +285,12 @@ def _probe(args):
             }
         )
         _recv(parent, args.timeout, "before_write")
-        message = [
-            b"ABORT",
-            str(args.room).encode(),
-            b"127.0.0.1",
-            str(ack_port).encode(),
-            token.encode(),
-        ]
+        message = AbortNotification(
+            room=args.room,
+            decode_ip="127.0.0.1",
+            decode_port=ack_port,
+            generation=generation,
+        ).to_zmq()
         abort.send_multipart(message)
         cancelled = _recv(parent, args.timeout, "cancelled")
         assert cancelled["closed"] and cancelled["new_admission_rejected"]
@@ -301,11 +308,9 @@ def _probe(args):
             "No ACK after production chunk completion"
         )
         parts = ack.recv_multipart()
-        assert parts == [b"ABORT_ACK", str(args.room).encode(), b"0", token.encode()], (
-            parts
-        )
-        manager.note_abort_ack(args.room, int(parts[2]), token=parts[3].decode())
-        assert manager.is_abort_release_safe(args.room, 1)
+        assert parts == AbortAck(args.room, 0, generation).to_zmq(), parts
+        manager.note_abort_ack(args.room, 0, generation)
+        assert manager.is_abort_release_safe(args.room, 1, generation=generation)
         assert _recv(parent, args.timeout, "completed")["drained"]
         observe("drained_ack_received", reuse_allowed=True)
 

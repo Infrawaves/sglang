@@ -61,6 +61,7 @@ class TestDeferredReleaseRecovery(CustomTestCase):
         self.generation = manager.register_deferred_abort_room(7)
         receiver = SimpleNamespace(
             kv_mgr=manager,
+            _abort_generation=self.generation,
             retry_abort=MagicMock(return_value=sent),
             abort_notified=already_notified,
             bootstrap_infos=[{"rank": 0}, {"rank": 1}],

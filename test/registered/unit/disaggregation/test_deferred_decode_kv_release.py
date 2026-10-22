@@ -692,8 +692,18 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     return q
 
 
+class _FakeReceiver(SimpleNamespace):
+    @property
+    def _abort_generation(self):
+        # Like a real receiver, it holds whatever generation it armed for its
+        # room; these tests arm through the manager directly.
+        state = self.kv_mgr._deferred_abort_ack_tracker.get(self.room)
+        return state.generation if state is not None else None
+
+
 def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
-    receiver = SimpleNamespace(
+    receiver = _FakeReceiver(
+        room=room,
         kv_mgr=mgr,
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
@@ -1024,6 +1034,7 @@ def _make_pop_queue(mgr):
 def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
+        _abort_generation=None,
         abort_notified=abort_notified,
         bootstrap_infos=[{"rank": 0}, {"rank": 1}],
         failure_exception=lambda: None,

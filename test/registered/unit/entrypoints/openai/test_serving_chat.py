@@ -1727,7 +1727,12 @@ class ServingChatTestCase(CustomTestCase):
             [
                 part["image_url"]["url"]
                 for message in self.tm.tokenizer.apply_chat_template.call_args.args[0]
-                for part in (message.get("content") or [])
+                # Text-only turns keep plain-string content.
+                for part in (
+                    message.get("content")
+                    if isinstance(message.get("content"), list)
+                    else []
+                )
                 if part.get("type") == "image_url"
             ],
             videos[-2:],
@@ -5296,6 +5301,7 @@ class TestAllowedToolsServing(CustomTestCase):
                                 content=content,
                                 request=request,
                                 has_tool_calls=has_tool_calls,
+                                created=0,
                             )
                         ]
                         self.assertTrue(events)
@@ -5306,7 +5312,7 @@ class TestAllowedToolsServing(CustomTestCase):
                         )
                         self.assertIsNone(
                             self.chat._check_for_unstreamed_tool_args(
-                                parser_dict[0], content, request, 0
+                                parser_dict[0], content, request, 0, created=0
                             )
                         )
                     return calls

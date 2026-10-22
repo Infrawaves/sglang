@@ -62,6 +62,7 @@ def _hold(q, room, metadata_idx, *, acked=True):
     mgr.test_generation = generation
     receiver = SimpleNamespace(
         kv_mgr=mgr,
+        _abort_generation=generation,
         bootstrap_infos=[{"rank": 0}],
         retry_abort=lambda: None,
     )

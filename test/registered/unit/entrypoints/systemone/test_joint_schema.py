@@ -128,6 +128,10 @@ class HeadManager:
     def config_value(self, name):
         return None
 
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        # The real manager runs this on its preprocessing thread.
+        return func(*args, **kwargs)
+
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         num_tokens = _expanded_length(request)

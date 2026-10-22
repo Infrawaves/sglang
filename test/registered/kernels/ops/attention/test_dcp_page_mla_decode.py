@@ -47,9 +47,8 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
         backend.req_to_token = req_to_token
         backend.workspace_buffer = workspace
         backend.q_indptr_decode = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-        backend._decode_kernel_loc = None
         backend.kv_index_translator = SimpleNamespace(
-            is_translating=False, full_v2p_table=None, full_page_multiplier=1
+            is_translating=False, full_v2p_table=None
         )
         backend.decode_cuda_graph_metadata = {}
         backend.decode_cuda_graph_kv_indices = torch.full(
@@ -147,6 +146,7 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
                         batch_size=1,
                         seq_lens=seq_lens,
                         out_cache_loc=loc,
+                        out_cache_loc_is_physical=False,
                     )
                     backend = self._make_backend(
                         pool,
@@ -164,8 +164,13 @@ class TestCuteDslDcpLayoutParity(CustomTestCase):
                         k_rope.copy_(kv[length - 1, 512:].view(1, 1, 64))
                         if length - 1 in row_for_position:
                             buffer[row_for_position[length - 1]].zero_()
+                        # Non-translating pool: the KV loc plan is not read.
                         backend._apply_cuda_graph_metadata(
-                            1, req_indices, seq_lens, ForwardMode.DECODE
+                            plan=None,
+                            bs=1,
+                            req_pool_indices=req_indices,
+                            seq_lens=seq_lens,
+                            forward_mode=ForwardMode.DECODE,
                         )
 
                     def forward():

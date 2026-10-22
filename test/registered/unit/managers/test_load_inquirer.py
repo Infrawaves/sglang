@@ -156,8 +156,8 @@ class TestContextLengthLoad(CustomTestCase):
         load = self.get_loads(inquirer)
         self.assertEqual(load.context_length_histogram, [1, 1, 1, 1, 1, 0, 0, 0, 0])
         self.assertEqual(load.num_context_tokens, sum(lengths))
-        self.assertEqual(sum(load.context_length_histogram), 6)
-        self.assertEqual(load.num_running_reqs + load.num_waiting_reqs, 6)
+        self.assertEqual(sum(load.context_length_histogram), len(queues))
+        self.assertEqual(load.num_running_reqs + load.num_waiting_reqs, len(queues))
         # Context load counts full lengths, independent of allocator usage.
         self.assertNotEqual(load.num_context_tokens, load.num_total_tokens)
 

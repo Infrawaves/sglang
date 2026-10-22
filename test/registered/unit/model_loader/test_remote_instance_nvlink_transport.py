@@ -770,9 +770,13 @@ def _transporter(model, endpoints):
         _TransportEndpoint,
     )
 
-    transporter = RemoteInstanceWeightTransporter(
-        get_model=lambda: model, tp_rank=0, gpu_id=0
-    )
+    from sglang.srt.runtime_context import get_parallel
+
+    # tp_rank is read from the published topology (upstream made it init=False).
+    with get_parallel().override(tp_rank=0):
+        transporter = RemoteInstanceWeightTransporter(
+            get_model=lambda: model, gpu_id=0
+        )
     transporter.endpoints = {
         protocol: _TransportEndpoint(
             protocol=protocol, engine=_RecordingEngine(), session_id="10.1.1.4:16000"

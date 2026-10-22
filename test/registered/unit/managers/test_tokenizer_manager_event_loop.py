@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from types import SimpleNamespace
 import unittest
 from contextvars import ContextVar
 
@@ -42,6 +43,8 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             tokenization_started, release_tokenization
         )
         manager.async_dynamic_batch_tokenizer = None
+        # The post-tokenization EOS fix-up reads this (upstream).
+        manager.model_config = SimpleNamespace(is_embedding_gemma=False)
         if hasattr(manager, "init_request_preprocessor"):
             manager.init_request_preprocessor()
 

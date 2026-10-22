@@ -1,7 +1,6 @@
 """CPU protocol contracts for Page DCP capability and destination registration."""
 
 import asyncio
-import concurrent.futures
 import json
 import struct
 import threading
@@ -97,16 +96,6 @@ class _RouteRequest:
 
     async def json(self):
         return self._data
-
-
-class _InlineExecutor:
-    def submit(self, fn, *args, **kwargs):
-        future = concurrent.futures.Future()
-        try:
-            future.set_result(fn(*args, **kwargs))
-        except BaseException as e:  # noqa: BLE001 - mirrored onto the future
-            future.set_exception(e)
-        return future
 
 
 class TestBootstrapDcpPageSupport(CustomTestCase):
@@ -226,7 +215,6 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn._get_bootstrap_session")
     def test_decode_checks_page_support_before_caching_prefill_info(self, mock_session):
-        mock_get = mock_session.return_value.get
         bootstrap_addr = "127.0.0.1:30000"
         prefill_info = {
             "attn_tp_size": 1,
@@ -260,9 +248,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     return_value={**prefill_info, **support_fields}
                 )
 
-                # The topology fetch is asynchronous (#39): run it inline and
-                # let the second call consume the finished future.
-                manager._ensure_parallel_info_executor = lambda: _InlineExecutor()
+                # The topology fetch runs on the manager's executor; the first
+                # call submits it and _drain_parallel_info waits for it.
                 manager.try_ensure_parallel_info(bootstrap_addr)
                 if accepted:
                     self.assertEqual(
@@ -330,7 +317,6 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     enable_staging=False,
                     defer_decode_allocation=False,
                     request_status={},
-                    _ensure_bootstrap_executor=lambda: _InlineExecutor(),
                     local_ip="127.0.0.1",
                     rank_port=30001,
                     get_session_id=lambda: "session",

@@ -68,6 +68,10 @@ class _MockTokenizerManager:
         self.tokenizer = Mock()
         self._stream_chunks = stream_chunks
 
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        # The real manager runs this on its preprocessing thread.
+        return func(*args, **kwargs)
+
     def generate_request(self, adapted_request, raw_request):
         chunks = self._stream_chunks
 
@@ -279,6 +283,10 @@ class _MockChunkTokenizerManager:
         self._results = results_per_request
         self.active_dispatches = 0
         self.max_active_dispatches = 0
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        # The real manager runs this on its preprocessing thread.
+        return func(*args, **kwargs)
 
     def generate_request(self, adapted_request, raw_request):
         idx = len(self.requests)
