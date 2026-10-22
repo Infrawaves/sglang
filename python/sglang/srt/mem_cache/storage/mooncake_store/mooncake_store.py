@@ -24,7 +24,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import (
+    StorageMetrics,
+    hicache_diagnostic_metrics_enabled,
+)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -591,6 +594,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+            self.enable_diagnostic_metrics = (
+                self.enable_storage_metrics and hicache_diagnostic_metrics_enabled()
+            )
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -1388,7 +1394,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # Fast path: one min() over the batch; per-key counting only on failure.
-        if self.enable_storage_metrics and results and min(results) <= 0:
+        if self.enable_diagnostic_metrics and results and min(results) <= 0:
             self._record_read_failures(pool, results)
         return results
 
