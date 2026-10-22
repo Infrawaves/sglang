@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import msgspec
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
 
 
-@dataclass(frozen=True)
-class KernelConfig:
+class KernelConfig(msgspec.Struct, frozen=True):
     """One compiled kernel: logical CTA token tile, hidden tile, hidden cluster."""
 
     tile_m: int = 128
@@ -37,8 +36,7 @@ SUPPORTED_CONFIGS = tuple(
 )
 
 
-@dataclass(frozen=True)
-class WorkspaceLayout:
+class WorkspaceLayout(msgspec.Struct, frozen=True):
     max_m: int
     n: int
     world_size: int
@@ -58,7 +56,7 @@ class WorkspaceLayout:
         )
         if not configs:
             raise ValueError("configs must declare at least one compiled kernel")
-        object.__setattr__(self, "configs", configs)
+        msgspec.structs.force_setattr(self, "configs", configs)
         if self.world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError("world_size must be 2, 4, or 8")
         if self.max_m <= 0 or self.max_m % self.world_size:
