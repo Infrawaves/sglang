@@ -2549,8 +2549,7 @@ class UnifiedRadixCache(BasePrefixCache):
         collector.log_hybrid_prefetch_result(kind, assume)
         age = _prefetch_read_age(operation)
         if age is not None:
-            outcome = "ok" if all_succeeded else "discard"
-            collector.log_storage_read_age(outcome, assume, age)
+            collector.log_storage_read_age(kind, assume, age)
 
     def _record_storage_prefetch_hit(
         self, request: CacheRequestHandle, num_tokens: int
@@ -3036,8 +3035,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 query_spread = getattr(operation, "query_rank_spread", None)
+                # Drop non-signal samples: terminated ops (a rank that saw the
+                # terminate reported 0), skipped queries, and all-rank misses.
                 if (
                     query_spread is not None
+                    and not operation.is_terminated()
+                    and not operation.assume_stored
+                    and hit_tokens + query_spread > 0
                     and self.enable_storage_metrics
                     and self.storage_metrics_collector is not None
                 ):

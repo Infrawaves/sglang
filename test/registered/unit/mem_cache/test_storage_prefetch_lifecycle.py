@@ -13,6 +13,9 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -32,7 +35,10 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    SchedulerStats,
+    StorageMetricsCollector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -595,20 +601,77 @@ class TestHybridPrefetchOutcomeMetrics(CustomTestCase):
         )
         ages = collector.storage_read_age_seconds
         self.assertEqual(
-            _label_hits(ages, outcome="discard", assume_stored="1"), [[2.0]]
+            _label_hits(ages, kind="discard_pool_short", assume_stored="1"), [[2.0]]
         )
 
         collector = self._run_outcome(
             2048, 2048, True, query_done_ts=100.0, kv_last_ts=102.0, sidecar_ts=103.5
         )
         ages = collector.storage_read_age_seconds
-        self.assertEqual(_label_hits(ages, outcome="ok", assume_stored="0"), [[3.5]])
+        self.assertEqual(_label_hits(ages, kind="success", assume_stored="0"), [[3.5]])
+
+    def test_read_age_keeps_terminated_apart_from_pool_short(self):
+        """Terminated prefetches are slow by construction under the timeout
+        policy, so their age must not land in the series the lease check reads."""
+        collector = self._run_outcome(
+            0,
+            2048,
+            False,
+            skip_reason="terminated",
+            query_done_ts=100.0,
+            kv_last_ts=109.0,
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(_label_hits(ages, kind="discard_terminated"), [[9.0]])
+        self.assertEqual(_label_hits(ages, kind="discard_pool_short"), [])
 
         # No existence query timestamp (e.g. the query path raised): no age.
         collector = self._run_outcome(
             0, 2048, False, query_done_ts=None, kv_last_ts=5.0
         )
         self.assertEqual(collector.storage_read_age_seconds.values, {})
+
+
+class _Pool:
+    def __init__(self, size, free):
+        self.size = self.logical_size = size
+        self.free = free
+
+    def available_size(self):
+        return self.free
+
+
+class _NoAllocatorPool(_Pool):
+    def available_size(self):
+        raise NotImplementedError("reuses SWA transfer indices and has no allocator")
+
+
+class TestHostPoolStats(CustomTestCase):
+    def test_only_allocator_pools_are_read(self):
+        """A pool whose available_size() raises (DeepSeek V4 state pools) must
+        not take the scheduler down, and derived pools that never allocate must
+        not be reported as idle."""
+        group = SimpleNamespace(
+            entry_map={
+                PoolName.KV: SimpleNamespace(host_pool=_Pool(1024, 1024)),
+                PoolName.MAMBA: SimpleNamespace(host_pool=_Pool(64, 16)),
+                PoolName.INDEXER: SimpleNamespace(host_pool=_Pool(1024, 1024)),
+                PoolName.DEEPSEEK_V4_C4_STATE: SimpleNamespace(
+                    host_pool=_NoAllocatorPool(32, 0)
+                ),
+            }
+        )
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.stats = SchedulerStats()
+        reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            tree_cache=SimpleNamespace(
+                token_to_kv_pool_host=_Pool(1024, 1000), host_pool_group=group
+            ),
+        )
+        reporter._log_hicache_stats()
+        self.assertEqual(reporter.stats.hicache_host_pool_stats, {"mamba": (48, 64)})
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 24)
 
 
 def _peer_min(peers):
@@ -624,6 +687,46 @@ def _peer_min(peers):
 
 
 class TestPrefetchRankSpread(CustomTestCase):
+    def test_query_spread_drops_non_signal_samples(self):
+        """Only clean queries where some rank hit are recorded: a rank that saw
+        the terminate reports 0 without querying, assume_stored skips the query,
+        and all-rank misses would flood the zero bucket."""
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache.discard_storage_prefetch_accounting = Mock()
+        cases = [
+            ("clean", 1024, 0, False, False),
+            ("disagree", 0, 2048, False, False),
+            ("terminated", 0, 2048, True, False),
+            ("assumed", 1024, 0, False, True),
+            ("all_miss", 0, 0, False, False),
+        ]
+        for rid, hit, spread, terminated, assumed in cases:
+            cache.cache_controller.prefetch_hit_queue.put(
+                SimpleNamespace(
+                    handle=CacheRequestHandle(rid, 0),
+                    storage_hit_count=hit,
+                    query_rank_spread=spread,
+                    assume_stored=assumed,
+                    is_terminated=lambda t=terminated: t,
+                )
+            )
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=len(cases),
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        logged = [
+            c.args[0]
+            for c in cache.storage_metrics_collector.log_prefetch_query_rank_spread.call_args_list
+        ]
+        self.assertEqual(logged, [0, 2048])
+
     def test_ack_reduction_keeps_scalar_shape(self):
         """The completion-sync collectives carry no spread: completed_tokens is
         a scalar and pool hits one int per pool, as before."""

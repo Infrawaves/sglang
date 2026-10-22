@@ -168,7 +168,7 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
-    # Non-KV L2 host pools by pool name: (used_slots, total_slots).
+    # Allocator-owning non-KV L2 host pools by name: (used_slots, total_slots).
     hicache_host_pool_stats: Dict[str, Tuple[int, int]] = field(default_factory=dict)
 
     # Streaming session metrics
@@ -678,14 +678,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
             self.hicache_host_pool_used_slots = Gauge(
                 name="sglang:hicache_host_pool_used_slots",
-                documentation="Used slots of each non-KV L2 host pool (e.g. "
-                "mamba: KDA state slots). The KV pool is hicache_host_used_tokens.",
+                documentation="Used slots of L2 host pools that own an allocator "
+                "(currently only mamba: KDA state slots). The KV pool is "
+                "hicache_host_used_tokens; derived pools reuse KV indices.",
                 labelnames=list(labels.keys()) + ["pool"],
                 multiprocess_mode="mostrecent",
             )
             self.hicache_host_pool_total_slots = Gauge(
                 name="sglang:hicache_host_pool_total_slots",
-                documentation="Total slots of each non-KV L2 host pool.",
+                documentation="Total slots of L2 host pools that own an "
+                "allocator (currently only mamba).",
                 labelnames=list(labels.keys()) + ["pool"],
                 multiprocess_mode="mostrecent",
             )
@@ -2032,8 +2034,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "rank's monotonic clock. The master grants a short read lease at "
             "query time, so this shows whether waiting used it up. For "
             "assume_stored=1 there was no query; the age is measured from the "
-            "point the query was skipped.",
-            labelnames=list(labels.keys()) + ["outcome", "assume_stored"],
+            "point the query was skipped. kind matches "
+            "hicache_hybrid_prefetch_result_total; compare discard_pool_short "
+            "with success, since terminated / kv_short ages are biased by "
+            "slowness.",
+            labelnames=list(labels.keys()) + ["kind", "assume_stored"],
             buckets=[0.1, 0.5, 1, 2, 3, 4, 5, 6, 10, 30],
         )
         self.prefetch_query_rank_spread_tokens = Histogram(
@@ -2061,10 +2066,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                         **self.labels, kind=kind, assume_stored=assume
                     )
                 )
-            for outcome in ("ok", "discard"):
-                self._read_age_children[(outcome, assume)] = (
+                self._read_age_children[(kind, assume)] = (
                     self.storage_read_age_seconds.labels(
-                        **self.labels, outcome=outcome, assume_stored=assume
+                        **self.labels, kind=kind, assume_stored=assume
                     )
                 )
 
@@ -2163,10 +2167,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetch_query_rank_spread(self, spread_tokens: int) -> None:
         self._query_rank_spread_child.observe(spread_tokens)
 
-    def log_storage_read_age(
-        self, outcome: str, assume_stored: str, age: float
-    ) -> None:
-        self._read_age_children[(outcome, assume_stored)].observe(age)
+    def log_storage_read_age(self, kind: str, assume_stored: str, age: float) -> None:
+        self._read_age_children[(kind, assume_stored)].observe(age)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

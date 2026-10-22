@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
