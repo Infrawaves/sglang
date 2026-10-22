@@ -903,6 +903,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # accounts the request; prefill accepts and ignores these options.
         if get_disagg().disaggregation_mode == "prefill":
             return {}
+        # Requests without a gateway identity keep the original API behavior,
+        # including usage fields and response headers, without a cache snapshot.
+        if request.cache_user_id is None:
+            return {}
         if not getattr(get_serving(), "enable_cache_accounting", False):
             if (
                 request.prompt_cache_options is None
@@ -913,15 +917,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # The gateway supplies its authenticated user's identity independently
         # of optional engine API authentication. Hash it before dispatch; never
         # use one shared gateway credential as all users' cache identity.
-        cache_user_id = None
-        if request.cache_user_id is not None:
-            cache_user_id = (
-                "cache-user-id:"
-                + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
-            )
+        cache_user_id = (
+            "cache-user-id:" + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
+        )
         # TokenizerManager decides which shapes can use Redis accounting for
-        # identified users. Missing cache_user_id always uses physical usage
-        # only, regardless of the request's interface authentication credential.
+        # identified users.
         return {
             "cache_user_id": cache_user_id,
             "cache_required": (

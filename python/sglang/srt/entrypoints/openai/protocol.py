@@ -265,6 +265,14 @@ class UsageInfo(BaseModel):
     # Kept on the object for internal protocol adapters, never on the OpenAI wire.
     cache_usage: Optional[CacheUsage] = Field(default=None, exclude=True)
 
+    @model_serializer(mode="wrap")
+    def _serialize_usage(self, handler):
+        data = handler(self)
+        if self.cache_usage is not None:
+            # Kimi exposes the same cache read count at both usage locations.
+            data["cached_tokens"] = self.cache_usage.read_tokens
+        return data
+
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
