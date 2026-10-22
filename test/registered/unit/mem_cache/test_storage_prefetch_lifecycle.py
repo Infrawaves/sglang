@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     StorageMetricsCollector,
+    hicache_diagnostic_metrics_enabled,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -546,10 +547,10 @@ def _label_hits(metric, **labels):
     ]
 
 
-def _diagnostic_flag(test, on):
+def _diagnostic_flag(test, on, metrics=True):
     """Install --enable-hicache-diagnostic-metrics for one test."""
     override = get_context().override_server_args(
-        enable_metrics=True, enable_hicache_diagnostic_metrics=on
+        enable_metrics=metrics, enable_hicache_diagnostic_metrics=on
     )
     override.install()
     test.addCleanup(override.restore)
@@ -662,6 +663,17 @@ class _NoAllocatorPool(_Pool):
 
 
 class TestDiagnosticFlagOff(CustomTestCase):
+    def test_flag_needs_enable_metrics(self):
+        """Without --enable-metrics nothing would be recorded, so the flag must
+        not switch the hit-count all-reduce to the packed shape either."""
+        _diagnostic_flag(self, True, metrics=False)
+        self.assertFalse(hicache_diagnostic_metrics_enabled())
+        collector = _FakeStorageCollector({"model_name": "m"})
+        self.assertFalse(hasattr(collector, "storage_read_failed_keys_total"))
+
+        _diagnostic_flag(self, True, metrics=True)
+        self.assertTrue(hicache_diagnostic_metrics_enabled())
+
     def test_collector_registers_no_diagnostic_metrics(self):
         """With the flag off the new series are never created, so /metrics
         shows nothing extra."""

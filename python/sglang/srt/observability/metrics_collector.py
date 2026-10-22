@@ -238,10 +238,11 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
 
 
 def hicache_diagnostic_metrics_enabled() -> bool:
-    """--enable-hicache-diagnostic-metrics; False when the config is unpublished."""
+    """--enable-hicache-diagnostic-metrics, effective only with --enable-metrics."""
     if not get_context().is_config_namespace_published("observability"):
         return False
-    return bool(get_observability().enable_hicache_diagnostic_metrics)
+    obs = get_observability()
+    return bool(obs.enable_metrics and obs.enable_hicache_diagnostic_metrics)
 
 
 class _StatLoggerDIMixin:
