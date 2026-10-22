@@ -95,9 +95,14 @@ pub enum ApiError {
     BreakerOpen { worker: String },
 
     /// The prefill worker rejected a PD request. Client errors retain the
-    /// worker's status; server errors are mapped to 502.
+    /// worker's status; server errors are mapped to 502. `message` carries a
+    /// client-facing replacement for known engine rejections (see
+    /// [`known_prefill_rejection`]); unknown bodies stay hidden.
     #[error("prefill worker returned status {status}")]
-    PrefillFailed { status: StatusCode },
+    PrefillFailed {
+        status: StatusCode,
+        message: Option<&'static str>,
+    },
 
     /// The worker URL emitted by discovery failed to parse.  Always a
     /// config / discovery-backend bug, not a transient infra issue — but
@@ -113,6 +118,24 @@ pub enum ApiError {
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// Kimi K3's chat encoder raises this when a `tool` message has no `tool` /
+/// `name` and no preceding assistant `tool_call` to borrow one from.
+const K3_UNRESOLVABLE_TOOL_NAME: &str = "Kimi K3 tool messages need a resolvable tool name";
+
+/// OpenAI's wording for the same malformed conversation, so clients see the
+/// error they already handle.
+pub const ORPHAN_TOOL_MESSAGE: &str = "Invalid request: messages with role 'tool' must be a \
+     response to a preceeding message with 'tool_calls'";
+
+/// Map a prefill 4xx body to a client-facing message when it is a known
+/// request-shape rejection. Matching is substring-based because the engine
+/// wraps the encoder's `ValueError` text in its own error envelope.
+pub fn known_prefill_rejection(body: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(body);
+    text.contains(K3_UNRESOLVABLE_TOOL_NAME)
+        .then_some(ORPHAN_TOOL_MESSAGE)
 }
 
 impl ApiError {
@@ -143,7 +166,7 @@ impl ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
             }
             ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
-            ApiError::PrefillFailed { status } if status.is_client_error() => {
+            ApiError::PrefillFailed { status, .. } if status.is_client_error() => {
                 (*status, "prefill_request_rejected")
             }
             ApiError::PrefillFailed { .. } => (StatusCode::BAD_GATEWAY, "prefill_worker_error"),
@@ -243,11 +266,13 @@ impl IntoResponse for ApiError {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
             }
-            ApiError::PrefillFailed { status } if status.is_client_error() => {
+            ApiError::PrefillFailed { status, message } if status.is_client_error() => {
                 tracing::warn!(prefill_status = %status, "prefill worker rejected request");
-                "prefill worker rejected the request".to_string()
+                message
+                    .unwrap_or("prefill worker rejected the request")
+                    .to_string()
             }
-            ApiError::PrefillFailed { status } => {
+            ApiError::PrefillFailed { status, .. } => {
                 tracing::warn!(prefill_status = %status, "prefill worker failed the request");
                 "prefill worker returned an error".to_string()
             }
@@ -316,6 +341,35 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn k3_unresolvable_tool_name_maps_to_openai_message() {
+        let body = br#"{"object":"error","message":"Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.","type":"BadRequestError","code":400}"#;
+        assert_eq!(known_prefill_rejection(body), Some(ORPHAN_TOOL_MESSAGE));
+        assert_eq!(known_prefill_rejection(br#"{"message":"other"}"#), None);
+
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::BAD_REQUEST,
+            message: known_prefill_rejection(body),
+        }
+        .into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code_header.as_deref(), Some("prefill_request_rejected"));
+        assert_eq!(env.error.typ, "invalid_request_error");
+        assert_eq!(env.error.message, ORPHAN_TOOL_MESSAGE);
+    }
+
+    #[test]
+    fn unknown_prefill_rejection_keeps_generic_message() {
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::BAD_REQUEST,
+            message: None,
+        }
+        .into_response();
+        let (_, _, env) = parse_envelope(resp);
+        assert_eq!(env.error.message, "prefill worker rejected the request");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::policies::{
 };
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
-use crate::server::error::ApiError;
+use crate::server::error::{known_prefill_rejection, ApiError};
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, PdDecodeAbortOutcome, PolicySelectionFailureReason,
     RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
@@ -950,9 +950,20 @@ pub(crate) async fn proxy_inference(
                 .await
             {
                 Ok(response) if response.status().is_success() => Ok(()),
-                Ok(response) => Err(ApiError::PrefillFailed {
-                    status: response.status(),
-                }),
+                Ok(response) => {
+                    let status = response.status();
+                    // forward_json_to already buffered and capped the error
+                    // body, so collecting it here cannot block or grow.
+                    let message = if status.is_client_error() {
+                        axum::body::to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .ok()
+                            .and_then(|body| known_prefill_rejection(&body))
+                    } else {
+                        None
+                    };
+                    Err(ApiError::PrefillFailed { status, message })
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = &outcome {
