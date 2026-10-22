@@ -44,6 +44,12 @@ def validate_cache_accounting(cfg: Any) -> None:
             "parameters, or fragments; use SGLANG_CACHE_REDIS_USERNAME "
             "and SGLANG_CACHE_REDIS_PASSWORD for authentication"
         )
+    if getattr(cfg, "cache_redis_cluster", False) and parsed.path not in (
+        "",
+        "/",
+        "/0",
+    ):
+        raise ValueError("Redis Cluster cache accounting only supports database 0")
     if not cfg.cache_namespace or not cfg.cache_namespace.strip():
         raise ValueError("Cache accounting requires --cache-namespace")
     if not math.isfinite(cfg.cache_timeout) or cfg.cache_timeout <= 0:

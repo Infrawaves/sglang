@@ -160,7 +160,7 @@ http2 = [
 ]
 
 cache-accounting = [
-  "redis>=5.0",
+  "redis>=6.4",
 ]
 
 fastokens = [
