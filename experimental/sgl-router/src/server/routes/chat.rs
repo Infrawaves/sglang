@@ -23,16 +23,41 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_chat_request, SelectedWorkers};
-use preparation::{parse_routing_fields, PreparedChatRequest};
+use preparation::{parse_request_fields, PreparedChatRequest};
 use std::sync::Arc;
 use std::time::Instant;
 
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+/// Default maximum buffered request body, including base64 multimodal inputs.
+/// The live limit is `--max-chat-body-bytes`, enforced by the `DefaultBodyLimit`
+/// layer in app.rs, which returns 413.
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
+
+/// The upstream protocol determines its URL, output budget and request-ID key.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceEndpoint {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl InferenceEndpoint {
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Responses => "/v1/responses",
+        }
+    }
+
+    pub(crate) fn request_id_field(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "rid",
+            Self::Responses => "request_id",
+        }
+    }
+}
 
 /// Validate, select workers, and forward a chat-completions request.
 pub async fn chat_completions(
@@ -40,27 +65,59 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    proxy_inference(&ctx, headers, body, InferenceEndpoint::ChatCompletions).await
+}
+
+/// Proxy Responses requests, preserving their body and JSON/SSE response format.
+///
+/// The chat encoder cannot render Responses input, so these route on load and
+/// the body-size token estimate instead of tokenized prompts.
+pub async fn responses(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    proxy_inference(&ctx, headers, body, InferenceEndpoint::Responses).await
+}
+
+async fn proxy_inference(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    body: Bytes,
+    endpoint: InferenceEndpoint,
+) -> Result<Response<Body>, ApiError> {
     match &ctx.chat_routing {
-        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
+        ChatRouting::Legacy => proxy_inference_legacy(ctx, headers, body, endpoint).await,
         ChatRouting::Reorg(resolvers) => {
-            reorg::chat_completions(&ctx, resolvers, headers, body).await
+            reorg::chat_completions(ctx, resolvers, headers, body, endpoint).await
         }
     }
 }
 
-async fn chat_completions_legacy(
+/// Parse routing fields and resolve the target model for `endpoint`.
+fn parse_request(
+    ctx: &AppContext,
+    body: &Bytes,
+    endpoint: InferenceEndpoint,
+) -> Result<(ModelId, preparation::RoutingFields), ApiError> {
+    let mut fields = parse_request_fields(body, endpoint)?;
+    let model = ModelId(match fields.model.take() {
+        Some(model) => model,
+        // `model` is optional in the Responses API; use the served model.
+        None if endpoint == InferenceEndpoint::Responses => ctx.config.model.id.clone(),
+        None => return Err(ApiError::BadRequest("missing `model` field".into())),
+    });
+    Ok((model, fields))
+}
+
+async fn proxy_inference_legacy(
     ctx: &AppContext,
     headers: HeaderMap,
     body: Bytes,
+    endpoint: InferenceEndpoint,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let mut fields = parse_routing_fields(&body)?;
-    let model = ModelId(
-        fields
-            .model
-            .take()
-            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
-    );
+    let (model, fields) = parse_request(ctx, &body, endpoint)?;
 
     let policy = ctx
         .policies
