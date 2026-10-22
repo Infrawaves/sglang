@@ -747,7 +747,8 @@ class Envs:
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     # Decode side, seconds from request arrival until the prefill handshake is done;
-    # unset follows SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.
+    # unset follows SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT. The prefill_complete
+    # wait that follows the handshake is bounded by the waiting timeout instead.
     SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT = EnvInt(None)
     # Split connect/read budgets so half-dead prefill HTTP calls have a bound.
     SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT = EnvFloat(5.0)

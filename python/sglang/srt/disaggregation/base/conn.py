@@ -246,6 +246,9 @@ class BaseKVReceiver(ABC):
         """
         raise NotImplementedError
 
+    # Deferred-abort ACK generation this receiver armed; None until it arms.
+    _abort_generation: Optional[int] = None
+
     @abstractmethod
     def __init__(
         self,

@@ -10,7 +10,18 @@ import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import Callable, Deque, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 import numpy as np
@@ -35,6 +46,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -61,6 +73,9 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+# Default for the generation-scoped deferred-abort helpers: act on whatever
+# generation holds the room (the pre-scoping behavior).
+_ANY_GENERATION = object()
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -315,41 +330,12 @@ class CommonKVManager(BaseKVManager):
     # ``[room, status, prefill_rank]``; backends whose control socket also
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
-    requires_transfer_drain = False
-    # Guards one manager's decode-side room and connection tables.
-    _connection_lock_init = threading.Lock()
-
-    @property
-    def connection_lock(self) -> threading.Lock:
-        lock = self.__dict__.get("_connection_lock")
-        if lock is None:
-            with CommonKVManager._connection_lock_init:
-                lock = self.__dict__.setdefault("_connection_lock", threading.Lock())
-        return lock
-
-    @connection_lock.setter
-    def connection_lock(self, lock) -> None:
-        self.__dict__["_connection_lock"] = lock
-
-    @property
-    def _parallel_info_futures(self) -> Dict[str, Tuple[int, concurrent.futures.Future]]:
-        return self.__dict__.setdefault("_parallel_info_futures_table", {})
-
-    @_parallel_info_futures.setter
-    def _parallel_info_futures(self, value) -> None:
-        self.__dict__["_parallel_info_futures_table"] = value
-
-    @property
-    def _parallel_info_epochs(self) -> Dict[str, int]:
-        return self.__dict__.setdefault(
-            "_parallel_info_epochs_table", defaultdict(int)
-        )
-
-    @_parallel_info_epochs.setter
-    def _parallel_info_epochs(self, value) -> None:
-        self.__dict__["_parallel_info_epochs_table"] = value
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
+
+    requires_transfer_drain = False
+    # Prefill-side source-buffer lease tracker; only Mooncake prefill sets it.
+    _transfer_lifetime: Optional[TransferLifetimeTracker] = None
 
     dsv41_spec_layout: Optional[dict] = None
 
@@ -635,9 +621,8 @@ class CommonKVManager(BaseKVManager):
         return min(statuses)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        lifetime = getattr(self, "_transfer_lifetime", None)
-        if status == KVPoll.Failed and lifetime is not None:
-            lifetime.close(bootstrap_room)
+        if status == KVPoll.Failed and self._transfer_lifetime is not None:
+            self._transfer_lifetime.close(bootstrap_room)
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -929,6 +914,26 @@ class CommonKVManager(BaseKVManager):
         )
         return generation
 
+    def arm_deferred_abort_room(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> Optional[int]:
+        """Arm, or keep, ``generation``'s ACK state for a held room.
+
+        Returns the generation to put on the ABORT, or None while another
+        receiver's generation still holds the room. Under transfer drain an ACK
+        only proves the writers of its own generation stopped, so a newer
+        receiver of a reused room must not replace an undrained one's state:
+        its ACKs would then release buffers the older writers still target.
+        The caller retries once the older receiver releases and clears.
+        """
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if state is not None:
+            if generation is not None and state.generation == generation:
+                return generation
+            if self.requires_transfer_drain:
+                return None
+        return self.register_deferred_abort_room(bootstrap_room)
+
     def is_deferred_abort_generation_armed(
         self, bootstrap_room: int, generation: Optional[int]
     ) -> bool:
@@ -965,13 +970,37 @@ class CommonKVManager(BaseKVManager):
         self.note_abort_ack(ack.room, ack.prefill_rank, ack.generation)
         return True
 
-    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
-        """True once every prefill rank that could still write these pages has acked."""
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        required_acks: int,
+        *,
+        generation: Any = _ANY_GENERATION,
+    ) -> bool:
+        """True once every prefill rank that could still write these pages has acked.
+
+        With ``generation``, only that generation's ACKs count under transfer
+        drain: another receiver's ACKs say nothing about this one's writers.
+        """
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if (
+            state is not None
+            and generation is not _ANY_GENERATION
+            and self.requires_transfer_drain
+            and state.generation != generation
+        ):
+            state = None
         acks = state.prefill_ranks if state is not None else ()
         return len(acks) >= required_acks
 
-    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+    def clear_deferred_abort_state(
+        self, bootstrap_room: int, *, generation: Any = _ANY_GENERATION
+    ) -> None:
+        """With ``generation``, a newer owner's armed state is left alone."""
+        if generation is not _ANY_GENERATION and not (
+            self.is_deferred_abort_generation_armed(bootstrap_room, generation)
+        ):
+            return
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
@@ -2480,6 +2509,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self._decode_allocation_policy = "early"
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        # Set when this receiver failed without owning the room, so its reason
+        # must not be read from (or popped out of) the room's failure record.
+        self._local_failure_reason: Optional[str] = None
         # Published whole, only once the handshake for every CP rank succeeded.
         self.bootstrap_infos: Optional[List[Dict]] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
@@ -2503,6 +2535,22 @@ class CommonKVReceiver(BaseKVReceiver):
             mgr.update_status(bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
             return
+        if mgr.requires_transfer_drain:
+            with mgr.connection_lock:
+                room_held = bootstrap_room in mgr.room_generations
+            if room_held:
+                # Under transfer drain an earlier receiver keeps the room until
+                # its prefill writers drain, and only the owner may resend the
+                # ABORT that gets them there. Taking the room over would strand
+                # it, so fail fast before publishing any destination. The room's
+                # status and failure record stay the earlier receiver's.
+                self._owns_bootstrap_room = False
+                self._setup_cancelled = True
+                self._local_failure_reason = (
+                    "Bootstrap room is still held by an undrained receiver"
+                )
+                self.conclude_state = KVPoll.Failed
+                return
         self._room_generation = mgr.register_receiver_room(
             bootstrap_room=bootstrap_room, bootstrap_addr=bootstrap_addr
         )
@@ -2961,8 +3009,13 @@ class CommonKVReceiver(BaseKVReceiver):
         ):
             # Preserve the recorded root cause; this is cleanup, not a new abort.
             self.ensure_abort_notified()
-        # Deferred-abort ACK state is dropped by the decode release path
-        # (_do_release), so a newer owner's armed generation is never cleared.
+        # Callers clear only once no destination is held (prealloc aborts,
+        # or after the deferred release). Drop this generation's ACK state;
+        # a newer owner's armed generation is left alone.
+        with self.kv_mgr.connection_lock:
+            self.kv_mgr.clear_deferred_abort_state(
+                self.bootstrap_room, generation=self._abort_generation
+            )
         self.kv_mgr.release_receiver_room(
             bootstrap_room=self.bootstrap_room,
             bootstrap_addr=self.bootstrap_addr,
@@ -3016,12 +3069,13 @@ class CommonKVReceiver(BaseKVReceiver):
             ):
                 # A retry re-sends the armed generation so ACKs already received
                 # for this receiver are kept; only a new arm starts a generation.
-                if not self.kv_mgr.is_deferred_abort_generation_armed(
+                generation = self.kv_mgr.arm_deferred_abort_room(
                     self.bootstrap_room, self._abort_generation
-                ):
-                    self._abort_generation = self.kv_mgr.register_deferred_abort_room(
-                        self.bootstrap_room
-                    )
+                )
+                if generation is None:
+                    # An older receiver of this room has not drained yet.
+                    return False
+                self._abort_generation = generation
             frames = AbortNotification(
                 room=self.bootstrap_room,
                 decode_ip=self.kv_mgr.local_ip,

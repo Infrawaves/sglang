@@ -924,6 +924,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = self._calc_padded_blocks(max_seq_k)
                 self.forward_prefill_metadata.block_kv_indices = (
                     self._create_block_kv_indices(
+                        forward_batch.kv_loc_plan,
                         bs,
                         max_seqlen_pad,
                         forward_batch.req_pool_indices,
@@ -1734,7 +1735,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and layer.head_dim == self.kv_lora_rank + self.qk_rope_head_dim
         ):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            # Per-layer views may be strided (unified memory); never .view() them.
+            kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
             raw_out = self._run_varlen_absorbed_kernel(
                 query=q.to(self.data_type),
                 kv_cache=kv_cache,
