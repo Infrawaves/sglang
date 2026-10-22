@@ -28,16 +28,26 @@ pub struct ProxyConfig {
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
     pub request_timeout_secs: u64,
+    /// Maximum accepted body size for `/v1/chat/completions`, in bytes.
+    /// Larger bodies are rejected with HTTP 413 before routing.
+    pub max_chat_body_bytes: usize,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
     300
 }
 
+/// Default maximum accepted `/v1/chat/completions` body size, in bytes.
+/// Deployments can override it with `--max-chat-body-bytes`.
+pub const fn default_max_chat_body_bytes() -> usize {
+    70_000_000
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            max_chat_body_bytes: default_max_chat_body_bytes(),
         }
     }
 }

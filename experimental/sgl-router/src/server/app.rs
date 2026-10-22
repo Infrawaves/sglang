@@ -50,6 +50,7 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    let max_chat_body_bytes = ctx.config.proxy.max_chat_body_bytes;
     Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
@@ -69,7 +70,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_chat_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(

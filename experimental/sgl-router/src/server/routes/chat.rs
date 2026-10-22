@@ -111,7 +111,7 @@ fn prefill_policy_reason(
 
 /// Maximum buffered inference body (32MiB), shared by chat and responses. Sized for base64 multimodal inputs;
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -236,6 +236,18 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    // Log arrival before parsing or routing so a request that later fails
+    // during body probing still leaves an access-log breadcrumb.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::info!(
+        request_id = %request_id,
+        method = "POST",
+        path = "/v1/chat/completions",
+        "chat_completions_start",
+    );
     proxy_inference(ctx, headers, body, InferenceEndpoint::ChatCompletions).await
 }
 

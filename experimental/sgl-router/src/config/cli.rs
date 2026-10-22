@@ -10,7 +10,8 @@ use clap::Parser;
 use std::num::NonZeroU32;
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
+    default_cb_cool_down, default_max_chat_body_bytes, default_proxy_request_timeout_secs,
+    default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
     CachePrefixProvider, CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend,
     EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
@@ -214,6 +215,10 @@ pub struct Cli {
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
+    /// Max accepted `/v1/chat/completions` body size in bytes. Larger bodies
+    /// are rejected with 413 before routing.
+    #[arg(long, default_value_t = default_max_chat_body_bytes())]
+    pub max_chat_body_bytes: usize,
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
@@ -636,6 +641,7 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                max_chat_body_bytes: self.max_chat_body_bytes,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -762,7 +768,23 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
+        assert_eq!(c.proxy.max_chat_body_bytes, default_max_chat_body_bytes());
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+    }
+
+    #[test]
+    fn max_chat_body_bytes_defaults_and_overrides() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, default_max_chat_body_bytes());
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--max-chat-body-bytes",
+            "536870912",
+        ]))
+        .unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 512 << 20);
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the
