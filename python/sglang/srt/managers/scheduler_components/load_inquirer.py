@@ -98,10 +98,12 @@ class SchedulerLoadInquirer:
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Bootstrapping requests have not been prefix-matched yet.
+            # Bootstrapping requests have not been prefix-matched yet. Count
+            # them at full length: the windowed hit rate only advances on
+            # prefill batches, so it freezes exactly when bootstrap stalls,
+            # and discounting by it makes a congested worker look idle.
             num_tokens += sum(
-                int(req.seqlen * cache_miss_rate)
-                for req in self.get_disagg_prefill_bootstrap_queue().queue
+                req.seqlen for req in self.get_disagg_prefill_bootstrap_queue().queue
             )
         cr = self.get_chunked_req()
         if cr is not None:

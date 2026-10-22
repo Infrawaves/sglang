@@ -124,6 +124,29 @@ pub enum LoadBasedMetric {
     Tokens,
 }
 
+/// Request-count gate for `--load-based-metric tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadBasedTokenGate {
+    /// Workers whose request count exceeds the fleet minimum by more than
+    /// this are not picked, however few tokens they report.
+    pub slack: u64,
+    /// Token loads within this band of the minimum tie and rank by request count.
+    pub tie_band: u64,
+}
+
+pub const DEFAULT_LOAD_BASED_TOKEN_SLACK: u64 = 8;
+/// One chunked prefill step: a smaller token difference is noise.
+pub const DEFAULT_LOAD_BASED_TOKEN_TIE_BAND: u64 = 16384;
+
+impl Default for LoadBasedTokenGate {
+    fn default() -> Self {
+        Self {
+            slack: DEFAULT_LOAD_BASED_TOKEN_SLACK,
+            tie_band: DEFAULT_LOAD_BASED_TOKEN_TIE_BAND,
+        }
+    }
+}
+
 /// Role served by a static bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +363,8 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Load unit for every `load_based` instance of this model.
     pub load_based_metric: LoadBasedMetric,
+    /// Request-count gate applied when `load_based_metric` is `tokens`.
+    pub load_based_token_gate: LoadBasedTokenGate,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,

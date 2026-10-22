@@ -15,8 +15,9 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LoadBasedMetric, LogFormat,
-    ModelConfig,
+    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LoadBasedMetric,
+    LoadBasedTokenGate, LogFormat, ModelConfig, DEFAULT_LOAD_BASED_TOKEN_SLACK,
+    DEFAULT_LOAD_BASED_TOKEN_TIE_BAND,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
     DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
@@ -213,6 +214,17 @@ pub struct RoutingArgs {
     /// `tokens` ranks prefill workers by prompt tokens still to prefill.
     #[arg(long, value_enum, default_value = "requests")]
     pub load_based_metric: LoadBasedMetric,
+
+    /// With --load-based-metric tokens: skip prefill workers whose request count
+    /// (waiting + bootstrap + running) exceeds the fleet minimum by more than this.
+    /// 0 ranks like `requests`; a large value disables the gate.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_SLACK)]
+    pub load_based_token_slack: u64,
+
+    /// With --load-based-metric tokens: token loads within this many tokens of the
+    /// minimum tie and rank by request count. Defaults to one 16K prefill chunk.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_TIE_BAND)]
+    pub load_based_token_tie_band: u64,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -485,6 +497,10 @@ impl Cli {
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 load_based_metric: self.routing.load_based_metric,
+                load_based_token_gate: LoadBasedTokenGate {
+                    slack: self.routing.load_based_token_slack,
+                    tie_band: self.routing.load_based_token_tie_band,
+                },
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -2612,6 +2628,28 @@ mod tests {
         );
 
         assert!(cfg_of("--load-based-metric blocks").is_err());
+    }
+
+    #[test]
+    fn load_based_token_gate_defaults_and_overrides() {
+        let default_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            default_config.model.load_based_token_gate,
+            LoadBasedTokenGate::default()
+        );
+
+        let tuned = cfg_of(
+            "--policy load_based --load-based-metric tokens \
+             --load-based-token-slack 3 --load-based-token-tie-band 0",
+        )
+        .unwrap();
+        assert_eq!(
+            tuned.model.load_based_token_gate,
+            LoadBasedTokenGate {
+                slack: 3,
+                tie_band: 0
+            }
+        );
     }
 
     /// `tokens` only changes `load_based`; a config with no `load_based`

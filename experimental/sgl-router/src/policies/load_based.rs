@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::LoadBasedMetric;
+use crate::config::{LoadBasedMetric, LoadBasedTokenGate};
 use crate::policies::admission::FreshLoadLookup;
 use crate::policies::scoring::ScoringPolicy;
 use crate::policies::SelectionContext;
@@ -9,9 +9,17 @@ use crate::workers::Worker;
 use std::sync::Arc;
 
 /// Prefers the least-loaded candidate; `select()` is the blanket impl's.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct LoadBasedPolicy {
     metric: LoadBasedMetric,
+    token_slack: u64,
+    token_tie_band: u64,
+}
+
+impl Default for LoadBasedPolicy {
+    fn default() -> Self {
+        Self::with_metric(LoadBasedMetric::default())
+    }
 }
 
 impl LoadBasedPolicy {
@@ -20,9 +28,75 @@ impl LoadBasedPolicy {
         Self::default()
     }
 
-    /// Ranks by the configured load unit.
+    /// Ranks by the configured load unit, with the default token gate.
     pub fn with_metric(metric: LoadBasedMetric) -> Self {
-        Self { metric }
+        let gate = LoadBasedTokenGate::default();
+        Self {
+            metric,
+            token_slack: gate.slack,
+            token_tie_band: gate.tie_band,
+        }
+    }
+
+    /// Sets the request-count gate used by `tokens`.
+    pub fn with_token_gate(mut self, gate: LoadBasedTokenGate) -> Self {
+        self.token_slack = gate.slack;
+        self.token_tie_band = gate.tie_band;
+        self
+    }
+
+    /// `tokens` ranking. Request count gates, tokens rank:
+    ///
+    /// 1. Eligible: request count (waiting + bootstrap + running + unreported
+    ///    dispatches) within `token_slack` of the fleet minimum. Metadata
+    ///    buffers, running slots and decode preallocation are all per-request
+    ///    resources; a worker whose count runs ahead is congested whatever its
+    ///    token gauge says, so it is not picked for looking light in tokens.
+    /// 2. Among eligible workers, the fewest pending tokens wins. Loads within
+    ///    `token_tie_band` of that minimum tie and rank by request count, then
+    ///    the selector's router-local active load and rotation. Exact token
+    ///    loads almost never tie, so without the band those spreading
+    ///    tie-breaks would never run.
+    ///
+    /// Scores: best tied count `1.0`, rest of the band `[0.6, 0.9]`, eligible
+    /// outside the band `[0.1, 0.5]` by tokens, ineligible `0.0`.
+    fn token_scores(&self, counts: &[u64], tokens: &[u64]) -> Vec<f32> {
+        let min_count = counts.iter().copied().min().unwrap_or(0);
+        let eligible: Vec<bool> = (counts.iter())
+            .map(|&c| c <= min_count.saturating_add(self.token_slack))
+            .collect();
+        let eligible_tokens = || {
+            (0..tokens.len())
+                .filter(|&i| eligible[i])
+                .map(|i| tokens[i])
+        };
+        let min_tok = eligible_tokens().min().unwrap_or(0);
+        let max_tok = eligible_tokens().max().unwrap_or(0);
+        let in_band =
+            |i: usize| eligible[i] && tokens[i] <= min_tok.saturating_add(self.token_tie_band);
+        let band_min_count = (0..counts.len())
+            .filter(|&i| in_band(i))
+            .map(|i| counts[i])
+            .min()
+            .unwrap_or(min_count);
+        let count_span = self.token_slack.max(1) as f64;
+        let tok_span = (max_tok - min_tok).max(1) as f64;
+        (0..counts.len())
+            .map(|i| {
+                if in_band(i) {
+                    let d = (counts[i] - band_min_count) as f64;
+                    if d == 0.0 {
+                        1.0
+                    } else {
+                        (0.9 - 0.3 * (d / count_span).min(1.0)) as f32
+                    }
+                } else if eligible[i] {
+                    (0.1 + 0.4 * (1.0 - (tokens[i] - min_tok) as f64 / tok_span)) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
 }
 
@@ -49,23 +123,23 @@ impl ScoringPolicy for LoadBasedPolicy {
     /// With `--load-based-metric tokens`, load is the prompt tokens each
     /// worker still has to prefill (see
     /// [`FreshLoadLookup::pending_prefill_tokens`]): two 20K-token prompts
-    /// are more work than five 3K-token ones. When every candidate carries
-    /// the same token load (an idle fleet) the request count ranks instead.
+    /// are more work than five 3K-token ones, gated by request count (see
+    /// [`LoadBasedPolicy::token_scores`]).
     ///
     /// Purely a preference: "everybody is busy" is not a reason to refuse to
     /// route, so this term never constrains. Capacity is `--filter`'s job.
     fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
         let lookup = FreshLoadLookup::new(ctx.load_snapshot(), workers.iter());
+        let counts: Vec<u64> = (workers.iter())
+            .map(|w| lookup.score_load(w) as u64)
+            .collect();
         if self.metric == LoadBasedMetric::Tokens {
             let tokens: Vec<u64> = (workers.iter())
                 .map(|w| lookup.pending_prefill_tokens(w))
                 .collect();
-            if tokens.iter().min() != tokens.iter().max() {
-                return min_max_scores(tokens);
-            }
+            return self.token_scores(&counts, &tokens);
         }
-        let requests = workers.iter().map(|w| lookup.score_load(w) as u64);
-        min_max_scores(requests.collect())
+        min_max_scores(counts)
     }
 }
 
@@ -363,17 +437,17 @@ mod tests {
         let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
             53,
             HashMap::from([
-                (ws[0].url.clone(), native(0, 1_000, Instant::now())),
-                (ws[1].url.clone(), native(0, 2_000, Instant::now())),
+                (ws[0].url.clone(), native(0, 10_000, Instant::now())),
+                (ws[1].url.clone(), native(0, 40_000, Instant::now())),
             ]),
         );
-        let _after = ws[0].timestamped_load_guard(5_000);
+        let _after = ws[0].timestamped_load_guard(50_000);
         let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
 
         assert_eq!(
             pick(LoadBasedMetric::Tokens, &ws, &ctx),
             ws[1].id,
-            "1_000 reported + 5_000 unreported outweighs 2_000"
+            "10_000 reported + 50_000 unreported outweighs 40_000"
         );
     }
 
@@ -381,14 +455,14 @@ mod tests {
     fn tokens_dispatched_before_the_sample_are_not_double_counted() {
         let model = ModelId("tiny".into());
         let ws = vec![worker("w0"), worker("w1")];
-        let _before = ws[0].timestamped_load_guard(5_000);
+        let _before = ws[0].timestamped_load_guard(50_000);
         std::thread::sleep(std::time::Duration::from_millis(5));
         let at = Instant::now();
         let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
             55,
             HashMap::from([
-                (ws[0].url.clone(), native(0, 1_000, at)),
-                (ws[1].url.clone(), native(0, 2_000, at)),
+                (ws[0].url.clone(), native(0, 10_000, at)),
+                (ws[1].url.clone(), native(0, 40_000, at)),
             ]),
         );
         let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
@@ -410,11 +484,100 @@ mod tests {
             57,
             HashMap::from([(ws[0].url.clone(), native(0, 0, Instant::now()))]),
         );
-        let _w0 = ws[0].timestamped_load_guard(9_000);
-        let _w1 = ws[1].timestamped_load_guard(1_000);
+        let _w0 = ws[0].timestamped_load_guard(90_000);
+        let _w1 = ws[1].timestamped_load_guard(10_000);
         let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
 
         assert_eq!(pick(LoadBasedMetric::Tokens, &ws, &ctx), ws[1].id);
+    }
+
+    fn pick_gated(
+        slack: u64,
+        tie_band: u64,
+        ws: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> WorkerId {
+        LoadBasedPolicy::with_metric(LoadBasedMetric::Tokens)
+            .with_token_gate(LoadBasedTokenGate { slack, tie_band })
+            .select(ws, ctx)
+            .expect("non-empty")
+            .id
+            .clone()
+    }
+
+    /// The failure seen in production: a worker with hundreds of requests
+    /// parked in bootstrap reports few tokens. The request-count gate must
+    /// keep it from winning on tokens alone.
+    #[test]
+    fn a_congested_worker_is_not_picked_for_reporting_few_tokens() {
+        let model = ModelId("tiny".into());
+        let ws = vec![worker("w0"), worker("w1")];
+        let at = Instant::now();
+        let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
+            59,
+            HashMap::from([
+                (ws[0].url.clone(), native(500, 1_000, at)), // stuck: many requests, few tokens
+                (ws[1].url.clone(), native(2, 100_000, at)),
+            ]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+
+        assert_eq!(
+            pick_gated(8, 16_384, &ws, &ctx),
+            ws[1].id,
+            "gate excludes w0"
+        );
+        assert_eq!(
+            pick_gated(u64::MAX, 16_384, &ws, &ctx),
+            ws[0].id,
+            "without the gate tokens alone pick the congested worker"
+        );
+    }
+
+    /// Token loads inside the band tie and rank by request count, so a burst
+    /// of short requests spreads instead of following one exact minimum.
+    #[test]
+    fn token_loads_inside_the_tie_band_rank_by_request_count() {
+        let model = ModelId("tiny".into());
+        let ws = vec![worker("w0"), worker("w1")];
+        let at = Instant::now();
+        let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
+            61,
+            HashMap::from([
+                (ws[0].url.clone(), native(4, 10_000, at)),
+                (ws[1].url.clone(), native(0, 20_000, at)),
+            ]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+
+        assert_eq!(
+            pick_gated(8, 16_384, &ws, &ctx),
+            ws[1].id,
+            "10K vs 20K tie; fewer requests win"
+        );
+        assert_eq!(
+            pick_gated(8, 0, &ws, &ctx),
+            ws[0].id,
+            "no band: fewest tokens win"
+        );
+    }
+
+    #[test]
+    fn zero_slack_ranks_by_request_count() {
+        let model = ModelId("tiny".into());
+        let ws = vec![worker("w0"), worker("w1")];
+        let at = Instant::now();
+        let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
+            63,
+            HashMap::from([
+                (ws[0].url.clone(), native(1, 500_000, at)),
+                (ws[1].url.clone(), native(3, 1_000, at)),
+            ]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+
+        assert_eq!(pick_gated(0, 16_384, &ws, &ctx), ws[0].id);
+        assert_eq!(pick(LoadBasedMetric::Requests, &ws, &ctx), ws[0].id);
     }
 
     /// `tokens` must tokenize the request: sizing it from the JSON body

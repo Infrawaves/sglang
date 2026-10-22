@@ -71,7 +71,7 @@ class TestSchedulerLoadInquirer(CustomTestCase):
             120,
         )
 
-    def test_prefill_bootstrap_queue_tokens_are_estimated(self):
+    def test_prefill_bootstrap_queue_tokens_count_full_length(self):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
         inquirer.disaggregation_mode = DisaggregationMode.PREFILL
         bootstrapping = [SimpleNamespace(seqlen=200), SimpleNamespace(seqlen=40)]
@@ -79,10 +79,11 @@ class TestSchedulerLoadInquirer(CustomTestCase):
             queue=bootstrapping
         )
 
-        # 120 as above, plus int(200 * 0.25) + int(40 * 0.25) for bootstrap.
+        # 120 as above, plus 200 + 40: bootstrap is not discounted by the
+        # (0.75) recent hit rate.
         self.assertEqual(
             SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
-            180,
+            360,
         )
 
     def test_bootstrap_queue_is_read_only_in_prefill_mode(self):
