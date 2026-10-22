@@ -1428,11 +1428,13 @@ class HybridCacheController(BaseHiCacheController):
         by any rank heals from the folded cut without learning presence."""
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
+        # The flag is read once at init, so every rank packs the same shape.
+        spread = [-storage_hit_count] if self.enable_diagnostic_metrics else []
         packed = torch.tensor(
             [storage_hit_count]
             + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
-            + [-storage_hit_count],
+            + spread,
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1443,10 +1445,11 @@ class HybridCacheController(BaseHiCacheController):
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[1:-1], strict=True)
+            for pool, pages in zip(pools, reduced[1 : 1 + len(pools)], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        operation.query_rank_spread = -reduced[-1] - reduced[0]
+        if spread:
+            operation.query_rank_spread = -reduced[-1] - reduced[0]
         return int(reduced[0])
 
     def _move_pool_indices(

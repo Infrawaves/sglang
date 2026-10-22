@@ -643,6 +643,7 @@ class TestMooncakeReadFailureMetrics(CustomTestCase):
     def _store_with_reads(self, results):
         store, fake_store = _make_store(is_mla_model=True)
         store.enable_storage_metrics = True
+        store.enable_diagnostic_metrics = True
         fake_store.batch_get_into = lambda keys, ptrs, sizes: results
         indexer_pool = FakeIndexerPool()
         store.register_mem_host_pool_v2(indexer_pool, PoolName.INDEXER)
@@ -680,6 +681,12 @@ class TestMooncakeReadFailureMetrics(CustomTestCase):
         store = self._store_with_reads([-800, 8])
         self._read(store)
         self.assertEqual(store.get_stats().read_failed_keys, {("indexer", -800): 1})
+        self.assertEqual(store.get_stats().read_failed_keys, {})
+
+    def test_flag_off_counts_nothing(self):
+        store = self._store_with_reads([-704, 8])
+        store.enable_diagnostic_metrics = False
+        self.assertEqual(self._read(store)[PoolName.INDEXER], [False, True])
         self.assertEqual(store.get_stats().read_failed_keys, {})
 
 

@@ -101,6 +101,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
+    hicache_diagnostic_metrics_enabled,
 )
 from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
@@ -212,6 +213,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -2548,7 +2550,11 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """Observability only: classify the all-or-nothing result and record how
         old the L3 read lease was when the last read started."""
-        if not self.enable_storage_metrics or self.storage_metrics_collector is None:
+        if (
+            not self.enable_storage_metrics
+            or not self.enable_diagnostic_metrics
+            or self.storage_metrics_collector is None
+        ):
             return
         collector = self.storage_metrics_collector
         assume = "1" if getattr(operation, "assume_stored", False) else "0"
@@ -3082,6 +3088,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     and not operation.assume_stored
                     and hit_tokens + query_spread > 0
                     and self.enable_storage_metrics
+                    and self.enable_diagnostic_metrics
                     and self.storage_metrics_collector is not None
                 ):
                     self.storage_metrics_collector.log_prefetch_query_rank_spread(
