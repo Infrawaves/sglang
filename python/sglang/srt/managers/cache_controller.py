@@ -1117,6 +1117,8 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
+                operation.kv_last_ts = time.monotonic()
+
                 try:
                     hit_pages = self._page_transfer_kv_batch(
                         operation,
@@ -1310,13 +1312,27 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
-        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        # [x, -x] under MIN yields [min x, -max x] in one collective, so
+        # the cross-rank spread costs no extra communication. PP-ticket
+        # mode reduces a scalar on these groups elsewhere, so keep the
+        # scalar shape there to avoid mismatched collectives.
+        pack_spread = getattr(self, "pp_prefetch_command_group", None) is None
+        hit_count = torch.tensor(
+            [storage_hit_count, -storage_hit_count]
+            if pack_spread
+            else storage_hit_count,
+            dtype=torch.int,
+        )
         self._all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
         )
-        return int(hit_count.item())
+        if not pack_spread:
+            return int(hit_count.item())
+        min_hits, neg_max_hits = hit_count.tolist()
+        operation.query_rank_spread = -neg_max_hits - min_hits
+        return int(min_hits)
 
     def write_storage(
         self,
