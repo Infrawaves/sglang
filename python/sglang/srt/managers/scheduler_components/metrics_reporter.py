@@ -1198,13 +1198,14 @@ class SchedulerMetricsReporter:
         group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
         if group is not None:
             pool_stats = {}
-            for name, entry in group.entry_map.items():
-                name = str(getattr(name, "value", name))
-                if name == "kv":
-                    continue  # already hicache_host_used_tokens / total_tokens
+            # Pools that own an allocator; derived pools reuse KV's indices,
+            # and some (DeepSeek V4 state pools) raise on available_size().
+            for name in (PoolName.MAMBA,):
+                entry = group.entry_map.get(name)
+                if entry is None:
+                    continue
                 pool = entry.host_pool
-                total = getattr(pool, "logical_size", pool.size)
-                pool_stats[name] = (total - pool.available_size(), total)
+                pool_stats[name.value] = (pool.size - pool.available_size(), pool.size)
             self.stats.hicache_host_pool_stats = pool_stats
 
     def _update_lora_metrics(self):
