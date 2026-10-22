@@ -762,8 +762,9 @@ class TestDcpStorage(unittest.TestCase):
             peer[other.pool_storage_result.restorable_prefix_pages] = 1
 
             def reduce(tensor, op, groups, peer=peer):
-                # Restorable flags lead; per-pool verdicts trail them.
-                self.assertEqual(tensor.numel(), peer.numel() + len(PoolName))
+                # Restorable flags lead; per-pool verdicts follow, then the
+                # [x, -x] pair that carries the cross-rank hit spread.
+                self.assertEqual(tensor.numel(), peer.numel() + len(PoolName) + 2)
                 self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                 tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 
