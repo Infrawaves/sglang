@@ -38,7 +38,9 @@ from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     StorageMetricsCollector,
+    hicache_diagnostic_metrics_enabled,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,6 +71,7 @@ def _staged_fixture(full_match=2):
     cache.prefetch_loaded_storage_start_by_reqid = {_REQ: 2}
     cache._storage_prefetch_hit_remaining_by_reqid = {}
     cache.enable_storage_metrics = False
+    cache.enable_diagnostic_metrics = False
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
@@ -138,6 +141,7 @@ def _hit_drain_fixture():
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False
+    cache.enable_diagnostic_metrics = False
     cache.storage_metrics_collector = None
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._prefetch_outcome_stats = defaultdict(int)
@@ -543,11 +547,23 @@ def _label_hits(metric, **labels):
     ]
 
 
+def _diagnostic_flag(test, on, metrics=True):
+    """Install --enable-hicache-diagnostic-metrics for one test."""
+    override = get_context().override_server_args(
+        enable_metrics=metrics, enable_hicache_diagnostic_metrics=on
+    )
+    override.install()
+    test.addCleanup(override.restore)
+
+
 class TestHybridPrefetchOutcomeMetrics(CustomTestCase):
-    def _run_outcome(self, completed, expected, ok, **op):
+    def _run_outcome(self, completed, expected, ok, diagnostic=True, **op):
+        _diagnostic_flag(self, True)
         collector = _FakeStorageCollector({"model_name": "m"})
         fake_self = SimpleNamespace(
-            enable_storage_metrics=True, storage_metrics_collector=collector
+            enable_storage_metrics=True,
+            enable_diagnostic_metrics=diagnostic,
+            storage_metrics_collector=collector,
         )
         fields = dict(
             assume_stored=False,
@@ -646,11 +662,41 @@ class _NoAllocatorPool(_Pool):
         raise NotImplementedError("reuses SWA transfer indices and has no allocator")
 
 
+class TestDiagnosticFlagOff(CustomTestCase):
+    def test_flag_needs_enable_metrics(self):
+        """Without --enable-metrics nothing would be recorded, so the flag must
+        not switch the hit-count all-reduce to the packed shape either."""
+        _diagnostic_flag(self, True, metrics=False)
+        self.assertFalse(hicache_diagnostic_metrics_enabled())
+        collector = _FakeStorageCollector({"model_name": "m"})
+        self.assertFalse(hasattr(collector, "storage_read_failed_keys_total"))
+
+        _diagnostic_flag(self, True, metrics=True)
+        self.assertTrue(hicache_diagnostic_metrics_enabled())
+
+    def test_collector_registers_no_diagnostic_metrics(self):
+        """With the flag off the new series are never created, so /metrics
+        shows nothing extra."""
+        _diagnostic_flag(self, False)
+        collector = _FakeStorageCollector({"model_name": "m"})
+        for name in (
+            "storage_read_failed_keys_total",
+            "hybrid_prefetch_result_total",
+            "storage_read_age_seconds",
+            "prefetch_query_rank_spread_tokens",
+        ):
+            self.assertFalse(hasattr(collector, name), name)
+
+    def test_outcome_logging_is_skipped(self):
+        collector = TestHybridPrefetchOutcomeMetrics._run_outcome(
+            self, 2048, 2048, False, diagnostic=False, query_done_ts=1.0, kv_last_ts=2.0
+        )
+        self.assertEqual(collector.hybrid_prefetch_result_total.values, {})
+        self.assertEqual(collector.storage_read_age_seconds.values, {})
+
+
 class TestHostPoolStats(CustomTestCase):
-    def test_only_allocator_pools_are_read(self):
-        """A pool whose available_size() raises (DeepSeek V4 state pools) must
-        not take the scheduler down, and derived pools that never allocate must
-        not be reported as idle."""
+    def _reporter(self):
         group = SimpleNamespace(
             entry_map={
                 PoolName.KV: SimpleNamespace(host_pool=_Pool(1024, 1024)),
@@ -669,6 +715,21 @@ class TestHostPoolStats(CustomTestCase):
                 token_to_kv_pool_host=_Pool(1024, 1000), host_pool_group=group
             ),
         )
+        return reporter
+
+    def test_flag_off_reports_no_pool_stats(self):
+        _diagnostic_flag(self, False)
+        reporter = self._reporter()
+        reporter._log_hicache_stats()
+        self.assertEqual(reporter.stats.hicache_host_pool_stats, {})
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 24)
+
+    def test_only_allocator_pools_are_read(self):
+        """A pool whose available_size() raises (DeepSeek V4 state pools) must
+        not take the scheduler down, and derived pools that never allocate must
+        not be reported as idle."""
+        _diagnostic_flag(self, True)
+        reporter = self._reporter()
         reporter._log_hicache_stats()
         self.assertEqual(reporter.stats.hicache_host_pool_stats, {"mamba": (48, 64)})
         self.assertEqual(reporter.stats.hicache_host_used_tokens, 24)
@@ -693,6 +754,7 @@ class TestPrefetchRankSpread(CustomTestCase):
         and all-rank misses would flood the zero bucket."""
         cache = _hit_drain_fixture()
         cache.enable_storage_metrics = True
+        cache.enable_diagnostic_metrics = True
         cache.storage_metrics_collector = Mock()
         cache._invalidate_absent_from_hit_query = Mock()
         cache.discard_storage_prefetch_accounting = Mock()
@@ -726,6 +788,31 @@ class TestPrefetchRankSpread(CustomTestCase):
             for c in cache.storage_metrics_collector.log_prefetch_query_rank_spread.call_args_list
         ]
         self.assertEqual(logged, [0, 2048])
+
+    def test_query_spread_flag_off_records_nothing(self):
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache.discard_storage_prefetch_accounting = Mock()
+        cache.cache_controller.prefetch_hit_queue.put(
+            SimpleNamespace(
+                handle=CacheRequestHandle("disagree", 0),
+                storage_hit_count=0,
+                query_rank_spread=2048,
+                assume_stored=False,
+                is_terminated=lambda: False,
+            )
+        )
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        cache.storage_metrics_collector.log_prefetch_query_rank_spread.assert_not_called()
 
     def test_ack_reduction_keeps_scalar_shape(self):
         """The completion-sync collectives carry no spread: completed_tokens is
@@ -774,13 +861,25 @@ class TestPrefetchRankSpread(CustomTestCase):
         ticket path; a rank that packs a different shape deadlocks the group.
         Packing is therefore enabled only when the PP ticket group is absent."""
         ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = True
         ctrl.pp_prefetch_command_group = None
         op = self._query(ctrl, torch.tensor([128, -128], dtype=torch.int))
         self.assertEqual((op.storage_hit_count, op.query_rank_spread), (128, 128))
         self.assertEqual(op.hash_value, ["h"] * 2)
 
         ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = True
         ctrl.pp_prefetch_command_group = object()
+        op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
+        self.assertEqual(op.storage_hit_count, 128)
+        self.assertFalse(hasattr(op, "query_rank_spread"))
+
+    def test_flag_off_keeps_the_original_scalar_collective(self):
+        """With the flag off the hit-count all-reduce has the pre-change shape,
+        so a mixed rollout of this code with the flag off cannot mismatch."""
+        ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = False
+        ctrl.pp_prefetch_command_group = None
         op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
         self.assertEqual(op.storage_hit_count, 128)
         self.assertFalse(hasattr(op, "query_rank_spread"))

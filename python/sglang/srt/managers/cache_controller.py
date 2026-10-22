@@ -42,6 +42,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.metrics_collector import (
+    hicache_diagnostic_metrics_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -323,6 +326,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Read once so every collective in this process uses the same shape.
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -1242,7 +1247,10 @@ class HiCacheController:
                 # the cross-rank spread costs no extra communication. PP-ticket
                 # mode reduces a scalar on these groups elsewhere, so keep the
                 # scalar shape there to avoid mismatched collectives.
-                pack_spread = getattr(self, "pp_prefetch_command_group", None) is None
+                pack_spread = (
+                    self.enable_diagnostic_metrics
+                    and getattr(self, "pp_prefetch_command_group", None) is None
+                )
                 storage_hit_count_tensor = torch.tensor(
                     [storage_hit_count, -storage_hit_count]
                     if pack_spread

@@ -24,6 +24,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollectorContext,
     SchedulerStats,
     compute_routing_key_stats,
+    hicache_diagnostic_metrics_enabled,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
@@ -1197,7 +1198,7 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_total_tokens = host_total
 
         group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
-        if group is not None:
+        if group is not None and hicache_diagnostic_metrics_enabled():
             pool_stats = {}
             # Pools that own an allocator; derived pools reuse KV's indices,
             # and some (DeepSeek V4 state pools) raise on available_size().
