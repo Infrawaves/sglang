@@ -1075,16 +1075,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
                 password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
                 metrics=self._cache_metrics,
+                cluster=getattr(cfg, "cache_redis_cluster", False),
             )
             action = "account"
         logger.info(
             "Cache accounting startup enabled=%s role=%s action=%s block_size=%d "
-            "metrics_enabled=%s",
+            "metrics_enabled=%s redis_mode=%s",
             cfg.enable_cache_accounting,
             "standalone" if role == "null" else role,
             action,
             CACHE_BLOCK_SIZE,
             self._cache_metrics is not None,
+            "cluster" if getattr(cfg, "cache_redis_cluster", False) else "standalone",
         )
 
     def _validate_cache_request(self, obj: GenerateReqInput) -> None:

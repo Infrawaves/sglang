@@ -339,3 +339,9 @@ class Serving(msgspec.Struct):
     disable_tokenizer_batch_decode: A[
         bool, "Disable batch decoding when decoding multiple completions."
     ] = False
+    # Append new input fields to preserve ServerArgs positional compatibility.
+    cache_redis_cluster: A[
+        bool,
+        "Use Redis Cluster for cache accounting. The Redis URL is a discovery seed; "
+        "workers must reach all advertised Redis nodes. Only database 0 is supported.",
+    ] = False

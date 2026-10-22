@@ -395,15 +395,15 @@ def _validate_plan(plan: PageCachePlan) -> None:
 class RedisPageCacheStore:
     """Lazy async Redis boundary; an error never becomes read/write success.
 
-    ``account`` and its Redis client do not retry operations automatically.
+    ``account`` and its Redis client do not replay operations after an uncertain
+    result. Cluster clients may follow server-side MOVED/ASK redirects.
     Cache keys require a dedicated Redis eviction/retention policy;
     eviction is equivalent to expiration for accounting. Memory exhaustion can
     still cause Redis runtime errors, so Redis failure remains explicitly
     unconfirmed rather than being billed as a cache miss.
 
-    The key layout is Redis Cluster slot compatible. The default client targets
-    a standalone Redis endpoint; Cluster discovery/MOVED routing is a separate
-    deployment integration and is not provided by this framework.
+    The default client targets a standalone Redis endpoint. Cluster mode uses
+    the same key layout and routes each script to the prefix's primary node.
     """
 
     def __init__(
@@ -413,6 +413,8 @@ class RedisPageCacheStore:
         username: str | None = None,
         password: str | None = None,
         metrics: Any = None,
+        *,
+        cluster: bool = False,
     ):
         if not isinstance(redis_url, str) or not redis_url:
             raise ValueError("redis_url must be nonempty")
@@ -423,29 +425,45 @@ class RedisPageCacheStore:
             or timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be positive and finite")
+        if type(cluster) is not bool:
+            raise ValueError("cluster must be a boolean")
         self._redis_url = redis_url
         self._timeout_seconds = timeout_seconds
         self._username = username
         self._password = password
         self._metrics = metrics
+        self._cluster = cluster
         self._redis: Any = None
 
     def _client(self):
         if self._redis is None:
-            from redis import asyncio as redis_async
             from redis.asyncio.retry import Retry
             from redis.backoff import NoBackoff
 
-            self._redis = redis_async.from_url(
-                self._redis_url,
+            kwargs = dict(
                 socket_timeout=self._timeout_seconds,
                 socket_connect_timeout=self._timeout_seconds,
                 decode_responses=False,
-                retry_on_timeout=False,
                 retry=Retry(NoBackoff(), 0),
                 username=self._username,
                 password=self._password,
             )
+            if self._cluster:
+                from redis.asyncio.cluster import RedisCluster
+
+                self._redis = RedisCluster.from_url(
+                    self._redis_url,
+                    read_from_replicas=False,
+                    dynamic_startup_nodes=False,
+                    cluster_error_retry_attempts=0,
+                    **kwargs,
+                )
+            else:
+                from redis import asyncio as redis_async
+
+                self._redis = redis_async.from_url(
+                    self._redis_url, retry_on_timeout=False, **kwargs
+                )
         return self._redis
 
     async def account(
