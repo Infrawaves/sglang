@@ -138,7 +138,7 @@ def fused_marlin_moe(
     w2: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
+    gating_output: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     global_num_experts: int = -1,
@@ -173,8 +173,8 @@ def fused_marlin_moe(
     - w2 (torch.Tensor): The second set of expert weights.
     - w1_scale (torch.Tensor): Scale to be used for w1.
     - w2_scale (torch.Tensor): Scale to be used for w2.
-    - gating_output (torch.Tensor): The output of the gating operation
-        (before softmax).
+    - gating_output (Optional[torch.Tensor]): Router logits, optional when
+        routing is supplied through topk_weights and topk_ids.
     - g_idx1 (Optional[torch.Tensor]): The first set of act_order indices.
     - g_idx2 (Optional[torch.Tensor]): The second set of act_order indices.
     - sort_indices1 (Optional[torch.Tensor]): The first act_order input
@@ -192,7 +192,8 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    # Precomputed routing (including TP-SP) need not materialize router logits.
+    assert hidden_states.shape[0] == topk_ids.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
         "Hidden size mismatch w2"

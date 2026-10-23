@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import PP_SHARDED_KEYS
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
@@ -58,6 +59,7 @@ from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopK,
     TopKOutputFormat,
     build_precomputed_topk_output,
@@ -87,7 +89,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -117,8 +123,10 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
@@ -279,6 +287,84 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
+def _pp_sp_rows(layout, kind: str, num_tokens: int, group) -> slice:
+    """Validate the wire layout without inspecting tensor data or synchronizing."""
+    wire_kind, wire_tokens, start, world_size = layout
+    shard_size = _cdiv(num_tokens, group.world_size)
+    expected_start = min(group.rank_in_group * shard_size, num_tokens)
+    if (
+        wire_kind != kind
+        or wire_tokens != num_tokens
+        or world_size != group.world_size
+        or start != expected_start
+        or (kind == "ep" and num_tokens % group.world_size != 0)
+    ):
+        raise ValueError(f"Incompatible K3 PP token layout: {layout}")
+    return slice(start, min(start + shard_size, num_tokens))
+
+
+class _TPTokenShard:
+    """Contiguous token layout shared across TP-SP layers; pad only collectives."""
+
+    def __init__(self, num_tokens: int):
+        self.group = get_parallel().tp_group
+        self.num_tokens = num_tokens
+        self.shard_size = _cdiv(num_tokens, self.group.world_size)
+        self.padded_size = self.shard_size * self.group.world_size
+        start = min(self.group.rank_in_group * self.shard_size, num_tokens)
+        stop = min(start + self.shard_size, num_tokens)
+        self.rows = slice(start, stop)
+        self.local_size = stop - start
+
+    @staticmethod
+    def _pad(x: torch.Tensor, size: int) -> torch.Tensor:
+        if x.shape[0] == size:
+            return x.contiguous()
+        padding = (0, 0) * (x.ndim - 1) + (0, size - x.shape[0])
+        return torch.nn.functional.pad(x, padding)
+
+    def all_gather(self, local: torch.Tensor) -> torch.Tensor:
+        full = local.new_empty((self.padded_size, *local.shape[1:]))
+        self.group.all_gather_into_tensor(full, self._pad(local, self.shard_size))
+        return full[: self.num_tokens]
+
+    def all_gather_packed(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Gather token matrices together, preserving mixed dtypes bit for bit."""
+        alignment = max(t.element_size() for t in tensors)
+        widths = [t.shape[1] * t.element_size() for t in tensors]
+        strides = [_cdiv(width, alignment) * alignment for width in widths]
+        # Pad token rows here so even empty ranks send the same byte count.
+        packed = torch.empty(
+            (self.shard_size, sum(strides)), dtype=torch.uint8, device=tensors[0].device
+        )
+        if self.local_size < self.shard_size:
+            packed[self.local_size :].zero_()
+        offset = 0
+        for tensor, width, stride in zip(tensors, widths, strides):
+            if self.local_size:
+                # Aligned typed destinations also accept strided sources directly.
+                packed[: self.local_size, offset : offset + width].view(
+                    tensor.dtype
+                ).copy_(tensor)
+                if width < stride:
+                    packed[: self.local_size, offset + width : offset + stride].zero_()
+            offset += stride
+        gathered = self.all_gather(packed)
+        outputs = []
+        offset = 0
+        for tensor, width, stride in zip(tensors, widths, strides):
+            outputs.append(
+                gathered[:, offset : offset + width].contiguous().view(tensor.dtype)
+            )
+            offset += stride
+        return tuple(outputs)
+
+    def reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        local = partial.new_empty((self.shard_size, *partial.shape[1:]))
+        self.group.reduce_scatter_tensor(local, self._pad(partial, self.padded_size))
+        return local[: self.local_size]
+
+
 class KimiK3MLP(nn.Module):
     """K3 MLP; SiLU or SiTU activation."""
 
@@ -421,6 +507,7 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        tp_sp: bool = False,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -487,7 +574,7 @@ class KimiK3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        self.topk = TopK(
+        topk_kwargs = dict(
             top_k=config.num_experts_per_token,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
@@ -498,6 +585,9 @@ class KimiK3MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+        )
+        self.topk = TopK(
+            **topk_kwargs,
             # TRT-LLM cannot consume fused-front's row-strided router logits;
             # keep K3's FP32 router and pass precomputed top-k instead.
             output_format=(
@@ -515,6 +605,15 @@ class KimiK3MoE(nn.Module):
                 else None
             ),
         )
+        if tp_sp:
+            # A separate routing instance preserves decode's existing format.
+            # Valid local row counts may differ, so these allocations must not
+            # register symmetric buffers across ranks. Only gather pads rows.
+            self.sp_topk = TopK(
+                **topk_kwargs,
+                output_format=TopKOutputFormat.STANDARD,
+                input_is_sequence_sharded=True,
+            )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
         # the routed experts call below. K3 routes ALL batches through it when
@@ -1443,6 +1542,93 @@ class KimiK3MoE(nn.Module):
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    def forward_tp_sp(
+        self,
+        hidden_states: torch.Tensor,
+        shard: _TPTokenShard,
+        prefix_sum: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Local front -> gathered TP experts -> reduced local latent tail."""
+        hidden_size = hidden_states.shape[1]
+        if shard.local_size:
+            router_logits = self.gate(hidden_states)
+            topk = self.sp_topk(hidden_states, router_logits)
+            routed_input = (
+                self.routed_expert_down_proj(hidden_states)[0]
+                if self.use_latent_moe
+                else hidden_states
+            )
+        else:
+            topk = self.sp_topk.empty_topk_output(hidden_states.device)
+            routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+
+        # Gather inputs and routing in one collective. Byte packing keeps the
+        # activation, FP32 weight and integer ID representations unchanged.
+        shared_input = None
+        if self.shared_experts is not None and self.use_latent_moe:
+            shared_input, routed_input, topk_weights, topk_ids = (
+                shard.all_gather_packed(
+                    hidden_states, routed_input, topk.topk_weights, topk.topk_ids
+                )
+            )
+        else:
+            routed_input, topk_weights, topk_ids = shard.all_gather_packed(
+                routed_input, topk.topk_weights, topk.topk_ids
+            )
+            if self.shared_experts is not None:
+                shared_input = routed_input
+        topk = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=None,
+        )
+
+        # Both calls return TP partial sums. Never normalize a partial latent.
+        expert_output = self.experts(routed_input, topk)
+        shared_output = None
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(shared_input)
+            if expert_output.dtype == shared_output.dtype:
+                # Pack per token, not [all latent rows | all shared rows].
+                if shard.num_tokens < shard.padded_size:
+                    # Write into the final RS input to avoid copying cat's output
+                    # again when padding the token dimension.
+                    partial = expert_output.new_empty(
+                        (
+                            shard.padded_size,
+                            expert_output.shape[1] + shared_output.shape[1],
+                        )
+                    )
+                    torch.cat(
+                        (expert_output, shared_output),
+                        dim=-1,
+                        out=partial[: shard.num_tokens],
+                    )
+                    partial[shard.num_tokens :].zero_()
+                else:
+                    partial = torch.cat((expert_output, shared_output), dim=-1)
+                local = shard.reduce_scatter(partial)
+                expert_output = local[:, : self.moe_hidden_size].contiguous()
+                shared_output = local[:, self.moe_hidden_size :].contiguous()
+            else:
+                expert_output = shard.reduce_scatter(expert_output)
+                shared_output = shard.reduce_scatter(shared_output)
+        else:
+            expert_output = shard.reduce_scatter(expert_output)
+
+        if not shard.local_size:
+            return hidden_states.new_empty((0, hidden_size))
+        out = (
+            self.routed_expert_up_proj(self._latent_norm(expert_output))[0]
+            if self.use_latent_moe
+            else expert_output
+        )
+        if shared_output is not None:
+            out = out + shared_output
+        if prefix_sum is not None:
+            out = out + prefix_sum
+        return out
 
     def forward(
         self,
@@ -2374,6 +2560,7 @@ class KimiK3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        tp_sp: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2391,6 +2578,9 @@ class KimiK3DecoderLayer(nn.Module):
             and config.num_experts is not None
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
+        )
+        self._tp_sp = tp_sp and (
+            self._is_moe_layer or config.attn_res_block_size is not None
         )
         # SP-MoE (EP a2a backend): o_proj defers its attention-TP reduction;
         # this layer completes it as a reduce-scatter so the whole MoE region
@@ -2460,6 +2650,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                tp_sp=self._tp_sp,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -2527,6 +2718,18 @@ class KimiK3DecoderLayer(nn.Module):
                     return _sp_inner_o_proj_forward(x, *args, **kwargs)
 
                 o_proj.forward = _sp_o_proj_forward
+
+        if self._tp_sp:
+            # Outside TP-SP forwards keep the original reduction/fusion policy.
+            # In particular, do not change reduce_results for decode.
+            _tp_sp_o_proj_forward = self.self_attn.o_proj.forward
+
+            def _deferred_o_proj_forward(x, *args, **kwargs):
+                if get_forward().defer_attn_output_reduce:
+                    kwargs["skip_all_reduce"] = True
+                return _tp_sp_o_proj_forward(x, *args, **kwargs)
+
+            self.self_attn.o_proj.forward = _deferred_o_proj_forward
 
     def _finish_attn_reduce(
         self,
@@ -2647,7 +2850,23 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         input_sharded: bool = False,
         keep_sharded: bool = False,
+        tp_token_shard: Optional[_TPTokenShard] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        if tp_token_shard is not None or (
+            self._tp_sp
+            and attn_res is None
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and hidden_states.shape[0] > 0
+        ):
+            return self._forward_tp_sp(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                attn_res,
+                zero_allocator,
+                tp_token_shard,
+            )
         if attn_res is not None:
             return self._forward_attn_residual(
                 positions,
@@ -2679,6 +2898,77 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual, False
+
+    def _forward_tp_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        attn_res: Optional[AttnResidual],
+        zero_allocator: BumpAllocator,
+        shard: Optional[_TPTokenShard] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        if shard is None:
+            shard = _TPTokenShard(hidden_states.shape[0])
+        if attn_res is not None:
+            # The stream and snapshot bank stay local across layers. Gather
+            # only the aggregated, normalized input consumed by attention.
+            hidden_states, residual = attn_res.forward(
+                hidden_states,
+                residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                write=self.is_block_write_layer,
+            )
+            if self.is_block_write_layer:
+                residual = None
+            hidden_states = shard.all_gather(hidden_states)
+        elif residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        with get_forward().scoped(defer_attn_output_reduce=True):
+            hidden_states = self._run_self_attn(
+                hidden_states, positions, forward_batch, zero_allocator
+            )
+        hidden_states = shard.reduce_scatter(hidden_states)
+        if attn_res is None and residual is not None:
+            residual = residual[shard.rows]
+
+        if attn_res is not None:
+            hidden_states, residual = attn_res.forward(
+                hidden_states,
+                residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        elif shard.local_size:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+        if not self._is_moe_layer:
+            # Dense MLP weights still use TP over the full token batch. Keep
+            # its residual add local and return to the same stream layout.
+            out = self.mlp(shard.all_gather(hidden_states), forward_batch=forward_batch)
+            return out[shard.rows] + residual, None, False
+
+        out = self.mlp.forward_tp_sp(
+            hidden_states, shard, prefix_sum=residual if attn_res is not None else None
+        )
+        if attn_res is not None:
+            return out, None, False
+
+        # The standard residual path returns delta and carry separately;
+        # preserve that contract and its fused-add rounding at the next layer.
+        gathered = shard.all_gather(torch.cat((out, residual), dim=-1))
+        out, residual = gathered.split(self.hidden_size, dim=-1)
+        return out.contiguous(), residual.contiguous(), False
 
     def _forward_attn_residual(
         self,
@@ -2834,6 +3124,47 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
+        parallel = get_parallel()
+        self._tp_sp = envs.SGLANG_K3_TP_SP.get()
+        if self._tp_sp:
+            if parallel.tp_size <= 1:
+                raise ValueError("SGLANG_K3_TP_SP requires tp_size > 1.")
+            if (
+                self._dp_attention
+                or parallel.ep_size != 1
+                or parallel.attn_cp_size != 1
+                or parallel.moe_dp_size != 1
+                or parallel.dwdp_size != 1
+                or not get_moe_a2a_backend().is_none()
+            ):
+                raise ValueError(
+                    "SGLANG_K3_TP_SP requires attention and MoE on the same TP "
+                    "group (DP attention disabled, EP=1, CP=1, MoE DP=1, "
+                    "DWDP=1, moe-a2a-backend=none)."
+                )
+            if get_spec().speculative_algorithm is not None:
+                raise ValueError(
+                    "SGLANG_K3_TP_SP is not compatible with speculative decoding."
+                )
+        # Keep graph buffers and layouts outside the targeted TP/EP topology on
+        # the legacy full-token PP contract. This is a model-load-time decision.
+        self._pp_sp_direct = (
+            self.pp_group.world_size > 1
+            and get_exec().graph.cuda_graph_config.prefill.backend == "disabled"
+            and not self._dp_attention
+            and parallel.attn_cp_size == 1
+            and parallel.moe_dp_size == 1
+            and parallel.dwdp_size == 1
+        )
+        # Only a dense prefix followed by a contiguous MoE suffix is supported:
+        # once a bank has local-only snapshots it must never be read in full.
+        self._pp_ep_sp = (
+            self._pp_sp_direct
+            and get_moe_a2a_backend().is_deepep()
+            and parallel.attn_tp_group.world_size > 1
+            and config.num_experts is not None
+            and config.moe_layer_freq == 1
+        )
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -2868,6 +3199,7 @@ class KimiK3LinearModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                tp_sp=self._tp_sp,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -2898,6 +3230,7 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        pp_layout = None
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -2908,6 +3241,7 @@ class KimiK3LinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            pp_layout = pp_proxy_tensors.tensors.get("__k3_sp_layout__")
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
@@ -2935,27 +3269,80 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
+        num_tokens = hidden_states.shape[0] if pp_layout is None else pp_layout[1]
+        pp_sp_direct = (
+            self._pp_sp_direct
+            and self.dspark_layers_to_capture is None
+            and self.config.attn_res_block_size is not None
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and num_tokens > 0
+        )
+        pp_ep_sp = (
+            pp_sp_direct
+            and self._pp_ep_sp
+            and num_tokens % get_parallel().attn_tp_group.world_size == 0
+        )
+        inherited_rows = None
+        if pp_layout is not None:
+            kind = "tp" if self._tp_sp else "ep"
+            if not pp_sp_direct or (kind == "ep" and not pp_ep_sp):
+                raise ValueError("K3 PP token shards received on an unsupported path")
+            group = (
+                get_parallel().tp_group
+                if kind == "tp"
+                else get_parallel().attn_tp_group
+            )
+            inherited_rows = _pp_sp_rows(pp_layout, kind, positions.shape[0], group)
+            local_tokens = inherited_rows.stop - inherited_rows.start
+            if (
+                hidden_states.shape[0] != local_tokens
+                or residual is None
+                or residual.shape[0] != local_tokens
+            ):
+                raise ValueError("K3 PP tensor rows do not match the token layout")
+
+        tp_token_shard = None
+        if (
+            self._tp_sp
+            and self.config.attn_res_block_size is not None
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and num_tokens > 0
+        ):
+            tp_token_shard = _TPTokenShard(num_tokens)
+            if pp_layout is None:
+                hidden_states = hidden_states[tp_token_shard.rows]
+                if residual is not None:
+                    residual = residual[tp_token_shard.rows]
+
         attn_res = None
         if self.config.attn_res_block_size is not None:
             attn_res_block_num = _cdiv(self.end_layer, self.config.attn_res_block_size)
+            ep_entry = pp_layout is not None and tp_token_shard is None
             attn_res = AttnResidual(
                 hidden_states,
                 attn_res_block_num,
                 block_residual=residual,
+                num_tokens=num_tokens if ep_entry else None,
+                inherited_rows=inherited_rows if ep_entry else None,
             )
             residual = None
 
-        # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
-        # so those uncommon paths keep the established gather-per-layer flow.
+        # PP EP-SP works with ordinary collectives as well as fused ones.
+        # Preserve the existing opt-in behavior for PP=1 and decode.
         sp_attn_res = (
             attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
-            and self.pp_group.world_size == 1
+            and tp_token_shard is None
             and self.dspark_layers_to_capture is None
-            and k3_sp_collective.enabled()
+            and (
+                pp_ep_sp
+                or (
+                    envs.SGLANG_K3_SP_ATTN_RES.get()
+                    and self.pp_group.world_size == 1
+                    and k3_sp_collective.enabled()
+                )
+            )
         )
-        sp_sharded = False
+        sp_sharded = pp_layout is not None and tp_token_shard is None
         aux_hidden_states = []
         if (
             self.dspark_layers_to_capture is not None
@@ -2964,11 +3351,12 @@ class KimiK3LinearModel(nn.Module):
             if "dspark_hidden_states" in pp_proxy_tensors.tensors:
                 aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
             if self.start_layer - 1 in self.dspark_layers_to_capture:
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(
-                        self.start_layer - 1, hidden_states, residual, attn_res
-                    )
+                captured = self._dspark_capture_stream(
+                    self.start_layer - 1, hidden_states, residual, attn_res
                 )
+                if tp_token_shard is not None:
+                    captured = tp_token_shard.all_gather(captured)
+                aux_hidden_states.append(captured)
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2983,32 +3371,68 @@ class KimiK3LinearModel(nn.Module):
                     zero_allocator=zero_allocator,
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
+                    tp_token_shard=tp_token_shard,
                 )
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                captured = self._dspark_capture_stream(
+                    i, hidden_states, residual, attn_res
                 )
+                if tp_token_shard is not None:
+                    captured = tp_token_shard.all_gather(captured)
+                aux_hidden_states.append(captured)
 
         if not self.pp_group.is_last_rank:
-            assert not sp_sharded
+            outgoing_layout = None
             if attn_res is not None:
                 if residual is not None:
                     # Materialize the delayed MLP add: the wire carries the
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
-                residual = attn_res.block_residual  # raw bank across ranks
+                residual = attn_res.block_residual
+                if pp_sp_direct and (tp_token_shard is not None or sp_sharded):
+                    if tp_token_shard is not None:
+                        rows = tp_token_shard.rows
+                        group = tp_token_shard.group
+                        kind = "tp"
+                    else:
+                        rows = _sp_local_rows(hidden_states)
+                        group = get_parallel().attn_tp_group
+                        kind = "ep"
+                        residual = residual[rows]
+                    # The valid-block slice can have gaps between token rows.
+                    # One local packing copy replaces the old gather's packing.
+                    residual = residual[:, : attn_res.num_valid_blocks].contiguous()
+                    outgoing_layout = (kind, num_tokens, rows.start, group.world_size)
+                elif tp_token_shard is not None:
+                    hidden_states = tp_token_shard.all_gather(hidden_states)
+                    residual = tp_token_shard.all_gather(
+                        residual[:, : attn_res.num_valid_blocks]
+                    )
             proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if outgoing_layout is not None:
+                proxy_tensors[PP_SHARDED_KEYS] = ("hidden_states", "residual")
+                proxy_tensors["__k3_sp_layout__"] = outgoing_layout
             if aux_hidden_states:
                 proxy_tensors["dspark_hidden_states"] = torch.cat(
                     aux_hidden_states, dim=-1
                 )
             return PPProxyTensors(proxy_tensors)
 
-        if hidden_states.shape[0] != 0:
+        if tp_token_shard is not None:
+            hidden_states, _ = attn_res.forward(
+                hidden_states,
+                residual,
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
+            # Empty local shards must also participate in this collective.
+            hidden_states = tp_token_shard.all_gather(hidden_states)
+        elif hidden_states.shape[0] != 0:
             if attn_res is not None:
                 # ---- Final aggregation (output side, folds delayed add) ----
                 if sp_sharded:

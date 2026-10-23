@@ -752,6 +752,17 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else hidden_states.dtype
     )
     topk_output = dispatch_output.topk_output
+    # TP-SP and other callers may have already computed routing. Reuse the
+    # routed kernel rather than requiring logits and selecting experts again.
+    if TopKOutputChecker.format_is_standard(
+        topk_output
+    ) or TopKOutputChecker.format_is_packed(topk_output):
+        use_routed_topk = True
+    if use_routed_topk and not quant_info.block_quant:
+        raise NotImplementedError(
+            "FlashInfer TRTLLM FP8 precomputed routing requires block "
+            "quantization; per-tensor quantization only supports bypassed TopK."
+        )
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
