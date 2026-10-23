@@ -11,6 +11,7 @@ import os
 import re
 from array import array
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -1499,6 +1500,7 @@ class KimiK3DeltaAttention(nn.Module):
         prefix: str = "",
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
+        sp_moe: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1781,6 +1783,10 @@ class KimiK3DeltaAttention(nn.Module):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
+        if sp_moe:
+            self.o_proj.reduce_results = False
+            if k3_sp_collective.enabled():
+                k3_sp_collective.install_o_proj_wrapper(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2001,6 +2007,11 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def qkv_proj_fusion_target(self) -> Optional[nn.Module]:
+        if self.use_full_rank_gate and not _is_hip:
+            return self.fused_qkvg_proj
+        return None
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2154,6 +2165,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
+        sp_moe: bool = False,
     ) -> None:
         # ModelSlim can quantize K3 latent projections while still storing
         # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
@@ -2255,6 +2267,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # attn-TP group itself: the default full-TP collective is the wrong
             # group at attn_tp>1 and deadlocks idle DP ranks.
             self.o_proj.use_dp_attention_reduce = True
+        # The gate must run before either native or fused o_proj. Installing
+        # the SP wrapper here keeps it inside the gate wrapper below.
+        if sp_moe:
+            self.o_proj.reduce_results = False
+            if k3_sp_collective.enabled():
+                k3_sp_collective.install_o_proj_wrapper(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -2305,6 +2323,11 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+
+    def qkv_proj_fusion_target(self) -> Optional[nn.Module]:
+        if self.has_fused_proj and self.q_lora_rank is not None:
+            return self.fused_qkv_a_proj_with_mqa
+        return None
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -2433,6 +2456,7 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
+                sp_moe=self._sp_moe,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -2444,6 +2468,7 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
+                sp_moe=self._sp_moe,
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
@@ -2451,6 +2476,16 @@ class KimiK3DecoderLayer(nn.Module):
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the layer's own AR call-site must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+
+        # SP-MoE layers receive a token shard; this projection may then consume
+        # it through the fused all-gather + GEMM instead of a separate AG.
+        qkv_proj = self.self_attn.qkv_proj_fusion_target() if self._sp_moe else None
+        self._qkv_proj_fusion_target = (
+            qkv_proj
+            if qkv_proj is not None
+            and k3_sp_collective.install_qkv_proj_wrapper(qkv_proj)
+            else None
+        )
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -2507,26 +2542,6 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj = getattr(self.self_attn, "o_proj", None)
             assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
             o_proj.reduce_results = False
-            if k3_sp_collective.enabled():
-                # The table selects NVLS pull RS for larger token buckets.
-                # Only those o_proj outputs come from the persistent symmetric
-                # buffer; small push RS keeps the regular graph allocator.
-                _sp_inner_o_proj_forward = o_proj.forward
-
-                def _sp_o_proj_forward(x, *args, **kwargs):
-                    output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
-                    if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
-                        output = k3_sp_collective.get_o_proj_output_buffer(
-                            output_rows, x.dtype, o_proj.output_size
-                        )
-                        result = _sp_inner_o_proj_forward(
-                            x, *args, output_tensor=output[: x.shape[0]], **kwargs
-                        )
-                        k3_sp_collective.register_o_proj_output(result[0], output)
-                        return result
-                    return _sp_inner_o_proj_forward(x, *args, **kwargs)
-
-                o_proj.forward = _sp_o_proj_forward
 
     def _finish_attn_reduce(
         self,
@@ -2567,6 +2582,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        o_proj_call=None,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -2579,7 +2595,8 @@ class KimiK3DecoderLayer(nn.Module):
         # prefill rejects the row mismatch, and silent paths would write the
         # padded rows' garbage KV through zero-padded out_cache_loc (clobbering
         # pool slot 0 -> cross-request corruption). Run attention on the real
-        # rows and zero-pad the output back.
+        # rows and zero-pad the output back (the fused o_proj pads its input
+        # instead).
         num_padded = hidden_states.shape[0]
         num_real = num_padded
         if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
@@ -2594,6 +2611,9 @@ class KimiK3DecoderLayer(nn.Module):
                     forward_batch,
                     zero_allocator,
                 )
+            if o_proj_call is not None and o_proj_call.fused_output is not None:
+                # For fuse o_proj+rs kernel, the output is already padded.
+                return attn_out
             padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
                 attn_out, num_padded
             )
@@ -2698,7 +2718,30 @@ class KimiK3DecoderLayer(nn.Module):
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
         # the fast kernel; standalone copy on other paths). ----
-        if input_sharded:
+        ag_input = None
+        if input_sharded and self._qkv_proj_fusion_target is not None:
+            ag_input = k3_sp_collective.ag_qkv_proj_input(
+                self._qkv_proj_fusion_target, hidden_states.shape[0]
+            )
+        fused_qkv = None
+        if ag_input is not None:
+            # Aggregate/norm only this rank's rows straight into its slot of
+            # the gathered input; the fused kernel all-gathers and runs qkv_proj.
+            hidden_states, prefix_sum = attn_res.forward(
+                hidden_states,
+                prefix_sum,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                rows=_sp_local_rows(hidden_states),
+                write=self.is_block_write_layer,
+                out=ag_input,
+            )
+            fused_qkv = k3_sp_collective.ag_qkv_proj(
+                self._qkv_proj_fusion_target, hidden_states
+            )
+            hidden_states = fused_qkv.hidden_states
+        elif input_sharded:
             assert self._sp_moe
             input_rows = _sp_local_rows(hidden_states)
             fused_ag = attn_res.forward_sp_all_gather(
@@ -2737,19 +2780,32 @@ class KimiK3DecoderLayer(nn.Module):
         if self.is_block_write_layer:
             prefix_sum = None
 
-        # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
-
-        # ---- Complete o_proj's deferred reduction ----
-        # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
-        # otherwise the fused all-reduce when enabled; otherwise o_proj already
-        # reduced itself (use_dp_attention_reduce, on when neither is active).
+        qkv_proj_call_context = nullcontext()
+        if fused_qkv is not None:
+            qkv_proj_call_context = k3_sp_collective.qkv_proj_fusion_call(fused_qkv)
+        o_proj_call_context = nullcontext(None)
+        if self._sp_moe and not forward_batch.forward_mode.is_idle():
+            o_proj_call_context = k3_sp_collective.o_proj_fusion_call(
+                prefix_sum, hidden_states.shape[0]
+            )
+        with qkv_proj_call_context, o_proj_call_context as o_proj_call:
+            hidden_states = self._run_self_attn(
+                hidden_states,
+                positions,
+                forward_batch,
+                zero_allocator,
+                o_proj_call=o_proj_call,
+            )
+        fused_o_proj_output = None if o_proj_call is None else o_proj_call.fused_output
         rows = None
         shard_lo = -1
         agg2_fused = False
-        if self._sp_moe:
+        if fused_o_proj_output is not None:
+            hidden_states = fused_o_proj_output.output
+            shard_lo = fused_o_proj_output.shard_start_row
+            rows = slice(shard_lo, shard_lo + hidden_states.shape[0])
+            prefix_sum = None
+        elif self._sp_moe:
             group = get_parallel().attn_tp_group
             if (
                 hidden_states.shape[0] > 0
@@ -2948,9 +3004,13 @@ class KimiK3LinearModel(nn.Module):
         # Carry the raw residual stream as a token shard across consecutive
         # SP-MoE layers. PP transfer and dspark capture require full tensors,
         # so those uncommon paths keep the established gather-per-layer flow.
+        # GEMM fusion shards the residual itself, so its AG can fuse with the
+        # next layer's qkv_proj.
         sp_attn_res = (
             attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
+            and (
+                envs.SGLANG_K3_SP_ATTN_RES.get() or envs.SGLANG_K3_SP_GEMM_FUSION.get()
+            )
             and self.pp_group.world_size == 1
             and self.dspark_layers_to_capture is None
             and k3_sp_collective.enabled()
@@ -3155,6 +3215,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
         # taps already capture here, so reuse them without the usual +1 shift.
         self.set_dspark_layers_to_capture(layer_ids)
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        # BaseRunner.warmup runs this once before any eager warmup or graph
+        # capture forward, whether or not CUDA graphs are enabled.
+        if self.config.attn_res_block_size is not None:
+            k3_sp_collective.prepare_gemm_fusion()
 
     @torch.no_grad()
     def forward(
@@ -3585,6 +3651,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if self.language_model is not None:
+            self.language_model.prepare_before_cuda_graph_capture(model_runner)
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
