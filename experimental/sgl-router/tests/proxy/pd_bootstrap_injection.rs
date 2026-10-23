@@ -572,6 +572,74 @@ async fn pd_stream_scheduler_400_cancels_decode() {
     .await;
 }
 
+/// A prefill 4xx (here Kimi K3's orphan `tool` message rejection) reaches the
+/// client verbatim instead of the generic "prefill worker rejected" message.
+#[tokio::test]
+async fn pd_prefill_4xx_passes_worker_body_through() {
+    let decode =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let prefill_error = json!({"object": "error", "type": "BadRequest", "param": null,
+        "code": 400,
+        "message": "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
+            or match a preceding assistant tool_call by order."});
+    let prefill = crate::common::mock_worker::MockWorker::start_error_after_peer(
+        StatusCode::BAD_REQUEST,
+        prefill_error.clone(),
+        Some(Arc::clone(&decode.captured)),
+    )
+    .await;
+    let mut cfg = config();
+    cfg.model.disable_input_ids_forwarding = true;
+    let ctx = build_ctx_with_config(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+        cfg,
+    );
+    let app = build_router(ctx);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "tiny", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "call_0", "content": "42"},
+            ]})
+            .to_string(),
+        ))
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), app.oneshot(req))
+        .await
+        .expect("prefill rejection must not wait for decode")
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("prefill_request_rejected"),
+    );
+    let bytes = http_body_util::BodyExt::collect(res.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(parse_body(&bytes), prefill_error);
+}
+
 #[tokio::test]
 async fn pd_prefill_non_streaming_preserves_decode_sse() {
     const CHUNK: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
@@ -764,7 +832,7 @@ async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
     }
     let _servers = TestServers([p_task, d_task]);
     let mut cfg = config();
-    cfg.model.tokenizer_path = None;
+    cfg.model.disable_input_ids_forwarding = true;
     let ctx = build_ctx_with_config(
         vec![
             WorkerSpec {

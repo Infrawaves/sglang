@@ -269,6 +269,32 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
         self.assertIs(pool.full_kv_pool.mla_set_calls[0], loc)
 
+    def test_get_mla_kv_buffer_waits_for_model_layer_before_read(self):
+        """The full sub-pool's counter is unregistered, so the hybrid read door must
+        wait for the HiCache layer load itself, on the model layer id, before reading."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        events = []
+        pool = object.__new__(HybridLinearKVPool)
+        pool.use_mla = True
+        pool.start_layer = 0
+        # Model layer 5 is the second full-attention layer (full id 1).
+        pool.full_attention_layer_id_mapping = {2: 0, 5: 1}
+        pool.layer_transfer_counter = types.SimpleNamespace(
+            wait_until=lambda layer_id: events.append(("wait", layer_id))
+        )
+        pool.full_kv_pool = types.SimpleNamespace(
+            get_mla_kv_buffer=lambda layer, loc, dst_dtype: events.append(
+                ("read", layer.layer_id)
+            )
+        )
+        layer = types.SimpleNamespace(layer_id=5)
+
+        pool.get_mla_kv_buffer(layer, torch.arange(2))
+
+        self.assertEqual(events, [("wait", 5), ("read", 1)])
+        self.assertEqual(layer.layer_id, 5)
+
 
 class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     """Which MLA write door is DCP-aware, and which refuses.

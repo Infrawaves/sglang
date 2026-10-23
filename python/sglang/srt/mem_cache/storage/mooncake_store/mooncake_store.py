@@ -2,6 +2,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -23,7 +24,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import (
+    StorageMetrics,
+    hicache_diagnostic_metrics_enabled,
+)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -105,6 +109,25 @@ class MooncakeStoreConfig:
     enable_ssd_offload: bool = False
     ssd_offload_path: Optional[str] = None
     tenant_id: str = DEFAULT_TENANT_ID
+
+    @staticmethod
+    def load(extra_config: Optional[dict] = None) -> "MooncakeStoreConfig":
+        if extra_config and (
+            extra_config.get("master_server_address") is not None
+            or extra_config.get("client_server_address") is not None
+        ):
+            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            config = MooncakeStoreConfig.from_file()
+            logger.info("Mooncake Configuration loaded from file successfully.")
+
+        else:
+            config = MooncakeStoreConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded from env successfully.")
+
+        return config
 
     @staticmethod
     def _resolve_local_hostname(overrides: Optional[dict] = None) -> str:
@@ -300,23 +323,7 @@ class MooncakeBaseStore:
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
         )
-
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
-            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-            logger.info("Mooncake Configuration loaded from extra_config successfully.")
-
-        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            config = MooncakeStoreConfig.from_file()
-            logger.info("Mooncake Configuration loaded from file successfully.")
-
-        else:
-            config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
-
-        return config
+        return MooncakeStoreConfig.load(extra_config)
 
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
@@ -385,6 +392,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.mem_pool_host: Optional[HostKVCache] = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -590,6 +598,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+            self.enable_diagnostic_metrics = (
+                self.enable_storage_metrics and hicache_diagnostic_metrics_enabled()
+            )
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -622,6 +633,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            # (pool, raw return value) -> failed key count, drained by get_stats().
+            # The lock is only taken when a batch read had a failure.
+            self._read_failed_keys = {}
+            self._read_failed_keys_lock = threading.Lock()
+            self._read_codes_logged = set()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -705,6 +721,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
+            return
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            # Only the rank that owns the shared MLA host copy reads L3 into it.
             return
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
@@ -965,7 +987,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         io_results[i] = res
             else:
                 io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
+                    key_strs,
+                    ptr_list,
+                    element_size_list,
+                    pool=str(transfer.name),
                 )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
@@ -1302,6 +1327,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            # Follower: the leader's real hit count wins the cache-group
+            # all_reduce(MIN).
+            return len(keys)
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
@@ -1366,13 +1398,43 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        pool: str = "kv",
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        # Fast path: one min() over the batch; per-key counting only on failure.
+        if self.enable_diagnostic_metrics and results and min(results) <= 0:
+            self._record_read_failures(pool, results)
+        return results
+
+    def _record_read_failures(self, pool: str, results: List[int]) -> None:
+        failed = {}
+        for res in results:
+            if res <= 0:
+                failed[res] = failed.get(res, 0) + 1
+        with self._read_failed_keys_lock:
+            for code, count in failed.items():
+                key = (pool, code)
+                self._read_failed_keys[key] = self._read_failed_keys.get(key, 0) + count
+                if key not in self._read_codes_logged:
+                    # Once per (pool, raw value): shows which values batch_get
+                    # actually returns, to map them onto Mooncake error codes.
+                    self._read_codes_logged.add(key)
+                    logger.warning(
+                        "Mooncake batch read first saw value %d for pool=%s "
+                        "(%d keys in this batch)",
+                        code,
+                        pool,
+                        count,
+                    )
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1401,4 +1463,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        with self._read_failed_keys_lock:
+            storage_metrics.read_failed_keys = self._read_failed_keys
+            self._read_failed_keys = {}
         return storage_metrics

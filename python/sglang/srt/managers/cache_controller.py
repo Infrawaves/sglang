@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -42,6 +43,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.metrics_collector import (
+    hicache_diagnostic_metrics_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -69,13 +73,20 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+    ):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Called on the forward stream after each wait,
+        # with (consumer index, transfer layer id).
+        self.on_layer_ready = on_layer_ready
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -91,6 +102,8 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if self.on_layer_ready is not None:
+            self.on_layer_ready(self.consumer_index, threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -299,6 +312,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -323,6 +337,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Read once so every collective in this process uses the same shape.
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -344,7 +360,16 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        # MLA host dedup: the forward broadcasts each loaded layer as it waits for it.
+        self.node_leader_broadcast = node_leader_broadcast
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            on_layer_ready=(
+                None
+                if node_leader_broadcast is None
+                else node_leader_broadcast.broadcast_ready_layers
+            ),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -960,6 +985,10 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        if self.node_leader_broadcast is not None:
+            # Before the fence below, so the new H2D also waits for it.
+            self.node_leader_broadcast.flush_stale(producer_id, self.load_fence_stream)
+
         if self.load_fence_stream is not None:
             # in overlap scheduling, reclaimed pages might still be written by the forward thread
             # therefore a fence is needed for loading thread to prevent memory corruption
@@ -974,6 +1003,12 @@ class HiCacheController:
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.node_leader_broadcast is not None:
+            self.node_leader_broadcast.start_load(
+                index=producer_id,
+                device_indices=device_indices,
+                finish_event=completion.finish_event,
+            )
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1096,6 +1131,8 @@ class HiCacheController:
 
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+                operation.kv_last_ts = time.monotonic()
 
                 hit_pages = self._page_transfer_kv_batch(
                     operation,
@@ -1236,15 +1273,32 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                # [x, -x] under MIN yields [min x, -max x] in one collective, so
+                # the cross-rank spread costs no extra communication. PP-ticket
+                # mode reduces a scalar on these groups elsewhere, so keep the
+                # scalar shape there to avoid mismatched collectives.
+                pack_spread = (
+                    self.enable_diagnostic_metrics
+                    and getattr(self, "pp_prefetch_command_group", None) is None
+                )
                 storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                    [storage_hit_count, -storage_hit_count]
+                    if pack_spread
+                    else storage_hit_count,
+                    dtype=torch.int,
                 )
                 self._all_reduce(
                     storage_hit_count_tensor,
                     torch.distributed.ReduceOp.MIN,
                     self.prefetch_hits_sync_groups,
                 )
-                storage_hit_count = storage_hit_count_tensor.item()
+                if pack_spread:
+                    storage_hit_count = int(storage_hit_count_tensor[0].item())
+                    operation.query_rank_spread = (
+                        -int(storage_hit_count_tensor[1].item()) - storage_hit_count
+                    )
+                else:
+                    storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

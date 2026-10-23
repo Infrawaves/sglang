@@ -296,6 +296,9 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+    validate_runtime_storage_update,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -1340,6 +1343,11 @@ class Scheduler(
     def _validate_prefill_round_robin(self) -> None:
         if not self.enable_chunked_prefill_round_robin:
             return
+        if get_schedule().enable_hrrn_prefill_chunk_limit:
+            logger.warning(
+                "--enable-hrrn-prefill-chunk-limit has no effect with "
+                "--enable-chunked-prefill-round-robin."
+            )
         if (
             get_disagg().disaggregation_mode != "prefill"
             or self.ps.pp_size != 1
@@ -1451,6 +1459,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_hrrn_prefill_chunk_limit=get_schedule().enable_hrrn_prefill_chunk_limit,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4009,13 +4018,19 @@ class Scheduler(
             else None,
         )
 
+        chunk_limit_budget = adder.rem_chunk_tokens or 0
         if self.chunked_req is not None and not self.enable_chunked_prefill_round_robin:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
+                chunk_limit_budget,
                 self.page_size,
+                max_reqs=adder.reservable_new_reqs(
+                    self.get_num_allocatable_reqs(
+                        len(running_batch.reqs), running_batch=running_batch
+                    )
+                ),
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4201,6 +4216,12 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        self.policy.record_chunk_limit_outcome(
+            limit=adder.chunked_req_limit,
+            budget=chunk_limit_budget,
+            leftover_tokens=adder.rem_chunk_tokens or 0,
+        )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -5253,6 +5274,11 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+
         if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
                 success=False,
@@ -5308,6 +5334,11 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if not self.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
