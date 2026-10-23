@@ -130,6 +130,14 @@ impl Policy for StickyPolicy {
     fn needs_dispatch_timestamps(&self) -> bool {
         self.fallback.needs_dispatch_timestamps()
     }
+
+    fn needs_request_tokens(&self) -> bool {
+        self.fallback.needs_request_tokens()
+    }
+
+    fn needs_token_count(&self) -> bool {
+        self.fallback.needs_token_count()
+    }
 }
 
 impl std::fmt::Debug for StickyPolicy {
@@ -163,6 +171,20 @@ mod tests {
             Arc::new(crate::policies::load_based::LoadBasedPolicy::new()),
         );
         assert!(load_policy.needs_dispatch_timestamps());
+        assert!(!load_policy.needs_request_tokens());
+
+        let token_policy = StickyPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Arc::new(crate::policies::load_based::LoadBasedPolicy::with_metric(
+                crate::config::LoadBasedMetric::Tokens,
+            )),
+        );
+        assert!(
+            token_policy.needs_token_count(),
+            "a tokens fallback must get a request token count"
+        );
+        assert!(!token_policy.needs_request_tokens());
     }
     use crate::policies::round_robin::RoundRobinPolicy;
 

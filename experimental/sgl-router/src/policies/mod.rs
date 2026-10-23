@@ -439,8 +439,24 @@ impl SelectionProposal {
         self
     }
 
+    /// Narrows the admissible set; intersects an existing set so an outer
+    /// filter cannot widen what an inner policy narrowed.
     pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
-        self.eligible_workers = Some(workers);
+        let merged = match self.eligible_workers.take() {
+            Some(inner) => {
+                let both: Vec<Arc<Worker>> = inner
+                    .into_iter()
+                    .filter(|w| workers.iter().any(|o| o.id == w.id))
+                    .collect();
+                if both.is_empty() {
+                    workers
+                } else {
+                    both
+                }
+            }
+            None => workers,
+        };
+        self.eligible_workers = Some(merged);
         self
     }
 }
@@ -534,6 +550,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether routing needs only the request's token count, not its ids.
+    fn needs_token_count(&self) -> bool {
+        false
+    }
+
     /// Attaches the process metrics registry after construction.
     fn attach_metrics(&self, _metrics: Arc<MetricsRegistry>) {}
 
@@ -618,6 +639,27 @@ mod tests {
             model_ids: vec![ModelId("model".into())],
             bootstrap_port: None,
         }))
+    }
+
+    /// An outer filter (Pipeline) intersects an inner policy's narrowed set
+    /// instead of widening it back.
+    #[test]
+    fn outer_eligibility_intersects_the_inner_set() {
+        let (w0, w1) = (worker("w0"), worker("w1"));
+        let ids = |p: &SelectionProposal| -> Vec<String> {
+            let set = p.eligible_workers.as_deref().unwrap_or(&[]);
+            set.iter().map(|w| w.id.0.clone()).collect()
+        };
+        let inner = SelectionProposal::primary(Arc::clone(&w1))
+            .with_eligible_workers(vec![Arc::clone(&w1)]);
+        let outer = inner.with_eligible_workers(vec![Arc::clone(&w0), Arc::clone(&w1)]);
+        assert_eq!(ids(&outer), vec!["w1"]);
+
+        // Disjoint sets keep the outer one rather than emptying the proposal.
+        let disjoint = SelectionProposal::primary(Arc::clone(&w1))
+            .with_eligible_workers(vec![Arc::clone(&w1)])
+            .with_eligible_workers(vec![Arc::clone(&w0)]);
+        assert_eq!(ids(&disjoint), vec!["w0"]);
     }
 
     #[test]

@@ -52,6 +52,11 @@ pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether scoring needs only the request's token count.
+    fn needs_token_count(&self) -> bool {
+        false
+    }
+
     /// Whether scoring reads the request-scoped Engine Load snapshot.
     fn needs_load_snapshot(&self) -> bool {
         false
@@ -144,6 +149,10 @@ impl<T: ScoringPolicy> Policy for T {
         ScoringPolicy::needs_tokens(self) || self.as_filter().is_some_and(|f| f.needs_tokens())
     }
 
+    fn needs_token_count(&self) -> bool {
+        ScoringPolicy::needs_token_count(self)
+    }
+
     fn needs_load_snapshot(&self) -> bool {
         ScoringPolicy::needs_load_snapshot(self)
     }
@@ -180,6 +189,32 @@ impl FusedScorePolicy {
             anyhow::ensure!(p.can_fuse(), "policy {p:?} does not support fusion");
         }
         Ok(Self { terms })
+    }
+
+    fn term_filters(&self) -> impl Iterator<Item = &dyn EligibilityFilter> {
+        self.terms
+            .iter()
+            .filter_map(|(p, _)| p.as_scoring().and_then(|s| s.as_filter()))
+    }
+}
+
+/// AND of the fused terms' filters; abstains if they reject every candidate.
+impl EligibilityFilter for FusedScorePolicy {
+    fn keep(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<bool> {
+        let mut keep = vec![true; workers.len()];
+        for filter in self.term_filters() {
+            for (k, f) in keep.iter_mut().zip(filter.keep(workers, ctx)) {
+                *k &= f;
+            }
+        }
+        if !keep.iter().any(|&k| k) {
+            keep.fill(true);
+        }
+        keep
+    }
+
+    fn needs_tokens(&self) -> bool {
+        self.term_filters().any(|f| f.needs_tokens())
     }
 }
 
@@ -317,6 +352,10 @@ impl Policy for Pipeline {
         self.inner.needs_request_tokens() || self.views().any(|f| f.needs_tokens())
     }
 
+    fn needs_token_count(&self) -> bool {
+        self.inner.needs_token_count()
+    }
+
     fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
         self.inner.attach_metrics(metrics);
     }
@@ -344,9 +383,27 @@ impl Policy for ScorePolicy {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
-        self.inner
-            .propose(workers, ctx)
-            .map(|proposal| proposal.with_kind(crate::policies::ProposalKind::Score))
+        let proposal = self
+            .inner
+            .propose(workers, ctx)?
+            .with_kind(crate::policies::ProposalKind::Score);
+        // Shared admission falls back within `eligible_workers`; without this a
+        // capacity fallback could pick a worker the inner filter rejected.
+        match self.inner.as_filter() {
+            Some(filter) => {
+                let keep = filter.keep(workers, ctx);
+                let eligible: Vec<Arc<Worker>> = (workers.iter().zip(&keep))
+                    .filter(|(_, &k)| k)
+                    .map(|(w, _)| Arc::clone(w))
+                    .collect();
+                if eligible.is_empty() {
+                    Some(proposal)
+                } else {
+                    Some(proposal.with_eligible_workers(eligible))
+                }
+            }
+            None => Some(proposal),
+        }
     }
 
     fn uses_shared_prefill_admission(&self) -> bool {
@@ -355,6 +412,10 @@ impl Policy for ScorePolicy {
 
     fn needs_request_tokens(&self) -> bool {
         self.inner.needs_request_tokens()
+    }
+
+    fn needs_token_count(&self) -> bool {
+        self.inner.needs_token_count()
     }
 
     fn needs_dispatch_timestamps(&self) -> bool {
@@ -375,11 +436,19 @@ impl Policy for ScorePolicy {
 }
 
 impl ScoringPolicy for FusedScorePolicy {
+    /// Weighted sum of the terms. A worker any term's filter rejects scores
+    /// `-inf`, so another term's preference cannot add it back.
     fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        let keep = EligibilityFilter::keep(self, workers, ctx);
         let mut total = vec![0.0f32; workers.len()];
         for (term, w) in self.terms.iter().map(view) {
             for (acc, s) in total.iter_mut().zip(term.scores(workers, ctx)) {
                 *acc += w * s;
+            }
+        }
+        for (acc, kept) in total.iter_mut().zip(keep) {
+            if !kept {
+                *acc = f32::NEG_INFINITY;
             }
         }
         total
@@ -387,6 +456,21 @@ impl ScoringPolicy for FusedScorePolicy {
 
     fn needs_tokens(&self) -> bool {
         self.terms.iter().map(view).any(|(t, _)| t.needs_tokens())
+            || EligibilityFilter::needs_tokens(self)
+    }
+
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        self.term_filters()
+            .next()
+            .is_some()
+            .then_some(self as &dyn EligibilityFilter)
+    }
+
+    fn needs_token_count(&self) -> bool {
+        self.terms
+            .iter()
+            .map(view)
+            .any(|(t, _)| t.needs_token_count())
     }
 
     fn needs_load_snapshot(&self) -> bool {

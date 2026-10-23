@@ -697,6 +697,7 @@ pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
     basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
+    local_prefill_tokens_by_worker_id: HashMap<String, u64>,
     compare_engine: bool,
     compare_basic_engine: bool,
 }
@@ -710,6 +711,10 @@ impl<'a> FreshLoadLookup<'a> {
         let local_active_by_worker_id: HashMap<String, usize> = workers
             .iter()
             .map(|worker| (worker.id.0.clone(), worker.router_inflight_load()))
+            .collect();
+        let local_prefill_tokens_by_worker_id: HashMap<String, u64> = workers
+            .iter()
+            .map(|worker| (worker.id.0.clone(), worker.router_inflight_prefill_tokens()))
             .collect();
         let by_worker_id = snapshot
             .into_iter()
@@ -739,6 +744,7 @@ impl<'a> FreshLoadLookup<'a> {
             by_worker_id,
             basic_by_worker_id,
             local_active_by_worker_id,
+            local_prefill_tokens_by_worker_id,
             compare_engine,
             compare_basic_engine,
         }
@@ -835,6 +841,23 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
+    /// Prompt tokens this worker still has to prefill: the engine's
+    /// `num_waiting_uncached_tokens` plus dispatches after that sample when
+    /// every candidate reports, else router-tracked in-flight tokens for all.
+    pub(crate) fn pending_prefill_tokens(&self, worker: &Arc<Worker>) -> u64 {
+        self.comparable_get(&worker.id)
+            .map(|load| {
+                load.num_waiting_uncached_tokens
+                    .saturating_add(worker.prefill_tokens_acquired_since(load.captured_at))
+            })
+            .unwrap_or_else(|| {
+                self.local_prefill_tokens_by_worker_id
+                    .get(worker.id.0.as_str())
+                    .copied()
+                    .unwrap_or(u64::MAX)
+            })
+    }
+
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,

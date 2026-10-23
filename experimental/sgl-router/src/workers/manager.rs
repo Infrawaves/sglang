@@ -594,6 +594,8 @@ mod tests {
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                load_based_metric: Default::default(),
+                load_based_token_gate: Default::default(),
                 bucket_config: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),

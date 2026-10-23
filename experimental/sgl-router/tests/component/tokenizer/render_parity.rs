@@ -115,6 +115,8 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
