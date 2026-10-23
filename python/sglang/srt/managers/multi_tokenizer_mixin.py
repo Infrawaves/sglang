@@ -202,6 +202,9 @@ def _handle_output_by_indices(output, indices: List[int]):
             cached_tokens_details=_extract_field_by_indices(
                 output, "cached_tokens_details", indices
             ),
+            cache_input_metadata=_extract_field_by_indices(
+                output, "cache_input_metadata", indices
+            ),
             image_tokens=_extract_field_by_indices(output, "image_tokens", indices),
             audio_tokens=_extract_field_by_indices(output, "audio_tokens", indices),
             video_tokens=_extract_field_by_indices(output, "video_tokens", indices),
@@ -336,6 +339,9 @@ def _handle_output_by_indices(output, indices: List[int]):
             cached_tokens=_extract_field_by_indices(output, "cached_tokens", indices),
             cached_tokens_details=_extract_field_by_indices(
                 output, "cached_tokens_details", indices
+            ),
+            cache_input_metadata=_extract_field_by_indices(
+                output, "cache_input_metadata", indices
             ),
             image_tokens=_extract_field_by_indices(output, "image_tokens", indices),
             audio_tokens=_extract_field_by_indices(output, "audio_tokens", indices),

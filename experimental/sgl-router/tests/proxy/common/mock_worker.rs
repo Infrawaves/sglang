@@ -69,6 +69,15 @@ impl MockWorker {
     /// chat-completion request arrives.
     #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
+        Self::start_with_response_headers(stream_chunks, HeaderMap::new()).await
+    }
+
+    /// Like `start`, with additional chat response headers for transport tests.
+    #[allow(dead_code)]
+    pub async fn start_with_response_headers(
+        stream_chunks: Vec<&'static str>,
+        response_headers: HeaderMap,
+    ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let state = MockWorkerState {
@@ -79,7 +88,18 @@ impl MockWorker {
         // worker-manager introspect step resolves model_ids for the
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
-            .route("/v1/chat/completions", post(chat))
+            .route(
+                "/v1/chat/completions",
+                post(chat).layer(axum::middleware::map_response(
+                    move |mut response: Response<Body>| {
+                        let response_headers = response_headers.clone();
+                        async move {
+                            response.headers_mut().extend(response_headers);
+                            response
+                        }
+                    },
+                )),
+            )
             .route("/v1/responses", post(responses))
             .route("/server_info", get(serve_tiny_server_info))
             .route(
@@ -364,6 +384,15 @@ impl MockWorker {
         Self::start_error_after_peer(status, body, None).await
     }
 
+    /// Return a fixed successful JSON body plus additional response headers.
+    #[allow(dead_code)]
+    pub async fn start_json_with_response_headers(
+        body: Value,
+        response_headers: HeaderMap,
+    ) -> Self {
+        Self::start_error_response(StatusCode::OK, body, None, false, response_headers).await
+    }
+
     /// Gate the response on a peer receiving its chat request, so PD failure
     /// tests exercise cancellation of an accepted decode without timing races.
     pub async fn start_error_after_peer(
@@ -371,7 +400,7 @@ impl MockWorker {
         body: Value,
         peer: Option<Arc<Mutex<CapturedHeaders>>>,
     ) -> Self {
-        Self::start_error_response(status, body, peer, false).await
+        Self::start_error_response(status, body, peer, false, HeaderMap::new()).await
     }
 
     /// Model scheduler failures: streaming requests get HTTP 200 with an SSE
@@ -381,7 +410,7 @@ impl MockWorker {
         body: Value,
         peer: Option<Arc<Mutex<CapturedHeaders>>>,
     ) -> Self {
-        Self::start_error_response(status, body, peer, true).await
+        Self::start_error_response(status, body, peer, true, HeaderMap::new()).await
     }
 
     async fn start_error_response(
@@ -389,6 +418,7 @@ impl MockWorker {
         body: Value,
         peer: Option<Arc<Mutex<CapturedHeaders>>>,
         scheduler_error: bool,
+        response_headers: HeaderMap,
     ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -401,6 +431,7 @@ impl MockWorker {
             status: StatusCode,
             peer: Option<Arc<Mutex<CapturedHeaders>>>,
             scheduler_error: bool,
+            response_headers: HeaderMap,
         }
 
         async fn error_handler(
@@ -447,6 +478,7 @@ impl MockWorker {
                 HeaderName::from_static("content-type"),
                 HeaderValue::from_static("application/json"),
             );
+            r.headers_mut().extend(s.response_headers);
             r
         }
 
@@ -456,6 +488,7 @@ impl MockWorker {
             status,
             peer,
             scheduler_error,
+            response_headers,
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))

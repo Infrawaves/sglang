@@ -10,6 +10,8 @@ import signal
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest import mock
 
@@ -59,6 +61,14 @@ class ClientReadingServingChat(OpenAIServingChat):
 
     def _convert_to_internal_request(self, request, raw_request=None):
         _ = raw_request.client
+        return super()._convert_to_internal_request(request, raw_request)
+
+
+class StateReadingServingChat(OpenAIServingChat):
+    """Reads request state, which a preprocessor child does not have."""
+
+    def _convert_to_internal_request(self, request, raw_request=None):
+        _ = raw_request.state
         return super()._convert_to_internal_request(request, raw_request)
 
 
@@ -114,6 +124,90 @@ class TestHelpers(CustomTestCase):
         mapping = SimpleNamespace(headers={"X-Smg-Routing-Key": "k"})
         self.assertEqual(prp.snapshot_headers(mapping), [(b"x-smg-routing-key", b"k")])
         self.assertEqual(prp.snapshot_headers(object()), [])
+
+    def test_child_request_state_access_falls_back(self):
+        class Handler:
+            attribute = "api_key"
+
+            def _convert_to_internal_request(self, request, raw_request):
+                _ = getattr(raw_request.state, self.attribute, None)
+                return SimpleNamespace(), request
+
+        state = SimpleNamespace(handler=lambda cls: Handler())
+        with mock.patch.object(prp, "_CHILD_STATE", state):
+            for attribute in ("api_key", "cache_identity", "unknown"):
+                with self.subTest(attribute=attribute):
+                    Handler.attribute = attribute
+                    result = prp._child_convert(Handler, _chat_request(), [])
+                    self.assertEqual(result[0], "fallback")
+                    self.assertIn("raw_request.state", result[1])
+
+    def test_cache_conversion_uses_body_identity_without_request_state(self):
+        class Handler:
+            def _convert_to_internal_request(self, request, raw_request):
+                params = OpenAIServingChat._cache_request_params(self, request)
+                return SimpleNamespace(**params), request
+
+        with (
+            mock.patch.object(
+                prp, "_CHILD_STATE", SimpleNamespace(handler=lambda cls: Handler())
+            ),
+            mock.patch(
+                "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+                return_value=SimpleNamespace(enable_cache_accounting=True),
+            ),
+            mock.patch(
+                "sglang.srt.entrypoints.openai.serving_chat.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+            ),
+        ):
+            for user in (None, "gateway-user"):
+                with self.subTest(user=user):
+                    result = prp._child_convert(
+                        Handler, _chat_request(cache_user_id=user), []
+                    )
+                    self.assertEqual(result[0], "ok")
+                    self.assertEqual(
+                        result[1].cache_user_id,
+                        (
+                            "cache-user-id:" + sha256(user.encode()).hexdigest()
+                            if user
+                            else None
+                        ),
+                    )
+                    self.assertEqual(result[1].cache_ttl_seconds, 300)
+
+    def test_parent_submits_body_and_headers_without_request_state(self):
+        class Handler:
+            def _convert_to_internal_request(self, request, raw_request):
+                return SimpleNamespace(cache_user_id=request.cache_user_id), request
+
+        state = SimpleNamespace(handler=lambda cls: Handler())
+        pre = prp.ProcessRequestPreprocessor.__new__(prp.ProcessRequestPreprocessor)
+        pre._ready = True
+        pre._disabled_reason = None
+        pre._handler_classes = (Handler,)
+        pre._warned = set()
+        raw_request = _RawRequest({"Authorization": "Bearer verified-secret"})
+        raw_request.state = SimpleNamespace(
+            api_key="retired-bearer-identity", secret="must-not-cross"
+        )
+        request = _chat_request(cache_user_id="gateway-user")
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            mock.patch.object(prp, "_CHILD_STATE", state),
+            mock.patch.object(
+                prp, "_child_convert", wraps=prp._child_convert
+            ) as convert,
+        ):
+            pre._pool = pool
+            adapted, processed = asyncio.run(
+                pre.convert(Handler(), request, raw_request)
+            )
+        self.assertIs(processed, request)
+        self.assertEqual(adapted.cache_user_id, "gateway-user")
+        self.assertEqual(convert.call_args.args[2], list(raw_request.headers.raw))
+        self.assertEqual(len(convert.call_args.args), 3)
 
     def test_request_changes_replay(self):
         request = _chat_request(
@@ -328,6 +422,7 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
         cls.handler_classes = (
             OpenAIServingChat,
             ClientReadingServingChat,
+            StateReadingServingChat,
             GilHeavyServingChat,
         )
         cls.tokenizer_manager.maybe_start_process_request_preprocessor(
@@ -412,6 +507,22 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
                     _chat_request(), raw_request
                 )
             self.assertTrue(any("raw_request.client" in m for m in logs.output))
+            return adapted
+
+        adapted = asyncio.run(run())
+        self.assertGreater(len(adapted.input_ids), 0)
+
+    def test_request_state_access_falls_back_to_thread(self):
+        handler = self._handler(StateReadingServingChat)
+        raw_request = _RawRequest({})
+        raw_request.state = SimpleNamespace(cache_identity="parent-only")
+
+        async def run():
+            with self.assertLogs(prp.logger, level="WARNING") as logs:
+                adapted, _ = await handler._run_request_conversion(
+                    _chat_request(), raw_request
+                )
+            self.assertTrue(any("raw_request.state" in m for m in logs.output))
             return adapted
 
         adapted = asyncio.run(run())
@@ -523,6 +634,7 @@ class TestProcessRequestPreprocessorDisables(TestProcessRequestPreprocessorEndTo
     test_matches_in_process_conversion = None
     test_conversion_errors_keep_their_type = None
     test_non_header_access_falls_back_to_thread = None
+    test_request_state_access_falls_back_to_thread = None
     test_event_loop_stays_responsive = None
     test_broken_pool_restarts = None
 

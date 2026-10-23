@@ -760,6 +760,8 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
@@ -810,6 +812,8 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise

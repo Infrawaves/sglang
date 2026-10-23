@@ -1,0 +1,1384 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU tests; optional real Redis script tests use REDIS_SERVER_BIN or PATH.
+
+Run directly with Python to avoid importing the GPU-serving dependency tree:
+    python test/registered/unit/cache_accounting/test_page_cache.py -v
+"""
+
+import asyncio
+import importlib.util
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+import uuid
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+# Load this dependency-free module without importing sglang.__init__, which
+# initializes the model-serving environment. This also permits stdlib-only QA.
+_SOURCE = (
+    Path(__file__).resolve().parents[4]
+    / "python/sglang/srt/cache_accounting/page_cache.py"
+)
+_SPEC = importlib.util.spec_from_file_location("_page_cache_test", _SOURCE)
+cache = importlib.util.module_from_spec(_SPEC)
+with patch.dict(sys.modules, {_SPEC.name: cache}):
+    _SPEC.loader.exec_module(cache)
+
+_METRICS_SOURCE = _SOURCE.with_name("metrics.py")
+_METRICS_SPEC = importlib.util.spec_from_file_location(
+    "_cache_metrics_test", _METRICS_SOURCE
+)
+cache_metrics = importlib.util.module_from_spec(_METRICS_SPEC)
+_METRICS_SPEC.loader.exec_module(cache_metrics)
+
+# CI registration is parsed statically; avoid importing heavyweight sglang.
+if "sglang.test.ci.ci_register" in sys.modules:
+    from sglang.test.ci.ci_register import register_cpu_ci
+else:
+
+    def register_cpu_ci(**kwargs):
+        """Runtime no-op when testing without the serving package installed."""
+
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def plan(ids, *, ttl=300, page_size=4, **kwargs):
+    return cache.build_page_cache_plan(
+        ids,
+        kwargs.pop("cache_user_id", "api-key-1"),
+        kwargs.pop("namespace", "weights-v1/tokenizer-v1/template-v1/adapter-none"),
+        page_size,
+        ttl,
+        **kwargs,
+    )
+
+
+class TestPageCachePlan(unittest.TestCase):
+    def test_identity_field_rename_preserves_existing_redis_keys(self):
+        # Captured before renaming the internal identity field to cache_user_id.
+        identity = (
+            "cache-user-id:"
+            "fa78d54838e4374df058377ad3aa57c5e39d9d127deef7cdd60fbfa367c41363"
+        )
+        for ttl, digests in (
+            (
+                300,
+                (
+                    "6adc732ffda5622d982be5a9788d94f5bda7e600c2d6cf585c006f27fd7b0799",
+                    "1edd3896c8e9ee1183b0f700ba3ae16b6805a086c0b3b6a1db546436273e4939",
+                ),
+            ),
+            (
+                3600,
+                (
+                    "ae356b9bbed5f3c5aa174ed1d722a9dbb8e170fcfa737fe1021350cf4e72e557",
+                    "730b2f7e992ecf185e28d5c446d563ae94c7d92d2567b7b40ffe8512c12f4b41",
+                ),
+            ),
+        ):
+            with self.subTest(ttl=ttl):
+                result = cache.build_page_cache_plan(
+                    input_ids=list(range(600)),
+                    cache_user_id=identity,
+                    namespace="cache-field-rename-v1",
+                    page_size=256,
+                    ttl_seconds=ttl,
+                )
+                self.assertEqual(
+                    result.page_keys,
+                    tuple(
+                        f"sglang:cache:v1:{{{digests[0]}}}:page:{digest}"
+                        for digest in digests
+                    ),
+                )
+
+    def test_media_preserves_text_prefix_and_changes_only_its_suffix(self):
+        tokens = list(range(1024))
+        span = cache.CacheMediaSpan(300, 700, "a" * 64)
+        original = plan(tokens, page_size=256)
+        first = plan(tokens, page_size=256, media_spans=[span])
+        other = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(300, 700, "b" * 64)],
+        )
+        self.assertEqual(first.page_keys[0], original.page_keys[0])
+        self.assertEqual(first.page_keys[0], other.page_keys[0])
+        for index in range(1, 4):
+            self.assertNotEqual(first.page_keys[index], other.page_keys[index])
+
+    def test_media_pad_projection_does_not_identify_content(self):
+        tokens = [11] * 512
+        span = cache.CacheMediaSpan(255, 300, "a" * 64)
+        first = plan(tokens, page_size=256, media_spans=[span])
+        tokens[255:300] = [1 << 40] * 45
+        second = plan(tokens, page_size=256, media_spans=[span])
+        self.assertEqual(first.page_keys, second.page_keys)
+        with self.assertRaises(ValueError):
+            plan(tokens, page_size=256)
+
+    def test_media_at_block_boundary_and_partial_tail(self):
+        tokens = [1] * 513
+        original = plan(tokens, page_size=256)
+        tail = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(512, 513, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys, tail.page_keys)
+        boundary = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(256, 300, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys[0], boundary.page_keys[0])
+        self.assertNotEqual(original.page_keys[1], boundary.page_keys[1])
+
+    def test_media_span_layout_and_text_after_media_affect_keys(self):
+        tokens = [1] * 512
+        original = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(0, 10, "a" * 64)],
+        )
+        for spans in (
+            [cache.CacheMediaSpan(1, 11, "a" * 64)],
+            [cache.CacheMediaSpan(0, 11, "a" * 64)],
+            [cache.CacheMediaSpan(0, 10, "b" * 64)],
+            [
+                cache.CacheMediaSpan(0, 10, "a" * 64),
+                cache.CacheMediaSpan(10, 20, "a" * 64),
+            ],
+        ):
+            with self.subTest(spans=spans):
+                self.assertNotEqual(
+                    original.page_keys,
+                    plan(tokens, page_size=256, media_spans=spans).page_keys,
+                )
+        tokens[300] = 2
+        changed = plan(
+            tokens,
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(0, 10, "a" * 64)],
+        )
+        self.assertEqual(original.page_keys[0], changed.page_keys[0])
+        self.assertNotEqual(original.page_keys[1], changed.page_keys[1])
+
+    def test_media_spans_are_validated_even_in_incomplete_tail(self):
+        for spans in (
+            [cache.CacheMediaSpan(-1, 1, "a" * 64)],
+            [cache.CacheMediaSpan(0, 0, "a" * 64)],
+            [cache.CacheMediaSpan(0, 3, "a" * 64)],
+            [cache.CacheMediaSpan(0, 1, "invalid")],
+            [cache.CacheMediaSpan(True, 2, "a" * 64)],
+            [
+                cache.CacheMediaSpan(0, 2, "a" * 64),
+                cache.CacheMediaSpan(1, 2, "b" * 64),
+            ],
+            [
+                cache.CacheMediaSpan(1, 2, "a" * 64),
+                cache.CacheMediaSpan(0, 1, "b" * 64),
+            ],
+            [(0, 1, "a" * 64)],
+        ):
+            with self.subTest(spans=spans), self.assertRaises(ValueError):
+                plan([1, 2], page_size=256, media_spans=spans)
+
+    def test_usage_requires_one_valid_ttl_and_nonnegative_integer_counts(self):
+        with self.assertRaises(TypeError):
+            cache.CacheUsage()
+        for ttl in (300, 3600):
+            with self.subTest(ttl=ttl):
+                self.assertEqual(
+                    cache.CacheUsage(ttl_seconds=ttl).to_dict(),
+                    {"ttl_seconds": ttl, "read_tokens": 0, "write_tokens": 0},
+                )
+        for change in (
+            {"ttl_seconds": 600},
+            {"ttl_seconds": 300.0},
+            {"read_tokens": -1},
+            {"read_tokens": True},
+            {"write_tokens": 1.0},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                cache.CacheUsage(**{"ttl_seconds": 300, **change})
+
+    def test_fixed_256_block_boundaries(self):
+        self.assertEqual(cache.CACHE_BLOCK_SIZE, 256)
+        for length, complete_blocks, tail in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (255, 0, 255),
+            (256, 1, 0),
+            (257, 1, 1),
+            (511, 1, 255),
+            (512, 2, 0),
+            (513, 2, 1),
+        ]:
+            with self.subTest(length=length):
+                result = plan(list(range(length)), page_size=cache.CACHE_BLOCK_SIZE)
+                self.assertEqual(len(result.page_keys), complete_blocks)
+                self.assertEqual(result.prompt_tokens, length)
+                self.assertEqual(result.prompt_tokens % result.page_size, tail)
+
+    def test_page_boundaries_and_partial_tail(self):
+        for length, expected in [(0, 0), (3, 0), (4, 1), (5, 1), (8, 2)]:
+            with self.subTest(length=length):
+                result = plan(list(range(length)))
+                self.assertEqual(len(result.page_keys), expected)
+                self.assertEqual(result.prompt_tokens, length)
+
+    def test_tail_changes_do_not_change_complete_pages(self):
+        self.assertEqual(
+            plan([1, 2, 3, 4, 5]).page_keys, plan([1, 2, 3, 4, 6]).page_keys
+        )
+
+    def test_identical_pages_after_different_history_do_not_match(self):
+        original = plan([1, 2, 3, 4, 10, 11, 12, 13])
+        other = plan([5, 6, 7, 8, 10, 11, 12, 13])
+        self.assertNotEqual(original.page_keys[1], other.page_keys[1])
+
+    def test_extension_shares_only_the_identical_prefix(self):
+        shorter = plan(list(range(8)))
+        extended = plan(list(range(13)))
+        self.assertEqual(shorter.page_keys, extended.page_keys[:2])
+        changed = plan([*range(4), 99, *range(5, 13)])
+        self.assertEqual(shorter.page_keys[0], changed.page_keys[0])
+        self.assertNotEqual(shorter.page_keys[1], changed.page_keys[1])
+
+    def test_cache_user_id_namespace_page_size_and_ttl_are_isolated(self):
+        original = plan(list(range(12)))
+        for change in [
+            {"cache_user_id": "api-key-2"},
+            {"namespace": "weights-v2"},
+            {"page_size": 3},
+            {"ttl": 3600},
+        ]:
+            with self.subTest(change=change):
+                other = plan(list(range(12)), **change)
+                self.assertTrue(set(original.page_keys).isdisjoint(other.page_keys))
+
+    def test_all_script_keys_share_a_first_page_hash_tag(self):
+        result = plan(list(range(20)))
+        tags = {key.split("{", 1)[1].split("}", 1)[0] for key in result.page_keys}
+        self.assertEqual(len(tags), 1)
+        other = plan([99, *range(1, 20)])
+        self.assertNotEqual(
+            next(iter(tags)), other.page_keys[0].split("{", 1)[1].split("}", 1)[0]
+        )
+
+    def test_token_encoding_is_unambiguous_and_validates_tail(self):
+        self.assertNotEqual(
+            plan([1, 23], page_size=2).page_keys, plan([12, 3], page_size=2).page_keys
+        )
+        self.assertTrue(plan([0, 0xFFFFFFFF], page_size=2).page_keys)
+        for bad in [-1, 0x100000000, True, 1.0, "1"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                plan([0, 1, 2, 3, bad])
+
+    def test_reject_invalid_options(self):
+        for change in [
+            {"page_size": 0},
+            {"page_size": True},
+            {"ttl": 600},
+            {"cache_user_id": ""},
+            {"namespace": ""},
+        ]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                plan([1, 2, 3, 4], **change)
+
+    def test_more_than_4096_complete_pages_are_supported(self):
+        result = plan(list(range(4097)), page_size=1)
+        self.assertEqual(len(result.page_keys), 4097)
+        self.assertEqual(result.prompt_tokens, 4097)
+        self.assertIsNone(cache._validate_plan(result))
+
+    def test_prompt_token_validation_accepts_zero_and_safe_integer_limit(self):
+        self.assertIsNone(cache._validate_plan(plan([])))
+        largest = replace(
+            plan([1], page_size=1),
+            prompt_tokens=cache._MAX_SAFE_INTEGER,
+            page_size=cache._MAX_SAFE_INTEGER,
+        )
+        self.assertIsNone(cache._validate_plan(largest))
+
+
+class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.logger = Mock()
+        self.metrics = Mock()
+        logger_patch = patch.object(cache, "logger", self.logger)
+        logger_patch.start()
+        self.addCleanup(logger_patch.stop)
+
+    async def test_no_complete_page_never_initializes_redis(self):
+        store = cache.RedisPageCacheStore("redis://unused", metrics=self.metrics)
+        with patch.object(
+            store, "_client", side_effect=AssertionError("must stay lazy")
+        ):
+            usage = await store.account(plan([1, 2, 3]))
+        self.assertEqual(
+            usage.to_dict(),
+            {
+                "ttl_seconds": 300,
+                "read_tokens": 0,
+                "write_tokens": 0,
+            },
+        )
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
+        self.metrics.observe_redis.assert_not_called()
+        await store.aclose()
+
+    async def test_renew_without_complete_pages_never_initializes_redis(self):
+        store = cache.RedisPageCacheStore("redis://unused", metrics=self.metrics)
+        with patch.object(
+            store, "_client", side_effect=AssertionError("must stay lazy")
+        ):
+            self.assertIsNone(await store.renew(plan([1, 2, 3])))
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
+        self.metrics.observe_redis.assert_not_called()
+        self.metrics.observe_usage.assert_not_called()
+        await store.aclose()
+
+    async def test_renew_logs_success_without_accounting_or_usage_observation(self):
+        original = plan(list(range(9)), ttl=3600)
+        store = cache.RedisPageCacheStore(
+            "redis://unused", timeout_seconds=0.2, metrics=self.metrics
+        )
+        store._redis = AsyncMock()
+        store._redis.eval.return_value = 2
+        with patch.object(
+            store, "account", side_effect=AssertionError("must not account")
+        ):
+            self.assertIsNone(await store.renew(original, rid="renew-success"))
+        store._redis.eval.assert_awaited_once_with(
+            cache._RENEW_LUA, 2, *original.page_keys, 3600
+        )
+        start, complete = [
+            call.args[0] % call.args[1:] for call in self.logger.info.call_args_list
+        ]
+        self.assertEqual(
+            start,
+            "Cache Redis renew start rid=renew-success page_count=2 ttl=3600 "
+            "timeout_ms=200.000",
+        )
+        self.assertRegex(
+            complete,
+            r"^Cache Redis renew complete rid=renew-success result=success "
+            r"page_count=2 ttl=3600 elapsed_ms=\d+\.\d{3} timeout_ms=200\.000$",
+        )
+        self.logger.warning.assert_not_called()
+        self.metrics.observe_redis.assert_called_once()
+        self.assertEqual(
+            self.metrics.observe_redis.call_args.args[:2], (3600, "success")
+        )
+        self.metrics.observe_usage.assert_not_called()
+        await store.aclose()
+
+    async def test_renew_failure_logs_classification_without_sensitive_contents(self):
+        errors = [(TimeoutError, "timeout"), (ConnectionError, "error")]
+        try:
+            from redis.exceptions import TimeoutError as RedisTimeoutError
+        except ImportError:
+            pass
+        else:
+            errors.append((RedisTimeoutError, "timeout"))
+        original = plan(list(range(9)))
+        secret = "redis://:secret-password@private-redis secret-input-content"
+        for error_type, classification in errors:
+            with self.subTest(error_type=error_type):
+                self.logger.reset_mock()
+                self.metrics.reset_mock()
+                store = cache.RedisPageCacheStore(
+                    "redis://unused", metrics=self.metrics
+                )
+                store._redis = AsyncMock()
+                store._redis.eval.side_effect = error_type(secret)
+                with self.assertRaises(cache.CacheAccountingError):
+                    await store.renew(original, rid="renew-failure")
+                store._redis.eval.assert_awaited_once()
+                self.logger.warning.assert_called_once()
+                warning = self.logger.warning.call_args
+                message = warning.args[0] % warning.args[1:]
+                self.assertIn("Cache Redis renew failed rid=renew-failure", message)
+                self.assertIn(f"result={classification}", message)
+                self.assertIn(f"error_type={error_type.__name__}", message)
+                self.assertIn("page_count=2 ttl=300 elapsed_ms=", message)
+                self.assertNotIn(secret, message)
+                self.assertNotIn(original.page_keys[0], message)
+                self.assertEqual(warning.kwargs, {})
+                self.metrics.observe_redis.assert_called_once()
+                self.assertEqual(
+                    self.metrics.observe_redis.call_args.args[:2], (300, classification)
+                )
+                self.metrics.observe_usage.assert_not_called()
+                await store.aclose()
+
+    async def test_renew_timeout_is_unconfirmed_without_retry(self):
+        async def blocked_eval(*args):
+            await asyncio.Event().wait()
+
+        store = cache.RedisPageCacheStore(
+            "redis://unused", timeout_seconds=0.01, metrics=self.metrics
+        )
+        store._redis = AsyncMock()
+        store._redis.eval.side_effect = blocked_eval
+        with self.assertRaises(cache.CacheAccountingError) as failure:
+            await store.renew(plan(list(range(9))), rid="renew-timeout")
+        self.assertIsInstance(failure.exception.__cause__, TimeoutError)
+        store._redis.eval.assert_awaited_once()
+        self.metrics.observe_redis.assert_called_once()
+        self.assertEqual(
+            self.metrics.observe_redis.call_args.args[:2], (300, "timeout")
+        )
+        self.metrics.observe_usage.assert_not_called()
+        await store.aclose()
+
+    async def test_renew_cancellation_propagates_without_success_or_failure(self):
+        entered = asyncio.Event()
+
+        async def blocked_eval(*args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        store = cache.RedisPageCacheStore("redis://unused", metrics=self.metrics)
+        store._redis = AsyncMock()
+        store._redis.eval.side_effect = blocked_eval
+        task = asyncio.create_task(
+            store.renew(plan(list(range(9))), rid="renew-cancel")
+        )
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.logger.info.assert_called_once()
+        self.logger.warning.assert_not_called()
+        self.logger.debug.assert_called_once()
+        debug = self.logger.debug.call_args
+        self.assertIn(
+            "Cache Redis renew cancelled rid=renew-cancel page_count=2 ttl=300 elapsed_ms=",
+            debug.args[0] % debug.args[1:],
+        )
+        self.metrics.observe_redis.assert_not_called()
+        self.metrics.observe_usage.assert_not_called()
+        await store.aclose()
+
+    async def test_renew_requires_a_confirmed_page_count(self):
+        for outcome in (None, True, False, 0, -1, 3, 2.0, [0, 8]):
+            with self.subTest(outcome=outcome):
+                store = cache.RedisPageCacheStore("redis://unused")
+                store._redis = AsyncMock()
+                store._redis.eval.return_value = outcome
+                with self.assertRaises(cache.CacheAccountingError):
+                    await store.renew(plan(list(range(9))))
+                await store.aclose()
+
+    async def test_eval_start_and_success_logs_include_rid_and_confirmed_usage(self):
+        store = cache.RedisPageCacheStore(
+            "redis://unused", timeout_seconds=0.2, metrics=self.metrics
+        )
+        store._redis = AsyncMock()
+        store._redis.eval.return_value = [4, 4]
+        result = await store.account(plan(list(range(9))), rid="request-redis-1")
+        self.assertEqual(
+            result, cache.CacheUsage(ttl_seconds=300, read_tokens=4, write_tokens=4)
+        )
+        store._redis.eval.assert_awaited_once()
+        self.assertEqual(self.logger.info.call_count, 2)
+        start, complete = [
+            call.args[0] % call.args[1:] for call in self.logger.info.call_args_list
+        ]
+        self.assertEqual(
+            start,
+            "Cache Redis EVAL start rid=request-redis-1 page_count=2 ttl=300 "
+            "timeout_ms=200.000",
+        )
+        self.assertRegex(
+            complete,
+            r"^Cache Redis EVAL complete rid=request-redis-1 result=success "
+            r"page_count=2 ttl=300 prompt=9 read=4 write=4 "
+            r"elapsed_ms=\d+\.\d{3} timeout_ms=200\.000$",
+        )
+        self.logger.warning.assert_not_called()
+        self.metrics.observe_redis.assert_called_once()
+        self.assertEqual(
+            self.metrics.observe_redis.call_args.args[:2], (300, "success")
+        )
+        await store.aclose()
+
+    async def test_eval_failure_logs_classification_without_sensitive_contents(self):
+        errors = [(TimeoutError, "timeout"), (ConnectionError, "error")]
+        try:
+            from redis.exceptions import TimeoutError as RedisTimeoutError
+        except ImportError:
+            pass
+        else:
+            errors.append((RedisTimeoutError, "timeout"))
+        original = plan(list(range(9)))
+        secrets = (
+            "redis://:secret-password@private-redis:6379/0",
+            "secret-api-key",
+            "secret-input-content",
+            original.page_keys[0],
+        )
+        for error_type, classification in errors:
+            with self.subTest(error_type=error_type):
+                self.logger.reset_mock()
+                self.metrics.reset_mock()
+                store = cache.RedisPageCacheStore(
+                    "redis://unused", timeout_seconds=0.2, metrics=self.metrics
+                )
+                store._redis = AsyncMock()
+                store._redis.eval.side_effect = error_type(" ".join(secrets))
+                with self.assertRaises(cache.CacheAccountingError):
+                    await store.account(original, rid="request-redis-2")
+                self.logger.info.assert_called_once()
+                self.logger.warning.assert_called_once()
+                warning = self.logger.warning.call_args
+                message = warning.args[0] % warning.args[1:]
+                self.assertIn(
+                    f"rid=request-redis-2 result={classification} "
+                    f"error_type={error_type.__name__}",
+                    message,
+                )
+                self.assertIn("timeout_ms=200.000", message)
+                for secret in secrets:
+                    self.assertNotIn(secret, message)
+                self.assertEqual(warning.kwargs, {})
+                self.metrics.observe_redis.assert_called_once()
+                self.assertEqual(
+                    self.metrics.observe_redis.call_args.args[:2], (300, classification)
+                )
+                await store.aclose()
+
+    async def test_cancellation_propagates_without_failure_or_success_log(self):
+        entered = asyncio.Event()
+
+        async def blocked_eval(*args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        store = cache.RedisPageCacheStore("redis://unused", metrics=self.metrics)
+        store._redis = AsyncMock()
+        store._redis.eval.side_effect = blocked_eval
+        task = asyncio.create_task(store.account(plan(list(range(9))), rid="cancelled"))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.logger.info.assert_called_once()
+        self.assertIn("EVAL start", self.logger.info.call_args.args[0])
+        self.logger.warning.assert_not_called()
+        self.metrics.observe_redis.assert_not_called()
+        await store.aclose()
+
+    async def test_redis_error_and_malformed_result_do_not_invent_usage(self):
+        for outcome in [
+            ConnectionError("offline"),
+            [0, 8],
+            [0, 3],
+            [1, 3],
+            [-4, 8],
+            [False, 4],
+            [0, 4.0],
+            [0],
+            [0, 4, 0, 0],
+            None,
+        ]:
+            with self.subTest(outcome=outcome):
+                store = cache.RedisPageCacheStore("redis://unused")
+                client = AsyncMock()
+                if isinstance(outcome, Exception):
+                    client.eval.side_effect = outcome
+                else:
+                    client.eval.return_value = outcome
+                store._redis = client
+                with self.assertRaises(cache.CacheAccountingError):
+                    await store.account(plan([1, 2, 3, 4]))
+                await store.aclose()
+
+    async def test_timeout_is_unconfirmed(self):
+        async def slow_eval(*args):
+            await asyncio.sleep(1)
+
+        store = cache.RedisPageCacheStore("redis://unused", timeout_seconds=0.01)
+        store._redis = AsyncMock()
+        store._redis.eval.side_effect = slow_eval
+        with self.assertRaises(cache.CacheAccountingError) as failure:
+            await store.account(plan([1, 2, 3, 4]))
+        self.assertIsInstance(
+            failure.exception.__cause__, (TimeoutError, asyncio.TimeoutError)
+        )
+        self.logger.warning.assert_called_once()
+        warning = self.logger.warning.call_args
+        self.assertIn("result=timeout", warning.args[0] % warning.args[1:])
+        await store.aclose()
+
+    async def test_invalid_plan_is_rejected_before_redis(self):
+        original = plan(list(range(8)))
+        malformed_plans = [
+            replace(original, page_keys=(original.page_keys[0], "wrong-slot"))
+        ]
+        malformed_plans.extend(
+            replace(original, prompt_tokens=value)
+            for value in (None, "8", 8.0, True, False, -1, cache._MAX_SAFE_INTEGER + 1)
+        )
+        store = cache.RedisPageCacheStore("redis://unused")
+        with patch.object(
+            store, "_client", side_effect=AssertionError("must not connect")
+        ) as client:
+            for malformed in malformed_plans:
+                for operation in (store.account, store.renew):
+                    with self.subTest(operation=operation.__name__, plan=malformed):
+                        with self.assertRaises(ValueError):
+                            await operation(malformed)
+        client.assert_not_called()
+        self.logger.info.assert_not_called()
+        self.logger.warning.assert_not_called()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("redis"), "redis Python package required"
+    )
+    async def test_redis_client_does_not_retry_failed_operations(self):
+        from redis.exceptions import ConnectionError, TimeoutError
+
+        store = cache.RedisPageCacheStore("redis://unused")
+        retry = store._client().connection_pool.connection_kwargs["retry"]
+        for error_type in (ConnectionError, TimeoutError):
+            with self.subTest(error_type=error_type):
+                attempts = 0
+
+                async def failing_operation():
+                    nonlocal attempts
+                    attempts += 1
+                    raise error_type("unconfirmed")
+
+                async def handle_failure(error):
+                    pass
+
+                with self.assertRaises(error_type):
+                    await retry.call_with_retry(failing_operation, handle_failure)
+                self.assertEqual(attempts, 1)
+        await store.aclose()
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("prometheus_client"), "prometheus-client required"
+)
+class TestCacheMetrics(unittest.TestCase):
+    def setUp(self):
+        from prometheus_client import CollectorRegistry
+
+        self.registry = CollectorRegistry()
+        self.metrics = cache_metrics.CacheAccountingMetrics(
+            role="decode", registry=self.registry
+        )
+
+    def test_metric_values_labels_and_fallback_are_bounded(self):
+        self.metrics.observe_redis(300, "success", 0.025)
+        self.metrics.observe_redis(300, "timeout", 0.2)
+        self.metrics.observe_redis(3600, "error", 0.01)
+        self.metrics.observe_usage(
+            300,
+            cache.CacheUsage(ttl_seconds=300, read_tokens=256, write_tokens=256),
+            "redis",
+        )
+        self.metrics.observe_usage(
+            3600, cache.CacheUsage(ttl_seconds=3600, read_tokens=7), "physical"
+        )
+        self.metrics.observe_usage(
+            300, cache.CacheUsage(ttl_seconds=300), "no_complete_block"
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_redis_operations_total",
+                {"role": "decode", "ttl": "5m", "result": "success"},
+            ),
+            1,
+        )
+
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_redis_operation_duration_seconds_count",
+                {"role": "decode", "ttl": "5m", "result": "timeout"},
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_read_tokens_total",
+                {"role": "decode", "ttl": "5m", "source": "redis"},
+            ),
+            256,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_write_tokens_total",
+                {"role": "decode", "ttl": "5m", "source": "redis"},
+            ),
+            256,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_write_tokens_total",
+                {"role": "decode", "ttl": "1h", "source": "physical"},
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_fallbacks_total",
+                {"role": "decode", "ttl": "1h"},
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_requests_total",
+                {"role": "decode", "ttl": "5m", "source": "no_complete_block"},
+            ),
+            1,
+        )
+        for family in self.registry.collect():
+            for sample in family.samples:
+                self.assertLessEqual(
+                    set(sample.labels), {"role", "ttl", "result", "source", "le"}
+                )
+        token_families = {
+            family.name for family in self.registry.collect() if "tokens" in family.name
+        }
+        self.assertEqual(
+            token_families, {"sglang:cache_read_tokens", "sglang:cache_write_tokens"}
+        )
+
+    def test_multimodal_unavailable_counts_fallback_without_a_redis_operation(self):
+        self.metrics.observe_usage(
+            300,
+            cache.CacheUsage(ttl_seconds=300, read_tokens=333),
+            "multimodal_unavailable",
+        )
+        labels = {"role": "decode", "ttl": "5m", "source": "multimodal_unavailable"}
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_requests_total", labels
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_read_tokens_total", labels),
+            333,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_write_tokens_total", labels),
+            0,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_fallbacks_total",
+                {"role": "decode", "ttl": "5m"},
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.registry.get_sample_value(
+                "sglang:cache_redis_operations_total",
+                {"role": "decode", "ttl": "5m", "result": "success"},
+            )
+        )
+
+    def test_usage_ttl_mismatch_is_rejected_before_observation(self):
+        with self.assertRaisesRegex(ValueError, "TTL differs"):
+            self.metrics.observe_usage(
+                300, cache.CacheUsage(ttl_seconds=3600, write_tokens=256), "redis"
+            )
+        self.assertFalse(
+            [sample for family in self.registry.collect() for sample in family.samples]
+        )
+
+    def test_missing_identity_records_usage_without_redis_or_fallback(self):
+        self.metrics.observe_usage(
+            3600,
+            cache.CacheUsage(ttl_seconds=3600, read_tokens=7),
+            "missing_identity",
+        )
+        labels = {"role": "decode", "ttl": "1h", "source": "missing_identity"}
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_accounting_requests_total", labels
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_read_tokens_total", labels), 7
+        )
+        self.assertEqual(
+            self.registry.get_sample_value("sglang:cache_write_tokens_total", labels), 0
+        )
+        for family in self.registry.collect():
+            if "redis" in family.name or "fallback" in family.name:
+                self.assertFalse(family.samples)
+
+    def test_reinitialization_reuses_registered_families(self):
+        other = cache_metrics.CacheAccountingMetrics(
+            role="standalone", registry=self.registry
+        )
+        same = cache_metrics.CacheAccountingMetrics(
+            role="decode", registry=self.registry
+        )
+        self.assertIs(other._metrics, self.metrics._metrics)
+        self.assertIs(same._metrics, self.metrics._metrics)
+        self.metrics.observe_redis(300, "success", 0.01)
+        same.observe_redis(300, "success", 0.02)
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:cache_redis_operations_total",
+                {"role": "decode", "ttl": "5m", "result": "success"},
+            ),
+            2,
+        )
+
+    def test_arbitrary_label_values_are_rejected(self):
+        with self.assertRaises(ValueError):
+            cache_metrics.CacheAccountingMetrics(
+                role="api-key-or-rid", registry=self.registry
+            )
+        with self.assertRaises(ValueError):
+            self.metrics.observe_redis(300, "ArbitraryExceptionName", 0.01)
+        with self.assertRaises(ValueError):
+            self.metrics.observe_usage(301, cache.CacheUsage(ttl_seconds=300), "redis")
+        with self.assertRaises(ValueError):
+            self.metrics.observe_usage(
+                300, cache.CacheUsage(ttl_seconds=300), "namespace"
+            )
+
+    def test_metrics_export_failure_does_not_raise_or_log_exception_contents(self):
+        broken = Mock()
+        broken.labels.side_effect = OSError("secret-redis-url-or-input")
+        with (
+            patch.dict(self.metrics._metrics, {"redis_operations": broken}),
+            patch.object(cache_metrics, "logger") as logger,
+        ):
+            self.metrics.observe_redis(300, "success", 0.01)
+        logger.warning.assert_called_once()
+        call = logger.warning.call_args
+        self.assertEqual(
+            call.args[0] % call.args[1:],
+            "Cache metrics observation failed error_type=OSError",
+        )
+
+    def test_import_does_not_load_prometheus_or_register_metrics(self):
+        code = """
+import importlib.util
+import sys
+assert 'prometheus_client' not in sys.modules
+spec = importlib.util.spec_from_file_location('cache_metrics_import', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert 'prometheus_client' not in sys.modules
+"""
+        subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code), str(_METRICS_SOURCE)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_multiprocess_collector_exposes_child_process_observations(self):
+        from prometheus_client.parser import text_string_to_metric_families
+
+        worker = """
+import importlib.util
+import sys
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('cache_metrics_worker', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+metrics = module.CacheAccountingMetrics(role='decode')
+source = sys.argv[2]
+if source == 'redis':
+    metrics.observe_redis(300, 'success', .01)
+    usage = SimpleNamespace(ttl_seconds=300, read_tokens=256, write_tokens=256)
+else:
+    metrics.observe_redis(300, 'timeout', .2)
+    usage = SimpleNamespace(ttl_seconds=300, read_tokens=7, write_tokens=0)
+metrics.observe_usage(300, usage, source)
+"""
+        scrape = """
+from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+registry = CollectorRegistry()
+multiprocess.MultiProcessCollector(registry)
+print(generate_latest(registry).decode(), end='')
+"""
+        with tempfile.TemporaryDirectory(
+            prefix="sgl-cache-metrics-", dir="/tmp"
+        ) as directory:
+            env = dict(os.environ, PROMETHEUS_MULTIPROC_DIR=directory)
+            for source in ("redis", "physical"):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent(worker),
+                        str(_METRICS_SOURCE),
+                        source,
+                    ],
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            result = subprocess.run(
+                [sys.executable, "-c", textwrap.dedent(scrape)],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        samples = {
+            (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+            for family in text_string_to_metric_families(result.stdout)
+            for sample in family.samples
+        }
+
+        def value(name, **labels):
+            return samples[(name, tuple(sorted(labels.items())))]
+
+        self.assertEqual(
+            value(
+                "sglang:cache_redis_operations_total",
+                role="decode",
+                ttl="5m",
+                result="success",
+            ),
+            1,
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_redis_operations_total",
+                role="decode",
+                ttl="5m",
+                result="timeout",
+            ),
+            1,
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_redis_operation_duration_seconds_count",
+                role="decode",
+                ttl="5m",
+                result="timeout",
+            ),
+            1,
+        )
+        self.assertEqual(
+            value("sglang:cache_accounting_fallbacks_total", role="decode", ttl="5m"), 1
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_read_tokens_total",
+                role="decode",
+                ttl="5m",
+                source="redis",
+            ),
+            256,
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_read_tokens_total",
+                role="decode",
+                ttl="5m",
+                source="physical",
+            ),
+            7,
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_write_tokens_total",
+                role="decode",
+                ttl="5m",
+                source="redis",
+            ),
+            256,
+        )
+        self.assertEqual(
+            value(
+                "sglang:cache_write_tokens_total",
+                role="decode",
+                ttl="5m",
+                source="physical",
+            ),
+            0,
+        )
+
+
+_REDIS_SERVER = os.environ.get("REDIS_SERVER_BIN") or shutil.which("redis-server")
+_HAS_REDIS = importlib.util.find_spec("redis") is not None
+
+
+@unittest.skipUnless(
+    _REDIS_SERVER and _HAS_REDIS, "real redis-server and redis Python package required"
+)
+class TestRedisScript(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory(prefix="sgl-redis-", dir="/tmp")
+        cls.socket_path = str(Path(cls.directory.name) / "redis.sock")
+        cls.process = subprocess.Popen(
+            [
+                _REDIS_SERVER,
+                "--port",
+                "0",
+                "--unixsocket",
+                cls.socket_path,
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with socket.socket(socket.AF_UNIX) as probe:
+                try:
+                    probe.connect(cls.socket_path)
+                    return
+                except OSError:
+                    time.sleep(0.01)
+        cls.tearDownClass()
+        raise RuntimeError("test Redis failed to start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.process.kill()
+            cls.process.wait(timeout=5)
+        cls.directory.cleanup()
+
+    async def asyncSetUp(self):
+        self.store = cache.RedisPageCacheStore(f"unix://{self.socket_path}")
+        self.namespace = uuid.uuid4().hex
+
+    async def asyncTearDown(self):
+        await self.store.aclose()
+
+    def make_plan(self, count=9, *, ttl=300, page_size=4):
+        return plan(
+            list(range(count)),
+            namespace=self.namespace,
+            ttl=ttl,
+            page_size=page_size,
+        )
+
+    async def test_renew_restores_expired_pages_without_another_accounting_decision(
+        self,
+    ):
+        client = self.store._client()
+        for ttl in (300, 3600):
+            with self.subTest(ttl=ttl):
+                original = self.make_plan(ttl=ttl)
+                usage = await self.store.account(original)
+                self.assertEqual(
+                    usage, cache.CacheUsage(ttl_seconds=ttl, write_tokens=8)
+                )
+                for key in original.page_keys:
+                    await client.pexpire(key, 1)
+                await asyncio.sleep(0.02)
+                self.assertEqual(await client.exists(*original.page_keys), 0)
+                metrics = Mock()
+                with (
+                    patch.object(self.store, "_metrics", metrics),
+                    patch.object(
+                        self.store,
+                        "account",
+                        side_effect=AssertionError("must not account"),
+                    ),
+                ):
+                    self.assertIsNone(
+                        await self.store.renew(original, rid="restore-pages")
+                    )
+                metrics.observe_usage.assert_not_called()
+                metrics.observe_redis.assert_called_once()
+                self.assertEqual(
+                    metrics.observe_redis.call_args.args[:2], (ttl, "success")
+                )
+                for key in original.page_keys:
+                    self.assertEqual(await client.get(key), b"1")
+                    self.assertGreaterEqual(await client.pttl(key), (ttl - 2) * 1000)
+                self.assertEqual(
+                    await self.store.account(original),
+                    cache.CacheUsage(ttl_seconds=ttl, read_tokens=8),
+                )
+
+    async def test_renew_preserves_longer_deadlines_and_other_ttl_tier(self):
+        client = self.store._client()
+        for ttl, other_ttl in ((300, 3600), (3600, 300)):
+            with self.subTest(ttl=ttl):
+                selected = self.make_plan(ttl=ttl)
+                other = self.make_plan(ttl=other_ttl)
+                await self.store.account(selected)
+                await self.store.account(other)
+                await client.pexpire(selected.page_keys[0], ttl * 1000 + 60000)
+                await client.pexpire(selected.page_keys[1], 5000)
+                for key in other.page_keys:
+                    await client.pexpire(key, 5000)
+                before = await client.pttl(selected.page_keys[0])
+                await self.store.renew(selected)
+                self.assertGreaterEqual(
+                    await client.pttl(selected.page_keys[0]), before - 1000
+                )
+                self.assertGreaterEqual(
+                    await client.pttl(selected.page_keys[1]), (ttl - 2) * 1000
+                )
+                for key in other.page_keys:
+                    self.assertTrue(0 < await client.pttl(key) <= 5000)
+
+    async def test_renew_checks_all_key_types_before_restoring_or_extending_pages(self):
+        original = self.make_plan(13)
+        client = self.store._client()
+        await client.set(original.page_keys[0], "original-value", ex=5)
+        await client.hset(original.page_keys[1], "corrupt", "value")
+        with self.assertRaises(cache.CacheAccountingError):
+            await self.store.renew(original)
+        self.assertEqual(await client.get(original.page_keys[0]), b"original-value")
+        self.assertTrue(0 < await client.pttl(original.page_keys[0]) <= 5000)
+        self.assertEqual(await client.hget(original.page_keys[1], "corrupt"), b"value")
+        self.assertEqual(await client.exists(original.page_keys[2]), 0)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("prometheus_client"), "prometheus-client required"
+    )
+    async def test_renew_counts_only_redis_operations_not_requests_or_tokens(self):
+        from prometheus_client import CollectorRegistry
+
+        registry = CollectorRegistry()
+        metrics = cache_metrics.CacheAccountingMetrics(role="decode", registry=registry)
+        self.store._metrics = metrics
+        original = self.make_plan()
+        usage = await self.store.account(original)
+        metrics.observe_usage(300, usage, "redis")
+        await self.store.renew(original)
+        await self.store.renew(original)
+        labels = {"role": "decode", "ttl": "5m", "source": "redis"}
+        for name, expected in (
+            ("sglang:cache_accounting_requests_total", 1),
+            ("sglang:cache_read_tokens_total", 0),
+            ("sglang:cache_write_tokens_total", 8),
+        ):
+            self.assertEqual(registry.get_sample_value(name, labels), expected)
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:cache_redis_operations_total",
+                {"role": "decode", "ttl": "5m", "result": "success"},
+            ),
+            3,
+        )
+
+    async def test_fixed_256_block_accounting_and_prefix_extension(self):
+        for ttl in (300, 3600):
+            for length, read, written, tail in [
+                (255, 0, 0, 255),
+                (256, 0, 256, 0),
+                (257, 256, 0, 1),
+                (511, 256, 0, 255),
+                (512, 256, 256, 0),
+                (513, 512, 0, 1),
+            ]:
+                with self.subTest(ttl=ttl, length=length):
+                    result = await self.store.account(
+                        self.make_plan(
+                            length, ttl=ttl, page_size=cache.CACHE_BLOCK_SIZE
+                        )
+                    )
+                    self.assertEqual(
+                        result,
+                        cache.CacheUsage(
+                            ttl_seconds=ttl, read_tokens=read, write_tokens=written
+                        ),
+                    )
+                    self.assertEqual(
+                        result.read_tokens + result.write_tokens, length - tail
+                    )
+
+    async def test_real_eval_logs_cold_and_hit_results_with_request_id(self):
+        original = self.make_plan(513, ttl=3600, page_size=cache.CACHE_BLOCK_SIZE)
+        with patch.object(cache, "logger") as logger:
+            cold = await self.store.account(original, rid="real-cold")
+            hit = await self.store.account(original, rid="real-hit")
+        self.assertEqual(cold, cache.CacheUsage(ttl_seconds=3600, write_tokens=512))
+        self.assertEqual(hit, cache.CacheUsage(ttl_seconds=3600, read_tokens=512))
+        self.assertEqual(logger.info.call_count, 4)
+        messages = [call.args[0] % call.args[1:] for call in logger.info.call_args_list]
+        self.assertIn("EVAL start rid=real-cold page_count=2 ttl=3600", messages[0])
+        self.assertIn("rid=real-cold result=success", messages[1])
+        self.assertIn("prompt=513 read=0 write=512", messages[1])
+        self.assertIn("rid=real-hit result=success", messages[3])
+        self.assertIn("prompt=513 read=512 write=0", messages[3])
+        logger.warning.assert_not_called()
+
+    async def test_prefix_extension_read_write_and_tail_conserve_tokens(self):
+        initial = await self.store.account(self.make_plan(9))
+        self.assertEqual(initial, cache.CacheUsage(ttl_seconds=300, write_tokens=8))
+        extended = await self.store.account(self.make_plan(14))
+        self.assertEqual(
+            extended, cache.CacheUsage(ttl_seconds=300, read_tokens=8, write_tokens=4)
+        )
+
+    async def test_more_than_4096_pages_create_and_read_conserve_tokens(self):
+        initial = plan(list(range(4097)), page_size=1, namespace=self.namespace)
+        created = await self.store.account(initial)
+        self.assertEqual(created, cache.CacheUsage(ttl_seconds=300, write_tokens=4097))
+        read = await self.store.account(initial)
+        self.assertEqual(read, cache.CacheUsage(ttl_seconds=300, read_tokens=4097))
+
+    async def test_ttl_tiers_are_independent_and_hits_renew_selected_tier(self):
+        long = self.make_plan(ttl=3600)
+        short = self.make_plan(ttl=300)
+        self.assertEqual(
+            await self.store.account(long),
+            cache.CacheUsage(ttl_seconds=3600, write_tokens=8),
+        )
+        self.assertEqual(
+            await self.store.account(short),
+            cache.CacheUsage(ttl_seconds=300, write_tokens=8),
+        )
+        client = self.store._client()
+        await client.expire(short.page_keys[0], 5)
+        self.assertEqual(
+            await self.store.account(self.make_plan()),
+            cache.CacheUsage(ttl_seconds=300, read_tokens=8),
+        )
+        self.assertGreaterEqual(await client.ttl(short.page_keys[0]), 298)
+        self.assertGreaterEqual(await client.ttl(long.page_keys[0]), 3598)
+
+    async def test_ttl_tiers_never_read_each_other_in_either_order(self):
+        for first_ttl, second_ttl in ((300, 3600), (3600, 300)):
+            with self.subTest(first_ttl=first_ttl):
+                namespace = f"{self.namespace}:{first_ttl}"
+                first = plan(
+                    list(range(513)),
+                    namespace=namespace,
+                    ttl=first_ttl,
+                    page_size=cache.CACHE_BLOCK_SIZE,
+                )
+                second = plan(
+                    list(range(513)),
+                    namespace=namespace,
+                    ttl=second_ttl,
+                    page_size=cache.CACHE_BLOCK_SIZE,
+                )
+                expected_first = cache.CacheUsage(
+                    ttl_seconds=first_ttl, write_tokens=512
+                )
+                expected_second = cache.CacheUsage(
+                    ttl_seconds=second_ttl, write_tokens=512
+                )
+                self.assertEqual(await self.store.account(first), expected_first)
+                self.assertEqual(await self.store.account(second), expected_second)
+                for ttl in (300, 3600):
+                    following = plan(
+                        list(range(513)),
+                        namespace=namespace,
+                        ttl=ttl,
+                        page_size=cache.CACHE_BLOCK_SIZE,
+                    )
+                    self.assertEqual(
+                        await self.store.account(following),
+                        cache.CacheUsage(ttl_seconds=ttl, read_tokens=512),
+                    )
+
+    async def test_renewing_either_ttl_tier_leaves_other_tier_expiration_untouched(
+        self,
+    ):
+        client = self.store._client()
+        for selected_ttl, other_ttl in ((300, 3600), (3600, 300)):
+            with self.subTest(selected_ttl=selected_ttl):
+                namespace = f"{self.namespace}:renew:{selected_ttl}"
+                selected = plan(list(range(9)), namespace=namespace, ttl=selected_ttl)
+                other = plan(list(range(9)), namespace=namespace, ttl=other_ttl)
+                await self.store.account(selected)
+                await self.store.account(other)
+                for key in (*selected.page_keys, *other.page_keys):
+                    await client.expire(key, 5)
+                following = plan(
+                    list(range(9)),
+                    namespace=namespace,
+                    ttl=selected_ttl,
+                )
+                self.assertEqual(
+                    await self.store.account(following),
+                    cache.CacheUsage(ttl_seconds=selected_ttl, read_tokens=8),
+                )
+                for key in selected.page_keys:
+                    self.assertGreaterEqual(await client.ttl(key), selected_ttl - 2)
+                for key in other.page_keys:
+                    self.assertTrue(0 < await client.ttl(key) <= 5)
+
+    async def test_expired_pages_are_created_again(self):
+        first = self.make_plan()
+        await self.store.account(first)
+        for key in first.page_keys:
+            await self.store._client().pexpire(key, 1)
+        await asyncio.sleep(0.02)
+        self.assertEqual(
+            await self.store.account(self.make_plan()),
+            cache.CacheUsage(ttl_seconds=300, write_tokens=8),
+        )
+
+    async def test_only_longest_continuous_prefix_is_read(self):
+        initial = self.make_plan(13)
+        await self.store.account(initial)
+        await self.store._client().delete(initial.page_keys[1])
+        self.assertEqual(
+            await self.store.account(self.make_plan(13)),
+            cache.CacheUsage(ttl_seconds=300, read_tokens=4, write_tokens=8),
+        )
+
+    async def test_concurrent_requests_have_one_creator(self):
+        results = await asyncio.gather(
+            *(self.store.account(self.make_plan()) for _ in range(20))
+        )
+        self.assertEqual(sum(result.write_tokens for result in results), 8)
+        self.assertEqual(sum(result.read_tokens for result in results), 19 * 8)
+        self.assertTrue(all(result.ttl_seconds == 300 for result in results))
+        self.assertTrue(
+            all(result.read_tokens + result.write_tokens == 8 for result in results)
+        )
+
+    async def test_invalid_key_type_is_checked_before_any_page_mutation(self):
+        original = self.make_plan()
+        client = self.store._client()
+        await client.hset(original.page_keys[1], "corrupt", "value")
+        with self.assertRaises(cache.CacheAccountingError):
+            await self.store.account(original)
+        self.assertEqual(await client.exists(original.page_keys[0]), 0)
+
+    async def test_fixed_256_block_failure_does_not_return_usage_or_mutate_pages(self):
+        original = self.make_plan(769, page_size=cache.CACHE_BLOCK_SIZE)
+        client = self.store._client()
+        await client.set(original.page_keys[0], "1", ex=5)
+        await client.hset(original.page_keys[1], "corrupt", "value")
+        with self.assertRaises(cache.CacheAccountingError):
+            await self.store.account(original)
+        self.assertTrue(0 < await client.ttl(original.page_keys[0]) <= 5)
+        self.assertEqual(await client.hget(original.page_keys[1], "corrupt"), b"value")
+        self.assertEqual(await client.exists(original.page_keys[2]), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
