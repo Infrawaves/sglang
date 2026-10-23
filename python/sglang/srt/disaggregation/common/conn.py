@@ -333,7 +333,6 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
-    requires_transfer_drain = False
     # Prefill-side source-buffer lease tracker; only Mooncake prefill sets it.
     _transfer_lifetime: Optional[TransferLifetimeTracker] = None
 

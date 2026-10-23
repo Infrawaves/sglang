@@ -1166,7 +1166,7 @@ class KimiK3ImageProcessor(
     @staticmethod
     def _resolve_visual_modalities(request_obj, image_count, video_count):
         modalities = []
-        for modality in getattr(request_obj, "modalities", None) or []:
+        for modality in request_obj.modalities or []:
             if isinstance(modality, list):
                 modalities.extend(modality)
             else:
@@ -1588,7 +1588,7 @@ class KimiK3ImageProcessor(
         self, image_data, input_text, request_obj, **kwargs
     ):
         """Uncached path; under the "auto" budget, pick the backend first."""
-        video_data = getattr(request_obj, "video_data", None)
+        video_data = request_obj.video_data
         staged = (
             await self._stage_raw_images(list(image_data or []))
             if self._gpu_preprocess_budget_bytes is not None and not video_data
@@ -1619,7 +1619,7 @@ class KimiK3ImageProcessor(
     ):
         """Compatibility path for precomputed inputs and lightweight test stubs."""
         image_data = list(image_data or [])
-        video_data = list(getattr(request_obj, "video_data", None) or [])
+        video_data = list(request_obj.video_data or [])
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
@@ -1648,8 +1648,8 @@ class KimiK3ImageProcessor(
                 multimodal_tokens=self.mm_tokens,
                 discard_alpha_channel=False,
             )
-        loaded_images = list(getattr(base_output, "images", None) or [])
-        loaded_videos = list(getattr(base_output, "videos", None) or [])
+        loaded_images = list(base_output.images or [])
+        loaded_videos = list(base_output.videos or [])
         if len(loaded_images) != expected_image_count or len(loaded_videos) != len(
             video_data
         ):
@@ -1715,7 +1715,7 @@ class KimiK3ImageProcessor(
                         "Kimi-K3 video request rid=%s source_index=%d "
                         "duration=%.1fs source_frames=%d avg_fps=%.2f "
                         "sampled_frames=%d chunks=%d total_sampled_frames=%d",
-                        getattr(request_obj, "rid", None),
+                        request_obj.rid,
                         source_index,
                         total_frames / avg_fps if avg_fps > 0 else float("nan"),
                         total_frames,
@@ -1783,16 +1783,14 @@ class KimiK3ImageProcessor(
         *args,
         **kwargs,
     ):
-        audio_data = kwargs.get("audio_data") or getattr(
-            request_obj, "audio_data", None
-        )
+        audio_data = kwargs.get("audio_data") or request_obj.audio_data
         if audio_data:
             raise ValueError(
                 "Kimi-K3 supports image and video input (without audio track) only"
             )
 
         image_data = list(image_data or [])
-        video_data = list(getattr(request_obj, "video_data", None) or [])
+        video_data = list(request_obj.video_data or [])
         expected_image_count = len(image_data or [])
         expected_media_count = expected_image_count + len(video_data)
         placeholder_count = self.count_image_placeholders(

@@ -2872,22 +2872,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
+                kv_mgr = decode_req.kv_receiver.kv_mgr
                 requires_host_drain = (
                     self.enable_host_receive and decode_req.host_staged
                 )
                 # Mooncake must always drain a receiver whose destinations were
                 # published; one with none (e.g. a FakeKVReceiver health check)
                 # has nothing in flight and releases at once.
-                requires_transfer_drain = getattr(
-                    kv_mgr, "requires_transfer_drain", False
-                ) and bool(getattr(decode_req.kv_receiver, "bootstrap_infos", None))
+                requires_transfer_drain = kv_mgr.requires_transfer_drain and bool(
+                    getattr(decode_req.kv_receiver, "bootstrap_infos", None)
+                )
                 if (
                     requires_host_drain
                     or requires_transfer_drain
                     or (
                         self.enable_deferred_kv_release
-                        and getattr(kv_mgr, "enable_deferred_decode_kv_release", False)
+                        and kv_mgr.enable_deferred_decode_kv_release
                     )
                 ):
                     # A failure decode did not initiate (prefill fault, transport
@@ -2994,12 +2994,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
         receiver = decode_req.kv_receiver
-        if getattr(receiver.kv_mgr, "requires_transfer_drain", False):
+        if receiver.kv_mgr.requires_transfer_drain:
             # A skipped nonblocking send should not wait for a 30s warning.
             # Once accepted, allow the normal ACK wait before retrying.
             delay = (
                 min(max(self.deferred_kv_release_timeout, 0.05), 60.0)
-                if getattr(receiver, "abort_notified", False)
+                if receiver.abort_notified
                 else 0.05
             )
         else:
@@ -3013,7 +3013,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # Require an ack from every notified prefill rank (dummy-proof).
             # Snapshot now -- the receiver may be cleared by resolve time.
             # Unknown writer set (None) fails closed.
-            bootstrap_infos = getattr(receiver, "bootstrap_infos", None)
+            bootstrap_infos = receiver.bootstrap_infos
             required_acks = len(bootstrap_infos) if bootstrap_infos else None
         self._deferred_releases.append(
             (
@@ -3028,15 +3028,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _retry_deferred_abort(
         self, decode_req: DecodeRequest, now: float, warning_deadline: float
     ) -> None:
-        if now < getattr(decode_req, "_abort_retry_deadline", warning_deadline):
+        if now < decode_req._abort_retry_deadline:
             return
         receiver = decode_req.kv_receiver
-        retry_abort = getattr(receiver, "retry_abort", None)
-        if retry_abort is None:
-            return
-        sent = retry_abort()
-        if getattr(receiver.kv_mgr, "requires_transfer_drain", False):
-            delay = getattr(decode_req, "_abort_retry_interval", 0.05)
+        sent = receiver.retry_abort()
+        if receiver.kv_mgr.requires_transfer_drain:
+            delay = decode_req._abort_retry_interval
             if sent is not False:
                 # Accepted by ZMQ is not a drain ACK. Keep holding the buffers.
                 delay = max(
