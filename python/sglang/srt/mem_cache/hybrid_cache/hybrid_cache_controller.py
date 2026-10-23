@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -207,7 +208,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
-        mla_dedup_context: Optional[Any] = None,
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         startup_storage_backend = storage_backend
         # The MLA anchor host buffer is another rank's copy (shared or none):
@@ -241,7 +242,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
-            mla_dedup_context=mla_dedup_context,
+            node_leader_broadcast=node_leader_broadcast,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -757,7 +758,10 @@ class HybridCacheController(BaseHiCacheController):
             host_indices,
             device_indices,
             pool_transfers,
-            include_anchor=self.mla_dedup is None or not self.mla_dedup.is_follower,
+            include_anchor=(
+                self.node_leader_broadcast is None
+                or not self.node_leader_broadcast.is_follower
+            ),
         )
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers

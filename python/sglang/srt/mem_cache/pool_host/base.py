@@ -226,8 +226,8 @@ class HostKVCache(abc.ABC):
                 device_capacity,
             )
 
-        # Verify there is enough available host memory. A read-only pool maps
-        # the node leader's copy and allocates nothing, so it skips the check.
+        # The leader budgets the shared allocation; a follower's mapping is
+        # not a second copy. Keep the available-memory check on the owner.
         requested_bytes = self.size * self.size_per_token
         available_bytes = (
             requested_bytes

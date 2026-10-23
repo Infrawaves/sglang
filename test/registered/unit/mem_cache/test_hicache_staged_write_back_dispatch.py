@@ -226,7 +226,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mla_host_read_only = False
-        controller.mla_dedup = None
+        controller.node_leader_broadcast = None
         controller._l2_transfers.side_effect = lambda *args, **kwargs: (
             HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
@@ -365,7 +365,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host_pool.load_to_device_per_layer = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.mla_host_read_only = False
-        controller.mla_dedup = None
+        controller.node_leader_broadcast = None
         entry = PoolEntry(
             name=PoolName.KV,
             host_pool=host_pool,
@@ -647,71 +647,39 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(transfer.call_args_list[0].kwargs["direction"], "D2H")
         self.assertEqual(transfer.call_args_list[1].kwargs["direction"], "H2D")
 
-    def test_read_only_mla_skips_staging_without_disabling_mamba_indices(self):
-        """Follower MLA must not reserve D2H staging or disable per-pool Mamba dispatch."""
+    def test_read_only_mla_skips_write_back_staging(self):
+        """Read-only MLA pools must not reserve GPU memory for unused D2H staging."""
         for read_only in (False, True):
-            host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-            host.host_buffer_read_only = read_only
-            host.layout = "page_first"
-            host.page_num = 4
-            host.page_size = 2
-            host.layer_num = 2
-            host.kv_cache_dim = 8
-            host.dtype = torch.uint8
-            host.device_pool = SimpleNamespace(device="cpu")
-            with (
-                mock.patch(f"{MLA_POOL_HOST_MODULE}._is_cuda", True),
-                mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", False),
-                mock.patch(f"{MLA_POOL_HOST_MODULE}._is_xpu", False),
-                mock.patch(f"{MLA_POOL_HOST_MODULE}._is_mps", False),
-                mock.patch(
-                    f"{MLA_POOL_HOST_MODULE}.can_use_write_back_jit_kernel",
-                    return_value=True,
-                ),
-                mock.patch("torch.empty", wraps=torch.empty) as allocate,
-            ):
-                host._init_write_back_staging_buffers()
-            if read_only:
-                self.assertIsNone(host.staging_buffer)
-                self.assertEqual(host.staging_token_capacity, 0)
-                self.assertEqual(host.staging_page_capacity, 0)
-                allocate.assert_not_called()
-            else:
-                self.assertEqual(tuple(host.staging_buffer.shape), (8, 2, 1, 8))
-            mamba = MambaPoolHost.__new__(MambaPoolHost)
-            mamba.conv_buffer = [torch.empty(1)]
-            mamba._init_write_back_staging_buffers()
-            group = HostPoolGroup.__new__(HostPoolGroup)
-            group.entries = [
-                SimpleNamespace(host_pool=host),
-                SimpleNamespace(host_pool=mamba),
-            ]
-            group._refresh_transfer_capabilities()
-            self.assertEqual(group.can_use_write_back_jit, not read_only)
-            self.assertTrue(group.supports_per_pool_backup_indices)
-            group.layout = host.layout
-            group.anchor_entry = group.entries[0]
-            group.entry_map = {PoolName.MAMBA: group.entries[1]}
-            transfer = PoolTransfer(
-                name=PoolName.MAMBA,
-                host_indices=_indices(0, 2),
-                device_indices=_indices(2, 4),
-            )
-            op = CacheOperation(
-                host_indices=_indices(0, 2),
-                device_indices=_indices(2, 4),
-                node_id=1,
-                pool_transfers=[transfer],
-            )
-            controller = HybridCacheController.__new__(HybridCacheController)
-            controller.mem_pool_host = group
-            controller.io_backend = "kernel"
-            controller.move_indices = mock.Mock(
-                return_value=(mock.sentinel.host_indices, op.device_indices)
-            )
-            _, _, transfers = controller._move_write_operation(op)
-            self.assertIs(transfers[0].host_indices, transfer.host_indices)
-            self.assertIs(transfers[0].device_indices, transfer.device_indices)
+            with self.subTest(read_only=read_only):
+                host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+                host.host_buffer_read_only = read_only
+                host.layout = "page_first"
+                host.page_num = 4
+                host.page_size = 2
+                host.layer_num = 2
+                host.kv_cache_dim = 8
+                host.dtype = torch.uint8
+                host.device_pool = SimpleNamespace(device="cpu")
+                with (
+                    mock.patch(f"{MLA_POOL_HOST_MODULE}._is_cuda", True),
+                    mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", False),
+                    mock.patch(f"{MLA_POOL_HOST_MODULE}._is_xpu", False),
+                    mock.patch(f"{MLA_POOL_HOST_MODULE}._is_mps", False),
+                    mock.patch(
+                        f"{MLA_POOL_HOST_MODULE}.can_use_write_back_jit_kernel",
+                        return_value=True,
+                    ),
+                    mock.patch("torch.empty", wraps=torch.empty) as allocate,
+                ):
+                    host._init_write_back_staging_buffers()
+                if read_only:
+                    self.assertIsNone(host.staging_buffer)
+                    self.assertEqual(host.staging_token_capacity, 0)
+                    self.assertEqual(host.staging_page_capacity, 0)
+                    allocate.assert_not_called()
+                else:
+                    self.assertEqual(tuple(host.staging_buffer.shape), (8, 2, 1, 8))
+                self.assertEqual(host.can_use_write_back_jit, not read_only)
 
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2

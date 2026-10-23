@@ -4273,8 +4273,7 @@ class HybridLinearKVPool(KVCache):
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.
-        # Wait before the id swap: the counter is keyed by the model layer id.
-        # The inner pool's counter is None, so its own read does not wait.
+        # Wait on the model layer id, before _transfer_id_context rewrites it.
         self._wait_for_layer(layer.layer_id)
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)

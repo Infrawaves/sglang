@@ -14,10 +14,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.hicache_hook import (
-    MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR,
-)
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -37,6 +33,15 @@ logger = logging.getLogger(__name__)
 # carrying a bad policy is rejected before it can touch the controller.
 _PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
 _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
+
+
+def validate_runtime_storage_update() -> None:
+    if get_memory().enable_mla_hicache_per_node:
+        raise ValueError(
+            "HiCache L3 configuration is startup-only when "
+            "--enable-mla-hicache-per-node is set; runtime attach, detach, "
+            "and policy updates are not supported. Configure storage at launch."
+        )
 
 
 class StorageAttachment:
@@ -146,7 +151,7 @@ class StorageAttachment:
         return True, "Attached HiCache storage backend successfully."
 
     def detach(self) -> tuple[bool, str]:
-        """Disable the storage backend at runtime.
+        """Disable the storage backend for runtime detach or shutdown.
 
         The caller must ensure there are no running or queued requests. Ordering
         matters and is the reason this is not just ``controller.detach()``:
@@ -337,13 +342,6 @@ class StorageAttachment:
                 f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                 f"Expected one of {list(_WRITE_POLICIES)}."
             )
-        # Keyed on config, not mla_host_read_only, so leader and followers agree.
-        if (
-            hicache_write_policy == "write_back"
-            and get_memory().enable_mla_hicache_per_node
-            and envs.SGLANG_MLA_HICACHE_PER_NODE_MODE.get() == "shm"
-        ):
-            return MLA_HICACHE_PER_NODE_SHM_WRITE_BACK_ERROR
         return None
 
     def _apply_policies(
