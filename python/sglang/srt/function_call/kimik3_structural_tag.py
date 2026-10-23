@@ -24,6 +24,7 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -628,11 +629,20 @@ def get_kimik3_structural_tag(
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
+        # EOS is masked until a call exists, so a free <|close|> lets the model
+        # repeat it forever. Only allow it as the response close before tools.
         suffix: Format = SequenceFormat(
             elements=[
                 AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    excludes=[
+                        TOOLS_OPEN,
+                        THINK_OPEN,
+                        THINK_CLOSE,
+                        CALL_OPEN,
+                        _CLOSE_TOKEN,
+                    ]
                 ),
+                OptionalFormat(content=ConstStringFormat(value=RESPONSE_CLOSE)),
                 tools_tag,
             ]
         )

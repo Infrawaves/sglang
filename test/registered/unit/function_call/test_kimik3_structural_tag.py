@@ -221,6 +221,14 @@ def test_required_allows_response_prefix_but_requires_tools():
     assert not _accepts(grammar, response)
 
 
+def test_required_close_token_commits_to_response_close():
+    structural_tag = get_kimik3_structural_tag([_tool()], tool_choice="required")
+    matcher = xgr.GrammarMatcher(_TOKEN_COMPILER.compile_structural_tag(structural_tag))
+
+    assert matcher.accept_token(_CLOSE_TOKEN_ID)
+    assert not matcher.accept_token(_CLOSE_TOKEN_ID)
+
+
 def test_auto_allows_plain_response_or_multiple_tool_calls():
     grammar = _grammar([_tool(), _tool("forecast")])
     plain = (
