@@ -2133,6 +2133,11 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def qkv_proj_fusion_target(self) -> Optional[nn.Module]:
+        if self.use_full_rank_gate and not _is_hip:
+            return self.fused_qkvg_proj
+        return None
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2445,6 +2450,11 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _gated_o_proj_forward
 
+    def qkv_proj_fusion_target(self) -> Optional[nn.Module]:
+        if self.has_fused_proj and self.q_lora_rank is not None:
+            return self.fused_qkv_a_proj_with_mqa
+        return None
+
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
         from torch.nn.parameter import UninitializedParameter
@@ -2592,6 +2602,16 @@ class KimiK3DecoderLayer(nn.Module):
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the layer's own AR call-site must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+
+        # SP-MoE layers receive a token shard; this projection may then consume
+        # it through the fused all-gather + GEMM instead of a separate AG.
+        qkv_proj = self.self_attn.qkv_proj_fusion_target() if self._sp_moe else None
+        self._qkv_proj_fusion_target = (
+            qkv_proj
+            if qkv_proj is not None
+            and k3_sp_collective.install_qkv_proj_wrapper(qkv_proj)
+            else None
+        )
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -2824,7 +2844,30 @@ class KimiK3DecoderLayer(nn.Module):
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
         # the fast kernel; standalone copy on other paths). ----
-        if input_sharded:
+        ag_input = None
+        if input_sharded and self._qkv_proj_fusion_target is not None:
+            ag_input = k3_sp_collective.ag_qkv_proj_input(
+                self._qkv_proj_fusion_target, hidden_states.shape[0]
+            )
+        fused_qkv = None
+        if ag_input is not None:
+            # Aggregate/norm only this rank's rows straight into its slot of
+            # the gathered input; the fused kernel all-gathers and runs qkv_proj.
+            hidden_states, prefix_sum = attn_res.forward(
+                hidden_states,
+                prefix_sum,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                rows=_sp_local_rows(hidden_states),
+                write=self.is_block_write_layer,
+                out=ag_input,
+            )
+            fused_qkv = k3_sp_collective.ag_qkv_proj(
+                self._qkv_proj_fusion_target, hidden_states
+            )
+            hidden_states = fused_qkv.hidden_states
+        elif input_sharded:
             assert self._sp_moe
             input_rows = _sp_local_rows(hidden_states)
             fused_ag = attn_res.forward_sp_all_gather(
@@ -2863,12 +2906,15 @@ class KimiK3DecoderLayer(nn.Module):
         if self.is_block_write_layer:
             prefix_sum = None
 
+        qkv_proj_call_context = nullcontext()
+        if fused_qkv is not None:
+            qkv_proj_call_context = k3_sp_collective.qkv_proj_fusion_call(fused_qkv)
         o_proj_call_context = nullcontext(None)
         if self._sp_moe and not forward_batch.forward_mode.is_idle():
             o_proj_call_context = k3_sp_collective.o_proj_fusion_call(
                 prefix_sum, hidden_states.shape[0]
             )
-        with o_proj_call_context as o_proj_call:
+        with qkv_proj_call_context, o_proj_call_context as o_proj_call:
             hidden_states = self._run_self_attn(
                 hidden_states,
                 positions,
@@ -3084,9 +3130,13 @@ class KimiK3LinearModel(nn.Module):
         # Carry the raw residual stream as a token shard across consecutive
         # SP-MoE layers. PP transfer and dspark capture require full tensors,
         # so those uncommon paths keep the established gather-per-layer flow.
+        # GEMM fusion shards the residual itself, so its AG can fuse with the
+        # next layer's qkv_proj.
         sp_attn_res = (
             attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
+            and (
+                envs.SGLANG_K3_SP_ATTN_RES.get() or envs.SGLANG_K3_SP_GEMM_FUSION.get()
+            )
             and self.pp_group.world_size == 1
             and self.dspark_layers_to_capture is None
             and k3_sp_collective.enabled()

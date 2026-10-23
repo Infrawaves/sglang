@@ -1,4 +1,5 @@
-"""Kimi-K3's optional o_proj + reduce-scatter + prefix-add adapter."""
+"""Kimi-K3's optional o_proj + reduce-scatter + prefix-add and all-gather +
+qkv_proj adapters."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import torch
 from sglang.srt.runtime_context import get_disagg, get_exec, get_forward, get_lora
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.communication import ag_gemm
     from sglang.kernels.ops.communication.gemm_rs_prefix_add import DispatchTable
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
@@ -22,6 +24,12 @@ logger = logging.getLogger(__name__)
 class FusedOProjOutput(NamedTuple):
     output: torch.Tensor
     shard_start_row: int
+
+
+class FusedQKVProjOutput(NamedTuple):
+    # [M, N] qkv_proj output and the [M, K] all-gathered input it consumed.
+    output: torch.Tensor
+    hidden_states: torch.Tensor
 
 
 @dataclass
@@ -55,9 +63,23 @@ def use_o_proj_fusion_call(
         _CURRENT_O_PROJ_FUSION_CALL.reset(token)
 
 
-def create_gemm_fusion_manager(
-    group: GroupCoordinator, hidden_size: int
-) -> Optional[K3SPGemmFusionManager]:
+_CURRENT_QKV_PROJ_FUSION_OUTPUT: ContextVar[Optional[FusedQKVProjOutput]] = ContextVar(
+    "k3_sp_qkv_proj_fusion_output", default=None
+)
+
+
+@contextmanager
+def use_qkv_proj_fusion_output(fused_output: FusedQKVProjOutput):
+    """Hand the decoder's fused AG + GEMM result to qkv_proj for the enclosed
+    attention call; ``try_fused_qkv_proj`` returns it instead of the GEMM."""
+    token = _CURRENT_QKV_PROJ_FUSION_OUTPUT.set(fused_output)
+    try:
+        yield
+    finally:
+        _CURRENT_QKV_PROJ_FUSION_OUTPUT.reset(token)
+
+
+def _load_fusion_ops(feature: str, op_names: tuple[str, ...]) -> bool:
     execution_config = get_exec()
     unsupported_runtime_features = [
         name
@@ -75,43 +97,54 @@ def create_gemm_fusion_manager(
     ]
     if unsupported_runtime_features:
         logger.warning(
-            "K3 SP GEMM fusion disabled; unsupported execution configuration: %s",
+            "%s disabled; unsupported execution configuration: %s",
+            feature,
             ", ".join(unsupported_runtime_features),
         )
-        return None
+        return False
 
     try:
         # Importing the package loads its extension, which registers
         # torch.ops.mega_ops in this TP worker.
         import mega_ops  # noqa: F401
     except ImportError as exc:
-        logger.warning("K3 SP GEMM fusion disabled; cannot import mega_ops: %s", exc)
-        return None
-    missing_ops = [
-        name
-        for name in (
+        logger.warning("%s disabled; cannot import mega_ops: %s", feature, exc)
+        return False
+    missing_ops = [name for name in op_names if not hasattr(torch.ops.mega_ops, name)]
+    if missing_ops:
+        logger.warning(
+            "%s disabled; torch.ops.mega_ops is missing: %s",
+            feature,
+            ", ".join(missing_ops),
+        )
+        return False
+    return True
+
+
+def _device_name(group: GroupCoordinator) -> str:
+    return torch.cuda.get_device_name(group.device).replace(" ", "_").replace("/", "_")
+
+
+def create_gemm_fusion_manager(
+    group: GroupCoordinator, hidden_size: int
+) -> Optional[K3SPGemmFusionManager]:
+    if not _load_fusion_ops(
+        "K3 SP GEMM fusion",
+        (
             "sm100_device_uuid",
             "sm100_check_peer_access",
             "sm100_resident_cluster_capacity",
             "sm100_gemm_rs_prefix_add_pull",
             "sm100_gemm_rs_prefix_add_push",
-        )
-        if not hasattr(torch.ops.mega_ops, name)
-    ]
-    if missing_ops:
-        logger.warning(
-            "K3 SP GEMM fusion disabled; torch.ops.mega_ops is missing: %s",
-            ", ".join(missing_ops),
-        )
+        ),
+    ):
         return None
 
     from sglang.kernels.ops.communication.gemm_rs_prefix_add import (
         load_dispatch_table,
     )
 
-    device_name = (
-        torch.cuda.get_device_name(group.device).replace(" ", "_").replace("/", "_")
-    )
+    device_name = _device_name(group)
     dispatch_table = load_dispatch_table(group.world_size, hidden_size, device_name)
     if dispatch_table is None:
         logger.warning(
@@ -253,3 +286,150 @@ class K3SPGemmFusionManager:
             output, self.group.rank_in_group * num_local_tokens
         )
         return output, None
+
+
+def create_ag_gemm_fusion_manager(
+    group: GroupCoordinator, hidden_size: int
+) -> Optional[K3SPAgGemmFusionManager]:
+    if not _load_fusion_ops(
+        "K3 SP AG GEMM fusion",
+        (
+            "sm100_device_uuid",
+            "sm100_check_peer_access",
+            "sm100_ag_gemm_resident_cluster_capacity",
+            "sm100_ag_gemm_pull",
+        ),
+    ):
+        return None
+    return K3SPAgGemmFusionManager(group, hidden_size)
+
+
+class K3SPAgGemmFusionManager:
+    def __init__(self, group: GroupCoordinator, hidden_size: int):
+        self.group = group
+        self.hidden_size = hidden_size
+        self.device = torch.device(group.device)
+        # qkv_proj N -> DispatchTable; None caches a missing table.
+        self.dispatch_tables: dict[int, Optional[ag_gemm.DispatchTable]] = {}
+        self.ag_gemm_operator = None
+        # (M, N) -> DispatchConfig for every shape prepared on the operator.
+        self._prepared_dispatch = {}
+
+    def supports(self, qkv_proj) -> bool:
+        from sglang.srt.layers.linear import (
+            MergedColumnParallelLinear,
+            ReplicatedLinear,
+        )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return (
+            type(qkv_proj) in (MergedColumnParallelLinear, ReplicatedLinear)
+            and type(qkv_proj.quant_method) is UnquantizedLinearMethod
+            and not qkv_proj.skip_bias_add
+            and qkv_proj.bias is None
+            and qkv_proj.scheme is None
+            and qkv_proj.input_size == self.hidden_size
+            and qkv_proj.weight.dtype == torch.bfloat16
+        )
+
+    def register(self, qkv_proj) -> bool:
+        """Load the table for this projection's N; layers register at build time."""
+        if not self.supports(qkv_proj):
+            return False
+        n = qkv_proj.weight.shape[0]
+        if n not in self.dispatch_tables:
+            from sglang.kernels.ops.communication.ag_gemm import load_dispatch_table
+
+            device_name = _device_name(self.group)
+            self.dispatch_tables[n] = load_dispatch_table(
+                self.group.world_size, self.hidden_size, n, device_name
+            )
+            if self.dispatch_tables[n] is None:
+                logger.warning(
+                    "K3 SP AG GEMM fusion has no table for TP%d N=%d on %s; "
+                    "using native all-gather + qkv_proj.",
+                    self.group.world_size,
+                    n,
+                    device_name,
+                )
+        return self.dispatch_tables[n] is not None
+
+    def prepare(self, max_m: int) -> None:
+        dispatch_configs = {
+            (m, n): dispatch
+            for n, dispatch_table in self.dispatch_tables.items()
+            if dispatch_table is not None
+            for m, dispatch in dispatch_table.configs.items()
+            if m <= max_m and dispatch.mode != "baseline"
+        }
+        if not dispatch_configs:
+            return
+
+        from sglang.kernels.ops.communication.ag_gemm import AgGemm
+
+        max_fused_m = max(m for m, _ in dispatch_configs)
+        with torch.inference_mode(False), torch.cuda.device(self.device):
+            self.ag_gemm_operator = AgGemm(
+                self.group.cpu_group,
+                self.group.rank_in_group,
+                self.group.world_size,
+                max_fused_m,
+                self.hidden_size,
+                self.device,
+                {dispatch.kernel for dispatch in dispatch_configs.values()},
+            )
+            for (m, n), dispatch in sorted(dispatch_configs.items()):
+                self.ag_gemm_operator.prepare(m, n, dispatch)
+            torch.cuda.current_stream(self.device).synchronize()
+        self._prepared_dispatch = dispatch_configs
+        logger.info(
+            "K3 SP AG GEMM fusion prepared (TP%d, (M, N)=%s)",
+            self.group.world_size,
+            sorted(dispatch_configs),
+        )
+
+    def _dispatch_for(self, m: int, n: int):
+        dispatch = self._prepared_dispatch.get((m, n))
+        if dispatch is not None:
+            return dispatch
+        if self.ag_gemm_operator is None or m > self.ag_gemm_operator.layout.max_m:
+            return None
+        dispatch_table = self.dispatch_tables.get(n)
+        dispatch = None if dispatch_table is None else dispatch_table.select(m)
+        # Skip stream capture and baseline path.
+        if dispatch is None or torch.cuda.is_current_stream_capturing():
+            return None
+        with torch.inference_mode(False), torch.cuda.device(self.device):
+            self.ag_gemm_operator.prepare(m, n, dispatch)
+        self._prepared_dispatch[m, n] = dispatch
+        return dispatch
+
+    def local_input_shard(
+        self, qkv_proj, num_shard_tokens: int
+    ) -> Optional[torch.Tensor]:
+        if get_forward().sp_active:
+            return None
+        m = num_shard_tokens * self.group.world_size
+        if self._dispatch_for(m, qkv_proj.weight.shape[0]) is None:
+            return None
+        return self.ag_gemm_operator.local_input_shard(m)
+
+    def fused_qkv_proj(self, qkv_proj, local_input: torch.Tensor) -> FusedQKVProjOutput:
+        m = local_input.shape[0] * self.group.world_size
+        n = qkv_proj.weight.shape[0]
+        dispatch = self._prepared_dispatch[m, n]
+        output = torch.empty((m, n), device=self.device, dtype=local_input.dtype)
+        self.ag_gemm_operator(local_input, qkv_proj.weight, output, dispatch)
+        return FusedQKVProjOutput(output, self.ag_gemm_operator.gathered_input(m))
+
+    def try_fused_qkv_proj(self, hidden_states: torch.Tensor):
+        fused_output = _CURRENT_QKV_PROJ_FUSION_OUTPUT.get()
+        # Only the gathered input itself, or the real-row prefix attention
+        # trims it to, was multiplied by the fused kernel.
+        if (
+            fused_output is None
+            or hidden_states.data_ptr() != fused_output.hidden_states.data_ptr()
+            or hidden_states.shape[0] > fused_output.output.shape[0]
+        ):
+            return None
+        return fused_output.output[: hidden_states.shape[0]], None

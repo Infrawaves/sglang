@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "match": {
+    "device_name": "NVIDIA_B300_SXM6_AC",
+    "world_size": 8,
+    "k": 7168,
+    "n": 2112,
+    "dtype": "bfloat16"
+  },
+  "selection": {
+    "rule": "floor_m",
+    "fallback": "baseline"
+  },
+  "source": {
+    "device": "NVIDIA B300 SXM6 AC",
+    "gpus_per_node": 8,
+    "consumer": "MLA fused_qkv_a_proj_with_mqa",
+    "note": "B300 TP8, K=7168, N=2112, AG + GEMM, ms (nccl / fused pull): 2048 0.106/0.211; 4096 0.212/0.243; 8192 0.339/0.322; 12288 0.496/0.396; 16384 0.640/0.468. Native baseline below 8K, fused pull from 8K."
+  },
+  "validation": {
+    "shared_workspace_gpu_validated": false,
+    "note": "Only tile_shape [256, 128] with cluster_hidden 2 was measured; the 8K win is about 5%."
+  },
+  "configs": {
+    "512": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "1024": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "2048": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "4096": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "8192": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
+    },
+    "12288": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
+    },
+    "16384": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
+    }
+  }
+}
