@@ -681,6 +681,8 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # The decoder owns the reduction of the attention output projection.
+        "defer_attn_output_reduce": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -698,6 +700,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "defer_attn_output_reduce",
         }
     )
 

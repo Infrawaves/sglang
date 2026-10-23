@@ -346,7 +346,7 @@ def aggregate_stream(
     """Pre-norm aggregated stream value (softmax mixture, no output norm):
     the K3 analogue of the residual stream, for dspark aux capture -- the
     raw wire only carries the current block's running prefix."""
-    if nvb == 0:
+    if nvb == 0 or prefix_sum.shape[0] == 0:
         return prefix_sum
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
@@ -452,8 +452,13 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        num_tokens: Optional[int] = None,
+        inherited_rows: Optional[slice] = None,
     ) -> None:
-        num_tokens, hidden_size = hidden_states.shape
+        local_tokens, hidden_size = hidden_states.shape
+        if num_tokens is None:
+            num_tokens = local_tokens
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
@@ -462,7 +467,10 @@ class AttnResidual:
         self.num_valid_blocks = 0
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
-            self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
+            bank = self.block_residual
+            if inherited_rows is not None:
+                bank = bank[inherited_rows]
+            bank[:, : self.num_valid_blocks, :].copy_(block_residual)
 
     def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None:
         """Snapshot the pre-attention prefix into the next bank row.
@@ -489,6 +497,14 @@ class AttnResidual:
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
         nvb = self.num_valid_blocks
+        if hidden_states.shape[0] == 0:
+            # Empty SP ranks share the same snapshot schedule, but have no
+            # rows to aggregate or normalize.
+            prefix = hidden_states if prefix_sum is None else prefix_sum + hidden_states
+            if write:
+                self.write(prefix, rows)
+            return hidden_states, prefix
+
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None
@@ -549,6 +565,10 @@ class AttnResidual:
         write: bool = False,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Fuse a local aggregation point and the following row all-gather."""
+        from sglang.srt.layers.communication import k3_sp_collective
+
+        if not k3_sp_collective.enabled():
+            return None
         nvb = self.num_valid_blocks
         if nvb == 0:
             return None
@@ -558,8 +578,6 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers.communication import k3_sp_collective
-
         normed = k3_sp_collective.attn_res_all_gather(
             prefix,
             bank,
