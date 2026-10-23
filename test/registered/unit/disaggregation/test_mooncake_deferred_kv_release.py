@@ -42,6 +42,7 @@ def _manager(
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
     manager.enable_deferred_decode_kv_release = enabled
+    manager._abort_drain_lock = threading.RLock()
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()

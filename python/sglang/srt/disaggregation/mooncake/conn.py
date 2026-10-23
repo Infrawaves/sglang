@@ -260,8 +260,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
-    # Orders the drained-abort check against admission; held only briefly.
-    _abort_drain_lock = threading.RLock()
     requires_transfer_drain = True
 
     def __init__(
@@ -283,6 +281,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.enable_deferred_decode_kv_release = True
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._transfer_lifetime = TransferLifetimeTracker()
+        # Orders the drained-abort check against admission; held only briefly.
+        self._abort_drain_lock = threading.RLock()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()

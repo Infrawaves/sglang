@@ -271,6 +271,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
                 manager.attn_cp_size = 1
                 manager.attn_cp_rank = 0
                 manager._transfer_lifetime = TransferLifetimeTracker()
+                manager._abort_drain_lock = threading.RLock()
                 manager._deferred_ack_targets = {}
                 manager._deferred_ack_poisoned_rooms = set()
                 manager._staging_outstanding = defaultdict(int)
