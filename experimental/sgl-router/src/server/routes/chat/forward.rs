@@ -235,7 +235,17 @@ fn spawn_prefill_request(
             .await
         {
             Ok(response) if response.status().is_success() => Ok(()),
-            Ok(response) => Err(ApiError::PrefillFailed { status: response.status() }),
+            Ok(response) => {
+                let status = response.status();
+                // forward_json_to already buffered and capped the error body,
+                // so collecting it here cannot block or grow.
+                let body = if status.is_client_error() {
+                    axum::body::to_bytes(response.into_body(), usize::MAX).await.ok()
+                } else {
+                    None
+                };
+                Err(ApiError::PrefillFailed { status, body })
+            }
             Err(error) => Err(error),
         };
         if let Err(error) = &result {
