@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -72,13 +73,20 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+    ):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Called on the forward stream after each wait,
+        # with (consumer index, transfer layer id).
+        self.on_layer_ready = on_layer_ready
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -94,6 +102,8 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if self.on_layer_ready is not None:
+            self.on_layer_ready(self.consumer_index, threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -302,6 +312,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -349,7 +360,16 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        # MLA host dedup: the forward broadcasts each loaded layer as it waits for it.
+        self.node_leader_broadcast = node_leader_broadcast
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            on_layer_ready=(
+                None
+                if node_leader_broadcast is None
+                else node_leader_broadcast.broadcast_ready_layers
+            ),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -965,6 +985,10 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        if self.node_leader_broadcast is not None:
+            # Before the fence below, so the new H2D also waits for it.
+            self.node_leader_broadcast.flush_stale(producer_id, self.load_fence_stream)
+
         if self.load_fence_stream is not None:
             # in overlap scheduling, reclaimed pages might still be written by the forward thread
             # therefore a fence is needed for loading thread to prevent memory corruption
@@ -979,6 +1003,12 @@ class HiCacheController:
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.node_leader_broadcast is not None:
+            self.node_leader_broadcast.start_load(
+                index=producer_id,
+                device_indices=device_indices,
+                finish_event=completion.finish_event,
+            )
 
         self.ack_load_queue.append(
             HiCacheAck(

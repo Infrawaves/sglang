@@ -111,6 +111,25 @@ class MooncakeStoreConfig:
     tenant_id: str = DEFAULT_TENANT_ID
 
     @staticmethod
+    def load(extra_config: Optional[dict] = None) -> "MooncakeStoreConfig":
+        if extra_config and (
+            extra_config.get("master_server_address") is not None
+            or extra_config.get("client_server_address") is not None
+        ):
+            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            config = MooncakeStoreConfig.from_file()
+            logger.info("Mooncake Configuration loaded from file successfully.")
+
+        else:
+            config = MooncakeStoreConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded from env successfully.")
+
+        return config
+
+    @staticmethod
     def _resolve_local_hostname(overrides: Optional[dict] = None) -> str:
         """Resolve local_hostname for the current process.
 
@@ -304,23 +323,7 @@ class MooncakeBaseStore:
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
         )
-
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
-            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-            logger.info("Mooncake Configuration loaded from extra_config successfully.")
-
-        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            config = MooncakeStoreConfig.from_file()
-            logger.info("Mooncake Configuration loaded from file successfully.")
-
-        else:
-            config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
-
-        return config
+        return MooncakeStoreConfig.load(extra_config)
 
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
@@ -389,6 +392,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.mem_pool_host: Optional[HostKVCache] = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -717,6 +721,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
+            return
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            # Only the rank that owns the shared MLA host copy reads L3 into it.
             return
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
@@ -1317,6 +1327,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and self.mem_pool_host.host_buffer_read_only
+        ):
+            # Follower: the leader's real hit count wins the cache-group
+            # all_reduce(MIN).
+            return len(keys)
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 

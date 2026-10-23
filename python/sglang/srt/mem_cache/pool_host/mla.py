@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -84,10 +85,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        host_allocator: Optional[HostTensorAllocator] = None,
+        host_buffer_read_only: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        # This rank does not own the MLA host data; the node leader writes it.
+        self.host_buffer_read_only = host_buffer_read_only
 
         if is_dummy:
             self._init_dummy(
@@ -102,6 +107,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 dcp_size,
                 dcp_rank,
                 pool_label,
+                host_allocator=host_allocator,
             )
             return
 
@@ -117,6 +123,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             pool_label=pool_label,
+            host_allocator=host_allocator,
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
@@ -163,6 +170,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         dcp_size: int,
         dcp_rank: int,
         pool_label: str,
+        *,
+        host_allocator: Optional[HostTensorAllocator] = None,
     ) -> None:
         self.device_pool = device_pool
         self.pool_label = pool_label
@@ -176,7 +185,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = (
+            get_allocator_from_storage(allocator_type)
+            if host_allocator is None
+            else host_allocator
+        )
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -205,9 +218,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.data_refs = None
         self.data_ptrs = None
 
+        if host_allocator is not None:
+            # Collective with the leader's allocate: prefault this rank's share,
+            # then drop the mapping.
+            self.allocator.allocate(
+                (self.size * self.size_per_token,),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+
         logger.info(
             "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
-            "saving %.2f GB host memory",
+            "no retained %.2f GB host data mapping",
             self.size,
             self.size * self.size_per_token / 1e9,
         )
@@ -402,7 +424,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.host_buffer_read_only
+            or self.layout != "page_first"
+            or (_is_npu or _is_xpu or _is_mps)
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
