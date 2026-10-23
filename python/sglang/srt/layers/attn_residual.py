@@ -91,6 +91,7 @@ def _aggregate_fast(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Warp-specialized TMA kernel: online softmax over row chunks with the
     output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
@@ -103,7 +104,8 @@ def _aggregate_fast(
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
 
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
-    out = torch.empty_like(prefix_sum)
+    if out is None:
+        out = torch.empty_like(prefix_sum)
     attn_res_fused_tma(
         prefix_sum,
         bank,
@@ -366,6 +368,7 @@ def _aggregate_fused_add(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
@@ -392,6 +395,7 @@ def _aggregate_fused_add(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            out=out,
         ),
         prefix,
     )
@@ -405,6 +409,7 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
@@ -424,6 +429,7 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            out=out,
         )
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
@@ -438,6 +444,13 @@ def _aggregate(
         )[0]
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
+
+
+def _into(result: torch.Tensor, out: Optional[torch.Tensor]) -> torch.Tensor:
+    if out is None or result.data_ptr() == out.data_ptr():
+        return result
+    out.copy_(result)
+    return out
 
 
 class AttnResidual:
@@ -483,6 +496,7 @@ class AttnResidual:
         out_norm: RMSNorm,
         rows: Optional[slice] = None,
         write: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
@@ -491,7 +505,7 @@ class AttnResidual:
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
-            assert prefix_sum is None
+            assert prefix_sum is None and out is None
             if write:
                 self.write(hidden_states, rows)
             return out_norm(hidden_states), hidden_states
@@ -518,6 +532,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                out=out,
             )
             prefix = hidden_states
         else:
@@ -531,12 +546,13 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                out=out,
             )
         if fused_write:
             self.num_valid_blocks += 1  # row nvb written in-kernel
         elif write:
             self.write(prefix, rows)
-        return normed, prefix
+        return _into(normed, out), prefix
 
     def forward_sp_all_gather(
         self,

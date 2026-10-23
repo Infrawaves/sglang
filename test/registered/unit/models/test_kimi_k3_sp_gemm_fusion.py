@@ -486,3 +486,218 @@ def test_one_context_prepares_and_runs_both_modes(group, o_proj, runtime, monkey
         with fusion.use_o_proj_fusion_call(None, m):
             assert manager.try_fused_o_proj(o_proj, Tensor((m, 3072))) is not None
     assert [call[4] for call in operator.calls] == [PUSH, PULL, PUSH]
+
+
+from sglang.kernels.ops.communication import ag_gemm  # noqa: E402
+
+AG_PULL = ag_gemm.DispatchConfig("pull", ag_gemm.KernelConfig(256, 2))
+KDA_N, MLA_N = 6144, 2112
+
+
+class FakeAgOperator:
+    def __init__(self, group, rank, world_size, max_m, k, device, configs):
+        self.args = (group, rank, world_size, max_m, k, device, configs)
+        self.layout = SimpleNamespace(max_m=max_m)
+        self.world_size = world_size
+        self.prepare = Mock()
+        self.calls = []
+
+    def local_input_shard(self, m):
+        return Tensor((m // self.world_size, 7168))
+
+    def gathered_input(self, m):
+        return Tensor((m, 7168))
+
+    def __call__(self, local_input, weight, output, dispatch):
+        self.calls.append((local_input, weight, output, dispatch))
+        return output
+
+
+@pytest.fixture
+def ag_group(group, runtime, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA B300 SXM6 AC")
+    for name in ("sm100_ag_gemm_resident_cluster_capacity", "sm100_ag_gemm_pull"):
+        setattr(torch.ops.mega_ops, name, Mock())
+    group.world_size = 8
+    return group
+
+
+@pytest.fixture
+def qkv_proj_types(monkeypatch):
+    linear_module = ModuleType("sglang.srt.layers.linear")
+    unquant_module = ModuleType("sglang.srt.layers.quantization.unquant")
+
+    class MergedColumnParallelLinear:
+        pass
+
+    class ReplicatedLinear:
+        pass
+
+    class UnquantizedLinearMethod:
+        pass
+
+    linear_module.MergedColumnParallelLinear = MergedColumnParallelLinear
+    linear_module.ReplicatedLinear = ReplicatedLinear
+    unquant_module.UnquantizedLinearMethod = UnquantizedLinearMethod
+    monkeypatch.setitem(sys.modules, linear_module.__name__, linear_module)
+    monkeypatch.setitem(sys.modules, unquant_module.__name__, unquant_module)
+
+    def make(cls, n):
+        proj = cls()
+        proj.quant_method = UnquantizedLinearMethod()
+        proj.skip_bias_add = False
+        proj.bias = None
+        proj.scheme = None
+        proj.input_size = 7168
+        proj.weight = Tensor((n, 7168))
+        return proj
+
+    return SimpleNamespace(
+        kda=lambda: make(MergedColumnParallelLinear, KDA_N),
+        mla=lambda: make(ReplicatedLinear, MLA_N),
+        unquantized=UnquantizedLinearMethod,
+    )
+
+
+@pytest.fixture
+def ag_manager(ag_group, qkv_proj_types, monkeypatch):
+    monkeypatch.setattr(ag_gemm, "AgGemm", FakeAgOperator)
+    manager = fusion.create_ag_gemm_fusion_manager(ag_group, 7168)
+    kda, mla = qkv_proj_types.kda(), qkv_proj_types.mla()
+    assert manager.register(kda) and manager.register(mla)
+    manager.prepare(16384)
+    return SimpleNamespace(manager=manager, kda=kda, mla=mla)
+
+
+def test_b300_ag_tables_fuse_kda_from_4k_and_mla_from_8k(ag_manager):
+    baseline = ag_gemm.DispatchConfig("baseline")
+    tables = ag_manager.manager.dispatch_tables
+    assert {m: d for m, d in tables[KDA_N].configs.items()} == {
+        512: baseline,
+        1024: baseline,
+        2048: baseline,
+        4096: AG_PULL,
+        8192: AG_PULL,
+        12288: AG_PULL,
+        16384: AG_PULL,
+    }
+    assert {m for m, d in tables[MLA_N].configs.items() if d == AG_PULL} == {
+        8192,
+        12288,
+        16384,
+    }
+
+
+def test_ag_prepare_shares_one_arena_across_projections(ag_manager):
+    operator = ag_manager.manager.ag_gemm_operator
+    assert operator.args[2:5] == (8, 16384, 7168)
+    assert operator.args[6] == {AG_PULL.kernel}
+    # The order is collective-visible, so it is deterministic on every rank.
+    assert [call.args[:2] for call in operator.prepare.call_args_list] == [
+        (4096, KDA_N),
+        (8192, MLA_N),
+        (8192, KDA_N),
+        (12288, MLA_N),
+        (12288, KDA_N),
+        (16384, MLA_N),
+        (16384, KDA_N),
+    ]
+
+
+def test_ag_dispatch_is_decided_by_the_consuming_projection(ag_manager):
+    manager, kda, mla = ag_manager.manager, ag_manager.kda, ag_manager.mla
+    assert manager.local_input_shard(kda, 512).shape == (512, 7168)
+    assert manager.local_input_shard(mla, 512) is None
+    assert manager.local_input_shard(mla, 1024).shape == (1024, 7168)
+    assert manager.local_input_shard(kda, 128) is None
+
+
+def test_ag_unbucketed_m_prepares_its_floor_bucket_once(ag_manager):
+    manager, kda = ag_manager.manager, ag_manager.kda
+    operator = manager.ag_gemm_operator
+    eager_prepares = len(operator.prepare.call_args_list)
+    for _ in range(2):
+        assert manager.local_input_shard(kda, 1250) is not None
+    lazy = operator.prepare.call_args_list[eager_prepares:]
+    assert [call.args for call in lazy] == [(10000, KDA_N, AG_PULL)]
+
+
+def test_ag_m_beyond_the_arena_or_during_capture_stays_native(ag_manager, monkeypatch):
+    manager, kda = ag_manager.manager, ag_manager.kda
+    assert manager.local_input_shard(kda, 2049) is None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert manager.local_input_shard(kda, 1250) is None
+    # Bucket sizes are prepared up front, so a capture still fuses them.
+    assert manager.local_input_shard(kda, 1024) is not None
+
+
+def test_ag_megatron_sp_stays_native(ag_manager, monkeypatch):
+    monkeypatch.setattr(fusion, "get_forward", lambda: SimpleNamespace(sp_active=True))
+    assert ag_manager.manager.local_input_shard(ag_manager.kda, 1024) is None
+
+
+def test_ag_fused_call_returns_projection_and_gathered_rows(ag_manager):
+    manager, mla = ag_manager.manager, ag_manager.mla
+    slot = manager.local_input_shard(mla, 1024)
+    fused = manager.fused_qkv_proj(mla, slot)
+    [(local_input, weight, output, dispatch)] = manager.ag_gemm_operator.calls
+    assert local_input is slot and weight is mla.weight and dispatch == AG_PULL
+    assert fused.output is output and output.shape == (8192, MLA_N)
+    assert fused.hidden_states.shape == (8192, 7168)
+
+
+def test_unprepared_ag_manager_stays_native(ag_group, qkv_proj_types):
+    manager = fusion.K3SPAgGemmFusionManager(ag_group, 7168)
+    kda = qkv_proj_types.kda()
+    assert manager.register(kda)
+    assert manager.local_input_shard(kda, 1024) is None
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("skip_bias_add", True),
+        ("bias", object()),
+        ("scheme", object()),
+        ("input_size", 4096),
+        ("quant_method", object()),
+    ],
+)
+def test_ag_unsupported_projection_is_not_registered(
+    ag_group, qkv_proj_types, name, value
+):
+    manager = fusion.K3SPAgGemmFusionManager(ag_group, 7168)
+    kda = qkv_proj_types.kda()
+    setattr(kda, name, value)
+    assert not manager.register(kda)
+    assert manager.dispatch_tables == {}
+
+
+def test_ag_non_bf16_weight_or_unmeasured_n_is_not_registered(
+    ag_group, qkv_proj_types, caplog
+):
+    manager = fusion.K3SPAgGemmFusionManager(ag_group, 7168)
+    kda = qkv_proj_types.kda()
+    kda.weight.dtype = torch.float32
+    assert not manager.register(kda)
+    other = qkv_proj_types.kda()
+    other.weight = Tensor((4096, 7168))
+    assert not manager.register(other)
+    assert not manager.register(other)
+    assert caplog.text.count("no table for TP8 N=4096") == 1
+
+
+def test_qkv_proj_returns_the_fused_rows_only_inside_its_scope(ag_manager):
+    manager, kda = ag_manager.manager, ag_manager.kda
+    fused = manager.fused_qkv_proj(kda, manager.local_input_shard(kda, 512))
+    assert manager.try_fused_qkv_proj(fused.hidden_states) is None
+    with fusion.use_qkv_proj_fusion_output(fused):
+        output, bias = manager.try_fused_qkv_proj(fused.hidden_states)
+        assert output.shape == (4096, KDA_N) and bias is None
+        # Attention trims padded rows; the same storage prefix still matches.
+        trimmed, _ = manager.try_fused_qkv_proj(fused.hidden_states[:4093])
+        assert trimmed.shape == (4093, KDA_N)
+        assert trimmed.data_ptr() == output.data_ptr()
+        # Any other input was not multiplied by the fused kernel.
+        assert manager.try_fused_qkv_proj(Tensor((4096, 7168))) is None
+    assert manager.try_fused_qkv_proj(fused.hidden_states) is None

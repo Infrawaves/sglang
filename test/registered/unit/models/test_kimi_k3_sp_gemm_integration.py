@@ -271,6 +271,54 @@ class TestKimiK3SPGemmOProjWrapper(unittest.TestCase):
         run.native.assert_called_once_with(x, False)
 
 
+class TestKimiK3SPGemmQKVProjWrapper(unittest.TestCase):
+    def _wrapper(self, *, fused=False, manager=True, registered=True):
+        output = (_Tensor(8, name="fused"), None)
+        fusion_manager = SimpleNamespace(
+            register=Mock(return_value=registered),
+            try_fused_qkv_proj=Mock(return_value=output if fused else None),
+        )
+        native = Mock(return_value=(_Tensor(8, name="native"), None))
+        layer = SimpleNamespace(forward=native)
+        state = SimpleNamespace(
+            ag_gemm_fusion_manager=fusion_manager if manager else None
+        )
+        installed = _definitions(
+            SP, ["install_qkv_proj_wrapper"], {"_init_state": lambda: state}
+        ).install_qkv_proj_wrapper(layer)
+        return SimpleNamespace(
+            layer=layer, native=native, manager=fusion_manager, installed=installed
+        )
+
+    def test_fused_result_replaces_native_gemm(self):
+        run = self._wrapper(fused=True)
+        x = _Tensor(8)
+        self.assertTrue(run.installed)
+        self.assertIs(run.layer.forward(x), run.manager.try_fused_qkv_proj.return_value)
+        run.manager.try_fused_qkv_proj.assert_called_once_with(x)
+        run.native.assert_not_called()
+
+    def test_outside_the_fusion_scope_runs_native(self):
+        run = self._wrapper()
+        x = _Tensor(8)
+        self.assertIs(run.layer.forward(x), run.native.return_value)
+        run.native.assert_called_once_with(x)
+
+    def test_disabled_or_unregistered_projection_is_left_untouched(self):
+        for kwargs in (dict(manager=False), dict(registered=False)):
+            with self.subTest(**kwargs):
+                run = self._wrapper(**kwargs)
+                self.assertFalse(run.installed)
+                self.assertIs(run.layer.forward, run.native)
+
+    def test_explicit_arguments_stay_native(self):
+        run = self._wrapper(fused=True)
+        x = _Tensor(8)
+        run.layer.forward(x, output_tensor=None)
+        run.manager.try_fused_qkv_proj.assert_not_called()
+        run.native.assert_called_once_with(x, output_tensor=None)
+
+
 class TestKimiK3SPGemmGateOrdering(unittest.TestCase):
     def _dependencies(self):
         events = []
@@ -410,7 +458,13 @@ class TestKimiK3SPGemmPreparation(unittest.TestCase):
         ).prepare_gemm_fusion
 
     def test_prepare_sizes_workspace_for_the_prefill_ceiling(self):
-        manager = SimpleNamespace(prepare=Mock())
+        order = []
+        manager = SimpleNamespace(
+            prepare=Mock(side_effect=lambda m: order.append("rs"))
+        )
+        ag_manager = SimpleNamespace(
+            prepare=Mock(side_effect=lambda m: order.append("ag"))
+        )
         with patch.dict(
             sys.modules,
             {
@@ -419,11 +473,21 @@ class TestKimiK3SPGemmPreparation(unittest.TestCase):
                 )
             },
         ):
-            self._prepare(SimpleNamespace(gemm_fusion_manager=manager))()
+            self._prepare(
+                SimpleNamespace(
+                    gemm_fusion_manager=manager, ag_gemm_fusion_manager=ag_manager
+                )
+            )()
         manager.prepare.assert_called_once_with(16384)
+        # Symmetric allocation is collective, so the order is fixed on every rank.
+        ag_manager.prepare.assert_called_once_with(16384)
+        self.assertEqual(order, ["rs", "ag"])
 
     def test_prepare_with_fusion_off_is_a_no_op(self):
-        for state in (None, SimpleNamespace(gemm_fusion_manager=None)):
+        for state in (
+            None,
+            SimpleNamespace(gemm_fusion_manager=None, ag_gemm_fusion_manager=None),
+        ):
             with self.subTest(state=state):
                 with patch.dict(sys.modules, {"sglang.srt.runtime_context": None}):
                     self._prepare(state)()
@@ -503,6 +567,7 @@ class TestKimiK3SPGemmInitialization(unittest.TestCase):
             ),
         )
         factory = Mock(return_value=object() if manager_available else None)
+        ag_factory = Mock(return_value=object() if manager_available else None)
         gather = Mock()
         namespace = {
             "_STATE": None,
@@ -535,7 +600,8 @@ class TestKimiK3SPGemmInitialization(unittest.TestCase):
                 )
             ),
             "sglang.srt.layers.communication.k3_sp_gemm_fusion": SimpleNamespace(
-                create_gemm_fusion_manager=factory
+                create_gemm_fusion_manager=factory,
+                create_ag_gemm_fusion_manager=ag_factory,
             ),
         }
         with patch.dict(sys.modules, imports):
@@ -546,6 +612,7 @@ class TestKimiK3SPGemmInitialization(unittest.TestCase):
             state=first,
             envs=envs,
             factory=factory,
+            ag_factory=ag_factory,
             gather=gather,
             group=group,
             logger=namespace["logger"],
@@ -565,21 +632,35 @@ class TestKimiK3SPGemmInitialization(unittest.TestCase):
         self.assertIsNone(run.state.gemm_fusion_manager)
         run.gather.assert_not_called()
 
-    def test_attn_res_composes_with_gemm_initialization(self):
+    def test_gemm_fusion_creates_both_managers(self):
+        run = self._initialize(fusion_enabled=True)
+        run.ag_factory.assert_called_once_with(run.group, 7168)
+        self.assertIs(run.state.ag_gemm_fusion_manager, run.ag_factory.return_value)
+
+    def test_gemm_fusion_disables_attn_res_and_logs_it(self):
         for fusion_enabled in (False, True):
             with self.subTest(fusion_enabled=fusion_enabled):
                 run = self._initialize(
                     fusion_enabled=fusion_enabled, attn_res_enabled=True
                 )
                 run.envs.SGLANG_K3_SP_GEMM_FUSION.get.assert_called_once()
+                run.envs.SGLANG_K3_SP_ATTN_RES.get.assert_called_once()
+                messages = [call.args[0] for call in run.logger.info.call_args_list]
+                disabled = any(
+                    "SGLANG_K3_SP_ATTN_RES is disabled" in message
+                    for message in messages
+                )
+                carry = any(
+                    "attention-residual carry enabled" in message
+                    for message in messages
+                )
+                self.assertEqual(disabled, fusion_enabled)
+                self.assertEqual(carry, not fusion_enabled)
                 if fusion_enabled:
                     run.factory.assert_called_once_with(run.group, 7168)
-                    self.assertIs(
-                        run.state.gemm_fusion_manager, run.factory.return_value
-                    )
                 else:
                     run.factory.assert_not_called()
-                    self.assertIsNone(run.state.gemm_fusion_manager)
+                    self.assertIsNone(run.state.ag_gemm_fusion_manager)
                 run.gather.assert_not_called()
                 run.logger.warning.assert_not_called()
 
@@ -662,6 +743,7 @@ class TestKimiK3SPGemmReductionCompletion(unittest.TestCase):
         idle=False,
         input_sharded=False,
         sp_moe=True,
+        qkv_proj_fusion=None,
     ):
         group = SimpleNamespace(world_size=4, rank_in_group=1)
         gathered = _Tensor(8, name="gathered")
@@ -669,11 +751,24 @@ class TestKimiK3SPGemmReductionCompletion(unittest.TestCase):
         o_proj_call_context = Mock(
             side_effect=lambda *args, **kwargs: nullcontext(o_proj_call)
         )
+        # qkv_proj_fusion: None (no target), "native" (table says no), "fused".
+        ag_slot = _Tensor(2, name="ag_slot")
+        ag_output = SimpleNamespace(
+            hidden_states=_Tensor(8, name="ag_gathered"),
+            output=_Tensor(8, name="ag_qkv"),
+        )
         namespace = {
             "get_parallel": lambda: SimpleNamespace(attn_tp_group=group),
             "_sp_all_gather_rows": Mock(return_value=gathered),
             "_sp_local_rows": lambda hidden: slice(2, 4),
-            "k3_sp_collective": SimpleNamespace(o_proj_fusion_call=o_proj_call_context),
+            "k3_sp_collective": SimpleNamespace(
+                o_proj_fusion_call=o_proj_call_context,
+                ag_qkv_proj_input=Mock(
+                    return_value=ag_slot if qkv_proj_fusion == "fused" else None
+                ),
+                ag_qkv_proj=Mock(return_value=ag_output),
+                qkv_proj_fusion_call=Mock(side_effect=lambda *args: nullcontext()),
+            ),
             "nullcontext": nullcontext,
         }
         forward = _definitions(
@@ -691,7 +786,9 @@ class TestKimiK3SPGemmReductionCompletion(unittest.TestCase):
         attn_res = SimpleNamespace(
             forward=Mock(
                 side_effect=(
-                    [] if input_sharded else [(_Tensor(8, name="agg1"), prefix)]
+                    [(ag_slot, prefix)]
+                    if input_sharded and qkv_proj_fusion == "fused"
+                    else ([] if input_sharded else [(_Tensor(8, name="agg1"), prefix)])
                 )
                 + [(_Tensor(2, name="agg2"), agg2_prefix)]
             ),
@@ -713,6 +810,7 @@ class TestKimiK3SPGemmReductionCompletion(unittest.TestCase):
             _run_self_attn=Mock(return_value=shard if gemm_fused else projected),
             _finish_attn_reduce=Mock(return_value=(shard, 2, True)),
             mlp=Mock(return_value=_Tensor(2, name="moe")),
+            _qkv_proj_fusion_target=None if qkv_proj_fusion is None else object(),
         )
         result = forward(
             owner,
@@ -735,7 +833,42 @@ class TestKimiK3SPGemmReductionCompletion(unittest.TestCase):
             agg2_prefix=agg2_prefix,
             all_gather=namespace["_sp_all_gather_rows"],
             o_proj_call_context=o_proj_call_context,
+            collective=namespace["k3_sp_collective"],
+            ag_slot=ag_slot,
+            ag_output=ag_output,
         )
+
+    def test_fused_qkv_proj_writes_the_shard_in_place_and_skips_every_ag(self):
+        run = self._run_residual(
+            gemm_fused=True, input_sharded=True, qkv_proj_fusion="fused"
+        )
+        run.attn_res.forward_sp_all_gather.assert_not_called()
+        run.all_gather.assert_not_called()
+        # The live shard size, not the full batch, sizes the symmetric slot.
+        run.collective.ag_qkv_proj_input.assert_called_once_with(
+            run.owner._qkv_proj_fusion_target, 2
+        )
+        agg1 = run.attn_res.forward.call_args_list[0]
+        self.assertIs(agg1.kwargs["out"], run.ag_slot)
+        self.assertEqual(agg1.kwargs["rows"], slice(2, 4))
+        run.collective.ag_qkv_proj.assert_called_once_with(
+            run.owner._qkv_proj_fusion_target, run.ag_slot
+        )
+        attention = run.owner._run_self_attn.call_args
+        self.assertIs(attention.args[0], run.ag_output.hidden_states)
+        # qkv_proj reads the fused result from the scope around attention.
+        run.collective.qkv_proj_fusion_call.assert_called_once_with(run.ag_output)
+        # GEMM + RS still sees the full-batch row count after the fused AG.
+        run.o_proj_call_context.assert_called_once_with(run.prefix, 8)
+
+    def test_unselected_qkv_proj_fusion_keeps_the_native_all_gather(self):
+        run = self._run_residual(
+            gemm_fused=True, input_sharded=True, qkv_proj_fusion="native"
+        )
+        run.collective.ag_qkv_proj_input.assert_called_once()
+        run.collective.ag_qkv_proj.assert_not_called()
+        run.attn_res.forward_sp_all_gather.assert_called_once()
+        run.collective.qkv_proj_fusion_call.assert_not_called()
 
     def test_fused_completion_skips_both_rs_paths_but_runs_aggregation(self):
         run = self._run_residual(gemm_fused=True)
