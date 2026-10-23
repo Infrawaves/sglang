@@ -249,11 +249,6 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
-def _transfer_lifetime_of(mgr) -> Optional[TransferLifetimeTracker]:
-    """The prefill rank's source-buffer lease tracker; None on decode."""
-    return mgr._transfer_lifetime
-
-
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
@@ -2468,9 +2463,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # queued but not yet dequeued is invisible to _staging_outstanding.
         # close() is irreversible for this sender, so no acquire can race this.
         with self._abort_drain_lock:
-            lifetime = _transfer_lifetime_of(self)
-            if lifetime is not None and not (
-                lifetime.is_closed(room) and lifetime.is_drained(room)
+            if not (
+                self._transfer_lifetime.is_closed(room)
+                and self._transfer_lifetime.is_drained(room)
             ):
                 return
             super()._maybe_ack_drained_abort(room)
@@ -2931,11 +2926,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self, notification: AbortNotification, room_active: bool
     ) -> None:
         room = notification.room
-        lifetime = _transfer_lifetime_of(self)
-        if lifetime is not None:
-            # Stop admission even for a Success or not-yet-created sender, so
-            # the drain gate in _maybe_ack_drained_abort can close.
-            lifetime.close(room)
+        # Stop admission even for a Success or not-yet-created sender, so the
+        # drain gate in _maybe_ack_drained_abort can close.
+        self._transfer_lifetime.close(room)
         if room_active:
             self.update_status(room, KVPoll.Failed)
 
@@ -3183,11 +3176,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             wait_event=wait_event,
         )
         # Lease before publishing: once queued, the abort ACK must wait for it.
-        lifetime = _transfer_lifetime_of(self)
-        if lifetime is not None:
-            if not lifetime.try_acquire(bootstrap_room):
-                return
-            chunk.lease_held = True
+        if not self._transfer_lifetime.try_acquire(bootstrap_room):
+            return
+        chunk.lease_held = True
         try:
             self.transfer_queues[shard_idx].put(chunk)
         except BaseException:
