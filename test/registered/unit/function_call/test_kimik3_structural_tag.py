@@ -22,6 +22,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -219,6 +220,28 @@ def test_required_allows_response_prefix_but_requires_tools():
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)
+
+
+def test_required_close_token_commits_to_response_close():
+    structural_tag = get_kimik3_structural_tag([_tool()], tool_choice="required")
+    matcher = xgr.GrammarMatcher(_TOKEN_COMPILER.compile_structural_tag(structural_tag))
+
+    assert matcher.accept_token(_CLOSE_TOKEN_ID)
+    assert not matcher.accept_token(_CLOSE_TOKEN_ID)
+
+
+@pytest.mark.parametrize("thinking_mode", [False, True])
+def test_required_response_close_leads_into_tools_at_token_level(thinking_mode):
+    tag = get_kimik3_structural_tag(
+        [_tool()], tool_choice="required", thinking_mode=thinking_mode
+    )
+    prefix = "Thinking." + THINK_CLOSE if thinking_mode else ""
+    response = prefix + "<|open|>response<|sep|>Checking." + RESPONSE_CLOSE
+    tools = _tools_section(_valid_weather_call())
+
+    assert _token_accepts(tag, response + tools)
+    assert not _token_accepts(tag, response + RESPONSE_CLOSE + tools)
+    assert not _token_accepts(tag, prefix + "Checking.<|close|>message<|sep|>")
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():
