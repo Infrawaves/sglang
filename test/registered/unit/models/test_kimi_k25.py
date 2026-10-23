@@ -6,6 +6,7 @@ import functools
 import io
 import pickle
 import tempfile
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -64,6 +65,8 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _ensure_chw_rgb,
     _expand_image_token_ids,
+    _gpu_preprocess_images,
+    _process_single_image,
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
@@ -143,6 +146,99 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_gpu_preprocess_group_batching_matches_the_single_image_path():
+    # The batched branch frees its intermediate resize list before patchify, so
+    # nothing may read that list afterwards and every image must still land on
+    # its own original index. Mixed target sizes make the indices inside one
+    # group non-contiguous, which a same-size-only batch cannot expose.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    # Alternating configs put indices {0, 2} in one group and {1, 3} in the other.
+    resize_configs = [wide, tall, wide, tall]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+
+    pixel_values, grid_thws = _gpu_preprocess_images(
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    expected_grids = [
+        (1, config["new_height"] // patch_size, config["new_width"] // patch_size)
+        for config in resize_configs
+    ]
+    assert [tuple(row.tolist()) for row in grid_thws] == expected_grids
+    patch_counts = [grid[1] * grid[2] for grid in expected_grids]
+    assert pixel_values.shape[0] == sum(patch_counts)
+
+    # Each image's slice must equal what the one-image-per-group branch produces
+    # for that same image. A lost or shifted index silently returns another
+    # image's features instead of raising.
+    offset = 0
+    for image, config, count in zip(images, resize_configs, patch_counts):
+        reference = _process_single_image(
+            image,
+            config,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+        )
+        torch.testing.assert_close(pixel_values[offset : offset + count], reference)
+        offset += count
+
+
+def test_kimi_gpu_preprocess_frees_the_uint8_sources_before_patchify():
+    # to_chw makes a device copy of each source. For a large source that copy
+    # outweighs the resized image, so both branches must drop it once the
+    # resize is done instead of holding it across patchify. post_resize runs
+    # after the resize and before patchify, so every source copied so far must
+    # already be gone there. One image per group exercises the single-image
+    # branch; two share a group and exercise the batched one.
+    patch_size = 4
+    small = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    large = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    resize_configs = [small, large, large]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    sources = []
+
+    def copying_to_chw(image):
+        source = image.clone()
+        sources.append(weakref.ref(source))
+        return source
+
+    live_at_post_resize = []
+
+    def probe(x):
+        live_at_post_resize.append(sum(ref() is not None for ref in sources))
+        return x
+
+    _gpu_preprocess_images(
+        images,
+        resize_configs,
+        torch.full((1, 3, 1, 1), 1.0 / 255.0),
+        torch.zeros(1, 3, 1, 1),
+        patch_size,
+        to_chw=copying_to_chw,
+        post_resize=probe,
+    )
+
+    assert len(sources) == len(images)
+    assert live_at_post_resize and all(n == 0 for n in live_at_post_resize)
 
 
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
