@@ -4,6 +4,7 @@
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -160,8 +161,14 @@ pub enum ApiError {
     BreakerOpen { worker: String },
 
     /// A PD prefill worker rejected the request after decode was dispatched.
+    /// Client errors are passed through with the worker's own status and
+    /// `body` (already capped by the proxy), so clients see the engine's real
+    /// validation message; server errors are mapped to 502 with a generic message.
     #[error("prefill worker returned status {status}")]
-    PrefillFailed { status: StatusCode },
+    PrefillFailed {
+        status: StatusCode,
+        body: Option<Bytes>,
+    },
 
     /// The worker URL emitted by discovery failed to parse.  Always a
     /// config / discovery-backend bug, not a transient infra issue — but
@@ -199,7 +206,7 @@ impl ApiError {
             ApiError::StaleRequestExpired { .. } => ErrorClass::Timeout,
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
-            ApiError::PrefillFailed { status } if status.is_client_error() => {
+            ApiError::PrefillFailed { status, .. } if status.is_client_error() => {
                 ErrorClass::BadRequest
             }
             ApiError::PrefillFailed { .. } => ErrorClass::Upstream,
@@ -233,7 +240,7 @@ impl ApiError {
             ApiError::StaleRequestExpired { .. } => "stale_request_expired",
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
-            ApiError::PrefillFailed { status } if status.is_client_error() => {
+            ApiError::PrefillFailed { status, .. } if status.is_client_error() => {
                 "prefill_request_rejected"
             }
             ApiError::PrefillFailed { .. } => "prefill_worker_error",
@@ -251,7 +258,7 @@ impl ApiError {
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
-            ApiError::PrefillFailed { status } if status.is_server_error() => Some(*status),
+            ApiError::PrefillFailed { status, .. } if status.is_server_error() => Some(*status),
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
@@ -273,7 +280,7 @@ impl ApiError {
     /// via `into_response`. Exposed so a caller holding the error, rather than
     /// the response, can label it with the status the client actually saw.
     pub fn status_code(&self) -> StatusCode {
-        if let ApiError::PrefillFailed { status } = self {
+        if let ApiError::PrefillFailed { status, .. } = self {
             if status.is_client_error() {
                 return *status;
             }
@@ -299,6 +306,26 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let code = self.error_code();
+        // A prefill 4xx is the engine validating the client's request; hand
+        // its body back verbatim instead of masking it with a generic message.
+        if let ApiError::PrefillFailed {
+            status: prefill_status,
+            body: Some(body),
+        } = &self
+        {
+            if prefill_status.is_client_error() {
+                tracing::warn!(prefill_status = %prefill_status, "prefill worker rejected PD request");
+                let mut resp = Response::new(axum::body::Body::from(body.clone()));
+                *resp.status_mut() = status;
+                resp.headers_mut().insert(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/json"),
+                );
+                resp.headers_mut()
+                    .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+                return resp;
+            }
+        }
         let typ = match status.as_u16() {
             400..=499 => "invalid_request_error",
             _ => "server_error",
@@ -367,7 +394,8 @@ impl IntoResponse for ApiError {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
             }
-            ApiError::PrefillFailed { status } => {
+            // A 4xx only lands here when the prefill body could not be read.
+            ApiError::PrefillFailed { status, .. } => {
                 tracing::warn!(prefill_status = %status, "prefill worker rejected PD request");
                 "prefill worker rejected the request".to_string()
             }
@@ -447,6 +475,49 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn prefill_4xx_passes_worker_body_through() {
+        let body = r#"{"object":"error","message":"Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.","type":"BadRequest","param":null,"code":400}"#;
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(Bytes::from_static(body.as_bytes())),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("prefill_request_rejected"),
+        );
+        assert_eq!(collect_body(resp), body);
+    }
+
+    #[test]
+    fn prefill_4xx_without_body_keeps_generic_message() {
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::BAD_REQUEST,
+            body: None,
+        }
+        .into_response();
+        let (status, _, env) = parse_envelope(resp);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(env.error.message, "prefill worker rejected the request");
+    }
+
+    #[test]
+    fn prefill_5xx_body_stays_hidden() {
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: Some(Bytes::from_static(b"traceback at /secret/path")),
+        }
+        .into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(code_header.as_deref(), Some("prefill_worker_error"));
+        assert!(!env.error.message.contains("secret"), "{}", env.error.message);
     }
 
     #[test]
