@@ -514,17 +514,19 @@ async fn pd_stream_scheduler_400_cancels_decode() {
     .await;
 }
 
-/// Kimi K3's encoder rejects an orphan `tool` message on prefill; the client
-/// must get OpenAI's wording instead of the generic prefill rejection.
+/// A prefill 4xx (here Kimi K3's orphan `tool` message rejection) reaches the
+/// client verbatim instead of the generic "prefill worker rejected" message.
 #[tokio::test]
-async fn pd_prefill_k3_orphan_tool_message_uses_openai_error() {
+async fn pd_prefill_4xx_passes_worker_body_through() {
     let decode =
         crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let prefill_error = json!({"object": "error", "type": "BadRequest", "param": null,
+        "code": 400,
+        "message": "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
+            or match a preceding assistant tool_call by order."});
     let prefill = crate::common::mock_worker::MockWorker::start_error_after_peer(
         StatusCode::BAD_REQUEST,
-        json!({"object": "error", "type": "BadRequestError", "code": 400,
-            "message": "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
-                or match a preceding assistant tool_call by order."}),
+        prefill_error.clone(),
         Some(Arc::clone(&decode.captured)),
     )
     .await;
@@ -567,16 +569,17 @@ async fn pd_prefill_k3_orphan_tool_message_uses_openai_error() {
         .expect("prefill rejection must not wait for decode")
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("prefill_request_rejected"),
+    );
     let bytes = http_body_util::BodyExt::collect(res.into_body())
         .await
         .unwrap()
         .to_bytes();
-    let v = parse_body(&bytes);
-    assert_eq!(
-        v["error"]["message"],
-        sgl_router::server::error::ORPHAN_TOOL_MESSAGE
-    );
-    assert_eq!(v["error"]["code"], "prefill_request_rejected");
+    assert_eq!(parse_body(&bytes), prefill_error);
 }
 
 #[tokio::test]

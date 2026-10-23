@@ -4,6 +4,7 @@
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -94,14 +95,14 @@ pub enum ApiError {
     #[error("worker circuit breaker open: {worker}")]
     BreakerOpen { worker: String },
 
-    /// The prefill worker rejected a PD request. Client errors retain the
-    /// worker's status; server errors are mapped to 502. `message` carries a
-    /// client-facing replacement for known engine rejections (see
-    /// [`known_prefill_rejection`]); unknown bodies stay hidden.
+    /// The prefill worker rejected a PD request. Client errors are passed
+    /// through with the worker's own status and `body` (already capped by the
+    /// proxy), so clients see the engine's real validation message; server
+    /// errors are mapped to 502 with a generic message.
     #[error("prefill worker returned status {status}")]
     PrefillFailed {
         status: StatusCode,
-        message: Option<&'static str>,
+        body: Option<Bytes>,
     },
 
     /// The worker URL emitted by discovery failed to parse.  Always a
@@ -118,24 +119,6 @@ pub enum ApiError {
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
-}
-
-/// Kimi K3's chat encoder raises this when a `tool` message has no `tool` /
-/// `name` and no preceding assistant `tool_call` to borrow one from.
-const K3_UNRESOLVABLE_TOOL_NAME: &str = "Kimi K3 tool messages need a resolvable tool name";
-
-/// OpenAI's wording for the same malformed conversation, so clients see the
-/// error they already handle.
-pub const ORPHAN_TOOL_MESSAGE: &str = "Invalid request: messages with role 'tool' must be a \
-     response to a preceeding message with 'tool_calls'";
-
-/// Map a prefill 4xx body to a client-facing message when it is a known
-/// request-shape rejection. Matching is substring-based because the engine
-/// wraps the encoder's `ValueError` text in its own error envelope.
-pub fn known_prefill_rejection(body: &[u8]) -> Option<&'static str> {
-    let text = String::from_utf8_lossy(body);
-    text.contains(K3_UNRESOLVABLE_TOOL_NAME)
-        .then_some(ORPHAN_TOOL_MESSAGE)
 }
 
 impl ApiError {
@@ -201,6 +184,26 @@ struct ErrorBody<'a> {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
+        // A prefill 4xx is the engine validating the client's request; hand
+        // its body back verbatim instead of masking it with a generic message.
+        if let ApiError::PrefillFailed {
+            status: prefill_status,
+            body: Some(body),
+        } = &self
+        {
+            if prefill_status.is_client_error() {
+                tracing::warn!(prefill_status = %prefill_status, "prefill worker rejected request");
+                let mut resp = Response::new(axum::body::Body::from(body.clone()));
+                *resp.status_mut() = status;
+                resp.headers_mut().insert(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/json"),
+                );
+                resp.headers_mut()
+                    .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+                return resp;
+            }
+        }
         let typ = match status.as_u16() {
             400..=499 => "invalid_request_error",
             _ => "server_error",
@@ -266,11 +269,10 @@ impl IntoResponse for ApiError {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
             }
-            ApiError::PrefillFailed { status, message } if status.is_client_error() => {
+            // Only reached when the prefill body could not be read.
+            ApiError::PrefillFailed { status, .. } if status.is_client_error() => {
                 tracing::warn!(prefill_status = %status, "prefill worker rejected request");
-                message
-                    .unwrap_or("prefill worker rejected the request")
-                    .to_string()
+                "prefill worker rejected the request".to_string()
             }
             ApiError::PrefillFailed { status, .. } => {
                 tracing::warn!(prefill_status = %status, "prefill worker failed the request");
@@ -344,32 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn k3_unresolvable_tool_name_maps_to_openai_message() {
-        let body = br#"{"object":"error","message":"Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.","type":"BadRequestError","code":400}"#;
-        assert_eq!(known_prefill_rejection(body), Some(ORPHAN_TOOL_MESSAGE));
-        assert_eq!(known_prefill_rejection(br#"{"message":"other"}"#), None);
-
+    fn prefill_4xx_passes_worker_body_through() {
+        let body = r#"{"object":"error","message":"Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.","type":"BadRequest","param":null,"code":400}"#;
         let resp = ApiError::PrefillFailed {
             status: StatusCode::BAD_REQUEST,
-            message: known_prefill_rejection(body),
+            body: Some(Bytes::from_static(body.as_bytes())),
         }
         .into_response();
-        let (status, code_header, env) = parse_envelope(resp);
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(code_header.as_deref(), Some("prefill_request_rejected"));
-        assert_eq!(env.error.typ, "invalid_request_error");
-        assert_eq!(env.error.message, ORPHAN_TOOL_MESSAGE);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("prefill_request_rejected"),
+        );
+        assert_eq!(collect_body(resp), body);
     }
 
     #[test]
-    fn unknown_prefill_rejection_keeps_generic_message() {
+    fn prefill_4xx_without_body_keeps_generic_message() {
         let resp = ApiError::PrefillFailed {
             status: StatusCode::BAD_REQUEST,
-            message: None,
+            body: None,
         }
         .into_response();
         let (_, _, env) = parse_envelope(resp);
         assert_eq!(env.error.message, "prefill worker rejected the request");
+    }
+
+    #[test]
+    fn prefill_5xx_body_stays_hidden() {
+        let resp = ApiError::PrefillFailed {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: Some(Bytes::from_static(b"traceback at /secret/path")),
+        }
+        .into_response();
+        let (status, _, env) = parse_envelope(resp);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(env.error.message, "prefill worker returned an error");
     }
 
     #[test]
