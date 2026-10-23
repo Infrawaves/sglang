@@ -3042,51 +3042,7 @@ class CommonKVReceiver(BaseKVReceiver):
         Acceptance is local ZMQ queueing, not a drain ACK. A failed attempt must
         retain the ACK state and destination buffers for a later retry.
         """
-        infos = self.bootstrap_infos
-        if infos is None:
-            return False
-        if not self.kv_mgr.connection_lock.acquire(
-            blocking=not self.kv_mgr.requires_transfer_drain
-        ):
-            return False
-        try:
-            # An ABORT for a reused room would cancel the new request's transfer.
-            if not self._owns_room_locked():
-                return False
-            # Fence this attempt against an eviction that races its send. A
-            # later retry captures the new epoch instead of staying suppressed.
-            expected_epoch = (
-                self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
-                if self.kv_mgr.requires_transfer_drain
-                else None
-            )
-            # Arm before sending. Legacy prealloc cancellation has no held
-            # buffers; partial publication callers explicitly force arming.
-            if self.kv_mgr.enable_deferred_decode_kv_release and (
-                force_arm
-                or self.init_time is not None
-                or self.kv_mgr.requires_transfer_drain
-            ):
-                # A retry re-sends the armed generation so ACKs already received
-                # for this receiver are kept; only a new arm starts a generation.
-                generation = self.kv_mgr.arm_deferred_abort_room(
-                    self.bootstrap_room, self._abort_generation
-                )
-                if generation is None:
-                    # An older receiver of this room has not drained yet.
-                    return False
-                self._abort_generation = generation
-            frames = AbortNotification(
-                room=self.bootstrap_room,
-                decode_ip=self.kv_mgr.local_ip,
-                decode_port=self.kv_mgr.rank_port,
-                generation=self._abort_generation,
-            ).to_zmq()
-        finally:
-            self.kv_mgr.connection_lock.release()
-        accepted = self._send_abort_notification(
-            infos, frames, expected_epoch=expected_epoch
-        )
+        accepted = self._send_abort_notification(force_arm=force_arm)
         if accepted:
             self.abort_notified = True
         return accepted
@@ -3147,13 +3103,55 @@ class CommonKVReceiver(BaseKVReceiver):
         finally:
             lock.release()
 
-    def _send_abort_notification(
-        self,
-        bootstrap_infos: List[Dict],
-        frames: List[bytes],
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> bool:
+    def _send_abort_notification(self, *, force_arm: bool = False) -> bool:
+        """Arm this receiver's ACK state and send ABORT to every prefill writer.
+
+        Returns whether every target accepted the attempt. Under transfer drain
+        no lock or socket is waited on, so the caller can retry with backoff.
+        """
+        bootstrap_infos = self.bootstrap_infos
+        if bootstrap_infos is None:
+            return False
+        if not self.kv_mgr.connection_lock.acquire(
+            blocking=not self.kv_mgr.requires_transfer_drain
+        ):
+            return False
+        try:
+            # An ABORT for a reused room would cancel the new request's transfer.
+            if not self._owns_room_locked():
+                return False
+            # Fence this attempt against an eviction that races its send. A
+            # later retry captures the new epoch instead of staying suppressed.
+            expected_epoch = (
+                self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+                if self.kv_mgr.requires_transfer_drain
+                else None
+            )
+            # Arm before sending. Legacy prealloc cancellation has no held
+            # buffers; partial publication callers explicitly force arming.
+            if self.kv_mgr.enable_deferred_decode_kv_release and (
+                force_arm
+                or self.init_time is not None
+                or self.kv_mgr.requires_transfer_drain
+            ):
+                # A retry re-sends the armed generation so ACKs already received
+                # for this receiver are kept; only a new arm starts a generation.
+                generation = self.kv_mgr.arm_deferred_abort_room(
+                    self.bootstrap_room, self._abort_generation
+                )
+                if generation is None:
+                    # An older receiver of this room has not drained yet.
+                    return False
+                self._abort_generation = generation
+            frames = AbortNotification(
+                room=self.bootstrap_room,
+                decode_ip=self.kv_mgr.local_ip,
+                decode_port=self.kv_mgr.rank_port,
+                generation=self._abort_generation,
+            ).to_zmq()
+        finally:
+            self.kv_mgr.connection_lock.release()
+
         if self.kv_mgr.requires_transfer_drain:
             all_sent = True
             for bootstrap_info in bootstrap_infos:
