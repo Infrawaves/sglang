@@ -147,9 +147,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.kv_buffer = None
             self.data_refs = None
             self.data_ptrs = None
+            if host_allocator is not None:
+                # Collective with the leader's allocate: prefault this rank's
+                # share, then drop the mapping.
+                self.allocator.allocate(
+                    (self.size * self.size_per_token,),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
             logger.info(
                 "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
-                "saving %.2f GB host memory",
+                "no retained %.2f GB host data mapping",
                 self.size,
                 self.size * self.size_per_token / 1e9,
             )

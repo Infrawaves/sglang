@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import torch.distributed as dist
+
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -24,6 +26,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
+)
+from sglang.srt.mem_cache.mla_host_node_leader import (
+    maybe_create_node_leader_context,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
@@ -162,7 +167,7 @@ def build_kv_host_pool(
     )
     kwargs = {}
     if is_dummy:
-        # Allocator-only MLA host pool (#36800): same token capacity, no memory.
+        # Broadcast follower: same token capacity, no retained host data mapping.
         kwargs["is_dummy"] = True
     if host_allocator is not None:
         kwargs["host_allocator"] = host_allocator
@@ -1265,18 +1270,12 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
-    # Built before host allocation (world-collective in broadcast mode): it
-    # decides whether this rank's MLA host pool is real, allocator-only or
-    # mapped from the leader.
-    from sglang.srt.mem_cache.mla_host_node_leader import (
-        maybe_create_node_leader_context,
-    )
-
+    # WORLD-collective on every rank, before host allocation: it decides whether
+    # this rank's MLA host pool is real, allocator-only or mapped from the leader.
     node_leader = maybe_create_node_leader_context(
-        kv_pool,
-        full_layer_mapping,
-        params.tp_cache_group,
-        params.attn_tp_cache_group,
+        kv_pool=kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        tp_cache_group=params.tp_cache_group,
         draft_pools=root.packed_draft_device_pools,
     )
     with (
@@ -1290,12 +1289,23 @@ def build_hybrid_mamba_stack(
             use_mla=use_mla,
             host_size=kv_host_size,
             mtp_draft_device_pools=root.packed_draft_device_pools,
-            **(node_leader.host_pool_kwargs() if node_leader is not None else {}),
+            capacity_multiplier=(
+                1 if node_leader is None else node_leader.capacity_multiplier
+            ),
+            is_dummy=(
+                node_leader is not None
+                and node_leader.is_follower
+                and node_leader.broadcast is not None
+            ),
+            host_allocator=None
+            if node_leader is None
+            else node_leader.shared_allocator,
+            host_buffer_read_only=node_leader is not None and node_leader.is_follower,
         )
-    if node_leader is not None and node_leader.broadcast is not None:
-        # The Mamba host pool below checks free host memory; wait until the
-        # leader's MLA pin shows up in it.
-        node_leader.broadcast.wait_until_host_pool_ready()
+    if node_leader is not None:
+        # Mamba's budget check must observe the leader's completed MLA pin.
+        # Use Gloo: pinning can outlast the NCCL watchdog.
+        dist.barrier(group=params.tp_cache_group)
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
     # pool has no separate K/V buffers, so kv_split does not apply; override
@@ -1368,7 +1378,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
-        mla_dedup_context=None if node_leader is None else node_leader.broadcast,
+        node_leader_broadcast=None if node_leader is None else node_leader.broadcast,
     )
     return host_pool_group, cache_controller, config
 
@@ -2409,6 +2419,14 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
         strategy = _select_strategy(kvcache, components)
+        # Rank-independent: every rank rejects before any stack collective.
+        if get_memory().enable_mla_hicache_per_node and not isinstance(
+            strategy, _MambaStrategy
+        ):
+            raise ValueError(
+                "--enable-mla-hicache-per-node supports only hybrid MLA + "
+                f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
+            )
         result = strategy.build(
             cache=cache,
             kvcache=kvcache,

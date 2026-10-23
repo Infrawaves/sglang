@@ -521,6 +521,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_host_memory_fraction",
     "enable_linker_mla_dedup",
     "enable_mla_hicache_per_node",
+    "mla_hicache_per_node_mode",
     "_swa_full_tokens_ratio_explicitly_set",
     "swa_prefix_tails",
     "enable_encoder_swa_bounded_replay",

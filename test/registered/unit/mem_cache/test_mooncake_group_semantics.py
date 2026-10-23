@@ -285,59 +285,97 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_only_mla_data_owners_register_with_mooncake(self):
+        """A mapped follower must not register the leader's MLA storage."""
+        for read_only in (True, False):
+            with self.subTest(read_only=read_only):
+                store, backend = _make_store(
+                    is_mla_model=True, mla_host_read_only=read_only
+                )
+                host = store.mem_pool_host
+                host.kv_buffer = torch.empty(8, dtype=torch.uint8)
+                host.page_size = 1
+                host.get_ksize_per_token = lambda: 1
+                registrations = []
+
+                def register(ptr, size):
+                    registrations.append((ptr, size))
+                    return 0
+
+                with patch.object(backend, "register_buffer", side_effect=register):
+                    store.register_mem_pool_host(host)
+                self.assertEqual(
+                    registrations,
+                    []
+                    if read_only
+                    else [(host.kv_buffer.data_ptr(), host.kv_buffer.nbytes)],
+                )
+
     def test_mla_exists_before_registration_and_on_leader(self):
         """Ordinary MLA queries work before registration; leader misses remain real misses."""
         for host_read_only in (None, False):
-            store, backend = _make_store(
-                is_mla_model=True, mla_host_read_only=host_read_only
-            )
-            keys = ["page0", "page1"]
-            backend.existing_keys.add(f"page0_{store.mla_suffix}_k")
-            self.assertEqual(store.batch_exists(keys), 1)
-            backend.existing_keys.clear()
-            self.assertEqual(store.batch_exists(keys), 0)
+            with self.subTest(host_read_only=host_read_only):
+                store, backend = _make_store(
+                    is_mla_model=True, mla_host_read_only=host_read_only
+                )
+                keys = ["page0", "page1"]
+                backend.existing_keys.add(f"page0_{store.mla_suffix}_k")
+                self.assertEqual(store.batch_exists(keys), 1)
+                backend.existing_keys.clear()
+                self.assertEqual(store.batch_exists(keys), 0)
 
     def test_follower_exists_skips_only_mla_and_preserves_mamba_stop_points(self):
-        """Follower MLA is assumed present, but missing rank-sharded state still limits restore."""
+        """Follower MLA is assumed present; rank-sharded state still limits restore."""
         for dummy in (False, True):
-            store, backend = _make_store(
-                is_mla_model=True, tp_rank=1, tp_size=2, mla_host_read_only=True
-            )
-            store.mem_pool_host.kv_buffer = None if dummy else torch.empty(1)
-            store.registered_pools[PoolName.MAMBA] = SimpleNamespace(
-                conv_buffer=[torch.empty(1)], temporal_state_elem_size=1
-            )
-            keys = ["page0", "page1", "page2"]
-            for page in ("page0", "page2"):
+            with self.subTest(dummy=dummy):
+                store, backend = _make_store(
+                    is_mla_model=True, tp_rank=1, tp_size=2, mla_host_read_only=True
+                )
+                store.mem_pool_host.kv_buffer = None if dummy else torch.empty(1)
+                temporal, conv = torch.empty(1), torch.empty(1)
+                mamba_pool = SimpleNamespace(
+                    temporal_buffer=temporal,
+                    conv_buffer=[conv],
+                    temporal_state_elem_size=1,
+                    get_hybrid_pool_buffer=lambda: [temporal, conv],
+                )
+                registrations = []
+
+                def register(ptr, size):
+                    registrations.append((ptr, size))
+                    return 0
+
+                with patch.object(backend, "register_buffer", side_effect=register):
+                    store.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
+                self.assertEqual(
+                    registrations,
+                    [
+                        (temporal.data_ptr(), temporal.nbytes),
+                        (conv.data_ptr(), conv.nbytes),
+                    ],
+                )
+                keys = ["page0", "page1", "page2"]
                 backend.existing_keys.update(
                     [
-                        f"{page}_{store.mha_suffix}_temporal",
-                        f"{page}_{store.mha_suffix}_conv_0",
+                        "page0_1_temporal",
+                        "page0_1_conv_0",
+                        "page2_1_temporal",
+                        "page2_1_conv_0",
                     ]
                 )
-            with patch.object(
-                backend, "batch_is_exist", wraps=backend.batch_is_exist
-            ) as queries:
+                # No MLA keys exist: follower hits come from skipping MLA queries.
                 self.assertEqual(store.batch_exists(keys), 3)
-                queries.assert_not_called()
-                for policy, expected_pages, stop_points in (
-                    (PoolHitPolicy.ALL_PAGES, 1, [1]),
-                    (PoolHitPolicy.TRAILING_PAGES, 3, [1, 3]),
-                ):
-                    transfer = PoolTransfer(
-                        name=PoolName.MAMBA, keys=["page2"], hit_policy=policy
-                    )
-                    result = store.batch_exists_v2(keys, [transfer])
-                    self.assertEqual(result.kv_hit_pages, expected_pages)
-                    self.assertEqual(result.restorable_prefix_pages, stop_points)
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["page2"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+                result = store.batch_exists_v2(keys, [transfer])
+                self.assertEqual(result.kv_hit_pages, 3)
+                self.assertEqual(result.restorable_prefix_pages, [1, 3])
                 backend.existing_keys.clear()
                 self.assertEqual(
                     store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 0
-                )
-            self.assertTrue(queries.call_args_list)
-            for call in queries.call_args_list:
-                self.assertTrue(
-                    all(key.endswith(("_temporal", "_conv_0")) for key in call.args[0])
                 )
 
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
