@@ -5,7 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, pd_prefill_body, BootstrapFields,
+    PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -251,10 +252,17 @@ async fn dispatch<T: Transport>(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
+    // Without PD, "prefill" is the only worker and gets the client's body; a typed
+    // gRPC request has no body, and its prefill RPC is already unary.
+    let first_body = if pd.is_some() && !body.is_empty() {
+        pd_prefill_body(&body)?
+    } else {
+        body.clone()
+    };
     let prefill_leg = Leg::new(
         dp_aware,
         headers.clone(),
-        &body,
+        &first_body,
         &additions,
         prefill_rank,
         None,
