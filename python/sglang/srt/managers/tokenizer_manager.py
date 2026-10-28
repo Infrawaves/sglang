@@ -2851,7 +2851,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state
                     if state.cache_physical_ttl_seconds is not None:
-                        state.cache_metrics_parent = self.rid_to_state[objs[i].rid]
+                        # The initial rid has left rid_to_state; its state is kept here.
+                        state.cache_metrics_parent = request_states[objs[i].rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
