@@ -13,7 +13,7 @@ use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, PREFILL_REQUEST_REJECTED, X_ROUTER_ERROR_CODE};
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
@@ -76,6 +76,12 @@ pub(super) async fn forward_request(
         Ok(mut response) => {
             if let Some(hint) = dispatched.decode_url_header {
                 response.headers_mut().insert(X_SGL_DECODE_URL, hint);
+            }
+            if dispatched.prefill_rejected {
+                response.headers_mut().insert(
+                    X_ROUTER_ERROR_CODE,
+                    HeaderValue::from_static(PREFILL_REQUEST_REJECTED),
+                );
             }
             response
         }
@@ -157,6 +163,8 @@ struct Dispatched<R> {
     result: Result<R, ApiError>,
     log_context: RequestLogContext,
     decode_url_header: Option<HeaderValue>,
+    /// A PD prefill's 4xx, passed through with the worker's status and body.
+    prefill_rejected: bool,
     retry_excluding: Vec<WorkerId>,
 }
 
@@ -396,10 +404,16 @@ async fn dispatch<T: Transport>(
     };
     let log_context =
         metrics.record_dispatch_result::<T>(&result, engine_rid, blamed_prefill.as_ref());
+    // Only a prefill client error ends a PD request as `Ok` with prefill blamed.
+    let prefill_rejected = blamed_prefill.is_some()
+        && result
+            .as_ref()
+            .is_ok_and(|response| (400..500).contains(&T::status(response)));
     Ok(Dispatched {
         result,
         log_context,
         decode_url_header,
+        prefill_rejected,
         retry_excluding,
     })
 }
@@ -480,14 +494,15 @@ trait Transport: Clone + Send + Sync + 'static {
         decode_slot: Option<DecodeSlot>,
     ) -> impl Future<Output = Result<Self::Response, ApiError>> + Send;
 
-    /// Run a PD prefill to completion and judge it.
+    /// Run a PD prefill to completion and judge it; also whether the worker
+    /// answered with backpressure, which a 502 to the client would hide.
     fn prefill(
         self,
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
-    ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
+    ) -> impl Future<Output = (PrefillFailure<Self::Response>, bool)> + Send;
 }
 
 /// One worker's request: the HTTP body, and the same additions as typed fields.
@@ -577,7 +592,7 @@ impl Transport for Http {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
-    ) -> PrefillFailure {
+    ) -> (PrefillFailure, bool) {
         let result = proxy
             .forward_json_to(
                 &worker.url,
@@ -589,7 +604,11 @@ impl Transport for Http {
                 None,
             )
             .await;
-        prefill_failure(result).await
+        let backpressure = matches!(
+            dispatch_outcome::<Self>(&result),
+            RequestOutcome::Backpressure
+        );
+        (prefill_failure(result).await, backpressure)
     }
 }
 
@@ -666,7 +685,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: Arc<Worker>,
         _path: &'static str,
         leg: Leg,
-    ) -> PrefillFailure<Self::Response> {
+    ) -> (PrefillFailure<Self::Response>, bool) {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
@@ -674,6 +693,11 @@ impl<R: EngineRpc> Transport for Grpc<R> {
                 None,
             )
             .await;
+        let backpressure = matches!(
+            dispatch_outcome::<Self>(&result),
+            RequestOutcome::Backpressure
+        );
+        // A prefill 4xx passes through; any other failure becomes `prefill_worker_error`.
         let status = match result {
             Ok(response) if response.status.is_success() => {
                 let replies: Vec<_> = response.replies.collect().await;
@@ -684,23 +708,17 @@ impl<R: EngineRpc> Transport for Grpc<R> {
                         .is_ok_and(|reply| !reply.is_error_event(&mut scanner))
                 });
                 if clean {
-                    return None;
+                    return (None, backpressure);
                 }
                 response.status
             }
-            Ok(response)
-                if matches!(
-                    outcome_from_status(response.status.as_u16()),
-                    RequestOutcome::Error
-                ) =>
-            {
-                response.status
-            }
-            result => return Some(result),
+            Ok(response) if !response.status.is_client_error() => response.status,
+            result => return (Some(result), backpressure),
         };
-        Some(Err(ApiError::PrefillFailed {
+        let failure = Some(Err(ApiError::PrefillFailed {
             status: Some(status),
-        }))
+        }));
+        (failure, backpressure)
     }
 }
 
@@ -794,16 +812,19 @@ fn spawn_prefill_request<T: Transport>(
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
-        let failure = transport
+        let (failure, backpressure) = transport
             .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
             .await;
         if let Some(slot) = &slot {
             slot.release();
         }
         let prefill_url = &prefill_worker.url;
-        let outcome = failure
-            .as_ref()
-            .map_or(RequestOutcome::Success, dispatch_outcome::<T>);
+        let outcome = match &failure {
+            None => RequestOutcome::Success,
+            // The worker's backpressure stays backpressure even when the client sees a 502.
+            Some(_) if backpressure => RequestOutcome::Backpressure,
+            Some(failure) => dispatch_outcome::<T>(failure),
+        };
         registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
         match &failure {
             None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
@@ -822,8 +843,8 @@ fn spawn_prefill_request<T: Transport>(
     })
 }
 
-/// Client errors and backpressure pass through; only a prefill fault becomes
-/// `prefill_failed`.
+/// A prefill 4xx (429 included) passes through with the worker's status and body;
+/// any other failure, 503 included, becomes `prefill_worker_error`, as on prod v0.5.21.
 async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
     let status = match result {
         // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
@@ -834,14 +855,7 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
                 _ => status,
             }
         }
-        Ok(response)
-            if matches!(
-                outcome_from_status(response.status().as_u16()),
-                RequestOutcome::Error
-            ) =>
-        {
-            response.status()
-        }
+        Ok(response) if !response.status().is_client_error() => response.status(),
         result => return Some(result),
     };
     Some(Err(ApiError::PrefillFailed {

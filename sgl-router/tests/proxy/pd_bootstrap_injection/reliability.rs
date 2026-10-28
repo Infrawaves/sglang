@@ -93,26 +93,35 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
     for reorg in [false, true] {
         for stream in [false, true] {
             // (prefill, decode, client status, router error code, whether prefill is blamed)
+            // Gateways key on these codes: a prefill 4xx keeps the worker's status
+            // and body, any other prefill failure is a 502.
             let cases = [
                 (
                     error(StatusCode::BAD_REQUEST).await,
                     hanging().await,
                     StatusCode::BAD_REQUEST,
-                    None,
+                    Some("prefill_request_rejected"),
+                    true,
+                ),
+                (
+                    error(StatusCode::TOO_MANY_REQUESTS).await,
+                    hanging().await,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some("prefill_request_rejected"),
                     true,
                 ),
                 (
                     error(StatusCode::SERVICE_UNAVAILABLE).await,
                     hanging().await,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    None,
+                    StatusCode::BAD_GATEWAY,
+                    Some("prefill_worker_error"),
                     true,
                 ),
                 (
                     error(StatusCode::INTERNAL_SERVER_ERROR).await,
                     hanging().await,
                     StatusCode::BAD_GATEWAY,
-                    Some("prefill_failed"),
+                    Some("prefill_worker_error"),
                     true,
                 ),
                 // Transport failure: the prefill body is cut off.
@@ -143,9 +152,16 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                 assert_eq!(response.status(), expected);
                 let router_code = response.headers().get("x-router-error-code").cloned();
                 assert_eq!(router_code.as_ref().map(|c| c.to_str().unwrap()), code);
+                let upstream_status = response.headers().get("x-router-upstream-status").cloned();
                 let body = response.into_body().collect().await.unwrap().to_bytes();
-                if code.is_none() {
+                // Worker answers pass through verbatim; only router 502s carry the
+                // worker's status separately.
+                if matches!(code, None | Some("prefill_request_rejected")) {
                     assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), rejected);
+                    assert!(upstream_status.is_none());
+                }
+                if code == Some("prefill_worker_error") {
+                    assert!(upstream_status.is_some());
                 }
                 let (blamed, other) = match prefill_blamed {
                     true => ((&prefill.url, "prefill"), (&decode.url, "decode")),
@@ -286,7 +302,7 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
         .unwrap()
         .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
+        assert_eq!(response.headers()["x-router-error-code"], "prefill_worker_error");
         assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
     }
 }
