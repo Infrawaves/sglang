@@ -41,6 +41,9 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication.k3_shared_weight_stream import (
+    SharedWeightStream,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -788,6 +791,14 @@ class KimiK3MoE(nn.Module):
                 (parallel.attn_tp_group, parallel.tp_group),
             )
         )
+        # Set after weight loading by KimiK3LinearForCausalLM when
+        # SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM is on; None keeps the
+        # activation AG/RS path.
+        self._shared_weight_stream: Optional[SharedWeightStream] = None
+        self._shared_weight_slot: Optional[int] = None
+        self._shared_weight_stream_min_rows = (
+            envs.SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM_MIN_ROWS.get()
+        )
 
         if self.use_latent_moe:
             latent_quant_config = (
@@ -1268,6 +1279,35 @@ class KimiK3MoE(nn.Module):
         with the SP RS/AG would see collectives from two streams."""
         return bool(eligible) and all(shared_group is not g for g in sp_groups)
 
+    def _can_stream_shared_weights(self) -> bool:
+        """Weight streaming replaces the shared AG/RS of a TP-sharded dense
+        bf16 shared MLP that runs on the SBO side stream."""
+        if (
+            _is_npu
+            or _is_hip
+            or self.shared_experts is None
+            or not self._shared_experts_tp_comm
+            or not self._sbo_shared_overlap
+        ):
+            return False
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        linears = (self.shared_experts.gate_up_proj, self.shared_experts.down_proj)
+        return all(
+            isinstance(linear.quant_method, UnquantizedLinearMethod)
+            and linear.weight.dtype == torch.bfloat16
+            for linear in linears
+        )
+
+    def prefetch_shared_weights(self, *, num_rows: int) -> None:
+        """Queue this layer's staging copy ahead of its attention block. Only
+        a hint: _forward_unfused re-decides the path and acquires itself."""
+        if (
+            self._shared_weight_stream is not None
+            and num_rows >= self._shared_weight_stream_min_rows
+        ):
+            self._shared_weight_stream.prefetch(self._shared_weight_slot)
+
     def _gather_shared_expert_inputs(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1395,6 +1435,17 @@ class KimiK3MoE(nn.Module):
         # SBO input read on the side stream, held until the tail join for the
         # same reason (it may be a gathered tensor local to issue_shared).
         shared_input_keepalive = None
+        # Rank-uniform: SP-MoE shapes match across the subgroup, so every rank
+        # picks the same path and the activation fallback's collectives pair up.
+        weight_stream = self._shared_weight_stream
+        if weight_stream is not None and (
+            hidden_states.shape[0] < self._shared_weight_stream_min_rows
+        ):
+            weight_stream = None
+        if weight_stream is not None:
+            # No-op when the decoder layer already queued it ahead of attention
+            # (prefetch_shared_weights); otherwise the copy is exposed here.
+            weight_stream.prefetch(self._shared_weight_slot)
         # Nothing in this MoE block is record_stream'd (except the NPU
         # fine-grained path, which never uses symm mem). Under --enable-symm-mem
         # the Shared MLP output (down_proj) and the top-k tensors are allocated
@@ -1442,7 +1493,20 @@ class KimiK3MoE(nn.Module):
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
                     shared_input.record_stream(self.alt_stream)
                 return
-            if self._shared_experts_side_comm:
+            if weight_stream is not None:
+                # Full-width MLP on local rows, no subgroup collective. The
+                # current stream joins the staging copy first so alt_stream
+                # inherits it; the tail join on shared_event orders the next
+                # prefetch after this read of the staging weights.
+                current_stream = torch.cuda.current_stream()
+                weight_stream.acquire(self._shared_weight_slot)
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = weight_stream.forward(
+                        self.shared_experts, hidden_states
+                    )
+                    shared_event = self.alt_stream.record_event()
+            elif self._shared_experts_side_comm:
                 # AG -> MLP on the side stream; RS follows in
                 # issue_shared_reduce_scatter once the routed experts are in.
                 # The current stream joins shared_event before these buffers
@@ -1534,6 +1598,7 @@ class KimiK3MoE(nn.Module):
                 self._shared_experts_tp_comm
                 and not fine_grained_overlap
                 and not self._shared_experts_side_comm
+                and weight_stream is None
             ):
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
@@ -3231,6 +3296,16 @@ class KimiK3DecoderLayer(nn.Module):
             )
         return ()
 
+    def _prefetch_shared_weights(self, *, num_rows: int) -> None:
+        # Issued after the attention input's SP all-gather and before the
+        # attention compute, so the copy-engine weight pull shares NVLink with
+        # neither the SP collectives nor MegaMoE.
+        if not self._is_moe_layer:
+            return
+        if self._sp_moe:
+            num_rows //= get_parallel().attn_tp_size
+        self.mlp.prefetch_shared_weights(num_rows=num_rows)
+
     def _run_self_attn(
         self,
         hidden_states: torch.Tensor,
@@ -3243,6 +3318,7 @@ class KimiK3DecoderLayer(nn.Module):
         # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
             return hidden_states
+        self._prefetch_shared_weights(num_rows=hidden_states.shape[0])
 
         # MLA layers with q_lora_rank read their latent inputs from the
         # attention-TP context.
@@ -4082,6 +4158,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
 
+        if envs.SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM.get():
+            self._setup_shared_weight_stream()
+
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
                 layer.self_attn, KimiK3DeltaAttention
@@ -4104,6 +4183,36 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+    def _setup_shared_weight_stream(self) -> None:
+        """Move the local MoE layers' shared-expert shards into one IPC pool and
+        chain their staging copies in forward order. Must run before KV-cache
+        sizing and CUDA graph capture; idempotent across post-load calls."""
+        moes = [
+            layer.mlp
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+            and isinstance(layer.mlp, KimiK3MoE)
+            and layer.mlp.shared_experts is not None
+        ]
+        if not moes or moes[0]._shared_weight_stream is not None:
+            return
+        if not all(moe._can_stream_shared_weights() for moe in moes):
+            raise ValueError(
+                "SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM needs CUDA, an EP a2a "
+                "backend, --shared-experts-tp-size > 1 and dense bf16 shared "
+                "experts."
+            )
+        group = moes[0]._shared_experts_tp_group
+        stream = SharedWeightStream(
+            mlps=[moe.shared_experts for moe in moes],
+            cpu_group=group.cpu_group,
+            rank=group.rank_in_group,
+            world_size=group.world_size,
+        )
+        for slot, moe in enumerate(moes):
+            moe._shared_weight_stream = stream
+            moe._shared_weight_slot = slot
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
