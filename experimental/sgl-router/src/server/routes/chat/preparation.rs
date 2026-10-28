@@ -1041,6 +1041,21 @@ pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<B
     Some(Bytes::from(output))
 }
 
+/// The PD prefill copy of an outgoing body. Prefill only fills KV for decode, so
+/// it never streams: its own error status then reaches the client unwrapped.
+/// `stream_options` goes with it, which the engine rejects without `stream`.
+pub(super) fn pd_prefill_body(body: &Bytes) -> Result<Bytes, ApiError> {
+    let mut value: Value = serde_json::from_slice(body).map_err(|_| invalid_request())?;
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(body.clone());
+    };
+    fields.insert("stream".into(), Value::Bool(false));
+    fields.remove("stream_options");
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request")))
+}
+
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
 fn build_outgoing_body(
     body: &Bytes,

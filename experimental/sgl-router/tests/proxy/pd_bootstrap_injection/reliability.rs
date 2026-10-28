@@ -286,14 +286,30 @@ async fn decode_failure_leaves_prefill_running() {
     }
 }
 
-/// A streaming prefill that fails after committing a 200 is still a prefill failure.
+/// A scheduler rejection reaches a streaming client as prefill's own 4xx, not a
+/// 502: prefill never streams, so the engine reports it as a status, not an SSE event.
 #[tokio::test]
-async fn prefill_sse_error_event_is_a_prefill_failure() {
+async fn streaming_pd_prefill_rejection_keeps_its_status() {
+    use axum::response::IntoResponse;
     for reorg in [false, true] {
-        let prefill =
-            MockWorker::start(vec!["data: {\"error\": {\"message\": \"boom\"}}\n\n"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefill_url = format!("http://{}", listener.local_addr().unwrap());
+        // Like the engine: a streaming request fails as a 200 SSE event, else as a status.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                if body["stream"] == true {
+                    let event = "data: {\"error\": {\"message\": \"rejected\", \"code\": 400}}\n\n";
+                    (StatusCode::OK, event).into_response()
+                } else {
+                    let error = axum::Json(json!({"error": "rejected"}));
+                    (StatusCode::BAD_REQUEST, error).into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
-        let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
+        let ctx = pd_ctx(&prefill_url, &decode.url, reorg);
         let response = tokio::time::timeout(
             Duration::from_secs(1),
             build_router(ctx.clone()).oneshot(chat(true)),
@@ -301,8 +317,8 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(response.headers()["x-router-error-code"], "prefill_worker_error");
-        assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-router-error-code"], "prefill_request_rejected");
+        assert_eq!(outcomes(&ctx, &prefill_url, "prefill"), ["client_error"]);
     }
 }

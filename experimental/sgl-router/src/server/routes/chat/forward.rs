@@ -5,7 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, pd_prefill_body, BootstrapFields,
+    PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -127,8 +128,14 @@ pub(super) async fn forward_request(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
+    // Without PD, "prefill" is the only worker and gets the client's body.
+    let first_body = if pd.is_some() {
+        pd_prefill_body(&body)?
+    } else {
+        body.clone()
+    };
     let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+        with_dp_rank(dp_aware, headers.clone(), &first_body, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
