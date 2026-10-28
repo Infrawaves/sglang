@@ -119,7 +119,9 @@ pub(super) async fn forward_request(
         (decode, bootstrap)
     });
     let path = request.path;
-    let engine_rid = request.engine_rid();
+    let engine_rid = request.engine_rid(pd.is_some());
+    // Read before `outgoing_body`, which consumes the cached parse.
+    let caller_rid = pd.as_ref().and_then(|_| request.caller_rid());
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
@@ -144,6 +146,7 @@ pub(super) async fn forward_request(
             tracing::info!(
                 request_id,
                 engine_rid = ?engine_rid,
+                caller_rid = ?caller_rid,
                 prefill_url = %prefill.url,
                 decode_url = %decode.url,
                 bootstrap_room = bootstrap.room,

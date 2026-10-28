@@ -341,11 +341,15 @@ impl PreparedRequest {
         !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
-    pub(super) fn engine_rid(&self) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
-        // PD shares the minted ID, but only decode arms abort-on-drop.
-        if self.caller_set_rid || self.fans_out {
+    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
+        // Caller IDs are unsafe for prefix aborts and fan-out regenerates IDs.
+        // Single-sample PD replaces a caller ID with a fixed-length private one,
+        // shared by both sides, so decode can still be aborted.
+        if self.fans_out || (self.caller_set_rid && !pd_mode) {
             return None;
+        }
+        if pd_mode {
+            return Some(format!("sgl-router-{}", uuid::Uuid::new_v4()));
         }
         let id = uuid::Uuid::new_v4().simple();
         Some(match self.path {
@@ -353,6 +357,23 @@ impl PreparedRequest {
             RESPONSES_PATH => format!("resp_{id}"),
             _ => id.to_string(),
         })
+    }
+
+    /// The caller's own request ID, logged when PD replaces it with a private one.
+    pub(super) fn caller_rid(&self) -> Option<String> {
+        if !self.caller_set_rid {
+            return None;
+        }
+        let reparsed;
+        let body = match &self.parsed_body {
+            Some(body) => body,
+            None => {
+                reparsed = serde_json::from_slice::<Value>(&self.body).ok()?;
+                &reparsed
+            }
+        };
+        let rid = body.get(self.request_id_key()).filter(|rid| !rid.is_null())?;
+        Some(rid.as_str().map_or_else(|| rid.to_string(), str::to_owned))
     }
 
     /// The body key carrying the engine request ID.
