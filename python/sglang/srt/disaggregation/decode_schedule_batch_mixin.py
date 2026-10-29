@@ -18,6 +18,26 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def _h2d_nonblocking(data: List[int], dtype: torch.dtype, device) -> torch.Tensor:
+    """Copy a host list to ``device`` without blocking the CPU on the stream.
+
+    ``torch.tensor(data, device="cuda")`` stages through pageable memory and
+    then synchronizes the current stream. On PD decode admission the schedule
+    stream has just been fenced on the in-flight forward
+    (``schedule_stream.wait_stream(forward_stream)``), so that synchronize
+    parks the scheduler until the whole forward finishes and the overlap
+    pipeline collapses: the next batch's CPU prep becomes GPU idle time on
+    every DP rank. A pinned, non_blocking copy keeps the same stream ordering
+    on the GPU and only stops the CPU from waiting. Non-CUDA devices keep the
+    synchronous copy.
+    """
+    if torch.device(device).type != "cuda":
+        return torch.tensor(data, dtype=dtype, device=device)
+    return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+        device, non_blocking=True
+    )
+
+
 class ScheduleBatchDisaggregationDecodeMixin:
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
@@ -80,15 +100,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
         # input_ids from the relay.
         self.input_ids = None
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        # Non-blocking so a coarse WAR barrier on the schedule stream cannot
+        # turn these copies into a wait on the in-flight forward.
+        self.req_pool_indices = _h2d_nonblocking(
+            req_pool_indices, torch.int64, self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = _h2d_nonblocking(seq_lens, torch.int64, self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        self.orig_seq_lens = _h2d_nonblocking(seq_lens, torch.int32, self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -140,9 +160,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
-        )
+        # The caller has fenced the schedule stream on the in-flight forward
+        # (reused req_pool rows); a synchronous copy here would block the CPU
+        # until that forward ends. The stash below stays GPU-ordered after it.
+        last_tokens_tensor = _h2d_nonblocking(last_tokens, torch.int64, self.device)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
