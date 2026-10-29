@@ -477,6 +477,9 @@ class _GenerationStreamAccumulator:
                 # The admitted payload owns this one-time snapshot until sent.
                 req.cache_input_metadata = None
         self.cache_input_metadata.append(cache_input_metadata)
+        # A verified token block can extend past the stop position. Report
+        # reasoning usage only within the same prefix as completion usage.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -503,7 +506,6 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
