@@ -48,9 +48,10 @@ class CopyOp(msgspec.Struct, frozen=True):
 
 
 def slot_copy_plan(
-    *, slot: int, world_size: int, shard: int, hidden: int
+    *, slot: int, rank: int, world_size: int, shard: int, hidden: int
 ) -> List[CopyOp]:
-    """Copies assembling one layer's full-width weights from every rank's pool.
+    """Copies assembling one layer's full-width weights on ``rank`` from every
+    rank's pool.
 
     A pool slot is [gate_up shard (2*shard, hidden) | down shard (hidden,
     shard)], i.e. the row-major TP shards of MergedColumnParallelLinear and
@@ -60,16 +61,21 @@ def slot_copy_plan(
     base = slot * 3 * block
     full = shard * world_size
     ops = []
-    for rank in range(world_size):
+    # Peers first, rotated so the ranks do not all pull from the same pool at
+    # once; the local copies last. The copy stream runs these serially, and a
+    # same-GPU pitched copy is an SM kernel that waits for free SMs, so placed
+    # first it would hold the peer copies (copy engine) behind it.
+    for step in range(1, world_size + 1):
+        src_rank = (rank + step) % world_size
         # Rank r's [gate_r; up_r] is contiguous in its pool. In the TP1 gate_up,
         # gate_r starts at row r*shard and up_r at row full + r*shard, so one
         # 2-row pitched copy places both.
         ops.append(
             CopyOp(
                 dst=_GATE_UP,
-                dst_offset=rank * block,
+                dst_offset=src_rank * block,
                 dst_pitch=full * hidden,
-                src_rank=rank,
+                src_rank=src_rank,
                 src_offset=base,
                 src_pitch=block,
                 width=block,
@@ -81,9 +87,9 @@ def slot_copy_plan(
         ops.append(
             CopyOp(
                 dst=_DOWN,
-                dst_offset=rank * shard,
+                dst_offset=src_rank * shard,
                 dst_pitch=full,
-                src_rank=rank,
+                src_rank=src_rank,
                 src_offset=base + 2 * block,
                 src_pitch=shard,
                 width=shard,
@@ -195,7 +201,11 @@ class SharedWeightStream:
                     stream_handle,
                 )
                 for op in slot_copy_plan(
-                    slot=slot, world_size=world_size, shard=shard, hidden=hidden
+                    slot=slot,
+                    rank=rank,
+                    world_size=world_size,
+                    shard=shard,
+                    hidden=hidden,
                 )
             ]
             for slot in range(len(mlps))

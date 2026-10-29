@@ -25,31 +25,53 @@ def _rank_pool(gate_ups, downs, rank, world):
 class TestSharedWeightStreamPlan(CustomTestCase):
     def test_staging_matches_tp1_weights(self):
         # Pitched pull copies of every rank's shards must rebuild the TP1
-        # gate_up ([gate; up] rows) and down (columns) of the requested slot.
+        # gate_up ([gate; up] rows) and down (columns) of the requested slot,
+        # on every destination rank.
         hidden, full, layers = 8, 12, 3
         for world in (2, 4):
             gate_ups = [torch.randn(2 * full, hidden) for _ in range(layers)]
             downs = [torch.randn(hidden, full) for _ in range(layers)]
             pools = [_rank_pool(gate_ups, downs, r, world) for r in range(world)]
             for slot in range(layers):
-                with self.subTest(world=world, slot=slot):
-                    staging = {
-                        "gate_up": torch.full((2 * full, hidden), float("nan")),
-                        "down": torch.full((hidden, full), float("nan")),
-                    }
+                for rank in range(world):
+                    with self.subTest(world=world, slot=slot, rank=rank):
+                        staging = {
+                            "gate_up": torch.full((2 * full, hidden), float("nan")),
+                            "down": torch.full((hidden, full), float("nan")),
+                        }
+                        plan = slot_copy_plan(
+                            slot=slot,
+                            rank=rank,
+                            world_size=world,
+                            shard=full // world,
+                            hidden=hidden,
+                        )
+                        # Each op is one CPU launch on a launch-bound path.
+                        self.assertEqual(len(plan), 2 * world)
+                        for op in plan:
+                            dst = staging[op.dst].view(-1)
+                            for row in range(op.height):
+                                d = op.dst_offset + row * op.dst_pitch
+                                s = op.src_offset + row * op.src_pitch
+                                dst[d : d + op.width] = pools[op.src_rank][
+                                    s : s + op.width
+                                ]
+                        torch.testing.assert_close(staging["gate_up"], gate_ups[slot])
+                        torch.testing.assert_close(staging["down"], downs[slot])
+
+    def test_local_copies_last(self):
+        # The copy stream runs the plan serially and the same-GPU pitched
+        # copies are SM kernels that wait for free SMs; queued ahead, they hold
+        # the copy-engine peer pulls behind them into memory-bound attention.
+        for world in (2, 4, 8):
+            for rank in range(world):
+                with self.subTest(world=world, rank=rank):
                     plan = slot_copy_plan(
-                        slot=slot, world_size=world, shard=full // world, hidden=hidden
+                        slot=0, rank=rank, world_size=world, shard=2, hidden=4
                     )
-                    # Each op is one CPU launch on a launch-bound path.
-                    self.assertEqual(len(plan), 2 * world)
-                    for op in plan:
-                        dst = staging[op.dst].view(-1)
-                        for row in range(op.height):
-                            d = op.dst_offset + row * op.dst_pitch
-                            s = op.src_offset + row * op.src_pitch
-                            dst[d : d + op.width] = pools[op.src_rank][s : s + op.width]
-                    torch.testing.assert_close(staging["gate_up"], gate_ups[slot])
-                    torch.testing.assert_close(staging["down"], downs[slot])
+                    sources = [op.src_rank for op in plan]
+                    self.assertEqual(sources[-2:], [rank, rank])
+                    self.assertNotIn(rank, sources[:-2])
 
 
 if __name__ == "__main__":
