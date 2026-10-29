@@ -6,6 +6,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from sglang.kernels.ops.communication.sm100_peer_access import (
+    check_sm100_peer_access,
+)
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 from .workspace import WorkspaceLayout
@@ -35,13 +38,7 @@ class AgGemm:
         self._prepared_kernel_grids = {}
 
         with torch.cuda.device(device):
-            rank_device_uuids = [None] * world_size
-            dist.all_gather_object(
-                rank_device_uuids,
-                torch.ops.mega_ops.sm100_device_uuid(device.index),
-                group=group,
-            )
-            torch.ops.mega_ops.sm100_check_peer_access(device.index, rank_device_uuids)
+            check_sm100_peer_access(group, device)
 
             self._symmetric_workspace = symm_mem.empty(
                 self.layout.gathered_input_numel, device=device, dtype=torch.bfloat16

@@ -247,6 +247,12 @@ class DispatchTableTest(unittest.TestCase):
             },
         )
 
+    def test_gb300_tp8_table_mirrors_b300_tp8(self):
+        self.assertEqual(
+            load_dispatch_table(8, 7168, "NVIDIA_GB300"),
+            load_dispatch_table(8, 7168, "NVIDIA_B300_SXM6_AC"),
+        )
+
     def test_selection_takes_the_largest_bucket_not_exceeding_m(self):
         table = load_dispatch_table(8, 7168, "NVIDIA_B300_SXM6_AC")
         pull = table.configs[8192]
@@ -276,7 +282,7 @@ class DispatchTableTest(unittest.TestCase):
         self.assertIsNone(gb300.select(6000))
 
     def test_missing_table_selects_native(self):
-        self.assertIsNone(load_dispatch_table(8, 7168, "NVIDIA_GB300"))
+        self.assertIsNone(load_dispatch_table(2, 7168, "NVIDIA_GB300"))
         self.assertIsNone(load_dispatch_table(4, 4096, "NVIDIA_GB300"))
         self.assertIsNone(load_dispatch_table(4, 7168, "NVIDIA_B300"))
 
@@ -355,6 +361,7 @@ class ContextTest(unittest.TestCase):
             output[:] = [value, "uuid-1"]
 
         dist.all_gather_object = Mock(side_effect=all_gather_object)
+        dist.get_world_size = Mock(return_value=2)
         dist.barrier = Mock(side_effect=lambda group: self.events.append("barrier"))
         self.torch, self.dist, self.symm = torch, dist, symm
         jit_utils = types.ModuleType("sglang.kernels.jit.utils")
@@ -364,6 +371,19 @@ class ContextTest(unittest.TestCase):
         jit_utils.make_cpp_args = Mock()
         nvtx_utils = types.ModuleType("sglang.srt.utils.nvtx_utils")
         nvtx_utils.operations_nvtx_range = lambda _: contextlib.nullcontext()
+        self.same_node = [True, True]
+        self.one_nvlink_clique = True
+        ar_utils = types.ModuleType(
+            "sglang.srt.distributed.device_communicators.custom_all_reduce_utils"
+        )
+        ar_utils.is_one_nvlink_clique = Mock(
+            side_effect=lambda group, device: self.one_nvlink_clique
+        )
+        parallel_state = types.ModuleType("sglang.srt.distributed.parallel_state")
+        parallel_state.in_the_same_node_as = Mock(
+            side_effect=lambda group, source_rank: self.same_node
+        )
+        self.ar_utils, self.parallel_state = ar_utils, parallel_state
         patcher = patch.dict(
             sys.modules,
             {
@@ -372,6 +392,8 @@ class ContextTest(unittest.TestCase):
                 "torch.distributed._symmetric_memory": symm,
                 "sglang.kernels.jit.utils": jit_utils,
                 "sglang.srt.utils.nvtx_utils": nvtx_utils,
+                ar_utils.__name__: ar_utils,
+                parallel_state.__name__: parallel_state,
             },
         )
         patcher.start()
@@ -379,6 +401,10 @@ class ContextTest(unittest.TestCase):
         self.inkling = _load_module(
             "sglang.kernels.ops.communication.inkling_all_reduce",
             _ROOT / "python/sglang/kernels/ops/communication/inkling_all_reduce.py",
+        )
+        _load_module(
+            "sglang.kernels.ops.communication.sm100_peer_access",
+            _ROOT / "python/sglang/kernels/ops/communication/sm100_peer_access.py",
         )
         self.module = _load_module(
             _PACKAGE.__name__ + ".context", _PACKAGE_PATH / "context.py"
@@ -434,6 +460,26 @@ class ContextTest(unittest.TestCase):
         self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], self.group)
         # Initialization is published before any peer can launch.
         self.assertEqual(self.events, ["sync", "barrier"])
+
+    def test_single_host_group_skips_the_fabric_clique_query(self):
+        self.context()
+        self.parallel_state.in_the_same_node_as.assert_called_once_with(
+            self.group, source_rank=0
+        )
+        self.ar_utils.is_one_nvlink_clique.assert_not_called()
+
+    def test_multi_host_group_in_one_nvlink_clique_skips_the_native_check(self):
+        self.same_node = [True, False]
+        self.context()
+        self.ar_utils.is_one_nvlink_clique.assert_called_once()
+        self.torch.ops.mega_ops.sm100_check_peer_access.assert_not_called()
+
+    def test_multi_host_group_outside_one_nvlink_clique_raises(self):
+        self.same_node = [True, False]
+        self.one_nvlink_clique = False
+        with self.assertRaisesRegex(RuntimeError, "NVLink fabric clique"):
+            self.context()
+        self.torch.ops.mega_ops.sm100_check_peer_access.assert_not_called()
 
     def test_without_multicast_only_push_is_available(self):
         self.multicast_ptr = 0

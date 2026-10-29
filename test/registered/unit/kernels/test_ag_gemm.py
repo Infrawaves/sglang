@@ -78,16 +78,18 @@ class DispatchTableTest(unittest.TestCase):
         self.assertEqual(table.select(8192), self.PULL)
         self.assertEqual(table.select(13000), self.PULL)
 
-    def test_checked_in_b300_tables(self):
-        device = "NVIDIA_B300_SXM6_AC"
-        kda = ag_gemm.load_dispatch_table(8, 7168, 6144, device)
-        mla = ag_gemm.load_dispatch_table(8, 7168, 2112, device)
-        self.assertEqual((kda.k, kda.n, mla.k, mla.n), (7168, 6144, 7168, 2112))
-        self.assertIsNone(kda.select(4095))
-        self.assertEqual(kda.select(4096), self.PULL)
-        self.assertIsNone(mla.select(8191))
-        self.assertEqual(mla.select(8192), self.PULL)
-        self.assertIsNone(ag_gemm.load_dispatch_table(4, 7168, 6144, device))
+    def test_checked_in_tp8_tables(self):
+        # GB300 TP8 mirrors the B300 TP8 dispatch.
+        for device in ("NVIDIA_B300_SXM6_AC", "NVIDIA_GB300"):
+            with self.subTest(device=device):
+                kda = ag_gemm.load_dispatch_table(8, 7168, 6144, device)
+                mla = ag_gemm.load_dispatch_table(8, 7168, 2112, device)
+                self.assertEqual((kda.k, kda.n, mla.k, mla.n), (7168, 6144, 7168, 2112))
+                self.assertIsNone(kda.select(4095))
+                self.assertEqual(kda.select(4096), self.PULL)
+                self.assertIsNone(mla.select(8191))
+                self.assertEqual(mla.select(8192), self.PULL)
+                self.assertIsNone(ag_gemm.load_dispatch_table(4, 7168, 6144, device))
 
 
 def _operator(rank=3, world_size=8, max_m=1024, k=128):

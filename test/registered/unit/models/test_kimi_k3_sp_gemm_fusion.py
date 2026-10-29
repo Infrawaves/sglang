@@ -220,9 +220,9 @@ def test_missing_ops_or_table_keeps_native(group, runtime, caplog):
     assert fusion.create_gemm_fusion_manager(group, 7168) is None
     assert "missing: sm100_gemm_rs_prefix_add_push" in caplog.text
     torch.ops.mega_ops.sm100_gemm_rs_prefix_add_push = Mock()
-    group.world_size = 8
+    group.world_size = 2
     assert fusion.create_gemm_fusion_manager(group, 7168) is None
-    assert "has no table for TP8" in caplog.text
+    assert "has no table for TP2" in caplog.text
 
 
 @pytest.mark.parametrize("regime", ["pdmux", "tbo", "sbo", "lora", "compile"])

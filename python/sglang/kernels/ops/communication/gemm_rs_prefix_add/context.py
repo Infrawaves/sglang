@@ -7,6 +7,9 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from sglang.kernels.ops.communication.inkling_all_reduce import STATE_SIZE, flags_numel
+from sglang.kernels.ops.communication.sm100_peer_access import (
+    check_sm100_peer_access,
+)
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 from .tile_order import build_tile_m_order
@@ -33,13 +36,7 @@ class GemmRSPrefixAdd:
         self._prepared_kernel_grids = {}
 
         with torch.cuda.device(device):
-            rank_device_uuids = [None] * world_size
-            dist.all_gather_object(
-                rank_device_uuids,
-                torch.ops.mega_ops.sm100_device_uuid(device.index),
-                group=group,
-            )
-            torch.ops.mega_ops.sm100_check_peer_access(device.index, rank_device_uuids)
+            check_sm100_peer_access(group, device)
 
             # One symmetric arena: [push receive planes | shared GEMM partial].
             partial_offset = self.layout.recv_data_numel
