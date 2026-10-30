@@ -208,6 +208,10 @@ class TRTLLMMLAPrefillMetadata:
     block_kv_indices: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
     max_seq_len_k: Optional[int] = None
+    # Host copy of the extend lengths, int32 [batch_size]. Passed to the ragged
+    # kernel so it skips its device-side row-activity .item() sync.
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    num_tokens: Optional[int] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -951,6 +955,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
+                seq_lens_cpu=torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                ),
+                num_tokens=sum(forward_batch.extend_seq_lens_cpu),
             )
 
             if use_varlen_absorbed:
@@ -1316,6 +1324,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
@@ -1323,6 +1333,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+        if q_seq_lens_cpu is not None and kv_seq_lens_cpu is not None:
+            cpu_seq_lens_kwargs = dict(
+                q_seq_lens_cpu=q_seq_lens_cpu, kv_seq_lens_cpu=kv_seq_lens_cpu
+            )
+        else:
+            cpu_seq_lens_kwargs = {}
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1343,6 +1359,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            **cpu_seq_lens_kwargs,
         )
 
     def _set_kv_and_concat_q_fused(
@@ -1993,6 +2010,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert q_rope is None
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
+            chunk_seq_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx]
+            chunk_num_tokens = forward_batch.prefix_chunk_num_tokens[chunk_idx]
 
             out = torch.empty(
                 q.shape[0],
@@ -2016,6 +2035,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out_buffer=out,
                 o_sf_scale=-1.0,
+                **self._prefill_cpu_seq_lens(
+                    num_q_tokens=q.shape[0],
+                    num_kv_tokens=k.shape[0],
+                    kv_seq_lens_cpu=chunk_seq_lens_cpu,
+                    num_kv_tokens_cpu=chunk_num_tokens,
+                ),
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -2059,7 +2084,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                **self._prefill_cpu_seq_lens(
+                    num_q_tokens=q.shape[0],
+                    num_kv_tokens=k.shape[0],
+                    kv_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                    num_kv_tokens_cpu=self.forward_prefill_metadata.num_tokens,
+                ),
             )
+
+    def _prefill_cpu_seq_lens(
+        self,
+        *,
+        num_q_tokens: int,
+        num_kv_tokens: int,
+        kv_seq_lens_cpu: Optional[torch.Tensor],
+        num_kv_tokens_cpu: Optional[int],
+    ) -> dict:
+        # Host lengths are only valid when they describe the ragged tensors
+        # exactly; padded or DCP-filtered rows keep the kernel's device path.
+        metadata = self.forward_prefill_metadata
+        if (
+            metadata.seq_lens_cpu is None
+            or kv_seq_lens_cpu is None
+            or metadata.num_tokens != num_q_tokens
+            or num_kv_tokens_cpu != num_kv_tokens
+        ):
+            return {}
+        return dict(
+            q_seq_lens_cpu=metadata.seq_lens_cpu, kv_seq_lens_cpu=kv_seq_lens_cpu
+        )
 
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
