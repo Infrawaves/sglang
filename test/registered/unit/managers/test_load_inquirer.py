@@ -46,14 +46,19 @@ class TestSchedulerLoadInquirer(CustomTestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
         chunked_req = SimpleNamespace(seqlen=50, prefix_indices=range(10))
-        return SimpleNamespace(
+        inquirer = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
             get_waiting_queue=lambda: [waiting_req],
             waiting_queue_prefix_matched=lambda: waiting_queue_prefix_matched,
             get_chunked_req=lambda: chunked_req,
             get_recent_cache_hit_rate=lambda: 0.75,
             get_round_robin_requests=lambda: (),
+            get_pending_storage_hit_end=lambda req: None,
         )
+        inquirer._cached_prefix_len = lambda req, device_host_len: (
+            SchedulerLoadInquirer._cached_prefix_len(inquirer, req, device_host_len)
+        )
+        return inquirer
 
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=False)
@@ -71,19 +76,45 @@ class TestSchedulerLoadInquirer(CustomTestCase):
             120,
         )
 
-    def test_prefill_bootstrap_queue_tokens_count_full_length(self):
+    def test_prefill_bootstrap_queue_tokens_use_enqueue_time_match(self):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
         inquirer.disaggregation_mode = DisaggregationMode.PREFILL
-        bootstrapping = [SimpleNamespace(seqlen=200), SimpleNamespace(seqlen=40)]
+        bootstrapping = [
+            SimpleNamespace(seqlen=200, storage_prefetch_last_match_len=150),
+            SimpleNamespace(seqlen=40, storage_prefetch_last_match_len=None),
+        ]
         inquirer.get_disagg_prefill_bootstrap_queue = lambda: SimpleNamespace(
             queue=bootstrapping
         )
 
-        # 120 as above, plus 200 + 40: bootstrap is not discounted by the
+        # 120 as above, plus (200 - 150) + 40: bootstrap uses the enqueue-time
+        # match, falls back to full length without one, and ignores the
         # (0.75) recent hit rate.
         self.assertEqual(
             SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
-            360,
+            210,
+        )
+
+    def test_queried_l3_hit_extends_the_cached_prefix_without_double_counting(self):
+        inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
+        inquirer.disaggregation_mode = DisaggregationMode.PREFILL
+        waiting_req = inquirer.get_waiting_queue()[0]
+        overtaken = SimpleNamespace(seqlen=200, storage_prefetch_last_match_len=150)
+        cold = SimpleNamespace(seqlen=40, storage_prefetch_last_match_len=None)
+        inquirer.get_disagg_prefill_bootstrap_queue = lambda: SimpleNamespace(
+            queue=[overtaken, cold]
+        )
+        storage_hit_ends = {id(waiting_req): 90, id(overtaken): 120, id(cold): 32}
+        inquirer.get_pending_storage_hit_end = lambda req: storage_hit_ends.get(
+            id(req)
+        )
+
+        # The L3 end is an absolute prefix length, so it is max-ed with the
+        # device+host match, never added: waiting 100 - 90, bootstrap
+        # 200 - max(150, 120) and 40 - 32, plus the 40-token chunk remainder.
+        self.assertEqual(
+            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            10 + 50 + 8 + 40,
         )
 
     def test_bootstrap_queue_is_read_only_in_prefill_mode(self):
@@ -163,7 +194,11 @@ class TestContextLengthLoad(CustomTestCase):
 
     @staticmethod
     def req(length):
-        return SimpleNamespace(seqlen=length, waiting_for_input=False)
+        return SimpleNamespace(
+            seqlen=length,
+            waiting_for_input=False,
+            storage_prefetch_last_match_len=None,
+        )
 
     def get_loads(self, inquirer):
         with (

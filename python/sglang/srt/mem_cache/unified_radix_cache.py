@@ -2181,6 +2181,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
 
+    def get_pending_storage_hit_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        # Read from the scheduler thread; the prefetch thread sets
+        # storage_hit_count once, so a stale read only sees 0.
+        info = self.ongoing_prefetch.get(handle)
+        if info is None or info.operation.storage_hit_count <= 0:
+            return None
+        return info.operation.storage_start + info.operation.storage_hit_count
+
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:

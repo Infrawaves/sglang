@@ -594,6 +594,9 @@ class StreamingSession(BasePrefixCache):
     ) -> tuple[int, Optional[int]]:
         return self.inner.pop_prefetch_loaded_span(handle)
 
+    def get_pending_storage_hit_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        return self.inner.get_pending_storage_hit_end(handle)
+
     def finish_storage_prefetch_admission(
         self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:

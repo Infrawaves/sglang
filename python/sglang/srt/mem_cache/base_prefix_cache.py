@@ -579,6 +579,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
 
+    def get_pending_storage_hit_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        """Prefix end covered by a queried, not yet admitted L3 hit; None if unknown."""
+        return None
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading
