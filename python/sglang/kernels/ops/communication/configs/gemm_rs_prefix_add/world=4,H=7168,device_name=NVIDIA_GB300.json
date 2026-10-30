@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "match": {
+    "device_name": "NVIDIA_GB300",
+    "world_size": 4,
+    "n": 7168,
+    "k": 3072,
+    "dtype": "bfloat16"
+  },
+  "selection": {
+    "rule": "floor_m",
+    "fallback": "baseline"
+  },
+  "source": {
+    "measurement_date": "2026-10-08",
+    "device": "NVIDIA GB300",
+    "nodes": 1,
+    "gpus_per_node": 4,
+    "evidence": [
+      "bench/experiments/2026-10-08/staged_push_20261008/gmem_pull_nofence_full.json",
+      "bench/experiments/2026-10-08/small_m_20261008/",
+      "bench/experiments/2026-10-08/tiny_m_20261008/"
+    ],
+    "note": "These are historical strategy/configuration choices, not latency claims for the current source. Baseline means the complete native SGLang GEMM + RS + prefix path. Measured with the benchmark default K=2048; K3 TP4 o_proj uses K=96x128/4=3072, re-run with --k 3072 to confirm the crossover."
+  },
+  "validation": {
+    "shared_workspace_gpu_validated": false,
+    "push_sender_changed_since_measurement": true,
+    "note": "The historical 4K push candidate is disabled until the current sender is remeasured. Enabled pull entries retain historical kernel configurations; shared-workspace mode switching still requires GPU and CUDA Graph validation before production deployment. Unknown exact shapes use the native baseline."
+  },
+  "configs": {
+    "512": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "1024": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "2048": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "4096": {
+      "mode": "push",
+      "enabled": false,
+      "status": "needs_revalidation",
+      "tile_shape": [128, 128],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    },
+    "8192": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "historical_measurement",
+      "tile_shape": [256, 128],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    },
+    "12288": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "historical_measurement",
+      "tile_shape": [256, 128],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    },
+    "16384": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "historical_measurement",
+      "tile_shape": [256, 128],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    }
+  }
+}

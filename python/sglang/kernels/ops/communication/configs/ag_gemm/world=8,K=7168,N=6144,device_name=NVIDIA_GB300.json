@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "match": {
+    "device_name": "NVIDIA_GB300",
+    "world_size": 8,
+    "k": 7168,
+    "n": 6144,
+    "dtype": "bfloat16"
+  },
+  "selection": {
+    "rule": "floor_m",
+    "fallback": "baseline"
+  },
+  "source": {
+    "device": "NVIDIA GB300",
+    "gpus_per_node": 4,
+    "consumer": "KDA fused_qkvg_proj",
+    "note": "Not measured on GB300; dispatch mirrors the B300 TP8 table (world=8,K=7168,N=6144,device_name=NVIDIA_B300_SXM6_AC.json). B300 note: B300 TP8, K=7168, N=6144, AG + GEMM, ms (nccl / fused pull): 2048 0.168/0.222; 4096 0.326/0.258; 8192 0.546/0.427; 12288 0.798/0.608; 16384 1.048/0.820. Native baseline below 4K, fused pull from 4K.",
+    "nodes": 2
+  },
+  "validation": {
+    "shared_workspace_gpu_validated": false,
+    "note": "All buckets forced to native baseline: fused AG+GEMM deadlocked on GB300 TP8 (2026-10-30, TP0/TP4 stuck in Sm100AgGemmKernel, peers in finish_all_gather_epoch).",
+    "gb300_measured": false
+  },
+  "configs": {
+    "512": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "1024": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "2048": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "4096": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "8192": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "12288": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "16384": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    }
+  }
+}
