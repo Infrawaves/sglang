@@ -184,6 +184,36 @@ class TestKimiK3Eplb(CustomTestCase):
                 config
             )
 
+    def test_fused_remap_ok_follows_dispatch_algorithm_and_kill_switch(self):
+        cases = {
+            None: True,
+            "static": True,
+            "dynamic": True,
+            "fake": False,
+            "lp": False,
+        }
+        for algorithm, supported in cases.items():
+            for remap_enabled in (True, False):
+                with self.subTest(algorithm=algorithm, remap=remap_enabled):
+                    moe = make_module(kimi_k3.KimiK3MoE)
+                    with (
+                        patch.object(
+                            kimi_k3,
+                            "get_exec",
+                            return_value=SimpleNamespace(
+                                moe=SimpleNamespace(ep_dispatch_algorithm=algorithm)
+                            ),
+                        ),
+                        patch.object(
+                            kimi_k3.envs.SGLANG_EPLB_FUSED_FRONT_REMAP,
+                            "get",
+                            return_value=remap_enabled,
+                        ),
+                    ):
+                        self.assertEqual(
+                            moe._fused_remap_ok, supported and remap_enabled
+                        )
+
     def test_weight_views_exclude_non_routed_parameters(self):
         moe = make_module(kimi_k3.KimiK3MoE)
         moe._use_mega_moe = False

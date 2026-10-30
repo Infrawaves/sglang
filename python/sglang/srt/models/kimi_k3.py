@@ -98,6 +98,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputFormat,
     build_precomputed_topk_output,
     can_postprocess_precomputed_topk,
+    routed_experts_capture_active,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -912,6 +913,7 @@ class KimiK3MoE(nn.Module):
             "_front_shard",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_fused_remap_ok",
         ):
             self.__dict__.pop(prop, None)
         self._front_block_w = None
@@ -1180,6 +1182,27 @@ class KimiK3MoE(nn.Module):
         return self.routed_expert_norm(latent)
 
     @cached_property
+    def _dispatch_salt(self) -> int:
+        """Per-(rank, layer) salt for the fused front's dynamic replica pick,
+        so ranks and layers do not all favour the same replica of an expert."""
+        return (get_parallel().moe_ep_rank * 0x10001 + self.layer_idx) & 0xFFFFFFFF
+
+    @cached_property
+    def _fused_remap_ok(self) -> bool:
+        """Whether the merged front may apply the EPLB logical->physical remap
+        (and the recorder count) inside its epilogue.  Statically decidable
+        part only; the capturer and dispatch-table checks run per call.
+
+        When False, the merged front still runs but emits logical ids, and
+        build_precomputed_topk_output remaps them through select_experts'
+        post-processing (the base behaviour)."""
+        if not envs.SGLANG_EPLB_FUSED_FRONT_REMAP.get():
+            return False
+        algorithm = getattr(get_exec().moe, "ep_dispatch_algorithm", None)
+        # None means select_experts would not remap either (no dispatch info).
+        return algorithm in (None, "static", "dynamic")
+
+    @cached_property
     def _routing_contract_ok(self) -> bool:
         """Whether a kernel may emit (weights, ids) itself and bypass
         select_experts. Shared by the fused router and the merged front."""
@@ -1252,6 +1275,25 @@ class KimiK3MoE(nn.Module):
         ):
             return None
 
+        num_token_non_padded, dispatch_info = self.topk.routing_inputs()
+        # Fold the EPLB logical->physical remap and the recorder's
+        # per-physical-expert count into the epilogue when possible.  The
+        # capturer records logical ids, so capture runs keep the remap in
+        # select_experts' post-processing.
+        fuse_remap = (
+            self._fused_remap_ok
+            and not routed_experts_capture_active(cfg)
+            and moe_front.fused_remap_supported(dispatch_info)
+        )
+        # Count in the epilogue whenever the ids it emits are the ones the
+        # recorder would see (also under graph capture).
+        physical_count = (
+            get_global_expert_distribution_recorder().get_fused_select_count_buffer()
+            if fuse_remap
+            else None
+        )
+        kernel_dispatch_info = dispatch_info if fuse_remap else None
+
         w, i, routed = moe_front.fused_front(
             hidden_states,
             self._front_w,
@@ -1261,6 +1303,10 @@ class KimiK3MoE(nn.Module):
             renormalize=cfg.renormalize,
             routed_scaling_factor=cfg.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=cfg.apply_routed_scaling_factor_on_output,
+            dispatch_info=kernel_dispatch_info,
+            dispatch_salt=self._dispatch_salt,
+            physical_count=physical_count,
+            num_valid_tokens=num_token_non_padded,
         )
 
         global _EP_FRONT_LOGGED
@@ -1272,7 +1318,6 @@ class KimiK3MoE(nn.Module):
                 self.layer_idx,
                 hidden_states.shape[0],
             )
-        num_token_non_padded, dispatch_info = self.topk.routing_inputs()
         return (
             build_precomputed_topk_output(
                 w,
@@ -1280,7 +1325,13 @@ class KimiK3MoE(nn.Module):
                 cfg,
                 self.layer_idx,
                 num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
+                expert_location_dispatch_info=(
+                    None if fuse_remap else dispatch_info
+                ),
+                # With fuse_remap the epilogue emitted the final (physical)
+                # ids and, when recording, already counted them.
+                ids_are_physical=fuse_remap,
+                recorded=physical_count is not None,
             ),
             routed,
         )

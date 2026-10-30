@@ -3313,6 +3313,19 @@ def can_postprocess_precomputed_topk(topk_config: TopKConfig) -> bool:
     )
 
 
+def routed_experts_capture_active(topk_config: TopKConfig) -> bool:
+    """Whether the routed-experts capturer will read this layer's top-k ids.
+
+    The capturer stores *logical* ids. A router that emits physical ids
+    directly (EPLB remap fused into the kernel) must fall back while a
+    capturer is attached so the capture still sees logical ids.
+    """
+    return (
+        topk_config.allow_routed_experts_capture
+        and get_global_experts_capturer() is not None
+    )
+
+
 def build_precomputed_topk_output(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -3321,13 +3334,30 @@ def build_precomputed_topk_output(
     *,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ids_are_physical: bool = False,
+    recorded: bool = False,
 ) -> StandardTopKOutput:
     """Finish precomputed logical routes through select_experts' post-processing.
 
     The caller must supply already-scaled weights and exclude shared slots and
     routing simulation. Fake dispatch changes logits *before* top-k selection,
     so it must use the ordinary router rather than this entry point.
+
+    ``ids_are_physical`` means the router already applied the EPLB
+    logical->physical remap in-kernel (K3 fused-front remap); only the padded
+    region mask and, unless ``recorded`` (the kernel accumulated the
+    recorder's per-physical-expert counts), the recorder hook remain.
     """
+    if ids_are_physical:
+        # The capturer wants logical ids; callers must not fuse the remap
+        # while one is attached (see routed_experts_capture_active).
+        assert not routed_experts_capture_active(topk_config)
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        if not recorded:
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=topk_ids
+            )
+        return StandardTopKOutput(topk_weights, topk_ids, None)
     if num_token_non_padded is None and expert_location_dispatch_info is None:
         capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)

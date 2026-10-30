@@ -188,6 +188,46 @@ def fused_front_covered(
     )
 
 
+_FUSED_REMAP_ALGORITHMS = ("static", "dynamic")
+
+
+def fused_remap_supported(dispatch_info) -> bool:
+    """Whether the epilogue can apply this EPLB dispatch itself.
+
+    ``static`` reads the per-rank dispatch row; ``dynamic`` picks a replica
+    from the all-physical table.  ``fake`` rewrites the logits before the
+    top-k and ``lp`` needs a host-side solver, so both stay on the unfused
+    ``select_experts`` path.
+    """
+    if dispatch_info is None:
+        return True
+    algorithm = dispatch_info.ep_dispatch_algorithm
+    if algorithm not in _FUSED_REMAP_ALGORITHMS:
+        return False
+    if algorithm == "static":
+        return dispatch_info.partial_logical_to_rank_dispatch_physical_map is not None
+    return True
+
+
+def _remap_kernel_args(dispatch_info):
+    """(rank_dispatch, all_physical, num_valid, rank_invariant) kernel args.
+
+    The tensors are passed as views (never copies): EPLB rewrites the layer
+    rows in place, and a CUDA graph must keep reading the same storage.
+    """
+    if dispatch_info is None:
+        return None, None, None, False
+    if dispatch_info.ep_dispatch_algorithm == "static":
+        rank_dispatch = dispatch_info.partial_logical_to_rank_dispatch_physical_map
+        assert rank_dispatch.is_cuda and rank_dispatch.stride(0) == 1
+        return rank_dispatch, None, None, dispatch_info.rank_invariant
+    all_physical = dispatch_info.partial_logical_to_all_physical_map
+    num_valid = dispatch_info.partial_logical_to_all_physical_map_num_valid
+    assert all_physical.is_cuda and all_physical.stride(1) == 1
+    assert num_valid.stride(0) == 1
+    return None, all_physical, num_valid, dispatch_info.rank_invariant
+
+
 def fused_front(
     hidden_states: torch.Tensor,
     merged_weight: torch.Tensor,
@@ -198,12 +238,28 @@ def fused_front(
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
     config: Optional[dict] = None,
+    *,
+    dispatch_info=None,
+    dispatch_salt: int = 0,
+    physical_count: Optional[torch.Tensor] = None,
+    num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Merged front GEMM + fused top-k/cast epilogue.
 
     Returns ``(topk_weights [M, topk] fp32, topk_ids [M, topk] int32,
     routed_input [M, latent] bf16)``.
+
+    With ``dispatch_info`` (an ``ExpertLocationDispatchInfo``) the epilogue
+    maps each selected logical expert to a physical replica before storing it,
+    so ``topk_ids`` are already physical ids.  ``physical_count`` (int32
+    ``[num_physical]``) is incremented once per routed slot of every row below
+    ``num_valid_tokens``, replacing the recorder's per-layer scatter_add.
     """
+    if not fused_remap_supported(dispatch_info):
+        raise ValueError(
+            "fused_front cannot apply EPLB dispatch algorithm "
+            f"{dispatch_info.ep_dispatch_algorithm!r}"
+        )
     M = hidden_states.shape[0]
     device = hidden_states.device
     if config is None:
@@ -218,6 +274,14 @@ def fused_front(
     ids = torch.empty((M, topk), dtype=torch.int32, device=device)
     routed = torch.empty((M, latent), dtype=torch.bfloat16, device=device)
 
+    rank_dispatch, all_physical, num_valid, rank_invariant = _remap_kernel_args(
+        dispatch_info
+    )
+    if num_valid_tokens is not None:
+        num_valid_tokens = num_valid_tokens.reshape(1)
+        if num_valid_tokens.dtype != torch.int32:
+            num_valid_tokens = num_valid_tokens.to(torch.int32)
+
     _jit_module().front_epilogue(
         merged,
         correction_bias,
@@ -231,5 +295,12 @@ def fused_front(
         int(config["block_size"]),
         int(config["cast_vec"]),
         bool(config["cast_first"]),
+        rank_dispatch,
+        all_physical,
+        num_valid,
+        bool(rank_invariant),
+        int(dispatch_salt) & 0xFFFFFFFF,
+        physical_count,
+        num_valid_tokens,
     )
     return weights, ids, routed
