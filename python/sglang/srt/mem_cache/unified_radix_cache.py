@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 
 import torch
 
+from sglang.srt.disaggregation.decode_storage_write import DecodeStorageAnchor
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -88,12 +89,18 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
     hicache_diagnostic_metrics_enabled,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -302,6 +309,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        # Decode storage write: back up in the prefill layout and never read back.
+        self.decode_storage_write = (
+            get_disagg().disaggregation_decode_enable_storage_write
+        )
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -1755,6 +1766,34 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        if self.decode_storage_write:
+            self._release_written_through(publish_node_ids)
+
+    def _decode_storage_anchor(self, node_id: NodeId) -> DecodeStorageAnchor:
+        """Ancestor token spans and namespace seed for the prefill hash chain."""
+        node = self.tree_core.node_by_id(node_id)
+        chunks = []
+        parent = node.parent
+        while parent is not None and parent is not self.tree_core.root_node:
+            chunks.append(parent.key.token_ids)
+            parent = parent.parent
+        chunks.reverse()
+        return DecodeStorageAnchor(
+            prefix_chunks=tuple(chunks),
+            seed=storage_namespace_seed(node.key.extra_key, node.key.cache_salt),
+        )
+
+    def _release_written_through(self, node_ids: list[NodeId]) -> None:
+        # Decode storage write never reads these back; device copies only cost
+        # eviction work later.
+        tracker = {ct: 0 for ct in self.tree_components}
+        for node_id in node_ids:
+            node = self.tree_core.node_by_id(node_id)
+            # The root is never a device leaf, so the walk stops below it.
+            while self.tree_core.is_backed_device_leaf(node.id):
+                parent = node.parent
+                self._demote(node.id, tracker)
+                node = parent
 
     def load_back(
         self,
@@ -1952,6 +1991,11 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            decode_storage_anchor=(
+                self._decode_storage_anchor(node_id)
+                if self.decode_storage_write
+                else None
+            ),
         )
         self.ongoing_backup[operation_id] = (
             node_id,

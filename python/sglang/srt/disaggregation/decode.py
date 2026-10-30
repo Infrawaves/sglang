@@ -1475,8 +1475,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
+            # Storage write never reads the local cache: the request owns its whole
+            # row and binds at the root in _get_new_prebuilt_batch.
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
+                and not get_disagg().disaggregation_decode_enable_storage_write
                 and not decode_req.is_rebootstrap
             )
             if use_decode_radix_cache:

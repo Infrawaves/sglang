@@ -544,6 +544,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def is_backed_device_leaf(self, node_id: NodeId) -> bool:
+        """An unlocked device leaf whose host copy is complete; safe to demote."""
+        node = self.node_by_id(node_id)
+        return (
+            self._is_device_leaf(node)
+            and node.backuped
+            and node.write_through_pending_id is None
+        )
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
