@@ -489,6 +489,13 @@ class AttnResidual:
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
         nvb = self.num_valid_blocks
+        if hidden_states.shape[0] == 0:
+            # Empty TP-SP ranks still follow the snapshot schedule.
+            prefix = hidden_states if prefix_sum is None else prefix_sum + hidden_states
+            if write:
+                self.write(prefix, rows)
+            return hidden_states, prefix
+
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None

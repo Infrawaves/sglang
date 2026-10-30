@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
@@ -566,6 +567,7 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        input_is_sequence_sharded: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -575,6 +577,7 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self.input_is_sequence_sharded = input_is_sequence_sharded
 
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
@@ -607,6 +610,14 @@ class TopK(BaseFusedOp):
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             fused_gate_packed_ids=fused_gate_packed_ids,
             allow_routed_experts_capture=allow_routed_experts_capture,
+        )
+
+    def _allocation_context(self):
+        # Sequence shards can have unequal valid row counts across ranks.
+        if self.input_is_sequence_sharded:
+            return nullcontext()
+        return use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
@@ -716,9 +727,7 @@ class TopK(BaseFusedOp):
             )
         else:
             self.topk_config.torch_native = False
-            with use_symmetric_memory(
-                get_parallel().tp_group, disabled=not is_allocation_symmetric()
-            ):
+            with self._allocation_context():
                 topk_output = select_experts(
                     hidden_states=hidden_states,
                     layer_id=self.layer_id,
@@ -807,9 +816,7 @@ class TopK(BaseFusedOp):
                     )
                 )
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
-        with use_symmetric_memory(
-            get_parallel().tp_group, disabled=not is_allocation_symmetric()
-        ):
+        with self._allocation_context():
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         # FIXME: router_logits should be of size (0, num_experts)
