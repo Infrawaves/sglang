@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -13,6 +14,17 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.disaggregation.decode_storage_write import (
+    DecodeStorageAnchor,
+    MambaStateMeta,
+    StorageWritePlan,
+    StorageWriteTarget,
+    build_write_plan,
+    get_decode_storage_write_state,
+    local_sub_page_keys,
+    mamba_put_objects,
+    sub_page_hashes,
+)
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -28,6 +40,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
@@ -123,6 +136,39 @@ def _trailing_chain_groups(
     ]
 
 
+def _mamba_state_metas(host_pool) -> list[MambaStateMeta]:
+    # Order must match Mooncake's suffix order: temporal, then conv_i.
+    device_pool = host_pool.device_pool
+    metas = []
+    if host_pool.temporal_state_elem_size > 0:
+        shape = tuple(host_pool.temporal_state_shape)
+        metas.append(
+            MambaStateMeta(
+                key_suffix="temporal",
+                item_bytes=host_pool.temporal_state_elem_size
+                * host_pool.temporal_dtype.itemsize,
+                slice_dim=shape[0],
+                outer_count=1,
+                conv_shard_groups=None,
+            )
+        )
+    axis = device_pool.conv_slice_axis
+    groups = device_pool.conv_shard_groups
+    for i, shape in enumerate(host_pool.conv_state_shapes):
+        shape = tuple(shape)
+        metas.append(
+            MambaStateMeta(
+                key_suffix=f"conv_{i}",
+                item_bytes=host_pool.conv_state_elem_sizes[i]
+                * host_pool.conv_dtype.itemsize,
+                slice_dim=shape[axis],
+                outer_count=math.prod(shape[:axis]),
+                conv_shard_groups=tuple(groups) if groups is not None else None,
+            )
+        )
+    return metas
+
+
 class StorageOperation(BaseStorageOperation):
     def __init__(
         self,
@@ -132,10 +178,13 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        decode_storage_anchor: Optional[DecodeStorageAnchor] = None,
     ):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        # Set only by decode storage write: the backup goes out in the prefill layout.
+        self.decode_storage_anchor = decode_storage_anchor
 
 
 class PrefetchOperation(StorageOperation):
@@ -265,6 +314,8 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
+        # Decode storage write plans per frozen prefill target; backup thread only.
+        self._decode_storage_plans: dict[StorageWriteTarget, StorageWritePlan] = {}
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -1223,6 +1274,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        decode_storage_anchor: Optional[DecodeStorageAnchor] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1230,6 +1282,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            decode_storage_anchor=decode_storage_anchor,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1400,6 +1453,9 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
+        if operation.decode_storage_anchor is not None:
+            self._decode_storage_backup(operation)
+            return
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -1465,6 +1521,134 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         return False
+
+    def _decode_storage_backup(self, operation) -> None:
+        # Report stored even when skipped: decode never reads the node back,
+        # so the ack only releases the host lock.
+        operation.completed_tokens = len(operation.token_ids)
+        # The backup thread has no handler; a raise here would stop every
+        # rank's acks, since they are drained by a cross-rank MIN.
+        try:
+            self._decode_storage_backup_impl(operation)
+        except Exception:
+            logger.exception("Decode storage write failed")
+            get_decode_storage_write_state().disable("write_error")
+
+    def _decode_storage_backup_impl(self, operation) -> None:
+        state = get_decode_storage_write_state()
+        target = state.target()
+        if target is None:
+            return
+        plan = self._decode_storage_plan(target)
+        if plan is None:
+            return
+        anchor = operation.decode_storage_anchor
+        sub_hashes = sub_page_hashes(
+            prefix_chunks=anchor.prefix_chunks,
+            token_ids=operation.token_ids,
+            seed=anchor.seed,
+            sub_page_size=plan.sub_page_size,
+        )
+        if not sub_hashes:
+            return
+        if plan.writes_kv and not self._decode_storage_put_kv(
+            host_indices=operation.host_indices, sub_hashes=sub_hashes, plan=plan
+        ):
+            logger.warning(
+                "Decode storage write: KV put failed for %d pages", len(sub_hashes)
+            )
+        for transfer in operation.pool_transfers or []:
+            if transfer.name == PoolName.MAMBA and transfer.host_indices is not None:
+                if not self._decode_storage_put_mamba(
+                    slot=int(transfer.host_indices[-1]),
+                    page_key=sub_hashes[-1],
+                    plan=plan,
+                ):
+                    logger.warning("Decode storage write: Mamba state put failed")
+
+    def _decode_storage_put_kv(
+        self,
+        *,
+        host_indices: torch.Tensor,
+        sub_hashes: list[str],
+        plan: StorageWritePlan,
+    ) -> bool:
+        from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+
+        keys = local_sub_page_keys(
+            sub_hashes, dcp_size=plan.dcp_size, dcp_rank=plan.dcp_rank
+        )
+        # Host KV rows are per-rank physical; the tree hands out widened slots.
+        rows = maybe_dcp_kernel_indices(host_indices, plan.dcp_size, plan.dcp_rank)
+        page = plan.sub_page_size
+        assert len(rows) == len(keys) * page, (len(rows), len(keys), page)
+        for i in range(0, len(keys), STORAGE_BATCH_SIZE):
+            batch_keys = keys[i : i + STORAGE_BATCH_SIZE]
+            batch_rows = rows[i * page : (i + len(batch_keys)) * page]
+            if not all(self.storage_backend.batch_set_v1(batch_keys, batch_rows)):
+                return False
+        return True
+
+    def _decode_storage_put_mamba(
+        self, *, slot: int, page_key: str, plan: StorageWritePlan
+    ) -> bool:
+        host_pool = self.mem_pool_host.entry_map[PoolName.MAMBA].host_pool
+        keys, ptrs, sizes = mamba_put_objects(
+            page_key=page_key,
+            plan=plan,
+            # One-slot pages: the meta pointers are the slot bases, temporal first.
+            slot_bases=host_pool.get_page_buffer_meta(
+                torch.tensor([slot], dtype=torch.int64)
+            )[0],
+            num_layers=host_pool.num_mamba_layers,
+        )
+        results = self.storage_backend.batch_put_absent(
+            keys, ptrs, sizes, group_keys=[page_key] * len(keys)
+        )
+        return all(results)
+
+    def _decode_storage_plan(
+        self, target: StorageWriteTarget
+    ) -> Optional[StorageWritePlan]:
+        plan = self._decode_storage_plans.get(target)
+        if plan is not None:
+            return plan
+        state = get_decode_storage_write_state()
+        kv_entry = self.mem_pool_host.entry_map.get(PoolName.KV)
+        mamba_entry = self.mem_pool_host.entry_map.get(PoolName.MAMBA)
+        if (
+            self.storage_backend_type != "mooncake"
+            or kv_entry is None
+            or not isinstance(kv_entry.host_pool, MLATokenToKVPoolHost)
+            # Prefill runs the default page_first; page_first_direct orders a
+            # page layer-major, so equal keys would carry reordered bytes.
+            or kv_entry.host_pool.layout != "page_first"
+            or mamba_entry is None
+            or mamba_entry.host_pool.layout not in ("page_first", "page_first_direct")
+        ):
+            state.disable("host_layout")
+            return None
+        kv_pool = kv_entry.host_pool
+        result = build_write_plan(
+            target,
+            tree_page_size=self.page_size,
+            dcp_size=kv_pool.dcp_size,
+            dcp_rank=kv_pool.dcp_rank,
+            attn_tp_size=self.storage_config.tp_size,
+            attn_tp_rank=self.storage_config.tp_rank,
+            mamba_tensors=_mamba_state_metas(mamba_entry.host_pool),
+        )
+        if isinstance(result, str):
+            state.disable(result)
+            return None
+        # Keys only hit if this prefix equals prefill's; nothing cross-checks it.
+        logger.info(
+            "Decode storage write plan ready: %s, key prefix %r",
+            result,
+            self.storage_backend.config_prefix,
+        )
+        self._decode_storage_plans[target] = result
+        return result
 
     def backup_thread_func(self):
         """Back up rank-sharded sidecars on every TP rank.

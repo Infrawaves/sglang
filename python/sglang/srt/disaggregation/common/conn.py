@@ -1292,6 +1292,13 @@ class CommonKVManager(BaseKVManager):
                 return ParallelInfoState.FAILED
             self.prefill_info_table[bootstrap_addr] = info
 
+        if get_disagg().disaggregation_decode_enable_storage_write:
+            from sglang.srt.disaggregation.decode_storage_write import (
+                offer_prefill_info,
+            )
+
+            offer_prefill_info(info=info, decode_attn_tp_size=self.attn_tp_size)
+
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return ParallelInfoState.READY
 

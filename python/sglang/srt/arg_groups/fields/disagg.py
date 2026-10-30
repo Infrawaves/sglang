@@ -80,6 +80,15 @@ class Disagg(msgspec.Struct):
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
     ] = False
+    disaggregation_decode_enable_storage_write: A[
+        bool,
+        "Write finished decode KV and recurrent state to the HiCache storage backend "
+        "in the prefill server's parallel layout, so the next prefill round can hit "
+        "the decoded tokens (PD mode, decode only). Decode never reads its own cache "
+        "under this flag. Requires --disaggregation-decode-enable-radix-cache, "
+        "--enable-hierarchical-cache, --hicache-storage-backend mooncake and "
+        "--hicache-write-policy write_through.",
+    ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False
