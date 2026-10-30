@@ -419,6 +419,7 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
             instance.num_local_heads = 64
             instance.num_decode_q_heads = 64 * get_parallel().attn_dcp_size
             instance.kv_lora_rank = 512
+            instance.num_draft_tokens = None
             instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
 
         model_runner = SimpleNamespace(
@@ -442,6 +443,78 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
         self.assertIsNotNone(backend._decode_with_splits)
         # 256 gathered heads span two M128 tiles; 64 local heads would fit in one.
         self.assertEqual(backend.workspace_buffer.numel(), 4 * 128 * 2 * 8 * 513 * 4)
+
+    def test_fixed_splits_start_under_spec_with_verify_width_workspace(self):
+        """Fixed splits used to refuse speculative decoding at startup. Verify
+        runs num_draft_tokens queries per request, so the workspace must cover
+        ceil(Q * heads / 128) tiles: Q8 x 24 heads needs two, Q1 only one."""
+
+        def fake_base_init(instance, *_args, **_kwargs):
+            instance.num_local_heads = 24
+            instance.num_decode_q_heads = 24
+            instance.kv_lora_rank = 512
+            instance.num_draft_tokens = 8
+            instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
+
+        model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            req_to_token_pool=SimpleNamespace(size=4),
+            device="cpu",
+        )
+        with (
+            patch.dict(os.environ, {"SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS": "4"}),
+            patch.object(TRTLLMMLABackend, "__init__", fake_base_init),
+            patch.object(
+                splitkv_module,
+                "create_cutedsl_mla_decode_with_splits",
+                return_value=object(),
+            ),
+            patch.object(cute_module, "get_cuda_graph_max_batch_size", return_value=4),
+            patch.object(cute_module, "get_eager_max_batch_size", return_value=4),
+            get_context().override_server_args(dcp_size=1),
+        ):
+            backend = CuteDslMLABackend(model_runner)
+        self.assertIsNotNone(backend._decode_with_splits)
+        self.assertEqual(backend.workspace_buffer.numel(), 4 * 128 * 2 * 4 * 513 * 4)
+
+    def test_fixed_splits_run_multi_query_verify_without_dcp(self):
+        """A dense [B, Q>1] verify query must reach the fixed-split wrapper with
+        its Q dimension intact; it used to be rejected as non-single-token."""
+        backend = object.__new__(CuteDslMLABackend)
+        backend.workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend._compute_decode_bmm1_scale = lambda _layer: 1.0
+        calls = []
+
+        def fake_split_decode(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros((2, 8, 24, 512))
+
+        backend._decode_with_splits = fake_split_decode
+        query = torch.zeros((2, 8, 24, 576))
+        with get_context().override_server_args(dcp_size=1):
+            backend._run_decode_kernel(
+                query=query,
+                kv_cache=torch.empty((1, 1, 64, 576)),
+                block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                seq_lens=torch.full((2,), 16, dtype=torch.int32),
+                max_seq_len=24,
+                layer=SimpleNamespace(),
+            )
+            with self.assertRaises(ValueError):
+                backend._run_decode_kernel(
+                    query=query,
+                    kv_cache=torch.empty((1, 1, 64, 576)),
+                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                    seq_lens=torch.full((2,), 16, dtype=torch.int32),
+                    max_seq_len=24,
+                    layer=SimpleNamespace(),
+                    return_lse=True,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["query"], query)
+        self.assertNotIn("enable_dcp", calls[0])
 
     def test_forward_decode_derives_page_local_and_token_global_coordinates(self):
         backend = object.__new__(CuteDslMLABackend)

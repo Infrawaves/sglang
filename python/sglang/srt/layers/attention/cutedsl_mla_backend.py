@@ -56,8 +56,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism.
 
     SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS optionally overrides the split planner
-    for single-token decode, with or without DCP; the default keeps the base
-    cute-dsl path.
+    for fixed-Q decode and speculative verify (Q = verify width), with or
+    without DCP; the default keeps the base cute-dsl path.
     """
 
     # This kernel does not support varlen queries.
@@ -78,11 +78,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 create_cutedsl_mla_decode_with_splits,
             )
 
-            if not model_runner.spec_algorithm.is_none():
-                raise ValueError(
-                    "SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS currently requires "
-                    "speculative decoding disabled"
-                )
             if envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is not None:
                 raise ValueError("Fixed CuTeDSL MLA splits do not support skip-softmax")
             self._decode_with_splits = create_cutedsl_mla_decode_with_splits(num_splits)
@@ -107,9 +102,16 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 get_cuda_graph_max_batch_size(capacity),
                 get_eager_max_batch_size(capacity),
             )
+            # Speculative verify / draft-extend run up to num_draft_tokens
+            # queries per request; the workspace grows with ceil(Q * heads / 128).
             # Under DCP the kernel sees the DCP-gathered query heads.
+            max_q_len = max(1, self.num_draft_tokens or 1)
             _, required = plan_cutedsl_mla_splits(
-                max_bs, 1, self.num_decode_q_heads, self.kv_lora_rank, num_splits
+                max_bs,
+                max_q_len,
+                self.num_decode_q_heads,
+                self.kv_lora_rank,
+                num_splits,
             )
             if required > self.workspace_buffer.numel():
                 # Keep the shared upstream buffer intact for other instances.
@@ -120,12 +122,13 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 self.workspace_size = required
             logger.info(
                 "CuTeDSL MLA fixed KV splits=%d, decode_heads=%d, dcp_size=%d, "
-                "max_batch=%d, workspace=%.2f MiB "
+                "max_batch=%d, max_q_len=%d, workspace=%.2f MiB "
                 "(short contexts may use fewer nonempty splits)",
                 num_splits,
                 self.num_decode_q_heads,
                 get_parallel().attn_dcp_size,
                 max_bs,
+                max_q_len,
                 self.workspace_buffer.numel() / 1024**2,
             )
 
@@ -157,10 +160,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         """
         if cp_world <= 1:
             if self._decode_with_splits is not None:
-                if query.ndim != 4 or query.shape[1] != 1 or return_lse:
+                if query.ndim != 4 or return_lse:
                     raise ValueError(
-                        "Fixed CuTeDSL MLA splits support single-token decode "
-                        "only (Q length 1; LSE is returned only under DCP)"
+                        "Fixed CuTeDSL MLA splits support dense [B, Q, H, D] "
+                        "queries only (LSE is returned only under DCP)"
                     )
                 return self._run_fixed_split_decode(
                     query=query,
