@@ -229,3 +229,11 @@ def build_dcp_page_transfer_plan(
     return DCPPageTransferPlan(
         src_pages, dst_page_indices[dst_start : dst_start + src_pages.size]
     )
+
+
+def expand_dcp_page_rows(
+    page_indices: npt.NDArray[np.int32], page_size: int
+) -> npt.NDArray[np.int64]:
+    """Every token row of the given physical pages, in page order."""
+    pages = np.asarray(page_indices, dtype=np.int64)
+    return (pages[:, None] * page_size + np.arange(page_size)).reshape(-1)

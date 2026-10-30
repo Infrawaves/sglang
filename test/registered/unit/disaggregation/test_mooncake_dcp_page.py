@@ -20,7 +20,10 @@ class TestMooncakeDcpPage(CustomTestCase):
     page_size = 4
     widths = (3, 5)
 
-    def _case(self, *, custom_pool=False):
+    draft_width = 7
+    draft_layer_id = 90
+
+    def _case(self, *, custom_pool=False, draft=False):
         sources = [
             ((np.arange(64 * width) + layer * 41) % 251)
             .astype(np.uint8)
@@ -28,12 +31,26 @@ class TestMooncakeDcpPage(CustomTestCase):
             for layer, width in enumerate(self.widths)
         ]
         destinations = [np.full_like(source, 0xEE) for source in sources]
+        layer_ids = [11, 17]
+        if draft:
+            # The decode draft pool pages at page_size * dcp_size and holds
+            # every token, so it is larger than the per-rank target pool.
+            sources.append(
+                ((np.arange(64 * self.draft_width) * 7 + 3) % 251)
+                .astype(np.uint8)
+                .reshape(64, self.draft_width)
+            )
+            destinations.append(
+                np.full((15 * self.page_size * 3, self.draft_width), 0xEE, np.uint8)
+            )
+            layer_ids.append(self.draft_layer_id)
         manager = object.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
             page_size=self.page_size,
             kv_data_ptrs=[buffer.ctypes.data for buffer in sources],
             kv_item_lens=[buffer[0].nbytes * self.page_size for buffer in sources],
-            kv_layer_ids=[11, 17],
+            kv_layer_ids=layer_ids,
+            num_draft_entries=int(draft),
         )
         manager.enable_custom_mem_pool = custom_pool
         manager.custom_mem_pool_type = "NVLINK" if custom_pool else None
@@ -42,18 +59,21 @@ class TestMooncakeDcpPage(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.pp_size = 1
+        manager.attn_tp_size = 1
         transport = CopyTransport(sources, destinations)
         manager._transfer_data = transport
         return manager, sources, destinations, transport
 
     def _send(self, manager, destinations, *, executor=None, **kwargs):
+        layer_ids = manager.kv_args.kv_layer_ids
+        widths = list(self.widths) + [self.draft_width] * (len(layer_ids) - 2)
         return manager.send_kvcache_dcp(
             "session",
             kwargs.pop("source_pages", np.array([7], dtype=np.int32)),
             # Reversed destination registration exercises the existing layer map.
             [buffer.ctypes.data for buffer in reversed(destinations)],
             kwargs.pop("destination_pages", np.array([10], dtype=np.int32)),
-            dcp_token_item_lens=list(self.widths),
+            dcp_token_item_lens=widths,
             dst_dcp_kv_layout="page",
             dst_dcp_size=kwargs.pop("dcp_size", 3),
             dst_dcp_rank=kwargs.pop("rank", 0),
@@ -61,7 +81,8 @@ class TestMooncakeDcpPage(CustomTestCase):
             decode_prefix_len=kwargs.pop("prefix", 12),
             num_kv_tokens=kwargs.pop("length", 4),
             executor=executor,
-            dst_layer_ids=[17, 11],
+            dst_layer_ids=list(reversed(layer_ids)),
+            pack_buffer=kwargs.pop("pack_buffer", None),
         )
 
     def test_fragmented_chunks_copy_owned_pages_including_unused_tail(self):
@@ -105,6 +126,66 @@ class TestMooncakeDcpPage(CustomTestCase):
                         expected[destination_row] = source[source_row]
                     np.testing.assert_array_equal(destination, expected)
                 self.assertEqual(transport.bytes_sent, len(owned) * sum(self.widths))
+
+    def test_draft_entries_receive_every_token_at_the_virtual_page_size(self):
+        """DSPARK's replicated draft pool needs every token on every rank. The
+        page plan would send it only this rank's pages at the target geometry."""
+        source_pages = np.array([7, 1, 9, 3, 12, 4, 8], dtype=np.int32)
+        destination_pages = np.array([10, 2, 14], dtype=np.int32)
+        chunks = ((0, 2, 8), (2, 3, 12), (5, 2, 5))
+        total_tokens = sum(length for _, _, length in chunks)
+        for rank, custom_pool in product(range(3), (False, True)):
+            with self.subTest(rank=rank, custom_pool=custom_pool):
+                manager, sources, destinations, transport = self._case(
+                    custom_pool=custom_pool, draft=True
+                )
+                with (
+                    concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
+                    patch(
+                        "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+                        side_effect=AssertionError("page send must not pack"),
+                    ),
+                ):
+                    for offset, count, length in chunks:
+                        self.assertEqual(
+                            self._send(
+                                manager,
+                                destinations,
+                                executor=executor,
+                                source_pages=source_pages[offset : offset + count],
+                                destination_pages=destination_pages,
+                                rank=rank,
+                                offset=offset,
+                                length=length,
+                                # A token-layout peer may have created one.
+                                pack_buffer=object(),
+                            ),
+                            0,
+                        )
+
+                owned = [i for i in range(28) if ((12 + i) // 4) % 3 == rank]
+                for source, destination in zip(sources[:2], destinations[:2]):
+                    expected = np.full_like(destination, 0xEE)
+                    for local, logical in enumerate(owned):
+                        source_row = source_pages[logical // 4] * 4 + logical % 4
+                        destination_row = destination_pages[local // 4] * 4 + local % 4
+                        expected[destination_row] = source[source_row]
+                    np.testing.assert_array_equal(destination, expected)
+
+                virtual_page = 4 * 3
+                expected = np.full_like(destinations[2], 0xEE)
+                for token in range(total_tokens):
+                    source_row = source_pages[token // 4] * 4 + token % 4
+                    destination_row = (
+                        destination_pages[token // virtual_page] * virtual_page
+                        + token % virtual_page
+                    )
+                    expected[destination_row] = sources[2][source_row]
+                np.testing.assert_array_equal(destinations[2], expected)
+                self.assertEqual(
+                    transport.bytes_sent,
+                    len(owned) * sum(self.widths) + total_tokens * self.draft_width,
+                )
 
     def test_page_send_propagates_transport_failure(self):
         """A failed page transfer must not be reported as a successful handoff."""
