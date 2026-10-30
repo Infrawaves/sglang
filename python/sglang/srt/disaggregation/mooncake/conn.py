@@ -37,10 +37,12 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
     build_dcp_page_transfer_plan,
     build_dcp_token_transfer_plan,
+    expand_dcp_page_rows,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -1120,7 +1122,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
-        if dst_dcp_kv_layout == "page":
+        page_layout = dst_dcp_kv_layout == "page"
+        if page_layout and self.kv_args.num_draft_entries == 0:
             page_plan = build_dcp_page_transfer_plan(
                 prefill_kv_indices,
                 dst_kv_indices,
@@ -1178,6 +1181,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
+        if page_layout:
+            # The replicated draft pool takes every token at the virtual page
+            # size, as in token layout; the target takes this rank's whole pages.
+            # Pack buffers are sized for token layout, so page sends never pack.
+            page_plan = build_dcp_page_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=physical_page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+            )
+            plan = DCPTokenTransferPlan(
+                expand_dcp_page_rows(page_plan.src_page_indices, physical_page_size),
+                expand_dcp_page_rows(page_plan.dst_page_indices, physical_page_size),
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
+            )
+            pack_buffer = None
         if plan.empty():
             return 0
 
