@@ -20,7 +20,7 @@
   },
   "validation": {
     "shared_workspace_gpu_validated": false,
-    "note": "Only tile_shape [256, 128] with cluster_hidden 2 was measured; the 8K win is about 5%.",
+    "note": "All buckets forced to native baseline: fused AG+GEMM deadlocked on GB300 TP8 (2026-10-30, TP0/TP4 stuck in Sm100AgGemmKernel, peers in finish_all_gather_epoch).",
     "gb300_measured": false
   },
   "configs": {
@@ -45,34 +45,19 @@
       "status": "native_baseline"
     },
     "8192": {
-      "mode": "pull",
+      "mode": "baseline",
       "enabled": true,
-      "status": "measured",
-      "tile_shape": [
-        256,
-        128
-      ],
-      "cluster_hidden": 2
+      "status": "native_baseline"
     },
     "12288": {
-      "mode": "pull",
+      "mode": "baseline",
       "enabled": true,
-      "status": "measured",
-      "tile_shape": [
-        256,
-        128
-      ],
-      "cluster_hidden": 2
+      "status": "native_baseline"
     },
     "16384": {
-      "mode": "pull",
+      "mode": "baseline",
       "enabled": true,
-      "status": "measured",
-      "tile_shape": [
-        256,
-        128
-      ],
-      "cluster_hidden": 2
+      "status": "native_baseline"
     }
   }
 }
