@@ -1220,6 +1220,21 @@ class Envs:
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
+    # Fuse the EPLB logical->physical replica map (and the recorder's
+    # per-expert count) into the K3 fused MoE front kernel.  Off restores the
+    # old behavior: fused routing is disabled whenever EPLB is on.
+    SGLANG_EPLB_FUSED_FRONT_REMAP = EnvBool(True)
+    # With --moe-a2a-backend deepep, take `stat` counts from DeepEP's dispatch
+    # layout / recv stats instead of a per-layer scatter_add over top-k ids.
+    SGLANG_EPLB_DISPATCH_SIDE_COUNTS = EnvBool(True)
+    # Forward passes between expert-balancedness all_gathers.  Each pass's
+    # [layers, ep] GPU count is staged locally and the window is gathered
+    # once; 1 restores the old per-forward reduce.
+    SGLANG_EPLB_BALANCEDNESS_INTERVAL = EnvInt(16)
+    # Move same-node expert weights during a rebalance through CUDA IPC
+    # (peer copy over NVLink) instead of NCCL P2P.  Cross-node moves keep
+    # NCCL.  Falls back to NCCL on every rank if any rank cannot map a peer.
+    SGLANG_EPLB_IPC_WEIGHT_TRANSFER = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM

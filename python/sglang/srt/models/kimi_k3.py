@@ -65,6 +65,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputFormat,
     build_precomputed_topk_output,
     precomputed_topk_postprocess_is_noop,
+    routed_experts_capture_active,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -760,6 +761,8 @@ class KimiK3MoE(nn.Module):
             "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_expert_remap_active",
+            "_fused_remap_ok",
         ):
             self.__dict__.pop(prop, None)
 
@@ -943,22 +946,45 @@ class KimiK3MoE(nn.Module):
         return self.routed_expert_norm(latent)
 
     @cached_property
-    def _routing_contract_ok(self) -> bool:
-        """Whether a kernel may emit (weights, ids) itself and bypass
-        select_experts. Shared by the fused router and the merged front."""
-        # EPLB remaps logical TopK ids to physical expert ids in TopK's
-        # post-processing. Fused routing emits ids inside its kernel and has
-        # no dispatch-info hook, so keep every fused route off while a physical
-        # expert remap (EPLB, an initial placement, or redundant experts) is
-        # active.
+    def _dispatch_salt(self) -> int:
+        """Per-(rank, layer) salt for the fused front's dynamic replica pick,
+        so ranks and layers do not all favour the same replica of an expert."""
+        return (get_parallel().moe_ep_rank * 0x10001 + self.layer_idx) & 0xFFFFFFFF
+
+    @cached_property
+    def _expert_remap_active(self) -> bool:
+        """Whether TopK ids must be mapped from logical to physical experts
+        (EPLB, a non-trivial initial placement, or redundant experts)."""
         moe_runtime = get_exec().moe
-        if (
-            self._eligible_for_fused_front
-            or getattr(moe_runtime, "enable_eplb", False)
+        return bool(
+            getattr(moe_runtime, "enable_eplb", False)
             or getattr(moe_runtime, "ep_dispatch_algorithm", None) is not None
             or getattr(moe_runtime, "init_expert_location", "trivial") != "trivial"
             or getattr(moe_runtime, "ep_num_redundant_experts", 0) > 0
-        ):
+        )
+
+    @cached_property
+    def _fused_remap_ok(self) -> bool:
+        """Whether the merged front can apply the configured EPLB dispatch
+        itself (statically decidable part; the capturer check is per call)."""
+        if not envs.SGLANG_EPLB_FUSED_FRONT_REMAP.get():
+            return False
+        algorithm = getattr(get_exec().moe, "ep_dispatch_algorithm", None)
+        # None means select_experts would not remap either (no dispatch info).
+        return algorithm in (None, "static", "dynamic")
+
+    @cached_property
+    def _routing_contract_ok(self) -> bool:
+        """Whether a kernel may emit (weights, ids) itself and bypass
+        select_experts. Shared by the fused router and the merged front."""
+        if self._eligible_for_fused_front:
+            return False
+        # EPLB remaps logical TopK ids to physical expert ids. The merged
+        # front applies that remap inside its epilogue (static / dynamic
+        # dispatch, see moe_front.fused_remap_supported), so fused routing
+        # stays on with EPLB.  `fake` / `lp` dispatch, or the kill switch,
+        # keep the old behavior of falling back to select_experts.
+        if self._expert_remap_active and not self._fused_remap_ok:
             return False
         cfg = self.topk.topk_config
         if cfg.output_format is not TopKOutputFormat.STANDARD:
@@ -1029,6 +1055,21 @@ class KimiK3MoE(nn.Module):
         ):
             return None
 
+        dispatch_info = None
+        if self._expert_remap_active:
+            # The capturer records logical ids; the fused remap emits physical
+            # ones, so let select_experts handle capture runs.
+            if routed_experts_capture_active(cfg):
+                return None
+            dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_idx)
+            if not moe_front.fused_remap_supported(dispatch_info):
+                return None
+        # Count per physical expert in the epilogue whenever the recorder's
+        # select-experts hook would have run (also under graph capture).
+        physical_count = (
+            get_global_expert_distribution_recorder().get_fused_select_count_buffer()
+        )
+
         w, i, routed = moe_front.fused_front(
             hidden_states,
             self._front_w,
@@ -1038,6 +1079,10 @@ class KimiK3MoE(nn.Module):
             renormalize=cfg.renormalize,
             routed_scaling_factor=cfg.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=cfg.apply_routed_scaling_factor_on_output,
+            dispatch_info=dispatch_info,
+            dispatch_salt=self._dispatch_salt,
+            physical_count=physical_count,
+            num_valid_tokens=num_token_non_padded,
         )
 
         global _EP_FRONT_LOGGED
@@ -1056,6 +1101,8 @@ class KimiK3MoE(nn.Module):
                 cfg,
                 self.layer_idx,
                 num_token_non_padded=num_token_non_padded,
+                ids_are_physical=dispatch_info is not None,
+                recorded=physical_count is not None,
             ),
             routed,
         )

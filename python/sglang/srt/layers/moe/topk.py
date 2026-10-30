@@ -2777,6 +2777,19 @@ def precomputed_topk_postprocess_is_noop(
     )
 
 
+def routed_experts_capture_active(topk_config: TopKConfig) -> bool:
+    """Whether the routed-experts capturer will read this layer's top-k ids.
+
+    The capturer stores *logical* ids. A router that emits physical ids
+    directly (EPLB remap fused into the kernel) must fall back while a
+    capturer is attached so the capture still sees logical ids.
+    """
+    return (
+        topk_config.allow_routed_experts_capture
+        and get_global_experts_capturer() is not None
+    )
+
+
 def build_precomputed_topk_output(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2784,15 +2797,26 @@ def build_precomputed_topk_output(
     layer_id: int,
     *,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    ids_are_physical: bool = False,
+    recorded: bool = False,
 ) -> StandardTopKOutput:
     """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
     capture hook and the expert-distribution recorder that select_experts would.
 
-    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds, or when
+    the router already applied the EPLB logical->physical remap in-kernel
+    (``ids_are_physical``).  ``recorded`` means the kernel also accumulated the
+    recorder's per-physical-expert counts, so the scatter_add hook is skipped.
     """
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    if ids_are_physical:
+        # The capturer wants logical ids; callers must not fuse the remap
+        # while one is attached (see routed_experts_capture_active).
+        assert not routed_experts_capture_active(topk_config)
+    else:
+        capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    if not recorded:
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
     return StandardTopKOutput(topk_weights, topk_ids, None)

@@ -225,7 +225,8 @@ class TestKimiK3Eplb(CustomTestCase):
                 expert_call.assert_called_once_with(hidden, topk_output)
 
     def test_dispatch_disables_fused_router(self):
-        for algorithm in ("static", "dynamic", "fake", "lp"):
+        # fake / lp cannot be applied in the fused epilogue.
+        for algorithm in ("fake", "lp"):
             with self.subTest(algorithm=algorithm):
                 moe = make_module(kimi_k3.KimiK3MoE)
                 moe._eligible_for_fused_front = False
@@ -237,6 +238,34 @@ class TestKimiK3Eplb(CustomTestCase):
                     ),
                 ):
                     self.assertFalse(moe._routing_contract_ok)
+
+    def test_fused_front_remap_keeps_fused_routing_for_static_dynamic(self):
+        for algorithm in ("static", "dynamic"):
+            for remap_enabled in (True, False):
+                with self.subTest(algorithm=algorithm, remap=remap_enabled):
+                    moe = make_module(kimi_k3.KimiK3MoE)
+                    moe._eligible_for_fused_front = False
+                    with (
+                        patch.object(
+                            kimi_k3,
+                            "get_exec",
+                            return_value=SimpleNamespace(
+                                moe=SimpleNamespace(
+                                    ep_dispatch_algorithm=algorithm, enable_eplb=True
+                                )
+                            ),
+                        ),
+                        patch.object(
+                            kimi_k3.envs.SGLANG_EPLB_FUSED_FRONT_REMAP,
+                            "get",
+                            return_value=remap_enabled,
+                        ),
+                    ):
+                        self.assertTrue(moe._expert_remap_active)
+                        self.assertEqual(moe._fused_remap_ok, remap_enabled)
+                        if not remap_enabled:
+                            # Kill switch restores the old behavior.
+                            self.assertFalse(moe._routing_contract_ok)
 
     def test_weight_views_exclude_non_routed_parameters(self):
         moe = make_module(kimi_k3.KimiK3MoE)

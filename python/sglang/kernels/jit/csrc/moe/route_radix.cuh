@@ -386,7 +386,67 @@ struct MoEFrontParams {
   bf16_t* __restrict__ routed_out;
   int latent;
   long long routed_stride;
+
+  // ---- Optional EPLB logical -> physical replica mapping (remap_mode != 0) ----
+  // Applied to each selected logical id right before it is stored, so the
+  // fused front emits physical ids directly instead of handing logical ids to
+  // a separate gather kernel.  Map rows are views of the per-layer metadata
+  // tensors, which EPLB updates in place, so CUDA graphs observe new layouts.
+  //   1 (static):  out = rank_dispatch[logical]
+  //   2 (dynamic): out = all_physical[logical, pick % num_valid[logical]]
+  int remap_mode;
+  int map_is_int64;                        // rank_dispatch / all_physical element width
+  int valid_is_int64;                      // num_valid element width
+  int rank_invariant;                      // dynamic pick by token row only (no a2a backend)
+  const void* __restrict__ rank_dispatch;  // [E]
+  const void* __restrict__ all_physical;   // [E, all_physical_stride]
+  const void* __restrict__ num_valid;      // [E]
+  long long all_physical_stride;
+  uint32_t dispatch_salt;  // per-rank salt for the dynamic replica pick
+
+  // ---- Optional per-physical-expert routing count (EPLB recorder) ----
+  // physical_count[physical_id] += 1 for every routed slot of a non-padded
+  // row; replaces the recorder's separate per-layer scatter_add.
+  int32_t* __restrict__ physical_count;  // [num_physical] or nullptr
+  int num_physical;
+  const int32_t* __restrict__ num_valid_tokens;  // [1] or nullptr (all rows valid)
 };
+
+SGL_DEVICE long long fgt_load_index(const void* base, long long idx, int is_int64) {
+  return is_int64 ? static_cast<const int64_t*>(base)[idx]
+                  : static_cast<long long>(static_cast<const int32_t*>(base)[idx]);
+}
+
+// Deterministic replica pick for the dynamic dispatch algorithm.  The unfused
+// path draws torch.randint; a kernel has no generator, so mix the token row,
+// top-k slot and a per-rank salt instead.  Spreads (token, slot) pairs evenly
+// over the replicas, which is the load split EPLB's placement solver assumes.
+SGL_DEVICE uint32_t fgt_replica_hash(uint32_t row, uint32_t slot, uint32_t salt) {
+  uint32_t h = (row * 0x9E3779B1u) ^ (slot * 0x85EBCA77u) ^ (salt * 0xC2B2AE3Du);
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  return h;
+}
+
+SGL_DEVICE int32_t fgt_remap_expert_id(const MoEFrontParams& params, int32_t logical_id, int m, uint32_t slot) {
+  if (params.remap_mode == 1) {
+    return static_cast<int32_t>(fgt_load_index(params.rank_dispatch, logical_id, params.map_is_int64));
+  }
+  if (params.remap_mode == 2) {
+    const long long num_valid = fgt_load_index(params.num_valid, logical_id, params.valid_is_int64);
+    if (num_valid <= 0) return logical_id;  // unreachable for a valid layout; keep the id in range
+    const uint32_t pick = params.rank_invariant
+                              ? static_cast<uint32_t>(m)
+                              : fgt_replica_hash(static_cast<uint32_t>(m), slot, params.dispatch_salt);
+    const long long column = static_cast<long long>(pick % static_cast<uint32_t>(num_valid));
+    return static_cast<int32_t>(fgt_load_index(
+        params.all_physical,
+        static_cast<long long>(logical_id) * params.all_physical_stride + column,
+        params.map_is_int64));
+  }
+  return logical_id;
+}
 
 /// Radix-select top-k over one token's fp32 logits.  Lifted from
 /// route_radix.cuh; the only change is the input dtype (fp32 in place of bf16).
@@ -540,8 +600,15 @@ SGL_DEVICE void fgt_select_topk(
     const auto norm = (sum > 0.0f) ? sum : 1.0f;
     if (params.renormalize) wv = wv / norm;
     if (params.apply_scale) wv = wv * params.routed_scaling_factor;
+    const int32_t out_id = fgt_remap_expert_id(params, id, m, tx);
     params.out_w[m * params.out_w_stride + tx] = wv;
-    params.out_i[m * params.out_i_stride + tx] = id;
+    params.out_i[m * params.out_i_stride + tx] = out_id;
+    if (params.physical_count != nullptr) {
+      const bool row_valid = params.num_valid_tokens == nullptr || m < params.num_valid_tokens[0];
+      if (row_valid && out_id >= 0 && out_id < params.num_physical) {
+        atomicAdd(params.physical_count + out_id, 1);
+      }
+    }
   }
   __syncthreads();  // smem reuse across the token loop
 }
@@ -664,7 +731,17 @@ struct FusedFrontEpilogueKernel {
       bool apply_scale,
       int64_t block_size,
       int64_t cast_vec,
-      bool cast_first) {
+      bool cast_first,
+      // EPLB replica remap (see MoEFrontParams). Pass rank_dispatch for the
+      // static algorithm, or all_physical + num_valid for the dynamic one.
+      const tvm::ffi::Optional<tvm::ffi::TensorView> rank_dispatch,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> all_physical,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_valid,
+      bool rank_invariant,
+      int64_t dispatch_salt,
+      // EPLB recorder: per-physical-expert counts accumulated in-kernel.
+      const tvm::ffi::Optional<tvm::ffi::TensorView> physical_count,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_valid_tokens) {
     using namespace host;
 
     auto M_ = SymbolicSize{"num_tokens"};
@@ -711,6 +788,47 @@ struct FusedFrontEpilogueKernel {
     params.routed_out = static_cast<bf16_t*>(routed.data_ptr());
     params.latent = latent;
     params.routed_stride = static_cast<long long>(routed.stride(0));
+
+    RuntimeCheck(
+        !(rank_dispatch.has_value() && all_physical.has_value()),
+        "fused_front_epilogue: pass either rank_dispatch (static) or all_physical (dynamic), not both");
+    RuntimeCheck(
+        all_physical.has_value() == num_valid.has_value(),
+        "fused_front_epilogue: all_physical and num_valid must be given together");
+    if (rank_dispatch.has_value()) {
+      auto map_dtype = SymbolicDType{};
+      TensorMatcher({E_}).with_dtype<int32_t, int64_t>(map_dtype).with_device(device).verify(rank_dispatch.value());
+      params.remap_mode = 1;
+      params.map_is_int64 = map_dtype.is_type<int64_t>() ? 1 : 0;
+      params.rank_dispatch = rank_dispatch.value().data_ptr();
+    } else if (all_physical.has_value()) {
+      auto X_ = SymbolicSize{"max_replicas"};
+      auto XS_ = SymbolicSize{"replica_row_stride"};
+      auto map_dtype = SymbolicDType{};
+      auto valid_dtype = SymbolicDType{};
+      TensorMatcher({E_, X_}).with_strides({XS_, 1}).with_dtype<int32_t, int64_t>(map_dtype).with_device(device).verify(
+          all_physical.value());
+      TensorMatcher({E_}).with_dtype<int32_t, int64_t>(valid_dtype).with_device(device).verify(num_valid.value());
+      params.remap_mode = 2;
+      params.map_is_int64 = map_dtype.is_type<int64_t>() ? 1 : 0;
+      params.valid_is_int64 = valid_dtype.is_type<int64_t>() ? 1 : 0;
+      params.all_physical = all_physical.value().data_ptr();
+      params.num_valid = num_valid.value().data_ptr();
+      params.all_physical_stride = static_cast<long long>(XS_.unwrap());
+    }
+    params.rank_invariant = rank_invariant ? 1 : 0;
+    params.dispatch_salt = static_cast<uint32_t>(dispatch_salt);
+
+    if (physical_count.has_value()) {
+      auto P_ = SymbolicSize{"num_physical_experts"};
+      TensorMatcher({P_}).with_dtype<int32_t>().with_device(device).verify(physical_count.value());
+      params.physical_count = static_cast<int32_t*>(physical_count.value().data_ptr());
+      params.num_physical = static_cast<int>(P_.unwrap());
+    }
+    if (num_valid_tokens.has_value()) {
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_valid_tokens.value());
+      params.num_valid_tokens = static_cast<const int32_t*>(num_valid_tokens.value().data_ptr());
+    }
 
     // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
     // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.

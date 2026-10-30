@@ -26,6 +26,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sglang.srt.eplb.ipc_weight_transfer import IpcPeerWeights, gpu_barrier, p2p_tensor
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import get_bool_env_var
 
@@ -38,6 +39,49 @@ _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 class ExpertLocationUpdater:
     def __init__(self):
         self._first_execution = True
+        self._ipc_peer_weights: Optional[IpcPeerWeights] = None
+
+    def _get_ipc_peer_weights(
+        self,
+        routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+        *,
+        topology_num_nodes: int,
+        physical_num_nodes: int,
+        rank: int,
+    ) -> Optional[IpcPeerWeights]:
+        """Same-node CUDA-IPC weight table, built (collectively) on first use.
+
+        Every input to the enable decision is identical on all ranks (env,
+        launch args), and the rebuild decision is all-reduced, so ranks never
+        diverge on which collectives the update issues.
+        """
+        if (
+            not envs.SGLANG_EPLB_IPC_WEIGHT_TRANSFER.get()
+            or get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY")
+            or ElasticEPStateManager.instance() is not None
+            or not torch.cuda.is_available()
+            # A flat topology over several real nodes would label remote
+            # GPUs "same node"; only trust the grouping when it is physical.
+            or (topology_num_nodes != physical_num_nodes and physical_num_nodes > 1)
+        ):
+            return None
+
+        stale = self._ipc_peer_weights is None or not self._ipc_peer_weights.matches(
+            routed_experts_weights_of_layer
+        )
+        flag = torch.tensor(
+            [1 if stale else 0], dtype=torch.int32, device=get_device().device
+        )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        if flag.item():
+            world_size = torch.distributed.get_world_size()
+            self._ipc_peer_weights = IpcPeerWeights(
+                routed_experts_weights_of_layer,
+                rank=rank,
+                world_size=world_size,
+                num_gpu_per_node=world_size // topology_num_nodes,
+            )
+        return self._ipc_peer_weights if self._ipc_peer_weights.enabled else None
 
     def update(
         self,
@@ -62,6 +106,13 @@ class ExpertLocationUpdater:
         assert old_expert_location_metadata is not None
         topology_num_nodes = 1 if use_flat_topology else nnodes
 
+        ipc_peer_weights = self._get_ipc_peer_weights(
+            routed_experts_weights_of_layer,
+            topology_num_nodes=topology_num_nodes,
+            physical_num_nodes=nnodes,
+            rank=rank,
+        )
+
         missing_logical_experts_by_layers = _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
@@ -69,6 +120,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=topology_num_nodes,
             rank=rank,
+            ipc_peer_weights=ipc_peer_weights,
         )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
@@ -78,11 +130,14 @@ class ExpertLocationUpdater:
         return missing_logical_experts_by_layers
 
 
-def _update_expert_weights(**kwargs):
+def _update_expert_weights(*, ipc_peer_weights=None, **kwargs):
     if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
+        # The canary appends a fresh tensor per update, which an IPC table
+        # cannot map; ExpertLocationUpdater never builds one in this mode.
+        assert ipc_peer_weights is None
         return _update_expert_weights_with_canary(**kwargs)
     else:
-        return _update_expert_weights_raw(**kwargs)
+        return _update_expert_weights_raw(ipc_peer_weights=ipc_peer_weights, **kwargs)
 
 
 # can add watchdog as well
@@ -142,6 +197,7 @@ def _update_expert_weights_raw(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    ipc_peer_weights: Optional[IpcPeerWeights] = None,
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
@@ -172,6 +228,8 @@ def _update_expert_weights_raw(
             world_size=world_size,
             missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
+            ipc_peer_weights=ipc_peer_weights,
+            layer_id=layer_id,
         )
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
@@ -194,7 +252,18 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    ipc_peer_weights: Optional[IpcPeerWeights] = None,
+    layer_id: Optional[int] = None,
 ):
+    """Move this rank's physical experts to the new layout for one layer.
+
+    With ``ipc_peer_weights`` (same-node CUDA IPC enabled on every rank),
+    same-node moves are pulled straight out of the peer's weights and only
+    cross-node moves use NCCL P2P; a GPU-side barrier then keeps any rank
+    from overwriting weights a peer is still reading.
+    """
+    use_ipc = ipc_peer_weights is not None
+    assert not use_ipc or layer_id is not None
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -232,11 +301,18 @@ def update_expert_weights_single_layer(
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
         # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
+        # List[Tuple[logical_expert_id, src_rank, dst_expert_location]]
+        ipc_pull_infos: List[Tuple[int, int, int]] = []
 
-        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
+        _handle_recv(buffer2weight_copy_infos, p2p_op_infos, ipc_pull_infos)
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
+        _execute_ipc_pulls(ipc_pull_infos)
         _execute_p2p_ops(p2p_op_infos)
+        if use_ipc:
+            # Collective on every rank (even with nothing to pull): peers may
+            # be reading this rank's old weights for this layer.
+            gpu_barrier()
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
@@ -250,15 +326,22 @@ def update_expert_weights_single_layer(
         if debug:
             output_logs.append(f"{p2p_op_infos=}")
             output_logs.append(f"{buffer2weight_copy_infos=}")
+            output_logs.append(f"{ipc_pull_infos=}")
 
-    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
+    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos, ipc_pull_infos):
         for dst_expert_location in range(*local_expert_location_range):
             _handle_recv_of_dst_expert_location(
-                dst_expert_location, buffer2weight_copy_infos, p2p_op_infos
+                dst_expert_location,
+                buffer2weight_copy_infos,
+                p2p_op_infos,
+                ipc_pull_infos,
             )
 
     def _handle_recv_of_dst_expert_location(
-        dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos
+        dst_expert_location: int,
+        buffer2weight_copy_infos,
+        p2p_op_infos,
+        ipc_pull_infos,
     ):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
@@ -309,16 +392,25 @@ def update_expert_weights_single_layer(
             chosen_src_rank = same_node_mapping.chunk_value_from_element_value(
                 element_value=rank
             )
-            _create_p2p_recv_and_buffer2weight_copy(
-                buffer2weight_copy_infos,
-                p2p_op_infos,
-                src_rank=chosen_src_rank,
-                logical_expert_id=logical_expert_id,
-                dst_expert_location=dst_expert_location,
-            )
+            if use_ipc:
+                # Same source the NCCL sender would have used; pull instead.
+                ipc_pull_infos.append(
+                    (logical_expert_id, chosen_src_rank, dst_expert_location)
+                )
+                buffer2weight_copy_infos.append(
+                    (dst_expert_location, dst_expert_location)
+                )
+            else:
+                _create_p2p_recv_and_buffer2weight_copy(
+                    buffer2weight_copy_infos,
+                    p2p_op_infos,
+                    src_rank=chosen_src_rank,
+                    logical_expert_id=logical_expert_id,
+                    dst_expert_location=dst_expert_location,
+                )
             if debug:
                 output_logs.append(
-                    f"handle_recv_of_dst_expert_location {dst_expert_location=} case=same-node {chosen_src_rank=}"
+                    f"handle_recv_of_dst_expert_location {dst_expert_location=} case=same-node {chosen_src_rank=} {use_ipc=}"
                 )
             return
 
@@ -354,7 +446,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=p2p_tensor(
+                            _get_tensor(temp_buffers, i, dst_expert_location)
+                        ),
                         peer=src_rank,
                     )
                     for i in range(num_tensors)
@@ -389,7 +483,12 @@ def update_expert_weights_single_layer(
         cross_node_dst_ranks = cross_node_mapping.element_values_from_chunk_value(
             chunk_value=rank
         )
-        all_dst_ranks = same_node_dst_ranks + cross_node_dst_ranks
+        # Same-node destinations pull over IPC themselves.
+        all_dst_ranks = (
+            cross_node_dst_ranks
+            if use_ipc
+            else same_node_dst_ranks + cross_node_dst_ranks
+        )
 
         if debug:
             output_logs.append(
@@ -402,8 +501,8 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
+                        tensor=p2p_tensor(
+                            _get_tensor(routed_experts_weights, i, src_expert_location)
                         ),
                         peer=dst_rank,
                     )
@@ -503,6 +602,30 @@ def update_expert_weights_single_layer(
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
+
+    def _first_old_local_index(src_rank: int, logical_expert_id: int) -> int:
+        # The NCCL sender transmits its first old slot holding the expert
+        # (see _create_isend_ops); read the same slot.
+        start = src_rank * num_local_physical_experts
+        for location in range(start, start + num_local_physical_experts):
+            if old_physical_to_logical_map[location] == logical_expert_id:
+                return location - start
+        raise AssertionError(
+            f"rank {src_rank} holds no replica of logical expert {logical_expert_id}"
+        )
+
+    def _execute_ipc_pulls(ipc_pull_infos):
+        for logical_expert_id, src_rank, dst_expert_location in ipc_pull_infos:
+            assert ipc_peer_weights.is_same_node(src_rank)
+            ipc_peer_weights.pull(
+                layer_id=layer_id,
+                dst_tensors=[
+                    _get_tensor(temp_buffers, i, dst_expert_location)
+                    for i in range(num_tensors)
+                ],
+                src_rank=src_rank,
+                src_local_index=_first_old_local_index(src_rank, logical_expert_id),
+            )
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (

@@ -103,6 +103,30 @@ def _deepep_precompile_tp_barrier() -> None:
         get_parallel().tp_group.barrier()
 
 
+_LL_DISPATCH_RECV_STATS_SUPPORT = {}
+
+
+def _low_latency_dispatch_accepts_recv_stats(buffer) -> bool:
+    """Whether this DeepEP build counts received tokens per local expert.
+
+    Upstream DeepEP's ``low_latency_dispatch`` takes an optional int32
+    ``cumulative_local_expert_recv_stats`` [num_local_experts] tensor that the
+    dispatch kernel atomically increments; older or vendor builds do not.
+    """
+    if _is_npu:
+        return False
+    fn = type(buffer).low_latency_dispatch
+    cached = _LL_DISPATCH_RECV_STATS_SUPPORT.get(fn)
+    if cached is None:
+        try:
+            parameters = inspect.signature(fn).parameters
+            cached = "cumulative_local_expert_recv_stats" in parameters
+        except (TypeError, ValueError):
+            cached = False
+        _LL_DISPATCH_RECV_STATS_SUPPORT[fn] = cached
+    return cached
+
+
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
@@ -543,6 +567,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        # Dispatch-layout per-expert counts, handed to the EPLB recorder in
+        # dispatch_b once the compute stream has waited for the comm stream.
+        self._num_tokens_per_expert = None
 
     def dispatch_a(
         self,
@@ -606,6 +633,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        # The layout tensor is produced on the comm stream when async_finish
+        # is on; report it only after the compute stream has waited for it.
+        num_tokens_per_expert, self._num_tokens_per_expert = (
+            self._num_tokens_per_expert,
+            None,
+        )
+        if num_tokens_per_expert is not None:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal_layout(
+                num_tokens_per_expert
+            )
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -675,6 +712,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
         )
+        self._num_tokens_per_expert = num_tokens_per_expert
 
         return (
             recv_x,
@@ -690,7 +728,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
@@ -745,6 +782,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        # True when the last dispatch counted received tokens straight into
+        # the EPLB recorder via cumulative_local_expert_recv_stats.
+        self._recv_stats_fused = False
 
     def dispatch_a(
         self,
@@ -785,9 +825,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
-        )
+        if not self._recv_stats_fused:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                masked_m
+            )
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -828,6 +869,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
+        # Let the dispatch kernel count received tokens per local expert
+        # straight into the EPLB recorder (no per-layer add on masked_m).
+        recv_stats = None
+        if _low_latency_dispatch_accepts_recv_stats(buffer):
+            recv_stats = get_global_expert_distribution_recorder().get_deepep_low_latency_recv_stats_buffer()
+        self._recv_stats_fused = recv_stats is not None
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -849,6 +896,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **(
+                    dict(cumulative_local_expert_recv_stats=recv_stats)
+                    if recv_stats is not None
+                    else dict()
+                ),
                 **fp8_deepgemm_scale_opts,
             )
         )

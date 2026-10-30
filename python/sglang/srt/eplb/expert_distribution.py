@@ -174,6 +174,18 @@ class ExpertDistributionRecorder(ABC):
     def get_current_pass_count_buffer(self, layer_idx: int):
         return None
 
+    def get_fused_select_count_buffer(self) -> Optional[torch.Tensor]:
+        """Per-physical-expert int32 count row a fused router may increment.
+
+        Returns the current layer's ``[num_physical_experts]`` row of the
+        select-experts gatherer whenever :meth:`on_select_experts` would have
+        recorded this call (same gating, including CUDA-graph capture), so a
+        kernel that counts in-place is equivalent to the scatter_add hook.
+        Returns None when nothing should be counted or when another source
+        (e.g. a dispatch-side gatherer) owns the counts.
+        """
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -187,6 +199,21 @@ class ExpertDistributionRecorder(ABC):
         self, local_physical_count_of_layer: torch.Tensor
     ):
         pass
+
+    def on_deepep_dispatch_normal_layout(self, num_tokens_per_expert: torch.Tensor):
+        """DeepEP normal-mode dispatch layout: exact per-global-expert counts
+        of the tokens this rank sends (GPU tensor, ``[num_physical]``)."""
+        pass
+
+    def get_deepep_low_latency_recv_stats_buffer(self) -> Optional[torch.Tensor]:
+        """Local-expert int32 count slice DeepEP may accumulate into.
+
+        Passed as ``cumulative_local_expert_recv_stats`` to
+        ``low_latency_dispatch``; the dispatch kernel then counts received
+        tokens in-place and the separate recorder add is skipped. None when
+        the active gatherer cannot consume dispatch-side counts.
+        """
+        return None
 
     def start_record(self):
         self._on_not_implemented()
@@ -323,21 +350,57 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
-    def _on_hook(self, hook_name: str, **kwargs):
+    def on_deepep_dispatch_normal_layout(self, num_tokens_per_expert: torch.Tensor):
+        self._on_hook(
+            "on_deepep_dispatch_normal_layout",
+            num_tokens_per_expert=num_tokens_per_expert,
+        )
+
+    def _hook_active(self) -> bool:
+        # Shared by _on_hook and the in-kernel count buffers: a kernel that
+        # counts into the gatherer must do so exactly when the hook would.
         if self._disable_all:
-            return
+            return False
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
-            return
-        if not (
+            return False
+        return (
             self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
-            return
-        gatherer = self._single_pass_gatherers[
+        )
+
+    def _current_gatherer(self):
+        return self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
             )
         ]
+
+    def _on_hook(self, hook_name: str, **kwargs):
+        if not self._hook_active():
+            return
+        gatherer = self._current_gatherer()
         getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
+
+    def get_fused_select_count_buffer(self) -> Optional[torch.Tensor]:
+        if not self._hook_active():
+            return None
+        layer_idx = self._current_layer_idx.value
+        if layer_idx is None:
+            return None
+        gatherer = self._current_gatherer()
+        if type(gatherer) is not _SelectExpertsSinglePassGatherer:
+            return None
+        return gatherer._data[layer_idx]
+
+    def get_deepep_low_latency_recv_stats_buffer(self) -> Optional[torch.Tensor]:
+        if not self._hook_active():
+            return None
+        layer_idx = self._current_layer_idx.value
+        if layer_idx is None:
+            return None
+        gatherer = self._current_gatherer()
+        if not isinstance(gatherer, _DeepepDispatchCountSinglePassGatherer):
+            return None
+        return gatherer.local_count_view(layer_idx)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
@@ -425,13 +488,25 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if get_exec().moe.deepep_mode == "normal":
+            deepep_mode = get_exec().moe.deepep_mode
+            elastic_ep_enabled = get_exec().moe.elastic_ep_backend is not None
+            if (
+                envs.SGLANG_EPLB_DISPATCH_SIDE_COUNTS.get()
+                and not elastic_ep_enabled
+                and deepep_mode in ("normal", "low_latency", "auto")
+            ):
+                # Counts come out of DeepEP's dispatch itself; no per-layer
+                # scatter_add over the top-k ids.
+                return _DeepepDispatchCountSinglePassGatherer(
+                    expert_location_metadata, rank
+                )
+            if deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif get_exec().moe.deepep_mode == "low_latency":
+            elif deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata,
                     rank,
-                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
+                    elastic_ep_enabled=elastic_ep_enabled,
                 )
             else:
                 raise NotImplementedError
@@ -462,6 +537,11 @@ class _SinglePassGatherer(ABC):
 
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        pass
+
+    def on_deepep_dispatch_normal_layout(
+        self, layer_idx: int, num_tokens_per_expert: torch.Tensor
     ):
         pass
 
@@ -698,6 +778,53 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
+class _DeepepDispatchCountSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    """Exact `stat` counts taken from DeepEP's own dispatch outputs.
+
+    Replaces the per-layer ``scatter_add_`` over top-k ids
+    (:class:`_SelectExpertsSinglePassGatherer`) for ``--moe-a2a-backend
+    deepep``.  Both modes write the same global-physical ``[layers,
+    num_physical]`` layout, so ``deepep_mode=auto`` (normal prefill, low
+    latency decode) can share one recorder:
+
+    * normal: ``get_dispatch_layout``'s ``num_tokens_per_expert`` is the exact
+      per-global-expert count of tokens this rank *sends*; added as one
+      vector op.
+    * low latency: the dispatch kernel adds the tokens this rank *receives*
+      per local expert into :meth:`local_count_view` through
+      ``cumulative_local_expert_recv_stats`` (falls back to adding
+      ``masked_m`` when the DeepEP build lacks that argument).
+
+    Sent-by-every-rank and received-by-owner counts both sum to the same
+    global count after the dump's all-reduce.  Padded rows carry id -1 and
+    are excluded by DeepEP in both modes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, enable_global_physical_experts=True)
+        n = self._expert_location_metadata.num_local_physical_experts
+        self._local_slice = slice(self._rank * n, (self._rank + 1) * n)
+
+    def local_count_view(self, layer_idx: int) -> torch.Tensor:
+        # Contiguous int32 [num_local_physical_experts] view: rows of a
+        # row-major [layers, num_physical] tensor sliced along the last dim.
+        return self._data[layer_idx, self._local_slice]
+
+    def on_deepep_dispatch_normal_layout(
+        self, layer_idx: int, num_tokens_per_expert: torch.Tensor
+    ):
+        row = self._data[layer_idx]
+        if num_tokens_per_expert.shape[0] != row.shape[0]:
+            num_tokens_per_expert = num_tokens_per_expert[: row.shape[0]]
+        row.add_(num_tokens_per_expert.to(row.dtype))
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        view = self.local_count_view(layer_idx)
+        view.add_(local_physical_count_of_layer[: view.shape[0]].to(view.dtype))
+
+
 def _convert_per_token_to_global_physical_count(
     num_tokens: int,
     num_layers: int,
@@ -822,6 +949,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._metric_heatmap_pending = None
             self._metric_heatmap_copy_stream = None
             self._metric_heatmap_worker = None
+            # Balancedness is gathered once per window instead of reducing
+            # every forward pass: each pass writes its local [layers, ep]
+            # count into a GPU staging row, and the full window goes through
+            # one all_gather_into_tensor.  Every rank appends in lockstep
+            # (the same contract the per-pass reduce relied on).
+            self._balancedness_interval = max(
+                1, envs.SGLANG_EPLB_BALANCEDNESS_INTERVAL.get()
+            )
+            self._balancedness_staging = None
+            self._balancedness_gathered = None
+            self._balancedness_forward_pass_ids = []
 
     def append(
         self,
@@ -841,6 +979,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._enable:
             self._history.clear()
             self._reset_server_log_history = True
+            # Staged rows belong to the window being discarded; every rank
+            # resets together (dump_record / start_record run collectively).
+            self._balancedness_forward_pass_ids = []
 
     def _append_utilization_rate(
         self,
@@ -853,33 +994,78 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
-        torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+
+        staging = self._get_balancedness_staging(gpu_physical_count)
+        slot = len(self._balancedness_forward_pass_ids)
+        staging[slot].copy_(gpu_physical_count)
+        self._balancedness_forward_pass_ids.append(forward_pass_id)
+        if len(self._balancedness_forward_pass_ids) >= self._balancedness_interval:
+            self._flush_balancedness(outputs)
+
+    def _get_balancedness_staging(self, sample: torch.Tensor) -> torch.Tensor:
+        if self._balancedness_staging is None:
+            interval = self._balancedness_interval
+            world_size = torch.distributed.get_world_size()
+            self._balancedness_staging = torch.zeros(
+                (interval, *sample.shape), dtype=sample.dtype, device=sample.device
+            )
+            self._balancedness_gathered = torch.empty(
+                (world_size, interval, *sample.shape),
+                dtype=sample.dtype,
+                device=sample.device,
+            )
+        return self._balancedness_staging
+
+    def _flush_balancedness(self, outputs: Optional[Dict[str, Any]]):
+        """Gather the staged window once and emit its metrics on rank 0.
+
+        Collective: every rank must call it at the same point (a full window,
+        or a dump).  ``outputs`` may be None for a dump-time flush, where the
+        per-step history is still updated but no metrics object is emitted.
+        """
+        num_steps = len(self._balancedness_forward_pass_ids)
+        if num_steps == 0:
+            return
+        forward_pass_ids = self._balancedness_forward_pass_ids
+        self._balancedness_forward_pass_ids = []
+
+        torch.distributed.all_gather_into_tensor(
+            self._balancedness_gathered, self._balancedness_staging
         )
+        if self._rank != 0:
+            return
 
-        if self._rank == 0:
-            self._handle_metric_eplb_heatmap(gpu_physical_count)
+        # [steps, layers, ep], summed over the contributing ranks.
+        gpu_physical_count_of_step = self._balancedness_gathered[:, :num_steps].sum(
+            dim=0
+        )
+        self._handle_metric_eplb_heatmap(gpu_physical_count_of_step.sum(dim=0))
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
-            )
-            should_track_history = not math.isclose(
-                get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
-            )
+        # Per-step mean over layers, exactly what the per-pass path computed.
+        utilization_rate_of_step = compute_utilization_rate(
+            gpu_physical_count_of_step
+        ).mean(dim=-1)
+        should_track_history = not math.isclose(
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
+        )
+        if should_track_history:
+            # One host transfer per window rather than one .item() per pass.
+            for value in utilization_rate_of_step.tolist():
+                self._history.append(value)
 
-            should_log = logs_expert_balancedness_to_server_log()
-            outputs["metrics"] = ExpertDistributionMetrics(
-                forward_pass_id=forward_pass_id,
-                eplb_balancedness=utilization_rate_gpu,
-                gpu_physical_count_sum=(
-                    gpu_physical_count.sum() if should_log else None
-                ),
-                reset_server_log_history=self._reset_server_log_history,
-            )
-            self._reset_server_log_history = False
-
-            if should_track_history:
-                self._history.append(utilization_rate_gpu.item())
+        if outputs is None:
+            return
+        should_log = logs_expert_balancedness_to_server_log()
+        outputs["metrics"] = ExpertDistributionMetrics(
+            forward_pass_id=forward_pass_ids[-1],
+            # The window mean; with an interval of 1 this is the pass value.
+            eplb_balancedness=utilization_rate_of_step.mean(),
+            gpu_physical_count_sum=(
+                gpu_physical_count_of_step.sum() if should_log else None
+            ),
+            reset_server_log_history=self._reset_server_log_history,
+        )
+        self._reset_server_log_history = False
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -1148,6 +1334,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
         ):
             return None
+
+        # dump() runs on every rank, so it can flush the partial window and
+        # the rebalance decision still sees every recorded pass.
+        self._flush_balancedness(outputs=None)
 
         if self._rank == 0:
             utilization_mean_rates = self._history.mean()
