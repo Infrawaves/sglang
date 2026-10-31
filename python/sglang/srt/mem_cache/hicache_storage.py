@@ -40,6 +40,8 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    # HiCache pages per L3 object for the KV and draft pools (see storage_page_group).
+    storage_page_group: int = 1
 
 
 @dataclass
@@ -48,6 +50,10 @@ class HiCacheStorageExtraInfo:
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    # Absolute page index of the call's first key; needed when pages are grouped.
+    start_page: int = 0
+    # Pool name -> segment chain from the existence query, for grouped reads.
+    storage_plans: Optional[dict] = None
 
 
 class PoolName(str, Enum):
@@ -142,6 +148,8 @@ class PoolTransferResult:
     # per-rank maximum would pick a length that is illegal on another rank; the
     # caller intersects these sets instead.
     restorable_prefix_pages: Optional[List[int]] = None
+    # Pool name -> segment chain, set by backends that group pages per object.
+    storage_plans: Optional[dict] = None
 
     @classmethod
     def empty(cls) -> PoolTransferResult:

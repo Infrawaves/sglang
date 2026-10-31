@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.metrics_collector import (
     hicache_diagnostic_metrics_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -332,6 +332,11 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        storage_page_size = get_memory().hicache_storage_page_size
+        # HiCache pages per L3 object for the KV and draft pools.
+        self.storage_page_group = (
+            1 if storage_page_size is None else storage_page_size // page_size
+        )
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
@@ -772,6 +777,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
+            storage_page_group=self.storage_page_group,
         )
 
     def reset(self):

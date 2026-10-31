@@ -27,6 +27,8 @@ def handle_hicache(server_args: Any):
         validate_mla_hicache_per_node(server_args)
     if cfg.hicache_draft_node_merge:
         validate_hicache_draft_node_merge(server_args)
+    if cfg.hicache_storage_page_size is not None:
+        validate_hicache_storage_page_size(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -141,6 +143,45 @@ def validate_hicache_draft_node_merge(server_args: Any):
         raise ValueError(
             "--hicache-draft-node-merge requires --hicache-write-policy "
             "write_through or write_through_selective."
+        )
+
+
+def validate_hicache_storage_page_size(server_args: Any):
+    # Pool-level limits (standalone_storage, split heads) are checked by Mooncake.
+    cfg = resolving_view(server_args)
+    size, page_size = cfg.hicache_storage_page_size, cfg.page_size
+    if size <= 0 or size % page_size != 0:
+        raise ValueError(
+            f"--hicache-storage-page-size ({size}) must be a positive multiple "
+            f"of --page-size ({page_size})."
+        )
+    group = size // page_size
+    if group == 1:
+        return
+    # STORAGE_BATCH_SIZE pages per L3 batch; a group must not straddle two.
+    if 128 % group != 0:
+        raise ValueError(
+            "--hicache-storage-page-size / --page-size must divide 128, "
+            f"got {group}."
+        )
+    unsupported = {
+        "--enable-hierarchical-cache is off": not cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend is not mooncake": (
+            cfg.hicache_storage_backend != "mooncake"
+        ),
+        "--pp-size > 1": cfg.pp_size > 1,
+        "--dcp-size > 1": cfg.dcp_size > 1,
+        "PD decode": cfg.disaggregation_mode == "decode",
+        # Buffer mode writes staged spans without a radix node position.
+        "--hicache-host-memory-mode buffer_only": (
+            cfg.hicache_host_memory_mode == "buffer_only"
+        ),
+    }
+    reasons = [reason for reason, hit in unsupported.items() if hit]
+    if reasons:
+        raise ValueError(
+            "--hicache-storage-page-size larger than --page-size is not "
+            "supported when: " + ", ".join(reasons) + "."
         )
 
 

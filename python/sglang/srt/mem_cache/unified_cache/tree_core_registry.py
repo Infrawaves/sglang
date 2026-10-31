@@ -52,6 +52,12 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
+    from sglang.srt.runtime_context import get_memory
+
+    storage_page_size = get_memory().hicache_storage_page_size
+    if storage_page_size is not None and storage_page_size > params.page_size:
+        # Grouped L3 writes need a node's absolute page position.
+        return "--hicache-storage-page-size > --page-size requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (
