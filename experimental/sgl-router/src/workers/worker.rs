@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::workers::cold_ratio::ColdRatioEstimator;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,6 +79,7 @@ pub struct SlotRegistry {
     next_id: AtomicU64,
     /// Running sum of claimed `prefill_tokens`; read lock-free on the hot path.
     inflight_tokens: AtomicU64,
+    total_dispatched_tokens: AtomicU64,
 }
 
 impl SlotRegistry {
@@ -86,6 +88,7 @@ impl SlotRegistry {
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             inflight_tokens: AtomicU64::new(0),
+            total_dispatched_tokens: AtomicU64::new(0),
         })
     }
 
@@ -100,6 +103,8 @@ impl SlotRegistry {
             },
         );
         self.inflight_tokens
+            .fetch_add(prefill_tokens, Ordering::Relaxed);
+        self.total_dispatched_tokens
             .fetch_add(prefill_tokens, Ordering::Relaxed);
         id
     }
@@ -141,6 +146,11 @@ impl SlotRegistry {
     /// Prompt tokens of every currently-claimed slot.
     pub fn inflight_tokens(&self) -> u64 {
         self.inflight_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Prompt tokens of every slot ever claimed; never decremented.
+    pub fn total_dispatched_tokens(&self) -> u64 {
+        self.total_dispatched_tokens.load(Ordering::Relaxed)
     }
 }
 
@@ -205,6 +215,7 @@ pub struct Worker {
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
+    cold_ratio: Mutex<ColdRatioEstimator>,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -247,6 +258,7 @@ impl Worker {
             breaker,
             active_requests,
             slots,
+            cold_ratio: Mutex::new(ColdRatioEstimator::new()),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
         }
@@ -303,6 +315,17 @@ impl Worker {
     /// [`Self::load_guard`] requests carry no token count and are not included.
     pub fn router_inflight_prefill_tokens(&self) -> u64 {
         self.slots.inflight_tokens()
+    }
+
+    /// Fraction of dispatched prompt tokens this worker actually prefills,
+    /// fed by the engine's cumulative `total_prefill_uncached_tokens`.
+    /// `1.0` until enough traffic has been observed.
+    pub fn prefill_cold_ratio(&self, engine_total_prefill_uncached_tokens: u64) -> f64 {
+        let dispatched = self.slots.total_dispatched_tokens();
+        self.cold_ratio
+            .lock()
+            .unwrap()
+            .observe(engine_total_prefill_uncached_tokens, dispatched)
     }
 
     /// Returns a RAII guard that increments `active_requests` now and

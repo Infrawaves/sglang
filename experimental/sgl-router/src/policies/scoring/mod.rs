@@ -543,6 +543,7 @@ mod tests {
                             max_running_requests: 64,
                             prefill_throughput_tokens_per_s: None,
                             estimated_prefill_queue_ms: None,
+                            total_prefill_uncached_tokens: 0,
                             captured_at: Instant::now(),
                         },
                     )

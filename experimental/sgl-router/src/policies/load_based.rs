@@ -380,6 +380,7 @@ mod tests {
             max_running_requests: 64,
             prefill_throughput_tokens_per_s: None,
             estimated_prefill_queue_ms: None,
+            total_prefill_uncached_tokens: 0,
             captured_at: at,
         }
     }
@@ -448,6 +449,43 @@ mod tests {
             pick(LoadBasedMetric::Tokens, &ws, &ctx),
             ws[1].id,
             "10_000 reported + 50_000 unreported outweighs 40_000"
+        );
+    }
+
+    /// Low load: a fresh 100K prompt on a 93.6%-hit worker is ~6.4K cold
+    /// tokens, inside the tie band, so the request count decides.
+    #[test]
+    fn tokens_dispatched_after_the_sample_are_scaled_by_the_cold_ratio() {
+        use crate::workers::cold_ratio::COLD_RATIO_WINDOW_TOKENS;
+        let model = ModelId("tiny".into());
+        let ws = vec![worker("w0"), worker("w1")];
+        let engine_uncached = COLD_RATIO_WINDOW_TOKENS * 64 / 1000;
+        ws[0].prefill_cold_ratio(0);
+        drop(ws[0].timestamped_load_guard(COLD_RATIO_WINDOW_TOKENS as usize));
+        let ratio = ws[0].prefill_cold_ratio(engine_uncached);
+        assert!((ratio - 0.064).abs() < 1e-9, "{ratio}");
+
+        let at = Instant::now();
+        let snapshot = EngineReportedLoadSnapshot::from_native_cache_workers(
+            57,
+            HashMap::from([
+                (
+                    ws[0].url.clone(),
+                    EngineReportedSchedulingLoad {
+                        total_prefill_uncached_tokens: engine_uncached,
+                        ..native(0, 0, at)
+                    },
+                ),
+                (ws[1].url.clone(), native(2, 0, at)),
+            ]),
+        );
+        let _after = ws[0].timestamped_load_guard(100_000);
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+
+        assert_eq!(
+            pick(LoadBasedMetric::Tokens, &ws, &ctx),
+            ws[0].id,
+            "6_400 cold tokens tie with 0 inside the band; 1 request beats 2"
         );
     }
 

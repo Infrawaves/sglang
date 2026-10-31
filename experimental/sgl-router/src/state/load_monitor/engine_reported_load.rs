@@ -88,6 +88,9 @@ pub struct EngineReportedSchedulingLoad {
     pub max_running_requests: u64,
     pub prefill_throughput_tokens_per_s: Option<f64>,
     pub estimated_prefill_queue_ms: Option<f64>,
+    /// Cumulative tokens the engine prefilled (cache hits excluded), summed
+    /// over DP ranks; monotonic until the engine restarts.
+    pub total_prefill_uncached_tokens: u64,
     pub captured_at: Instant,
 }
 
@@ -472,6 +475,7 @@ impl EngineReportedLoadTable {
                 let mut num_total_tokens = 0u64;
                 let mut max_total_num_tokens = 0u64;
                 let mut max_running_requests = 0u64;
+                let mut total_prefill_uncached_tokens = 0u64;
                 let mut oldest_at = None;
                 let mut prefill_throughput_tokens_per_s = 0.0f64;
                 let mut complete_prefill_sample = !required.is_empty();
@@ -493,6 +497,8 @@ impl EngineReportedLoadTable {
                         max_total_num_tokens.saturating_add(load.max_total_num_tokens);
                     max_running_requests =
                         max_running_requests.saturating_add(native.max_running_requests);
+                    total_prefill_uncached_tokens = total_prefill_uncached_tokens
+                        .saturating_add(native.total_prefill_uncached_tokens);
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
 
                     match previous {
@@ -533,6 +539,7 @@ impl EngineReportedLoadTable {
                             max_running_requests,
                             prefill_throughput_tokens_per_s,
                             estimated_prefill_queue_ms,
+                            total_prefill_uncached_tokens,
                             captured_at,
                         },
                     )

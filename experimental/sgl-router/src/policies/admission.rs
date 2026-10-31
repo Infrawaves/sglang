@@ -847,8 +847,19 @@ impl<'a> FreshLoadLookup<'a> {
     pub(crate) fn pending_prefill_tokens(&self, worker: &Arc<Worker>) -> u64 {
         self.comparable_get(&worker.id)
             .map(|load| {
-                load.num_waiting_uncached_tokens
-                    .saturating_add(worker.prefill_tokens_acquired_since(load.captured_at))
+                // The snapshot is already cache-discounted; raw dispatches since
+                // it must be converted to the same unit before they are added.
+                let raw = worker.prefill_tokens_acquired_since(load.captured_at);
+                let cold_ratio = worker.prefill_cold_ratio(load.total_prefill_uncached_tokens);
+                let cold = (raw as f64 * cold_ratio).round() as u64;
+                tracing::debug!(
+                    worker = %worker.id.0,
+                    snapshot_tokens = load.num_waiting_uncached_tokens,
+                    inflight_raw_tokens = raw,
+                    cold_ratio,
+                    "load_based tokens: pending prefill"
+                );
+                load.num_waiting_uncached_tokens.saturating_add(cold)
             })
             .unwrap_or_else(|| {
                 self.local_prefill_tokens_by_worker_id
@@ -1120,6 +1131,7 @@ mod tests {
                             max_running_requests: 64,
                             prefill_throughput_tokens_per_s: None,
                             estimated_prefill_queue_ms: None,
+                            total_prefill_uncached_tokens: 0,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1746,6 +1758,7 @@ mod tests {
                 max_running_requests: 64,
                 prefill_throughput_tokens_per_s: None,
                 estimated_prefill_queue_ms: None,
+                total_prefill_uncached_tokens: 0,
                 captured_at: Instant::now(),
             }
         };
