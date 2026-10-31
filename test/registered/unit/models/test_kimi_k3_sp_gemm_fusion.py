@@ -491,6 +491,7 @@ def test_one_context_prepares_and_runs_both_modes(group, o_proj, runtime, monkey
 from sglang.kernels.ops.communication import ag_gemm  # noqa: E402
 
 AG_PULL = ag_gemm.DispatchConfig("pull", ag_gemm.KernelConfig(256, 2))
+AG_PULL_128 = ag_gemm.DispatchConfig("pull", ag_gemm.KernelConfig(128, 2))
 KDA_N, MLA_N = 6144, 2112
 
 
@@ -516,7 +517,10 @@ class FakeAgOperator:
 @pytest.fixture
 def ag_group(group, runtime, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "NVIDIA B300 SXM6 AC")
-    for name in ("sm100_ag_gemm_resident_cluster_capacity", "sm100_ag_gemm_pull"):
+    for name in (
+        "sm100_ag_gemm_warp_pull_resident_cluster_capacity",
+        "sm100_ag_gemm_warp_pull",
+    ):
         setattr(torch.ops.mega_ops, name, Mock())
     group.world_size = 8
     return group
@@ -569,32 +573,37 @@ def ag_manager(ag_group, qkv_proj_types, monkeypatch):
     return SimpleNamespace(manager=manager, kda=kda, mla=mla)
 
 
-def test_b300_ag_tables_fuse_kda_from_4k_and_mla_from_8k(ag_manager):
+def test_b300_ag_tables_fuse_kda_from_8k_and_mla_from_2k(ag_manager):
     baseline = ag_gemm.DispatchConfig("baseline")
     tables = ag_manager.manager.dispatch_tables
     assert {m: d for m, d in tables[KDA_N].configs.items()} == {
         512: baseline,
         1024: baseline,
         2048: baseline,
-        4096: AG_PULL,
+        4096: baseline,
         8192: AG_PULL,
         12288: AG_PULL,
         16384: AG_PULL,
     }
-    assert {m for m, d in tables[MLA_N].configs.items() if d == AG_PULL} == {
-        8192,
-        12288,
-        16384,
+    assert {m: d for m, d in tables[MLA_N].configs.items()} == {
+        512: baseline,
+        1024: baseline,
+        2048: AG_PULL_128,
+        4096: AG_PULL_128,
+        8192: AG_PULL_128,
+        12288: AG_PULL,
+        16384: AG_PULL,
     }
 
 
 def test_ag_prepare_shares_one_arena_across_projections(ag_manager):
     operator = ag_manager.manager.ag_gemm_operator
     assert operator.args[2:5] == (8, 16384, 7168)
-    assert operator.args[6] == {AG_PULL.kernel}
+    assert operator.args[6] == {AG_PULL.kernel, AG_PULL_128.kernel}
     # The order is collective-visible, so it is deterministic on every rank.
     assert [call.args[:2] for call in operator.prepare.call_args_list] == [
-        (4096, KDA_N),
+        (2048, MLA_N),
+        (4096, MLA_N),
         (8192, MLA_N),
         (8192, KDA_N),
         (12288, MLA_N),
@@ -606,10 +615,10 @@ def test_ag_prepare_shares_one_arena_across_projections(ag_manager):
 
 def test_ag_dispatch_is_decided_by_the_consuming_projection(ag_manager):
     manager, kda, mla = ag_manager.manager, ag_manager.kda, ag_manager.mla
-    assert manager.local_input_shard(kda, 512).shape == (512, 7168)
-    assert manager.local_input_shard(mla, 512) is None
-    assert manager.local_input_shard(mla, 1024).shape == (1024, 7168)
-    assert manager.local_input_shard(kda, 128) is None
+    assert manager.local_input_shard(mla, 512).shape == (512, 7168)
+    assert manager.local_input_shard(kda, 512) is None
+    assert manager.local_input_shard(kda, 1024).shape == (1024, 7168)
+    assert manager.local_input_shard(mla, 128) is None
 
 
 def test_ag_unbucketed_m_prepares_its_floor_bucket_once(ag_manager):
@@ -641,7 +650,7 @@ def test_ag_fused_call_returns_projection_and_gathered_rows(ag_manager):
     slot = manager.local_input_shard(mla, 1024)
     fused = manager.fused_qkv_proj(mla, slot)
     [(local_input, weight, output, dispatch)] = manager.ag_gemm_operator.calls
-    assert local_input is slot and weight is mla.weight and dispatch == AG_PULL
+    assert local_input is slot and weight is mla.weight and dispatch == AG_PULL_128
     assert fused.output is output and output.shape == (8192, MLA_N)
     assert fused.hidden_states.shape == (8192, 7168)
 
@@ -689,15 +698,15 @@ def test_ag_non_bf16_weight_or_unmeasured_n_is_not_registered(
 
 def test_qkv_proj_returns_the_fused_rows_only_inside_its_scope(ag_manager):
     manager, kda = ag_manager.manager, ag_manager.kda
-    fused = manager.fused_qkv_proj(kda, manager.local_input_shard(kda, 512))
+    fused = manager.fused_qkv_proj(kda, manager.local_input_shard(kda, 1024))
     assert manager.try_fused_qkv_proj(fused.hidden_states) is None
     with fusion.use_qkv_proj_fusion_output(fused):
         output, bias = manager.try_fused_qkv_proj(fused.hidden_states)
-        assert output.shape == (4096, KDA_N) and bias is None
+        assert output.shape == (8192, KDA_N) and bias is None
         # Attention trims padded rows; the same storage prefix still matches.
-        trimmed, _ = manager.try_fused_qkv_proj(fused.hidden_states[:4093])
-        assert trimmed.shape == (4093, KDA_N)
+        trimmed, _ = manager.try_fused_qkv_proj(fused.hidden_states[:8189])
+        assert trimmed.shape == (8189, KDA_N)
         assert trimmed.data_ptr() == output.data_ptr()
         # Any other input was not multiplied by the fused kernel.
-        assert manager.try_fused_qkv_proj(Tensor((4096, 7168))) is None
+        assert manager.try_fused_qkv_proj(Tensor((8192, 7168))) is None
     assert manager.try_fused_qkv_proj(fused.hidden_states) is None

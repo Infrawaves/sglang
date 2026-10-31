@@ -15,12 +15,12 @@
     "device": "NVIDIA GB300",
     "gpus_per_node": 4,
     "consumer": "MLA fused_qkv_a_proj_with_mqa",
-    "note": "Not measured on GB300; dispatch mirrors the B300 TP8 table (world=8,K=7168,N=2112,device_name=NVIDIA_B300_SXM6_AC.json). B300 note: B300 TP8, K=7168, N=2112, AG + GEMM, ms (nccl / fused pull): 2048 0.106/0.211; 4096 0.212/0.243; 8192 0.339/0.322; 12288 0.496/0.396; 16384 0.640/0.468. Native baseline below 8K, fused pull from 8K.",
+    "note": "Not measured on GB300; buckets come from B300 TP8 warp_pull, K=7168, N=2112, ms (nccl / warp_pull tile_m=128 / warp_pull tile_m=256): 2048 0.106/0.102/0.117; 4096 0.208/0.145/0.159; 8192 0.338/0.233/0.240; 12288 0.488/0.341/0.321; 16384 0.631/0.441/0.402. Native baseline below 2K, warp_pull from 2K.",
     "nodes": 2
   },
   "validation": {
     "shared_workspace_gpu_validated": false,
-    "note": "All buckets forced to native baseline: fused AG+GEMM deadlocked on GB300 TP8 (2026-10-30, TP0/TP4 stuck in Sm100AgGemmKernel, peers in finish_all_gather_epoch).",
+    "note": "Fused buckets run the in-kernel warp_pull AllGather; the copy-engine path that deadlocked on GB300 TP8 (2026-10-30) is no longer called.",
     "gb300_measured": false
   },
   "configs": {
@@ -35,29 +35,54 @@
       "status": "native_baseline"
     },
     "2048": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        128,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "4096": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        128,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "8192": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        128,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "12288": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "16384": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
     }
   }
 }

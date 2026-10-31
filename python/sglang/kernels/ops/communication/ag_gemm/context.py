@@ -1,4 +1,4 @@
-"""Copy-engine all-gather overlapped with a persistent SM100 BF16 GEMM."""
+"""All-gather pulled by warps inside a persistent SM100 BF16 GEMM."""
 
 from __future__ import annotations
 
@@ -13,9 +13,8 @@ from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 from .workspace import WorkspaceLayout
 
-# Matches kBarrierFlagWords / kBarrierStateWords in sm100_ag_gemm_comm.cuh.
-_BARRIER_FLAG_WORDS = 2
-_BARRIER_STATE_WORDS = 1
+# Matches sglang::inkling_ar::kLeaderStateWords in comm_barrier.cuh.
+_BARRIER_STATE_WORDS = 8
 
 
 class AgGemm:
@@ -46,13 +45,15 @@ class AgGemm:
             payload_handle = symm_mem.rendezvous(
                 self._symmetric_workspace, self.group_name
             )
-            # The host launcher issues the copy-engine peer pulls from these.
+            # The kernel's AllGather warps pull peer shards from these bases.
             self._payload_peer_ptrs = tuple(
                 int(ptr) for ptr in payload_handle.buffer_ptrs
             )
 
+            # [0, P) belongs to the exit grid_system_barrier, and [P, 2P)
+            # holds the input-ready epoch published by each source rank.
             self._barrier_flags = symm_mem.empty(
-                _BARRIER_FLAG_WORDS, device=device, dtype=torch.uint32
+                2 * world_size, device=device, dtype=torch.uint32
             )
             self._barrier_flags.zero_()
             barrier_handle = symm_mem.rendezvous(self._barrier_flags, self.group_name)
@@ -61,32 +62,17 @@ class AgGemm:
                 device=device,
                 dtype=torch.int64,
             )
-            self._shard_ready_flags = torch.zeros(
-                world_size, device=device, dtype=torch.uint32
-            )
             self._barrier_state = torch.zeros(
                 _BARRIER_STATE_WORDS, device=device, dtype=torch.uint32
             )
-
-            # The copy stream must be non-blocking and distinct from compute.
-            self._copy_stream = torch.cuda.Stream(device=device)
-            self._copy_start_event = torch.cuda.Event()
-            self._copy_complete_event = torch.cuda.Event()
-            # Events are created lazily; record both once so the raw handles
-            # passed to the host launcher are valid.
-            initialization_stream = torch.cuda.current_stream(device)
-            self._copy_start_event.record(initialization_stream)
-            self._copy_stream.wait_event(self._copy_start_event)
-            self._copy_complete_event.record(self._copy_stream)
-            initialization_stream.wait_event(self._copy_complete_event)
-            self._copy_handles = (
-                self._copy_stream.cuda_stream,
-                self._copy_start_event.cuda_event,
-                self._copy_complete_event.cuda_event,
+            # [ag_chunk_counter, shard_ready_cnt[P]]; the kernel clears both
+            # after its exit barrier.
+            self._ag_counters = torch.zeros(
+                1 + world_size, device=device, dtype=torch.uint32
             )
             # Publish zeroed flags before any peer can launch. Epochs advance
             # on the device afterwards and are never cleared.
-            initialization_stream.synchronize()
+            torch.cuda.current_stream(device).synchronize()
             dist.barrier(group=group)
 
     def input_shards(self, m):
@@ -111,12 +97,14 @@ class AgGemm:
         if not self.layout.can_fuse(m, n, config):
             raise ValueError(f"cannot fuse M={m} N={n} with {config.key}")
         # Also primes the native per-stream occupancy cache on this stream.
-        resident_capacity = torch.ops.mega_ops.sm100_ag_gemm_resident_cluster_capacity(
-            self._symmetric_workspace,
-            config.tile_m,
-            config.cluster_hidden,
-            self._copy_handles[0],
+        resident_capacity = (
+            torch.ops.mega_ops.sm100_ag_gemm_warp_pull_resident_cluster_capacity(
+                self._symmetric_workspace,
+                config.tile_m,
+                config.cluster_hidden,
+            )
         )
+        # The exit grid barrier requires every CTA of the grid to be resident.
         self._prepared_kernel_grids[key] = min(
             resident_capacity, self.layout.cluster_work(m, n, config)
         )
@@ -127,14 +115,14 @@ class AgGemm:
         num_clusters = self._prepared_kernel_grids[m, n, dispatch]
         config = dispatch.kernel
         # label the launch for torch profiler and Nsight Systems traces.
-        with operations_nvtx_range("mega_ops::sm100_ag_gemm_pull"):
-            torch.ops.mega_ops.sm100_ag_gemm_pull(
+        with operations_nvtx_range("mega_ops::sm100_ag_gemm_warp_pull"):
+            torch.ops.mega_ops.sm100_ag_gemm_warp_pull(
                 local_input,
                 weight,
                 output,
                 self.input_shards(m),
                 self._payload_peer_ptrs,
-                self._shard_ready_flags,
+                self._ag_counters,
                 self._barrier_state,
                 self._barrier_flags,
                 self._barrier_peer_ptrs,
@@ -143,7 +131,6 @@ class AgGemm:
                 config.tile_m,
                 config.cluster_hidden,
                 num_clusters,
-                *self._copy_handles,
             )
         return output
 
