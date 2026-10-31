@@ -2,6 +2,7 @@
 
 import itertools
 import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _fake_flashinfer_mla_decode(decode):
+    """sys.modules entries exposing ``decode`` as FlashInfer's cute_dsl_mla_decode."""
+    names = (
+        "flashinfer",
+        "flashinfer.cute_dsl",
+        "flashinfer.cute_dsl.attention",
+        "flashinfer.cute_dsl.attention.monolithic",
+        "flashinfer.cute_dsl.attention.monolithic.mla_decode",
+    )
+    modules = {name: SimpleNamespace() for name in names}
+    for parent, child in zip(names, names[1:]):
+        setattr(modules[parent], child.rsplit(".", 1)[1], modules[child])
+    modules[names[-1]].cute_dsl_mla_decode = decode
+    return modules
 
 
 class TestDcpPageMlaWriterContracts(CustomTestCase):
@@ -419,6 +436,8 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
             instance.num_local_heads = 64
             instance.num_decode_q_heads = 64 * get_parallel().attn_dcp_size
             instance.kv_lora_rank = 512
+            instance.num_draft_tokens = None
+            instance.dcp_kv_layout = "token"
             instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
 
         model_runner = SimpleNamespace(
@@ -442,6 +461,180 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
         self.assertIsNotNone(backend._decode_with_splits)
         # 256 gathered heads span two M128 tiles; 64 local heads would fit in one.
         self.assertEqual(backend.workspace_buffer.numel(), 4 * 128 * 2 * 8 * 513 * 4)
+
+    def test_fixed_splits_start_under_spec_with_verify_width_workspace(self):
+        """Fixed splits used to refuse speculative decoding at startup. Verify
+        runs num_draft_tokens queries per request, so the workspace must cover
+        ceil(Q * heads / 128) tiles: Q8 x 24 heads needs two, Q1 only one."""
+
+        def fake_base_init(instance, *_args, **_kwargs):
+            instance.num_local_heads = 24
+            instance.num_decode_q_heads = 24
+            instance.kv_lora_rank = 512
+            instance.num_draft_tokens = 8
+            instance.dcp_kv_layout = "token"
+            instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
+
+        model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            req_to_token_pool=SimpleNamespace(size=4),
+            device="cpu",
+        )
+        with (
+            patch.dict(os.environ, {"SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS": "4"}),
+            patch.object(TRTLLMMLABackend, "__init__", fake_base_init),
+            patch.object(
+                splitkv_module,
+                "create_cutedsl_mla_decode_with_splits",
+                return_value=object(),
+            ),
+            patch.object(cute_module, "get_cuda_graph_max_batch_size", return_value=4),
+            patch.object(cute_module, "get_eager_max_batch_size", return_value=4),
+            get_context().override_server_args(dcp_size=1),
+        ):
+            backend = CuteDslMLABackend(model_runner)
+        self.assertIsNotNone(backend._decode_with_splits)
+        self.assertEqual(backend.workspace_buffer.numel(), 4 * 128 * 2 * 4 * 513 * 4)
+
+    def test_fixed_splits_run_multi_query_verify_without_dcp(self):
+        """A dense [B, Q>1] verify query must reach the fixed-split wrapper with
+        its Q dimension intact; it used to be rejected as non-single-token."""
+        backend = object.__new__(CuteDslMLABackend)
+        backend.workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend._compute_decode_bmm1_scale = lambda _layer: 1.0
+        calls = []
+
+        def fake_split_decode(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros((2, 8, 24, 512))
+
+        backend._decode_with_splits = fake_split_decode
+        query = torch.zeros((2, 8, 24, 576))
+        with get_context().override_server_args(dcp_size=1):
+            backend._run_decode_kernel(
+                query=query,
+                kv_cache=torch.empty((1, 1, 64, 576)),
+                block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                seq_lens=torch.full((2,), 16, dtype=torch.int32),
+                max_seq_len=24,
+                layer=SimpleNamespace(),
+            )
+            with self.assertRaises(ValueError):
+                backend._run_decode_kernel(
+                    query=query,
+                    kv_cache=torch.empty((1, 1, 64, 576)),
+                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                    seq_lens=torch.full((2,), 16, dtype=torch.int32),
+                    max_seq_len=24,
+                    layer=SimpleNamespace(),
+                    return_lse=True,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["query"], query)
+        self.assertNotIn("enable_dcp", calls[0])
+
+    def _page_verify_backend(self, *, cp_interleave, num_splits):
+        def stock_decode(query, cp_interleave: int = 1, **kwargs):
+            pass
+
+        def old_decode(query, **kwargs):
+            pass
+
+        decode = stock_decode if cp_interleave else old_decode
+        split_decode = object()
+
+        def fake_base_init(instance, *_args, **_kwargs):
+            instance.dcp_kv_layout = "page"
+            instance.num_local_heads = 12
+            instance.num_decode_q_heads = 48
+            instance.kv_lora_rank = 512
+            instance.num_draft_tokens = 8
+            instance.workspace_buffer = torch.empty(1, dtype=torch.int8)
+
+        model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(size=4), device="cpu"
+        )
+        with (
+            patch.dict(
+                os.environ, {"SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS": str(num_splits)}
+            ),
+            patch.dict(sys.modules, _fake_flashinfer_mla_decode(decode)),
+            patch.object(TRTLLMMLABackend, "__init__", fake_base_init),
+            patch.object(
+                splitkv_module,
+                "create_cutedsl_mla_decode_with_splits",
+                return_value=split_decode,
+            ),
+            patch.object(cute_module, "get_cuda_graph_max_batch_size", return_value=4),
+            patch.object(cute_module, "get_eager_max_batch_size", return_value=4),
+            get_context().override_server_args(dcp_size=4, dcp_kv_layout="page"),
+        ):
+            backend = CuteDslMLABackend(model_runner)
+        return backend, decode, split_decode
+
+    def test_page_verify_resolves_an_interleave_capable_kernel_at_startup(self):
+        """Without cp_interleave the kernel would mask page shards as token
+        shards, so an unpatched FlashInfer must fail before serving."""
+        backend, decode, _ = self._page_verify_backend(cp_interleave=True, num_splits=0)
+        self.assertIs(backend._page_verify_decode, decode)
+        backend, _, split_decode = self._page_verify_backend(
+            cp_interleave=True, num_splits=4
+        )
+        self.assertIs(backend._page_verify_decode, split_decode)
+        with self.assertRaisesRegex(RuntimeError, "cp_interleave"):
+            self._page_verify_backend(cp_interleave=False, num_splits=0)
+
+    def test_page_verify_passes_global_causal_lengths_and_page_interleave(self):
+        """Page verify used to raise for q_len > 1. Each query must be bounded by
+        its global causal length while the kernel maps local keys through the
+        page interleave; q_len=1 decode keeps its local-length contract."""
+        backend = object.__new__(CuteDslMLABackend)
+        backend.dcp_kv_layout = "page"
+        backend.page_size = 64
+        backend.workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend._compute_decode_bmm1_scale = lambda _layer: 0.5
+        backend._decode_with_splits = None
+        calls = []
+
+        def fake_decode(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros((2, 8, 48, 512)), torch.zeros((2, 8, 48))
+
+        backend._page_verify_decode = fake_decode
+        local_lens = torch.tensor([64, 7], dtype=torch.int32)
+        global_lens = torch.tensor([200, 71], dtype=torch.int32)
+        with get_context().override_server_args(dcp_size=4, dcp_kv_layout="page"):
+            backend._run_decode_kernel(
+                query=torch.zeros((2, 8, 48, 576)),
+                kv_cache=torch.empty((1, 1, 64, 576)),
+                block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                seq_lens=local_lens,
+                max_seq_len=64,
+                layer=SimpleNamespace(),
+                causal_seqs=global_lens,
+                cp_world=4,
+                cp_rank=2,
+                return_lse=True,
+            )
+        self.assertEqual(len(calls), 1)
+        kwargs = calls[0]
+        self.assertIs(kwargs["seq_lens"], local_lens)
+        self.assertIs(kwargs["causal_seqlens_kv_global"], global_lens)
+        self.assertEqual(
+            (
+                kwargs["enable_dcp"],
+                kwargs["return_lse"],
+                kwargs["cp_world"],
+                kwargs["cp_rank"],
+                kwargs["cp_interleave"],
+                kwargs["softmax_scale"],
+            ),
+            (True, True, 4, 2, 64, 0.5),
+        )
 
     def test_forward_decode_derives_page_local_and_token_global_coordinates(self):
         backend = object.__new__(CuteDslMLABackend)

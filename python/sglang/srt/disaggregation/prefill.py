@@ -1445,7 +1445,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.suspended_prefill_queue.append(req)
             self.chunked_req = None
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, allow_send: bool = True
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1457,7 +1459,9 @@ class SchedulerDisaggregationPrefillMixin:
                 0, len(req.prefix_indices) - req.host_hit_length
             )
 
-        if req.pending_bootstrap:
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them (#44070).
+        if req.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.

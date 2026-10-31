@@ -37,10 +37,12 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
     build_dcp_page_transfer_plan,
     build_dcp_token_transfer_plan,
+    expand_dcp_page_rows,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -1120,7 +1122,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
-        if dst_dcp_kv_layout == "page":
+        page_layout = dst_dcp_kv_layout == "page"
+        if page_layout and self.kv_args.num_draft_entries == 0:
             page_plan = build_dcp_page_transfer_plan(
                 prefill_kv_indices,
                 dst_kv_indices,
@@ -1178,6 +1181,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
+        if page_layout:
+            # The replicated draft pool takes every token at the virtual page
+            # size, as in token layout; the target takes this rank's whole pages.
+            # Pack buffers are sized for token layout, so page sends never pack.
+            page_plan = build_dcp_page_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=physical_page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+            )
+            plan = DCPTokenTransferPlan(
+                expand_dcp_page_rows(page_plan.src_page_indices, physical_page_size),
+                expand_dcp_page_rows(page_plan.dst_page_indices, physical_page_size),
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
+            )
+            pack_buffer = None
         if plan.empty():
             return 0
 
@@ -2185,6 +2208,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # add_transfer_request acquired this lease before publishing to
                 # the queue. A staging retry keeps the same lease.
                 transfer_failed = False
+
+                # Under overlap scheduling an early cached-prefix send can
+                # precede completion of the previous prefill forward. Wait on
+                # the worker, not the scheduler, before reading source KV.
+                # A room that already failed skips the wait; the status check
+                # below then drops the chunk, including on an abort during it.
+                if kv_chunk.wait_event is not None:
+                    if (
+                        kv_chunk.room in self.request_status
+                        and self.check_status(kv_chunk.room) != KVPoll.Failed
+                    ):
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+
                 if (
                     kv_chunk.room not in self.request_status
                     or self._transfer_lifetime.is_closed(kv_chunk.room)
@@ -2658,6 +2695,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2696,6 +2734,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             state_indices=state_indices,
             num_kv_tokens=num_kv_tokens,
             trace_ctx=trace_ctx,
+            wait_event=wait_event,
         )
         if not self._transfer_lifetime.try_acquire(bootstrap_room):
             return
@@ -2809,6 +2848,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if should_skip:
             return
 
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -2817,6 +2858,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2828,6 +2870,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
