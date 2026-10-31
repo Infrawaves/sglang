@@ -23,6 +23,7 @@ import torch
 from sglang.srt.mem_cache.mla_host_node_leader import (
     NodeSharedHostTensorAllocator,
     split_ranks_by_node,
+    synchronize_shared_host_error,
 )
 from sglang.srt.mem_cache.pool_host.base import ranks_per_host
 
@@ -72,14 +73,29 @@ class DraftNodeShareAllocator(NodeSharedHostTensorAllocator):
         super().__init__(node_ranks=merge.node_ranks, tp_cache_group=tp_cache_group)
         self.merge = merge
         self.node_buffer = None
+        # Whether this rank has joined allocate's collectives (or aborted them).
+        self.entered = False
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        self.entered = True
         node_buffer = super().allocate(
             (self.merge.node_size, *dims), dtype=dtype, device=device
         )
         self.dims = dims
         self.node_buffer = node_buffer
         return node_buffer[self.merge.node_slot]
+
+    def abort(self, error: Exception) -> None:
+        """For a rank that failed before ``allocate``: run the same collectives
+        with no buffer so peers raise instead of waiting forever."""
+        if self.entered:
+            return
+        self.entered = True
+        group_ranks = torch.distributed.get_process_group_ranks(self.tp_cache_group)
+        torch.distributed.all_gather_object(
+            [None] * len(group_ranks), None, group=self.tp_cache_group
+        )
+        synchronize_shared_host_error(self.tp_cache_group, error, operation="prefault")
 
 
 def maybe_create_draft_node_merge(

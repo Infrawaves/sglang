@@ -130,6 +130,11 @@ def validate_hicache_draft_node_merge(server_args: Any):
         raise ValueError(
             "--hicache-draft-node-merge requires --hicache-storage-backend mooncake."
         )
+    # Unverified: CP ranks may not hold the same host index for a page.
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--hicache-draft-node-merge is not supported with --attn-cp-size > 1."
+        )
     # Write-back eviction syncs locally, so the node's last rank could put a
     # page before every rank's D2H into it has finished.
     if cfg.hicache_write_policy not in ("write_through", "write_through_selective"):

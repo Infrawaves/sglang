@@ -1553,15 +1553,22 @@ def build_full_draft_pools(
     )
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-        host_allocator=host_allocator,
-    )
+    try:
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_allocator=host_allocator,
+        )
+    except Exception as exc:
+        # A per-rank failure before allocation (e.g. the host budget check)
+        # must still release peers blocked in the node-share collectives.
+        if host_allocator is not None:
+            host_allocator.abort(exc)
+        raise
     if merge is not None:
         log_draft_node_merge(draft_host_pool, merge)
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}

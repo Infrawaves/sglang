@@ -1456,7 +1456,12 @@ class HybridCacheController(BaseHiCacheController):
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         # Checked before backup_skip: TP0 writes MLA but not a merged draft.
-        if transfer.name == PoolName.DRAFT and self.draft_node_merge is not None:
+        # Only Mooncake knows the node-object keys; other backends keep per-rank.
+        if (
+            transfer.name == PoolName.DRAFT
+            and self.draft_node_merge is not None
+            and self.storage_backend_type == "mooncake"
+        ):
             return self.draft_node_merge.is_leader
         if not self.backup_skip:
             return True
