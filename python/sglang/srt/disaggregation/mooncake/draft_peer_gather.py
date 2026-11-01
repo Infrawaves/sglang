@@ -195,19 +195,22 @@ class DraftPeerGather:
             else None
         )
 
-    def enqueue_chunk(self, *, has_wait_event: bool) -> int:
+    def enqueue_chunk(self, *, wait_event: Optional[torch.cuda.Event]) -> int:
         """Number one chunk handed to the transfer queue; returns its seq.
 
-        Scheduler thread only. ``has_wait_event`` marks a chunk whose source
-        may still be written by an unsynced forward; it and every later chunk
-        stay unpublished until ``mark_forward_synced``.
+        Scheduler thread only. ``wait_event`` is the event the transfer worker
+        waits on before reading the chunk's local KV. If it has not completed,
+        the chunk and every later one stay unpublished until
+        ``mark_forward_synced``; it is queried only when nothing is pending,
+        since publishing must not skip an earlier unpublished chunk.
         """
         seq = self._enqueued_seq + 1
         self._enqueued_seq = seq
-        if has_wait_event:
-            self._has_pending = True
-        elif not self._has_pending:
-            self._local_ready[0] = seq
+        if not self._has_pending:
+            if wait_event is None or wait_event.query():
+                self._local_ready[0] = seq
+            else:
+                self._has_pending = True
         return seq
 
     def mark_forward_synced(self) -> None:

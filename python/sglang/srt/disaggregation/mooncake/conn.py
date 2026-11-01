@@ -2966,7 +2966,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
         # Counted before any early return so attn-TP peers stay in lockstep.
         draft_peer_seq = (
-            self._draft_peer_gather.enqueue_chunk(has_wait_event=wait_event is not None)
+            self._draft_peer_gather.enqueue_chunk(wait_event=wait_event)
             if self._draft_peer_gather is not None
             else None
         )

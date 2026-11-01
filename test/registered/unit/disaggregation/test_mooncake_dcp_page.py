@@ -258,6 +258,13 @@ def _host_pack_buffer(size_bytes, *args, **kwargs):
     )
 
 
+def _early_send_event(completed):
+    """Stand-in for an overlap early-send CUDA event; query() reports completion."""
+    event = MagicMock()
+    event.query.return_value = completed
+    return event
+
+
 def _numpy_gather(sources, launches):
     """Byte-exact host model of copy_rows_into_strided_pack."""
 
@@ -663,7 +670,9 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         self._cluster = cluster = self._build(4, 2)
         self._register_all(cluster, 2)
         for p, manager in enumerate(cluster.managers):
-            self._enqueue(manager, p // cluster.k, early_send_event=MagicMock())
+            self._enqueue(
+                manager, p // cluster.k, early_send_event=_early_send_event(False)
+            )
         sender = cluster.managers[0]
         launches = []
         polls = []
@@ -695,25 +704,58 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         self.assertGreater(bytes_at_poll, 0)
         self._assert_decode_rows(cluster)
 
+    def test_overlap_early_send_with_completed_event_needs_no_peer_sync(self):
+        """An early send whose wait event already completed (e.g. the prior
+        forward finished while the scheduler idled) is ready at enqueue."""
+        self._cluster = cluster = self._build(4, 2)
+        self._register_all(cluster, 2)
+        for p, manager in enumerate(cluster.managers):
+            self._enqueue(
+                manager, p // cluster.k, early_send_event=_early_send_event(True)
+            )
+        launches = []
+        with (
+            patch.object(
+                draft_peer_gather,
+                "_launch_gather",
+                side_effect=_numpy_gather(cluster.sources, launches),
+            ),
+            patch.object(
+                draft_peer_gather.time,
+                "sleep",
+                side_effect=AssertionError("peer draft KV should be ready"),
+            ),
+        ):
+            for manager in cluster.managers:
+                self._drain(manager)
+        self._assert_decode_rows(cluster)
+
     def test_ready_watermark_stays_contiguous(self):
-        """Without a wait event a chunk is ready at enqueue, unless an earlier
-        chunk is still waiting on an unsynced forward."""
+        """A chunk is ready at enqueue when its wait event (if any) completed,
+        unless an earlier chunk still waits on an unsynced forward."""
         cluster = self._build(2, 1)
         sender, peer = (m._draft_peer_gather for m in cluster.managers)
         sender.open_peers([0, 1])
         ready = dict(peer_ranks=[0, 1], timeout_s=0, is_cancelled=lambda: False)
 
-        def enqueue(has_wait_event):
-            return peer.enqueue_chunk(has_wait_event=has_wait_event)
+        def enqueue(wait_event=None):
+            return peer.enqueue_chunk(wait_event=wait_event)
 
-        self.assertTrue(sender.wait_for_peers(seq=enqueue(False), **ready))
-        pending = enqueue(True)
-        after_pending = enqueue(False)
-        self.assertFalse(sender.wait_for_peers(seq=pending, **ready))
-        self.assertFalse(sender.wait_for_peers(seq=after_pending, **ready))
+        self.assertTrue(sender.wait_for_peers(seq=enqueue(), **ready))
+        self.assertTrue(
+            sender.wait_for_peers(seq=enqueue(_early_send_event(True)), **ready)
+        )
+        pending = enqueue(_early_send_event(False))
+        # Behind a pending chunk, even a completed event is not queried.
+        completed_behind = _early_send_event(True)
+        after_pending = enqueue(completed_behind)
+        last = enqueue()
+        completed_behind.query.assert_not_called()
+        for seq in (pending, after_pending, last):
+            self.assertFalse(sender.wait_for_peers(seq=seq, **ready))
         peer.mark_forward_synced()
-        self.assertTrue(sender.wait_for_peers(seq=after_pending, **ready))
-        self.assertTrue(sender.wait_for_peers(seq=enqueue(False), **ready))
+        self.assertTrue(sender.wait_for_peers(seq=last, **ready))
+        self.assertTrue(sender.wait_for_peers(seq=enqueue(), **ready))
         self.assertFalse(
             sender.wait_for_peers(
                 peer_ranks=[0, 1], seq=99, timeout_s=60, is_cancelled=lambda: True
@@ -728,11 +770,9 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         ready = dict(peer_ranks=[0, 1], timeout_s=60, is_cancelled=lambda: False)
         with self.assertLogs(draft_peer_gather.logger, "INFO") as logs:
             self.assertTrue(
-                sender.wait_for_peers(
-                    seq=peer.enqueue_chunk(has_wait_event=False), **ready
-                )
+                sender.wait_for_peers(seq=peer.enqueue_chunk(wait_event=None), **ready)
             )
-            pending = peer.enqueue_chunk(has_wait_event=True)
+            pending = peer.enqueue_chunk(wait_event=_early_send_event(False))
             with patch.object(
                 draft_peer_gather.time,
                 "sleep",
