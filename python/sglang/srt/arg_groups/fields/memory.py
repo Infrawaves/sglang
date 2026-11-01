@@ -226,6 +226,10 @@ class Memory(msgspec.Struct):
         bool,
         "Store each page's MHA draft KV as one Mooncake object per node, written and read by the node's last rank. Requires --enable-mla-hicache-per-node.",
     ] = False
+    hicache_storage_page_size: A[
+        Optional[int],
+        "Tokens per Mooncake L3 object for the KV and draft pools; a multiple of --page-size whose ratio divides 128. Pages are grouped by absolute position and each radix node writes only its own segments. Unset means --page-size; Mamba/KDA state keeps its per-node objects.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

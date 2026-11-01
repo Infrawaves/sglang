@@ -25,6 +25,13 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage_page_group import (
+    GroupReadPlan,
+    group_segments,
+    plan_group_reads,
+    regroup_layout,
+    segment_suffix,
+)
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     hicache_diagnostic_metrics_enabled,
@@ -53,6 +60,10 @@ class _ObjectLayout(msgspec.Struct, frozen=True):
 
 def _object_nbytes(size: Any) -> int:
     return sum(size) if isinstance(size, Sequence) else size
+
+
+def _as_size_list(size: Any) -> list:
+    return list(size) if isinstance(size, Sequence) else [size]
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -666,6 +677,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._host_pool_bytes = {}
             # Set when the DRAFT pool is a node share (hicache_draft_node_merge).
             self.draft_node_merge = None
+            # Pages per object for the KV and draft pools (storage_page_group.py).
+            self.storage_page_group = (
+                1 if storage_config is None else storage_config.storage_page_group
+            )
+            if self.storage_page_group > 1 and (
+                self.config.standalone_storage or self.should_split_heads
+            ):
+                raise ValueError(
+                    "--hicache-storage-page-size > --page-size does not support "
+                    "Mooncake standalone_storage or heterogeneous-TP head splits."
+                )
+            # Pool name -> registered scratch for pages read before a query start.
+            self._group_scratch: dict = {}
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -920,46 +944,52 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        start_page = 0 if extra_info is None else extra_info.start_page
+        plans: dict = {}
         if self.mem_pool_host.kv_buffer is None:
-            # Logical anchor: no physical KV object exists in Mooncake, so the
-            # usable prefix is determined entirely by required sidecar objects.
+            # Logical anchor (or an MLA node-leader follower): no physical KV
+            # object is read here, so required sidecar objects decide the prefix.
             kv_pages = len(keys)
+            restorable = list(range(1, kv_pages + 1))
+        elif self._is_grouped(PoolName.KV):
+            plans[PoolName.KV] = self._grouped_exists(
+                keys, PoolName.KV, start_page, extra_info
+            )
+            restorable = plans[PoolName.KV].restorable(start_page)
+            kv_pages = restorable[-1] if restorable else 0
         else:
             kv_pages = self.batch_exists(keys, extra_info)
+            restorable = list(range(1, kv_pages + 1))
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # Start from every KV prefix and let each pool remove the stop points it
         # cannot serve. Collect the whole set, not just its maximum: a
         # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
         # caller has to intersect these sets across ranks.
-        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
             if not restorable:
                 break
-            page_exists = self._pool_page_exists(keys, transfer, kv_pages, extra_info)
             boundary = 0
             pool_restorable = []
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-                pool_restorable = list(range(1, boundary + 1))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # A stop point works when the window ending there is complete,
-                # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
+            if self._is_grouped(transfer.name):
+                plan = self._grouped_exists(
+                    keys[:kv_pages], transfer.name, start_page, extra_info
+                )
+                if plan is None:
+                    # Draft node-merge follower: the node leader's result wins.
+                    pool_restorable = restorable
+                else:
+                    plans[transfer.name] = plan
+                    pool_restorable = plan.restorable(start_page)
+                boundary = pool_restorable[-1] if pool_restorable else 0
             else:
-                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+                page_exists = self._pool_page_exists(
+                    keys, transfer, kv_pages, extra_info
+                )
+                boundary, pool_restorable = self._pool_restorable(
+                    transfer, page_exists, kv_pages
+                )
             if boundary:
                 hit_count[transfer.name] = boundary
             pool_restorable_set = set(pool_restorable)
@@ -969,7 +999,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self._record_hit_limited(str(transfer.name))
 
         final_pages = restorable[-1] if restorable else 0
-        return PoolTransferResult(final_pages, hit_count, restorable)
+        return PoolTransferResult(
+            final_pages, hit_count, restorable, storage_plans=plans or None
+        )
+
+    @staticmethod
+    def _pool_restorable(
+        transfer: PoolTransfer, page_exists: List[bool], kv_pages: int
+    ) -> Tuple[int, List[int]]:
+        """(longest hit, every restorable prefix length) for a per-page pool."""
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            try:
+                boundary = page_exists.index(False)
+            except ValueError:
+                boundary = kv_pages
+            return boundary, list(range(1, boundary + 1))
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            # A stop point works when the window ending there is complete,
+            # so scan every one instead of stopping at the longest.
+            trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+            restorable = [
+                prefix_len
+                for prefix_len in range(kv_pages, 0, -1)
+                if all(
+                    page_exists[i]
+                    for i in range(max(0, prefix_len - trailing), prefix_len)
+                )
+            ]
+            return (restorable[0] if restorable else 0), restorable
+        raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
     def _object_layout(
         self,
@@ -1032,7 +1090,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i in range(num_pages)
         ]
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -1043,6 +1106,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
+
+            if self._is_grouped(transfer.name):
+                start_page = 0 if extra_info is None else extra_info.start_page
+                results[transfer.name] = (
+                    self._grouped_set(keys, transfer.name, host_indices, start_page)
+                    if is_set
+                    else self._grouped_get(
+                        keys, transfer.name, host_indices, extra_info
+                    )
+                )
+                continue
 
             layout = self._object_layout(keys, transfer, host_indices)
             if layout.skip_io:
@@ -1064,9 +1138,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _put_missing_objects(
-        self, layout: _ObjectLayout, tagged_page_keys: List[str], *, pool: str
+        self,
+        layout: _ObjectLayout,
+        tagged_page_keys: List[str],
+        *,
+        pool: str,
+        entry_pages: Optional[List[int]] = None,
     ) -> List[int]:
-        """Write the layout's objects the store does not hold yet."""
+        """Write the layout's objects the store does not hold yet.
+
+        An entry is a page, or a page segment with ``entry_pages`` pages.
+        """
         per_page = layout.objects_per_page
         group_ids = (
             self._expand_group_ids(tagged_page_keys, per_page)
@@ -1075,7 +1157,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         exist_result = self._batch_exist(layout.keys)
         self._record_io(
-            pool, "exists", objects=len(layout.keys), pages=len(tagged_page_keys)
+            pool,
+            "exists",
+            objects=len(layout.keys),
+            pages=sum(entry_pages) if entry_pages else len(tagged_page_keys),
         )
         io_results = [0 if state == 1 else -1 for state in exist_result]
         missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
@@ -1093,7 +1178,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 pool,
                 "put",
                 objects=len(missing_idx),
-                pages=len({i // per_page for i in missing_idx}),
+                pages=sum(
+                    entry_pages[e] if entry_pages else 1
+                    for e in {i // per_page for i in missing_idx}
+                ),
                 nbytes=sum(
                     _object_nbytes(layout.buffer_sizes[i]) for i in missing_idx
                 ),
@@ -1126,14 +1214,197 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False)
+        return self._batch_io_v2(transfers, is_set=False, extra_info=extra_info)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
+
+    # ===== Grouped pages (--hicache-storage-page-size) =====
+
+    def _is_grouped(self, pool_name) -> bool:
+        return self.storage_page_group > 1 and pool_name in (
+            PoolName.KV,
+            PoolName.DRAFT,
+        )
+
+    def _page_layout(
+        self, page_keys: List[str], pool_name, host_indices=None
+    ) -> _ObjectLayout:
+        """Per-page objects of a grouped pool, page-major; tagged keys."""
+        if pool_name != PoolName.KV:
+            return self._object_layout(
+                page_keys, PoolTransfer(name=pool_name), host_indices
+            )
+        tagged = self._tag_keys(page_keys)
+        if host_indices is None:
+            suffixes = (
+                [f"_{self.mla_suffix}_k"]
+                if self.is_mla_backend
+                else [f"_{self.mha_suffix}_k", f"_{self.mha_suffix}_v"]
+            )
+            keys = [f"{key}{suffix}" for key in tagged for suffix in suffixes]
+            return _ObjectLayout(keys=keys, objects_per_page=len(suffixes))
+        keys, ptrs, sizes = self._batch_preprocess(tagged, host_indices)
+        return _ObjectLayout(
+            keys=keys,
+            objects_per_page=len(keys) // len(page_keys),
+            buffer_ptrs=ptrs,
+            buffer_sizes=sizes,
+        )
+
+    def _grouped_layout(
+        self,
+        base: _ObjectLayout,
+        *,
+        base_page: int,
+        segments: List[Tuple[int, int]],
+        pool: str,
+    ) -> _ObjectLayout:
+        """One object per segment and component; leading pages go to scratch."""
+        per_page = base.objects_per_page
+        keys, ptrs, sizes = regroup_layout(
+            base.keys,
+            base.buffer_ptrs,
+            base.buffer_sizes,
+            per_page=per_page,
+            base_page=base_page,
+            segments=segments,
+            group=self.storage_page_group,
+            lead=lambda count: self._lead_scratch(pool, base, count),
+        )
+        return _ObjectLayout(
+            keys=keys, objects_per_page=per_page, buffer_ptrs=ptrs, buffer_sizes=sizes
+        )
+
+    def _lead_scratch(
+        self, pool: str, base: _ObjectLayout, count: int
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Scratch segments for ``count`` pages that precede a read's start."""
+        per_page = base.objects_per_page
+        comp_sizes = [
+            [int(s) for s in _as_size_list(base.buffer_sizes[c])]
+            for c in range(per_page)
+        ]
+        page_bytes = sum(sum(sizes) for sizes in comp_sizes)
+        scratch = self._group_scratch.get(pool)
+        need = (self.storage_page_group - 1) * page_bytes
+        if scratch is None or scratch.numel() < need:
+            # Fixed per pool; registered once with the transfer engine.
+            scratch = torch.empty(need, dtype=torch.uint8)
+            self.register_buffer(scratch)
+            self._group_scratch[pool] = scratch
+        base_ptr = scratch.data_ptr()
+        ptrs = [[] for _ in range(per_page)]
+        sizes = [[] for _ in range(per_page)]
+        offset = 0
+        for _ in range(count):
+            for comp in range(per_page):
+                for size in comp_sizes[comp]:
+                    ptrs[comp].append(base_ptr + offset)
+                    sizes[comp].append(size)
+                    offset += size
+        return ptrs, sizes
+
+    def _grouped_set(
+        self, page_keys: List[str], pool_name, host_indices, start_page: int
+    ) -> List[bool]:
+        """Write one object per node segment and component; page results."""
+        base = self._page_layout(page_keys, pool_name, host_indices)
+        if base.skip_io:
+            return [True] * len(page_keys)
+        segments = group_segments(start_page, len(page_keys), self.storage_page_group)
+        layout = self._grouped_layout(
+            base, base_page=start_page, segments=segments, pool=str(pool_name)
+        )
+        segment_keys = self._tag_keys(
+            [page_keys[hi - 1 - start_page] for _, hi in segments]
+        )
+        io_results = self._put_missing_objects(
+            layout,
+            segment_keys,
+            pool=str(pool_name),
+            entry_pages=[hi - lo for lo, hi in segments],
+        )
+        ok = self._batch_postprocess(
+            io_results, is_set_operate=True, key_multiplier=base.objects_per_page
+        )
+        return [ok[i] for i, (lo, hi) in enumerate(segments) for _ in range(hi - lo)]
+
+    def _grouped_exists(
+        self,
+        page_keys: List[str],
+        pool_name,
+        start_page: int,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[GroupReadPlan]:
+        """Segment chain of a grouped pool; None when this rank reads nothing."""
+        base = self._page_layout(page_keys, pool_name)
+        if base.skip_io:
+            return None
+        per_page = base.objects_per_page
+        group = self.storage_page_group
+
+        def probe(segments: List[Tuple[int, int]]) -> List[bool]:
+            keys = []
+            for lo, hi in segments:
+                suffix = segment_suffix((lo, hi), group)
+                last = (hi - 1 - start_page) * per_page
+                keys.extend(base.keys[last + comp] + suffix for comp in range(per_page))
+            ex = self._batch_exist(keys, extra_info)
+            self._record_io(
+                str(pool_name),
+                "exists",
+                objects=len(keys),
+                pages=sum(hi - max(lo, start_page) for lo, hi in segments),
+            )
+            return [
+                all(r == 1 for r in ex[i * per_page : (i + 1) * per_page])
+                for i in range(len(segments))
+            ]
+
+        return plan_group_reads(start_page, len(page_keys), group, probe)
+
+    def _grouped_get(
+        self,
+        page_keys: List[str],
+        pool_name,
+        host_indices,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> List[bool]:
+        """Read the segment chain found by the existence query; page results."""
+        num_pages = len(page_keys)
+        base = self._page_layout(page_keys, pool_name, host_indices)
+        if base.skip_io:
+            return [True] * num_pages
+        plans = None if extra_info is None else extra_info.storage_plans
+        plan = None if plans is None else plans.get(pool_name)
+        if plan is None:
+            # No query ran for this span (e.g. it was assumed stored).
+            return [False] * num_pages
+        start_page = extra_info.start_page
+        segments, end = plan.chain(start_page, start_page + num_pages)
+        if not segments:
+            return [False] * num_pages
+        layout = self._grouped_layout(
+            base, base_page=start_page, segments=segments, pool=str(pool_name)
+        )
+        io_results = self._get_objects(
+            layout, num_pages=end - start_page, pool=str(pool_name)
+        )
+        ok = self._batch_postprocess(
+            io_results, is_set_operate=False, key_multiplier=base.objects_per_page
+        )
+        results = [False] * num_pages
+        for (lo, hi), segment_ok in zip(segments, ok):
+            if not segment_ok:
+                break
+            for page in range(max(lo, start_page), hi):
+                results[page - start_page] = True
+        return results
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1247,6 +1518,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
+        if self._is_grouped(PoolName.KV):
+            return self._grouped_get(keys, PoolName.KV, host_indices, extra_info)
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1284,6 +1557,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
+        if self._is_grouped(PoolName.KV):
+            start_page = 0 if extra_info is None else extra_info.start_page
+            return self._grouped_set(keys, PoolName.KV, host_indices, start_page)
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)

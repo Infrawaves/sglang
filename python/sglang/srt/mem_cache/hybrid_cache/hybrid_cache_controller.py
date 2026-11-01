@@ -110,17 +110,27 @@ def _trailing_chain_groups(
     prefix_keys: Optional[List[str]],
     span_hashes: List[str],
     transfers: list[PoolTransfer],
+    *,
+    start_page: int = 0,
+    storage_plans: Optional[dict] = None,
 ) -> list[tuple[HiCacheStorageExtraInfo, list[PoolTransfer]]]:
-    """One extra_info per tail length so prefix_keys + keys stays contiguous."""
-    if prefix_keys is None:
-        return [(HiCacheStorageExtraInfo(prefix_keys=None), transfers)]
+    """One extra_info per tail length so prefix_keys + keys stays contiguous
+    and start_page names each transfer's first key."""
     groups: dict[int, list[PoolTransfer]] = {}
     for transfer in transfers:
         covered = len(span_hashes) - len(transfer.keys or ())
         groups.setdefault(covered, []).append(transfer)
     return [
         (
-            HiCacheStorageExtraInfo(prefix_keys=prefix_keys + span_hashes[:covered]),
+            HiCacheStorageExtraInfo(
+                prefix_keys=(
+                    None
+                    if prefix_keys is None
+                    else prefix_keys + span_hashes[:covered]
+                ),
+                start_page=start_page + covered,
+                storage_plans=storage_plans,
+            ),
             group,
         )
         for covered, group in groups.items()
@@ -136,8 +146,16 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        start_page: int = 0,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            start_page=start_page,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -151,6 +169,7 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        start_page: int = 0,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -167,6 +186,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            start_page=start_page,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
@@ -905,6 +925,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        start_page: int = 0,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -913,6 +934,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            start_page=start_page,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -949,7 +971,9 @@ class HybridCacheController(BaseHiCacheController):
                     last_hash,
                     prefix_keys,
                     extra_pools=pool_transfers,
-                    assume_stored=assume_stored,
+                    # A grouped read follows the chain only a query can find.
+                    assume_stored=assume_stored and self.storage_page_group == 1,
+                    start_page=len(matched_prefix_tokens or []) // self.page_size,
                 )
             )
 
@@ -1233,6 +1257,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        start_page: int = 0,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1240,6 +1265,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            start_page=start_page,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1263,11 +1289,14 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
+            start_page=operation.start_page,
         )
-        if operation.pool_transfers:
+        # Grouped L3 objects need the v2 query, which returns the segment chain.
+        if operation.pool_transfers or self.storage_page_group > 1:
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
+            operation.storage_plans = hit_result.storage_plans
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
@@ -1372,6 +1401,11 @@ class HybridCacheController(BaseHiCacheController):
                 operation.prefix_keys,
                 sidecar_hashes,
                 transfers_nonkv,
+                start_page=(
+                    operation.start_page
+                    - (len(sidecar_hashes) - len(operation.hash_value))
+                ),
+                storage_plans=operation.storage_plans,
             ):
                 results.update(
                     self.storage_backend.batch_get_v2(transfers, extra_info=extra_info)
@@ -1404,6 +1438,7 @@ class HybridCacheController(BaseHiCacheController):
         operation.hash_value = original_hashes[trim_pages:]
         operation.storage_hit_count -= trim_tokens
         operation.storage_start += trim_tokens
+        operation.start_page += trim_pages
 
     def _page_backup(self, operation):
         with self.mem_pool_host.layout_lease():
@@ -1423,7 +1458,10 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = {}
             for extra_info, transfers in _trailing_chain_groups(
-                operation.prefix_keys, operation.hash_value, backup_transfers
+                operation.prefix_keys,
+                operation.hash_value,
+                backup_transfers,
+                start_page=operation.start_page,
             ):
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)

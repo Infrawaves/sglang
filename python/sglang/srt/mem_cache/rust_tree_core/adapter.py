@@ -902,6 +902,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             hash_value=spec.hash_value,
             prefix_keys=spec.prefix_keys,
             comp_xfers=_comp_xfers_from_binding(spec.comp_xfers),
+            start_page=spec.start_page,
         )
 
     def build_hicache_transfers(
