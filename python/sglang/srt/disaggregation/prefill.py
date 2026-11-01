@@ -822,6 +822,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        # Queued chunks read KV from forwards up to this batch's: run_batch issues
+        # early sends before launching its forward. copy_done is None only without
+        # overlap, where early sends carry no wait event and are ready at enqueue.
+        self.disagg_prefill_bootstrap_queue.kv_manager.mark_prefill_forward_synced()
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )

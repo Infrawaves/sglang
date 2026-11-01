@@ -34,6 +34,8 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Mooncake DCP draft peer gather: this rank's enqueue seq for the chunk.
+    draft_peer_seq: Optional[int] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:

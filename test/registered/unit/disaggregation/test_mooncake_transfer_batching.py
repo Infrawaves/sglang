@@ -453,6 +453,7 @@ class TestMooncakeEarlySend(unittest.TestCase):
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
             _transfer_lifetime=lifetime,
+            _draft_peer_gather=None,
         )
         MooncakeKVManager.add_transfer_request(
             manager, 1, [0], slice(0, 1), False, wait_event=ready
