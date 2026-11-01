@@ -2070,43 +2070,35 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
-    def test_mla_hicache_mode_and_write_policy_admission(self):
-        """With the flag on, shm rejects write_back; flag off ignores the mode."""
+    def test_hicache_draft_node_merge_admission(self):
+        """Draft node merge needs per-node MLA, Mooncake and a write-through policy."""
+        mooncake = {
+            "hicache_storage_backend": "mooncake",
+            "hicache_storage_backend_extra_config": json.dumps(
+                {"client_server_address": "localhost:50052"}
+            ),
+        }
         cases = (
-            (True, "shm", "write_back", "does not support"),
-            (False, "shm", "write_back", None),
-            (True, "broadcast", "write_back", None),
-            (True, "shm", "write_through", None),
-            (True, "shm", "write_through_selective", None),
+            (True, mooncake, "write_through", None),
+            (True, mooncake, "write_through_selective", None),
+            (True, mooncake, "write_back", "write_through"),
+            (False, mooncake, "write_through", "--enable-mla-hicache-per-node"),
+            (True, {"hicache_storage_backend": "file"}, "write_through", "mooncake"),
         )
-        for enabled, mode, policy, error in cases:
-            with self.subTest(enabled=enabled, mode=mode, policy=policy):
+        for per_node, storage, policy, error in cases:
+            with self.subTest(per_node=per_node, storage=storage, policy=policy):
                 args = self._make_args(
                     enable_hierarchical_cache=True,
-                    enable_mla_hicache_per_node=enabled,
-                    mla_hicache_per_node_mode=mode,
+                    enable_mla_hicache_per_node=per_node,
+                    hicache_draft_node_merge=True,
                     hicache_write_policy=policy,
+                    **storage,
                 )
                 if error is not None:
                     with self.assertRaisesRegex(ValueError, error):
                         handle_hicache(args)
                 else:
                     handle_hicache(args)
-
-    def test_mla_hicache_per_node_mode_is_a_choice_server_arg(self):
-        """The restore mode is a CLI choice defaulting to broadcast."""
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        base = ["--model-path", "dummy"]
-        self.assertEqual(parser.parse_args(base).mla_hicache_per_node_mode, "broadcast")
-        self.assertEqual(
-            parser.parse_args(
-                base + ["--mla-hicache-per-node-mode", "shm"]
-            ).mla_hicache_per_node_mode,
-            "shm",
-        )
-        with self.assertRaises(SystemExit):
-            parser.parse_args(base + ["--mla-hicache-per-node-mode", "invalid"])
 
     def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
         """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""
@@ -2148,26 +2140,16 @@ class TestHiCacheArgs(CustomTestCase):
 
     def test_mla_hicache_per_node_requires_pp_size_one(self):
         """Per-node MLA HiCache must reject PP even on inactive or linker paths."""
-        for enabled, mode, cache_path, pp_size, rejects in (
-            (True, "broadcast", {"enable_hierarchical_cache": True}, 2, True),
-            (True, "shm", {"enable_hierarchical_cache": True}, 2, True),
-            (True, "broadcast", {}, 2, True),
-            (
-                True,
-                "broadcast",
-                {"enable_unified_cache_external_linker": True},
-                2,
-                True,
-            ),
-            (True, "shm", {"enable_hierarchical_cache": True}, 1, False),
-            (False, "shm", {"enable_hierarchical_cache": True}, 2, False),
+        for enabled, cache_path, pp_size, rejects in (
+            (True, {"enable_hierarchical_cache": True}, 2, True),
+            (True, {}, 2, True),
+            (True, {"enable_unified_cache_external_linker": True}, 2, True),
+            (True, {"enable_hierarchical_cache": True}, 1, False),
+            (False, {"enable_hierarchical_cache": True}, 2, False),
         ):
-            with self.subTest(
-                enabled=enabled, mode=mode, cache_path=cache_path, pp_size=pp_size
-            ):
+            with self.subTest(enabled=enabled, cache_path=cache_path, pp_size=pp_size):
                 args = self._make_args(
                     enable_mla_hicache_per_node=enabled,
-                    mla_hicache_per_node_mode=mode,
                     pp_size=pp_size,
                     **cache_path,
                 )

@@ -625,5 +625,24 @@ class TestMooncakeReadFailureMetrics(CustomTestCase):
         self.assertEqual(store.get_stats().read_failed_keys, {})
 
 
+class TestMooncakeObjectMetrics(CustomTestCase):
+    def test_put_counts_only_written_objects_and_their_pages(self):
+        """The per-page object KPI divides put objects by put pages, so objects
+        already in the store must count in neither; exists sees every object."""
+        store, fake_store = _make_store(enable_group_semantics=False)
+        store.enable_storage_metrics = True
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        # page0 is half stored, page1 fully stored.
+        fake_store.existing_keys.update({"page0_0_k", "page1_0_k", "page1_0_v"})
+
+        store.batch_set_v1(["page0", "page1"], torch.tensor([0, 1]))
+
+        self.assertEqual(
+            store.get_stats().storage_io,
+            {("kv", "exists"): [4, 2, 0], ("kv", "put"): [1, 1, 8]},
+        )
+        self.assertEqual(store.get_stats().storage_io, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)

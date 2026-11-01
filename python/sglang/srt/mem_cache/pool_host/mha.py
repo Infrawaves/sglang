@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -137,6 +138,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
+        host_allocator: Optional[HostTensorAllocator] = None,
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
@@ -150,6 +152,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
             pool_label=pool_label,
+            host_allocator=host_allocator,
         )
         self.element_dim = self.head_num * self.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only

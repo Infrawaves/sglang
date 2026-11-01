@@ -25,6 +25,8 @@ def handle_hicache(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.enable_mla_hicache_per_node:
         validate_mla_hicache_per_node(server_args)
+    if cfg.hicache_draft_node_merge:
+        validate_hicache_draft_node_merge(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -85,10 +87,10 @@ def validate_mla_hicache_per_node(server_args: Any):
     if cfg.pp_size > 1:
         raise ValueError(
             "--enable-mla-hicache-per-node requires --pp-size 1; "
-            "pipeline parallelism is not supported in broadcast or shm mode."
+            "pipeline parallelism is not supported."
         )
     if cfg.disaggregation_mode == "decode":
-        # Broadcast needs a forward to run the layer-wait hook; shm is unvalidated.
+        # Broadcast needs a forward to run the layer-wait hook.
         raise ValueError(
             "--enable-mla-hicache-per-node is not supported on PD decode instances."
         )
@@ -96,16 +98,6 @@ def validate_mla_hicache_per_node(server_args: Any):
         # DCP pages are rank-sharded in the current transfer contract.
         raise ValueError(
             "--enable-mla-hicache-per-node is not supported with --dcp-size > 1."
-        )
-    # Write-back eviction syncs locally: a follower could load shared pages before
-    # the leader's D2H into them finishes.
-    if (
-        cfg.mla_hicache_per_node_mode == "shm"
-        and cfg.hicache_write_policy == "write_back"
-    ):
-        raise ValueError(
-            "--mla-hicache-per-node-mode shm does not support "
-            "--hicache-write-policy write_back."
         )
     if cfg.hicache_storage_backend == "mooncake":
         # Lazy: only per-node Mooncake launches pay for these imports.
@@ -124,6 +116,32 @@ def validate_mla_hicache_per_node(server_args: Any):
                 "--enable-mla-hicache-per-node is incompatible with Mooncake "
                 "standalone_storage=True, which requires MooncakeHostTensorAllocator."
             )
+
+
+def validate_hicache_draft_node_merge(server_args: Any):
+    # The draft pool class, resolved layout and node size are checked when the
+    # draft host pool is built.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_mla_hicache_per_node:
+        raise ValueError(
+            "--hicache-draft-node-merge requires --enable-mla-hicache-per-node."
+        )
+    if cfg.hicache_storage_backend != "mooncake":
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-storage-backend mooncake."
+        )
+    # Unverified: CP ranks may not hold the same host index for a page.
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--hicache-draft-node-merge is not supported with --attn-cp-size > 1."
+        )
+    # Write-back eviction syncs locally, so the node's last rank could put a
+    # page before every rank's D2H into it has finished.
+    if cfg.hicache_write_policy not in ("write_through", "write_through_selective"):
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-write-policy "
+            "write_through or write_through_selective."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):
