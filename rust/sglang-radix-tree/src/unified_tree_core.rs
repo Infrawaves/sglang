@@ -415,6 +415,9 @@ pub struct StorageBackupSpec {
     pub prefix_keys: Option<Vec<String>>,
     /// Auxiliary per-component transfers riding the same storage write.
     pub comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
+    /// Pages between the root and the node, i.e. hash_value[0]'s absolute page
+    /// index; grouped L3 objects (--hicache-storage-page-size) are keyed by it.
+    pub start_page: usize,
 }
 
 /// Immutable metadata for a queued buffer-only backup.
@@ -3613,7 +3616,26 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             hash_value: node.hash_value.clone(),
             prefix_keys,
             comp_xfers,
+            start_page: self.prefix_page_count(node.parent),
         }))
+    }
+
+    /// Pages from the root down to and including `node_id`.
+    fn prefix_page_count(&self, node_id: Option<NodeIdx_>) -> usize {
+        let mut pages = 0;
+        let mut cursor = node_id;
+        while let Some(id) = cursor {
+            let node = self.arena.node(id);
+            if node.is_root() {
+                break;
+            }
+            pages += match node.hash_value.as_ref() {
+                Some(hash_value) => hash_value.len(),
+                None => node.key.atom_len() / self.page_size,
+            };
+            cursor = node.parent;
+        }
+        pages
     }
 
     /// Route a build_hicache_transfers call to the component for the given type.

@@ -36,7 +36,7 @@ class TestNodeLeaderPoolAssembly(CustomTestCase):
         events, budgets = [], []
         tp_cache_group = object()
         shared_allocator = object() if mode is not None else None
-        broadcast = object() if mode == "broadcast" else None
+        broadcast = object() if mode is not None else None
         context = (
             None
             if mode is None
@@ -150,7 +150,7 @@ class TestNodeLeaderPoolAssembly(CustomTestCase):
         return group, events, shared_allocator
 
     def test_pool_roles_and_allocation_order(self):
-        """Shm followers retain H2D buffers; both node-leader modes fence MLA before Mamba."""
+        """Node-leader followers keep no H2D buffers; MLA is fenced before Mamba."""
         # hicache_size=1 splits 6:2 by device bytes, so MLA gets 0.75 and Mamba 0.25;
         # capacity_multiplier=4 scales MLA ratio 2->8, size 0.75->3.0
         # and leader budget 8G->32G.
@@ -159,8 +159,6 @@ class TestNodeLeaderPoolAssembly(CustomTestCase):
             (None, False, 2, 0.75, False, False, None, ["kv", "mamba"]),
             ("broadcast", False, 8, 3.0, False, False, 32 << 30, gated),
             ("broadcast", True, 8, 3.0, True, True, None, gated),
-            ("shm", False, 8, 3.0, False, False, 32 << 30, gated),
-            ("shm", True, 8, 3.0, False, True, None, gated),
         ):
             with self.subTest(mode=mode, follower=follower):
                 group, events, allocator = self._build(

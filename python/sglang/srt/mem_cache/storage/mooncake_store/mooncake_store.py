@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import requests
 import torch
 
@@ -24,6 +25,13 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage_page_group import (
+    GroupReadPlan,
+    group_segments,
+    plan_group_reads,
+    regroup_layout,
+    segment_suffix,
+)
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     hicache_diagnostic_metrics_enabled,
@@ -34,6 +42,28 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+class _ObjectLayout(msgspec.Struct, frozen=True):
+    """How one PoolTransfer's pages map onto Mooncake objects."""
+
+    # Tagged object keys, page-major: page i owns keys[i * objects_per_page:].
+    keys: List[str]
+    objects_per_page: int
+    # Zipped with keys; an entry is a list when one object spans several
+    # host segments. None for existence-only layouts.
+    buffer_ptrs: Optional[List[Any]] = None
+    buffer_sizes: Optional[List[Any]] = None
+    # This rank does no L3 IO for the pool; report every page present and done.
+    skip_io: bool = False
+
+
+def _object_nbytes(size: Any) -> int:
+    return sum(size) if isinstance(size, Sequence) else size
+
+
+def _as_size_list(size: Any) -> list:
+    return list(size) if isinstance(size, Sequence) else [size]
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -638,6 +668,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._read_failed_keys = {}
             self._read_failed_keys_lock = threading.Lock()
             self._read_codes_logged = set()
+            # Backup and prefetch threads both record; drained by get_stats().
+            self._io_stats_lock = threading.Lock()
+            self._storage_io = {}
+            self._storage_io_durations = []
+            self._storage_hit_limited = {}
+            # Set at registration and resent on every flush (a gauge).
+            self._host_pool_bytes = {}
+            # Set when the DRAFT pool is a node share (hicache_draft_node_merge).
+            self.draft_node_merge = None
+            # Pages per object for the KV and draft pools (storage_page_group.py).
+            self.storage_page_group = (
+                1 if storage_config is None else storage_config.storage_page_group
+            )
+            if self.storage_page_group > 1 and (
+                self.config.standalone_storage or self.should_split_heads
+            ):
+                raise ValueError(
+                    "--hicache-storage-page-size > --page-size does not support "
+                    "Mooncake standalone_storage or heterogeneous-TP head splits."
+                )
+            # Pool name -> registered scratch for pages read before a query start.
+            self._group_scratch: dict = {}
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -718,6 +770,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self._record_host_pool_bytes(str(PoolName.KV), mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
@@ -743,9 +796,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        self._record_host_pool_bytes(str(host_pool_name), host_pool)
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            self.draft_node_merge = self._resolve_draft_node_merge(host_pool)
+            if self.draft_node_merge is None:
+                super().register_buffer(host_pool.kv_buffer)
+            elif self.draft_node_merge.is_leader:
+                # The leader scatter-gathers every rank's slice of the node.
+                super().register_buffer(host_pool.allocator.node_buffer)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -812,7 +871,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tag is what keeps these keys from colliding with target's
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
-            if isinstance(draft_pool, MLATokenToKVPoolHost):
+            if self.draft_node_merge is not None:
+                # One object per node: every rank's K and V for the page.
+                suffixes = [f"_{PoolName.DRAFT}_{self.draft_node_merge.key_suffix}"]
+            elif isinstance(draft_pool, MLATokenToKVPoolHost):
                 suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
@@ -882,134 +944,467 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        start_page = 0 if extra_info is None else extra_info.start_page
+        plans: dict = {}
         if self.mem_pool_host.kv_buffer is None:
-            # Logical anchor: no physical KV object exists in Mooncake, so the
-            # usable prefix is determined entirely by required sidecar objects.
+            # Logical anchor (or an MLA node-leader follower): no physical KV
+            # object is read here, so required sidecar objects decide the prefix.
             kv_pages = len(keys)
+            restorable = list(range(1, kv_pages + 1))
+        elif self._is_grouped(PoolName.KV):
+            plans[PoolName.KV] = self._grouped_exists(
+                keys, PoolName.KV, start_page, extra_info
+            )
+            restorable = plans[PoolName.KV].restorable(start_page)
+            kv_pages = restorable[-1] if restorable else 0
         else:
             kv_pages = self.batch_exists(keys, extra_info)
+            restorable = list(range(1, kv_pages + 1))
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # Start from every KV prefix and let each pool remove the stop points it
         # cannot serve. Collect the whole set, not just its maximum: a
         # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
         # caller has to intersect these sets across ranks.
-        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
             if not restorable:
                 break
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
-            component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys, extra_info)
-            if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
-            else:
-                page_exists = [False] * kv_pages
             boundary = 0
             pool_restorable = []
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-                pool_restorable = list(range(1, boundary + 1))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # A stop point works when the window ending there is complete,
-                # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
+            if self._is_grouped(transfer.name):
+                plan = self._grouped_exists(
+                    keys[:kv_pages], transfer.name, start_page, extra_info
+                )
+                if plan is None:
+                    # Draft node-merge follower: the node leader's result wins.
+                    pool_restorable = restorable
+                else:
+                    plans[transfer.name] = plan
+                    pool_restorable = plan.restorable(start_page)
+                boundary = pool_restorable[-1] if pool_restorable else 0
             else:
-                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+                page_exists = self._pool_page_exists(
+                    keys, transfer, kv_pages, extra_info
+                )
+                boundary, pool_restorable = self._pool_restorable(
+                    transfer, page_exists, kv_pages
+                )
             if boundary:
                 hit_count[transfer.name] = boundary
             pool_restorable_set = set(pool_restorable)
+            pool_final_before = restorable[-1]
             restorable = [p for p in restorable if p in pool_restorable_set]
+            if (restorable[-1] if restorable else 0) < pool_final_before:
+                self._record_hit_limited(str(transfer.name))
 
         final_pages = restorable[-1] if restorable else 0
-        return PoolTransferResult(final_pages, hit_count, restorable)
+        return PoolTransferResult(
+            final_pages, hit_count, restorable, storage_plans=plans or None
+        )
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    @staticmethod
+    def _pool_restorable(
+        transfer: PoolTransfer, page_exists: List[bool], kv_pages: int
+    ) -> Tuple[int, List[int]]:
+        """(longest hit, every restorable prefix length) for a per-page pool."""
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            try:
+                boundary = page_exists.index(False)
+            except ValueError:
+                boundary = kv_pages
+            return boundary, list(range(1, boundary + 1))
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            # A stop point works when the window ending there is complete,
+            # so scan every one instead of stopping at the longest.
+            trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+            restorable = [
+                prefix_len
+                for prefix_len in range(kv_pages, 0, -1)
+                if all(
+                    page_exists[i]
+                    for i in range(max(0, prefix_len - trailing), prefix_len)
+                )
+            ]
+            return (restorable[0] if restorable else 0), restorable
+        raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+
+    def _object_layout(
+        self,
+        page_keys: List[str],
+        transfer: PoolTransfer,
+        host_indices: Optional[torch.Tensor] = None,
+    ) -> _ObjectLayout:
+        """Expand logical pages into Mooncake objects for one pool.
+
+        Object keys and buffer pointers must stay zipped one-to-one; without
+        ``host_indices`` only the keys are built (existence queries).
+        """
+        component_keys, objects_per_page = self._get_hybrid_page_component_keys(
+            page_keys, transfer
+        )
+        keys = self._tag_keys(component_keys)
+        merge = self.draft_node_merge if transfer.name == PoolName.DRAFT else None
+        if merge is not None and not merge.is_leader:
+            return _ObjectLayout(
+                keys=keys, objects_per_page=objects_per_page, skip_io=True
+            )
+        if host_indices is None:
+            return _ObjectLayout(keys=keys, objects_per_page=objects_per_page)
+        host_pool = self.registered_pools[transfer.name]
+        if merge is not None:
+            from sglang.srt.mem_cache.hicache_draft_node_merge import (
+                node_page_buffer_meta,
+            )
+
+            ptr_list, size_list = node_page_buffer_meta(host_pool, merge, host_indices)
+        else:
+            ptr_list, size_list = host_pool.get_page_buffer_meta(host_indices)
+        ptr_list, size_list = self._pack_multi_buffer_meta(keys, ptr_list, size_list)
+        return _ObjectLayout(
+            keys=keys,
+            objects_per_page=objects_per_page,
+            buffer_ptrs=ptr_list,
+            buffer_sizes=size_list,
+        )
+
+    def _pool_page_exists(
+        self,
+        page_keys: List[str],
+        transfer: PoolTransfer,
+        num_pages: int,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> List[bool]:
+        layout = self._object_layout(page_keys, transfer)
+        if layout.skip_io:
+            return [True] * num_pages
+        per_page = layout.objects_per_page
+        if per_page <= 0:
+            return [False] * num_pages
+        ex = self._batch_exist(layout.keys, extra_info)
+        self._record_io(
+            str(transfer.name), "exists", objects=len(layout.keys), pages=num_pages
+        )
+        return [
+            all(r == 1 for r in ex[i * per_page : (i + 1) * per_page])
+            for i in range(num_pages)
+        ]
+
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
-            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            host_pool = self.registered_pools.get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            tagged_keys = self._tag_keys(keys)
-            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
-            key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if len(ptr_list) != len(key_strs):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
-
-            if is_set:
-                group_ids = (
-                    self._expand_group_ids(tagged_keys, key_multiplier)
-                    if self._can_use_group_semantics()
-                    else None
-                )
-                exist_result = self._batch_exist(key_strs)
-                io_results = [0 if state == 1 else -1 for state in exist_result]
-                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
-                    put_results = self._put_batch_zero_copy_impl(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
-                        self._filter_group_ids(group_ids, missing_idx),
+            if self._is_grouped(transfer.name):
+                start_page = 0 if extra_info is None else extra_info.start_page
+                results[transfer.name] = (
+                    self._grouped_set(keys, transfer.name, host_indices, start_page)
+                    if is_set
+                    else self._grouped_get(
+                        keys, transfer.name, host_indices, extra_info
                     )
-                    for i, res in zip(missing_idx, put_results):
-                        io_results[i] = res
+                )
+                continue
+
+            layout = self._object_layout(keys, transfer, host_indices)
+            if layout.skip_io:
+                results[transfer.name] = [True] * len(keys)
+                continue
+            if is_set:
+                io_results = self._put_missing_objects(
+                    layout, self._tag_keys(keys), pool=str(transfer.name)
+                )
             else:
-                io_results = self._get_batch_zero_copy_impl(
-                    key_strs,
-                    ptr_list,
-                    element_size_list,
-                    pool=str(transfer.name),
+                io_results = self._get_objects(
+                    layout, num_pages=len(keys), pool=str(transfer.name)
                 )
             results[transfer.name] = self._batch_postprocess(
-                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
+                io_results,
+                is_set_operate=is_set,
+                key_multiplier=layout.objects_per_page,
             )
         return results
+
+    def _put_missing_objects(
+        self,
+        layout: _ObjectLayout,
+        tagged_page_keys: List[str],
+        *,
+        pool: str,
+        entry_pages: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Write the layout's objects the store does not hold yet.
+
+        An entry is a page, or a page segment with ``entry_pages`` pages.
+        """
+        per_page = layout.objects_per_page
+        group_ids = (
+            self._expand_group_ids(tagged_page_keys, per_page)
+            if self._can_use_group_semantics()
+            else None
+        )
+        exist_result = self._batch_exist(layout.keys)
+        self._record_io(
+            pool,
+            "exists",
+            objects=len(layout.keys),
+            pages=sum(entry_pages) if entry_pages else len(tagged_page_keys),
+        )
+        io_results = [0 if state == 1 else -1 for state in exist_result]
+        missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+        if not missing_idx:
+            return io_results
+        start = time.perf_counter()
+        put_results = self._put_batch_zero_copy_impl(
+            [layout.keys[i] for i in missing_idx],
+            [layout.buffer_ptrs[i] for i in missing_idx],
+            [layout.buffer_sizes[i] for i in missing_idx],
+            self._filter_group_ids(group_ids, missing_idx),
+        )
+        if self.enable_storage_metrics:
+            self._record_io(
+                pool,
+                "put",
+                objects=len(missing_idx),
+                pages=sum(
+                    entry_pages[e] if entry_pages else 1
+                    for e in {i // per_page for i in missing_idx}
+                ),
+                nbytes=sum(
+                    _object_nbytes(layout.buffer_sizes[i]) for i in missing_idx
+                ),
+                seconds=time.perf_counter() - start,
+            )
+        for i, res in zip(missing_idx, put_results):
+            io_results[i] = res
+        return io_results
+
+    def _get_objects(
+        self, layout: _ObjectLayout, *, num_pages: int, pool: str
+    ) -> List[int]:
+        start = time.perf_counter()
+        io_results = self._get_batch_zero_copy_impl(
+            layout.keys, layout.buffer_ptrs, layout.buffer_sizes, pool=pool
+        )
+        if self.enable_storage_metrics:
+            self._record_io(
+                pool,
+                "get",
+                objects=len(layout.keys),
+                pages=num_pages,
+                nbytes=sum(res for res in io_results if res > 0),
+                seconds=time.perf_counter() - start,
+            )
+        return io_results
 
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False)
+        return self._batch_io_v2(transfers, is_set=False, extra_info=extra_info)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
+
+    # ===== Grouped pages (--hicache-storage-page-size) =====
+
+    def _is_grouped(self, pool_name) -> bool:
+        return self.storage_page_group > 1 and pool_name in (
+            PoolName.KV,
+            PoolName.DRAFT,
+        )
+
+    def _page_layout(
+        self, page_keys: List[str], pool_name, host_indices=None
+    ) -> _ObjectLayout:
+        """Per-page objects of a grouped pool, page-major; tagged keys."""
+        if pool_name != PoolName.KV:
+            return self._object_layout(
+                page_keys, PoolTransfer(name=pool_name), host_indices
+            )
+        tagged = self._tag_keys(page_keys)
+        if host_indices is None:
+            suffixes = (
+                [f"_{self.mla_suffix}_k"]
+                if self.is_mla_backend
+                else [f"_{self.mha_suffix}_k", f"_{self.mha_suffix}_v"]
+            )
+            keys = [f"{key}{suffix}" for key in tagged for suffix in suffixes]
+            return _ObjectLayout(keys=keys, objects_per_page=len(suffixes))
+        keys, ptrs, sizes = self._batch_preprocess(tagged, host_indices)
+        return _ObjectLayout(
+            keys=keys,
+            objects_per_page=len(keys) // len(page_keys),
+            buffer_ptrs=ptrs,
+            buffer_sizes=sizes,
+        )
+
+    def _grouped_layout(
+        self,
+        base: _ObjectLayout,
+        *,
+        base_page: int,
+        segments: List[Tuple[int, int]],
+        pool: str,
+    ) -> _ObjectLayout:
+        """One object per segment and component; leading pages go to scratch."""
+        per_page = base.objects_per_page
+        keys, ptrs, sizes = regroup_layout(
+            base.keys,
+            base.buffer_ptrs,
+            base.buffer_sizes,
+            per_page=per_page,
+            base_page=base_page,
+            segments=segments,
+            group=self.storage_page_group,
+            lead=lambda count: self._lead_scratch(pool, base, count),
+        )
+        return _ObjectLayout(
+            keys=keys, objects_per_page=per_page, buffer_ptrs=ptrs, buffer_sizes=sizes
+        )
+
+    def _lead_scratch(
+        self, pool: str, base: _ObjectLayout, count: int
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Scratch segments for ``count`` pages that precede a read's start."""
+        per_page = base.objects_per_page
+        comp_sizes = [
+            [int(s) for s in _as_size_list(base.buffer_sizes[c])]
+            for c in range(per_page)
+        ]
+        page_bytes = sum(sum(sizes) for sizes in comp_sizes)
+        scratch = self._group_scratch.get(pool)
+        need = (self.storage_page_group - 1) * page_bytes
+        if scratch is None or scratch.numel() < need:
+            # Fixed per pool; registered once with the transfer engine.
+            scratch = torch.empty(need, dtype=torch.uint8)
+            self.register_buffer(scratch)
+            self._group_scratch[pool] = scratch
+        base_ptr = scratch.data_ptr()
+        ptrs = [[] for _ in range(per_page)]
+        sizes = [[] for _ in range(per_page)]
+        offset = 0
+        for _ in range(count):
+            for comp in range(per_page):
+                for size in comp_sizes[comp]:
+                    ptrs[comp].append(base_ptr + offset)
+                    sizes[comp].append(size)
+                    offset += size
+        return ptrs, sizes
+
+    def _grouped_set(
+        self, page_keys: List[str], pool_name, host_indices, start_page: int
+    ) -> List[bool]:
+        """Write one object per node segment and component; page results."""
+        base = self._page_layout(page_keys, pool_name, host_indices)
+        if base.skip_io:
+            return [True] * len(page_keys)
+        segments = group_segments(start_page, len(page_keys), self.storage_page_group)
+        layout = self._grouped_layout(
+            base, base_page=start_page, segments=segments, pool=str(pool_name)
+        )
+        segment_keys = self._tag_keys(
+            [page_keys[hi - 1 - start_page] for _, hi in segments]
+        )
+        io_results = self._put_missing_objects(
+            layout,
+            segment_keys,
+            pool=str(pool_name),
+            entry_pages=[hi - lo for lo, hi in segments],
+        )
+        ok = self._batch_postprocess(
+            io_results, is_set_operate=True, key_multiplier=base.objects_per_page
+        )
+        return [ok[i] for i, (lo, hi) in enumerate(segments) for _ in range(hi - lo)]
+
+    def _grouped_exists(
+        self,
+        page_keys: List[str],
+        pool_name,
+        start_page: int,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[GroupReadPlan]:
+        """Segment chain of a grouped pool; None when this rank reads nothing."""
+        base = self._page_layout(page_keys, pool_name)
+        if base.skip_io:
+            return None
+        per_page = base.objects_per_page
+        group = self.storage_page_group
+
+        def probe(segments: List[Tuple[int, int]]) -> List[bool]:
+            keys = []
+            for lo, hi in segments:
+                suffix = segment_suffix((lo, hi), group)
+                last = (hi - 1 - start_page) * per_page
+                keys.extend(base.keys[last + comp] + suffix for comp in range(per_page))
+            ex = self._batch_exist(keys, extra_info)
+            self._record_io(
+                str(pool_name),
+                "exists",
+                objects=len(keys),
+                pages=sum(hi - max(lo, start_page) for lo, hi in segments),
+            )
+            return [
+                all(r == 1 for r in ex[i * per_page : (i + 1) * per_page])
+                for i in range(len(segments))
+            ]
+
+        return plan_group_reads(start_page, len(page_keys), group, probe)
+
+    def _grouped_get(
+        self,
+        page_keys: List[str],
+        pool_name,
+        host_indices,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> List[bool]:
+        """Read the segment chain found by the existence query; page results."""
+        num_pages = len(page_keys)
+        base = self._page_layout(page_keys, pool_name, host_indices)
+        if base.skip_io:
+            return [True] * num_pages
+        plans = None if extra_info is None else extra_info.storage_plans
+        plan = None if plans is None else plans.get(pool_name)
+        if plan is None:
+            # No query ran for this span (e.g. it was assumed stored).
+            return [False] * num_pages
+        start_page = extra_info.start_page
+        segments, end = plan.chain(start_page, start_page + num_pages)
+        if not segments:
+            return [False] * num_pages
+        layout = self._grouped_layout(
+            base, base_page=start_page, segments=segments, pool=str(pool_name)
+        )
+        io_results = self._get_objects(
+            layout, num_pages=end - start_page, pool=str(pool_name)
+        )
+        ok = self._batch_postprocess(
+            io_results, is_set_operate=False, key_multiplier=base.objects_per_page
+        )
+        results = [False] * num_pages
+        for (lo, hi), segment_ok in zip(segments, ok):
+            if not segment_ok:
+                break
+            for page in range(max(lo, start_page), hi):
+                results[page - start_page] = True
+        return results
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1123,6 +1518,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
+        if self._is_grouped(PoolName.KV):
+            return self._grouped_get(keys, PoolName.KV, host_indices, extra_info)
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1136,6 +1533,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
+            self._record_io(
+                str(PoolName.KV),
+                "get",
+                objects=len(key_strs),
+                pages=len(keys),
+                nbytes=sum(res for res in get_results if res > 0),
+                seconds=end_time - start_time,
+            )
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
                 len(keys) / (end_time - start_time) * self.gb_per_page
@@ -1152,6 +1557,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
+        if self._is_grouped(PoolName.KV):
+            start_page = 0 if extra_info is None else extra_info.start_page
+            return self._grouped_set(keys, PoolName.KV, host_indices, start_page)
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1164,6 +1572,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else None
         )
         exist_result = self._batch_exist(key_strs)
+        self._record_io(
+            str(PoolName.KV), "exists", objects=len(key_strs), pages=len(keys)
+        )
 
         set_keys = []
         set_buffer_ptrs = []
@@ -1191,6 +1602,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             end_time = time.perf_counter()
 
             if self.enable_storage_metrics:
+                self._record_io(
+                    str(PoolName.KV),
+                    "put",
+                    objects=len(set_keys),
+                    pages=len({i // key_multiplier for i in set_indices}),
+                    nbytes=sum(_object_nbytes(size) for size in set_buffer_sizes),
+                    seconds=end_time - start_time,
+                )
                 self.backup_pgs.append(len(set_keys))
                 self.backup_bandwidth.append(
                     len(set_keys) / (end_time - start_time) * self.gb_per_page
@@ -1355,6 +1774,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys, extra_info)
+        self._record_io(
+            str(PoolName.KV), "exists", objects=len(query_keys), pages=len(keys)
+        )
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1466,4 +1888,74 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         with self._read_failed_keys_lock:
             storage_metrics.read_failed_keys = self._read_failed_keys
             self._read_failed_keys = {}
+        with self._io_stats_lock:
+            storage_metrics.storage_io = self._storage_io
+            storage_metrics.storage_io_durations = self._storage_io_durations
+            storage_metrics.storage_hit_limited = self._storage_hit_limited
+            self._storage_io = {}
+            self._storage_io_durations = []
+            self._storage_hit_limited = {}
+        storage_metrics.host_pool_bytes = dict(self._host_pool_bytes)
         return storage_metrics
+
+    def _record_io(
+        self,
+        pool: str,
+        op: str,
+        *,
+        objects: int,
+        pages: int,
+        nbytes: int = 0,
+        seconds: Optional[float] = None,
+    ) -> None:
+        if not self.enable_storage_metrics or objects == 0:
+            return
+        with self._io_stats_lock:
+            totals = self._storage_io.setdefault((pool, op), [0, 0, 0])
+            totals[0] += objects
+            totals[1] += pages
+            totals[2] += nbytes
+            if seconds is not None and self.enable_diagnostic_metrics:
+                self._storage_io_durations.append((pool, op, seconds))
+
+    def _record_hit_limited(self, pool: str) -> None:
+        if not self.enable_storage_metrics:
+            return
+        with self._io_stats_lock:
+            self._storage_hit_limited[pool] = self._storage_hit_limited.get(pool, 0) + 1
+
+    def _record_host_pool_bytes(self, pool: str, host_pool: HostKVCache) -> None:
+        if not isinstance(host_pool, HostKVCache):
+            return
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeSharedHostTensorAllocator,
+        )
+
+        nbytes = sum(
+            buffer.nbytes for buffer in self._iter_host_pool_buffers(host_pool)
+        )
+        if nbytes == 0 or host_pool.host_buffer_read_only:
+            # Logical anchors and node-leader followers own no host copy.
+            return
+        # The MLA leader buffer holds the whole node's copy; a draft node-merge
+        # rank holds its slice of one node buffer. Either way, sum over ranks.
+        sharing = (
+            "node"
+            if isinstance(host_pool.allocator, NodeSharedHostTensorAllocator)
+            else "rank"
+        )
+        self._host_pool_bytes[(pool, sharing)] = nbytes
+
+    @staticmethod
+    def _resolve_draft_node_merge(host_pool: Any):
+        if not isinstance(host_pool, HostKVCache):
+            return None
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.hicache_draft_node_merge import (
+            DraftNodeShareAllocator,
+        )
+
+        if not isinstance(host_pool.allocator, DraftNodeShareAllocator):
+            return None
+        return host_pool.allocator.merge

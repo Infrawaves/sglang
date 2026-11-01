@@ -1919,6 +1919,15 @@ class StorageMetrics:
     # (pool, raw batch_get return value) -> failed key count. A value of 0 means
     # the key was found but zero bytes were read; negative values are error codes.
     read_failed_keys: Dict[Tuple[str, int], int] = field(default_factory=dict)
+    # (pool, op) -> [objects, pages, bytes]; op is put/get/exists. Objects are
+    # backend keys after per-page expansion, pages are logical HiCache pages.
+    storage_io: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)
+    # (pool, op, seconds) per backend batch call; diagnostic metrics only.
+    storage_io_durations: List[Tuple[str, str, float]] = field(default_factory=list)
+    # pool -> existence queries where this pool cut the final hit short.
+    storage_hit_limited: Dict[str, int] = field(default_factory=dict)
+    # (pool, sharing) -> host bytes this rank owns; a gauge, resent every flush.
+    host_pool_bytes: Dict[Tuple[str, str], int] = field(default_factory=dict)
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -2015,7 +2024,48 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        io_labels = list(labels.keys()) + ["pool", "op"]
+        self.storage_objects_total = Counter(
+            name="sglang:hicache_storage_objects_total",
+            documentation="L3 backend objects touched, after expanding each "
+            "logical page into its per-rank / per-component keys. op=put counts "
+            "only objects actually written (existing ones are skipped).",
+            labelnames=io_labels,
+        )
+        self.storage_pages_total = Counter(
+            name="sglang:hicache_storage_pages_total",
+            documentation="Logical HiCache pages behind "
+            "hicache_storage_objects_total; op=put counts pages with at least "
+            "one object written.",
+            labelnames=io_labels,
+        )
+        self.storage_bytes_total = Counter(
+            name="sglang:hicache_storage_bytes_total",
+            documentation="Bytes moved to (put) or from (get) the L3 backend.",
+            labelnames=io_labels,
+        )
+        self.storage_hit_limited_total = Counter(
+            name="sglang:hicache_storage_hit_limited_total",
+            documentation="L3 existence queries where this pool's hit was "
+            "shorter than the KV hit and shortened the final hit.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+        self.host_pool_bytes = Gauge(
+            name="sglang:hicache_host_pool_bytes",
+            documentation="Host bytes of an L2 pool owned by this rank. "
+            "sharing=node means the buffer holds the whole node's copy (MLA "
+            "node leader, or the draft node-merge share); sum over ranks.",
+            labelnames=list(labels.keys()) + ["pool", "sharing"],
+            multiprocess_mode="mostrecent",
+        )
+
         if hicache_diagnostic_metrics_enabled():
+            self.storage_batch_duration_seconds = Histogram(
+                name="sglang:hicache_storage_batch_duration_seconds",
+                documentation="Wall time of one L3 backend batch call.",
+                labelnames=io_labels,
+                buckets=[0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+            )
             self.storage_read_failed_keys_total = Counter(
                 name="sglang:hicache_storage_read_failed_keys_total",
                 documentation="L3 keys whose batch read did not return data, by "
@@ -2201,6 +2251,22 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.storage_read_failed_keys_total.labels(
                 **self.labels, pool=pool, code=str(code)
             ).inc(count)
+        for (pool, op), (objects, pages, nbytes) in storage_metrics.storage_io.items():
+            labels = dict(self.labels, pool=pool, op=op)
+            self.storage_objects_total.labels(**labels).inc(objects)
+            self.storage_pages_total.labels(**labels).inc(pages)
+            if nbytes > 0:
+                self.storage_bytes_total.labels(**labels).inc(nbytes)
+        for pool, op, seconds in storage_metrics.storage_io_durations:
+            self.storage_batch_duration_seconds.labels(
+                **self.labels, pool=pool, op=op
+            ).observe(seconds)
+        for pool, count in storage_metrics.storage_hit_limited.items():
+            self.storage_hit_limited_total.labels(**self.labels, pool=pool).inc(count)
+        for (pool, sharing), nbytes in storage_metrics.host_pool_bytes.items():
+            self.host_pool_bytes.labels(**self.labels, pool=pool, sharing=sharing).set(
+                nbytes
+            )
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

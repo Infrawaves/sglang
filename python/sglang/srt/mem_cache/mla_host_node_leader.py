@@ -6,10 +6,10 @@ initialization on all ranks. Each rank prefaults a contiguous, page-aligned shar
 under its own memory policy, and no rank registers or pins before all are ready.
 NUMA placement and binding are deployment responsibilities.
 
-Broadcast followers keep only dummy slot metadata; the leader restores MLA layers
-and the forward layer-wait hook broadcasts them over NCCL. Shm ranks keep the full
-shared mapping and each does its own H2D. Only the leader does MLA D2H, L3 reads
-and Mooncake registration; KDA/Mamba stays per rank.
+Followers keep only dummy slot metadata; the leader restores MLA layers and the
+forward layer-wait hook broadcasts them over NCCL. Only the leader does MLA D2H,
+L3 reads and Mooncake registration; KDA/Mamba stays per rank. An MHA draft
+sidecar can share a node buffer too (see hicache_draft_node_merge.py).
 
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.
@@ -270,7 +270,7 @@ class NodeLeaderMLAContext(msgspec.Struct, frozen=True):
     # Host KV capacity in per-rank shares, identical across the cache group.
     capacity_multiplier: int
     shared_allocator: NodeSharedHostTensorAllocator
-    broadcast: Optional[NodeLeaderMLABroadcast]
+    broadcast: NodeLeaderMLABroadcast
 
     @contextlib.contextmanager
     def leader_budget_scope(self):
@@ -330,7 +330,6 @@ def maybe_create_node_leader_context(
             "--enable-mla-hicache-per-node needs CUDA and a non-FP4 MLA KV pool, "
             "including MTP draft pools."
         )
-    mode = memory.mla_hicache_per_node_mode
     group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
     node_groups = split_ranks_by_node(group_ranks, ranks_per_host())
     rank = torch.distributed.get_rank()
@@ -338,31 +337,22 @@ def maybe_create_node_leader_context(
     # The smallest node decides: every rank in this cache group
     # keeps the same host capacity.
     min_node_size = min(len(ranks) for ranks in node_groups)
-    nccl_group = None
-    if mode == "broadcast":
-        # WORLD-collective: singleton cache groups must join before returning.
-        nccl_group = create_custom_parallel_group(
-            group_ranks=node_ranks, backend="nccl"
-        )
+    # WORLD-collective: singleton cache groups must join before returning.
+    nccl_group = create_custom_parallel_group(group_ranks=node_ranks, backend="nccl")
     if min_node_size <= 1:
-        if nccl_group is not None:
-            # Every rank returns here together, so each drops only its own handle.
-            torch.distributed.destroy_process_group(nccl_group)
+        # Every rank returns here together, so each drops only its own handle.
+        torch.distributed.destroy_process_group(nccl_group)
         logger.info(
             "MLA HiCache node leader inactive: "
             "the smallest node in this cache group has one rank."
         )
         return None
-    broadcast = (
-        _build_broadcast(
-            kv_pool=kv_pool,
-            full_layer_mapping=full_layer_mapping,
-            draft_pools=draft_pools,
-            nccl_group=nccl_group,
-            node_ranks=node_ranks,
-        )
-        if mode == "broadcast"
-        else None
+    broadcast = _build_broadcast(
+        kv_pool=kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        draft_pools=draft_pools,
+        nccl_group=nccl_group,
+        node_ranks=node_ranks,
     )
     is_follower = rank != node_ranks[0]
     context = NodeLeaderMLAContext(
@@ -375,9 +365,8 @@ def maybe_create_node_leader_context(
         broadcast=broadcast,
     )
     logger.info(
-        "MLA HiCache node leader enabled: mode=%s, node_ranks=%s, role=%s, "
+        "MLA HiCache node leader enabled: node_ranks=%s, role=%s, "
         "capacity_multiplier=%d, shared shard initialization",
-        mode,
         node_ranks,
         "follower" if is_follower else "leader",
         context.capacity_multiplier,
