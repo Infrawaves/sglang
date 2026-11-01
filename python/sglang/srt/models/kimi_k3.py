@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -396,6 +396,8 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
+# One-shot log guard: proves the deferred SBO shared MLP is live.
+_SHARED_AFTER_PRE_DISPATCH_LOGGED = False
 
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
@@ -636,6 +638,26 @@ class KimiK3MoE(nn.Module):
                 (parallel.attn_tp_group, parallel.tp_group),
             )
         )
+        # Under MegaMoE, submit the SBO shared MLP after MegaMoE rather than
+        # before the routed path. MegaMoE fills each SM's register file and its
+        # whole-grid barrier needs every CTA resident, so a side-stream gate_up
+        # that reaches the SMs first runs serially in front of it (~30 us per
+        # layer at EP32 decode). The side stream waits on an event recorded
+        # right after pre_dispatch, and its kernels are submitted only after
+        # MegaMoE: MegaMoE, PDL-launched off pre_dispatch, is then normally
+        # resident first and the shared kernels queue on the RESERVED_SMS spare
+        # SMs. A bias, not a guarantee: nothing stops the shared kernels if
+        # MegaMoE is not yet resident when pre_dispatch completes. Replicated
+        # (tp1) shared experts only: a shared-expert collective would land on
+        # the current stream between pre_dispatch and MegaMoE.
+        self._shared_after_pre_dispatch = (
+            envs.SGLANG_K3_SBO_SHARED_AFTER_PRE_DISPATCH.get()
+            and not _is_npu
+            and self._use_mega_moe
+            and self.use_latent_moe
+            and self._sbo_shared_overlap
+            and not self._shared_experts_tp_comm
+        )
 
         if self.use_latent_moe:
             latent_quant_config = (
@@ -779,13 +801,22 @@ class KimiK3MoE(nn.Module):
         )
 
     def _forward_mega_experts(
-        self, routed_input: torch.Tensor, topk_output
+        self,
+        routed_input: torch.Tensor,
+        topk_output,
+        after_mega_submit: Optional[Callable[[torch.cuda.Event], None]] = None,
     ) -> torch.Tensor:
         """Routed experts via deep_gemm MegaMoE: fused a2a dispatch + grouped
         GEMMs + SiTU + combine over the EP-group symmetric buffer. Semantically
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
-        applies the norm)."""
+        applies the norm).
+
+        ``after_mega_submit`` runs once MegaMoE is submitted, with an event
+        recorded on the current stream right after pre_dispatch. Side-stream
+        work it issues should wait on that event (not on the current stream,
+        which would also wait for MegaMoE): it then starts when pre_dispatch
+        completes but is submitted behind MegaMoE."""
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -841,6 +872,11 @@ class KimiK3MoE(nn.Module):
             buf.topk_weights,
             quant_group_size=32,
         )
+        pre_dispatch_done = (
+            torch.cuda.current_stream().record_event()
+            if after_mega_submit is not None
+            else None
+        )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
@@ -857,6 +893,8 @@ class KimiK3MoE(nn.Module):
                 activation="situ",
                 fast_math=True,
             )
+        if after_mega_submit is not None:
+            after_mega_submit(pre_dispatch_done)
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1169,11 +1207,18 @@ class KimiK3MoE(nn.Module):
                 )
                 shared_event = self.alt_stream.record_event()
 
-        def issue_shared():
+        def issue_shared(wait_event=None):
             nonlocal shared_input, shared_output, shared_event, shared_gather_event
             nonlocal shared_comm_buffers, shared_input_keepalive
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
+            # Only the replicated SBO branch below takes an explicit event.
+            assert wait_event is None or (
+                self._sbo_shared_overlap
+                and not fine_grained_overlap
+                and not self._shared_experts_side_comm
+                and not self._shared_experts_tp_comm
+            )
             if fine_grained_overlap:
                 # Fork before the routed front so HCCL's completion wait is
                 # queued on the side stream, leaving the front free to run.
@@ -1207,7 +1252,15 @@ class KimiK3MoE(nn.Module):
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
                 shared_input_keepalive = shared_input
-                self.alt_stream.wait_stream(current_stream)
+                if wait_event is None:
+                    self.alt_stream.wait_stream(current_stream)
+                else:
+                    # Deferred behind MegaMoE (_shared_after_pre_dispatch):
+                    # wait on the post-pre_dispatch event only. Between that
+                    # event and here the current stream enqueued only the
+                    # MegaMoE launch, which reads no alt-stream block, so the
+                    # lifetime ordering described above still holds.
+                    self.alt_stream.wait_event(wait_event)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
@@ -1218,7 +1271,13 @@ class KimiK3MoE(nn.Module):
             if not fine_grained_overlap:
                 wait_shared_gather()
                 expert_output = (
-                    self._forward_mega_experts(expert_input, topk_output)
+                    self._forward_mega_experts(
+                        expert_input,
+                        topk_output,
+                        after_mega_submit=(
+                            issue_shared_after_mega if defer_shared else None
+                        ),
+                    )
                     if self._use_mega_moe
                     else self.experts(expert_input, topk_output)
                 )
@@ -1297,7 +1356,37 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
+        # MegaMoE SBO: submit the shared MLP behind MegaMoE instead (see
+        # _shared_after_pre_dispatch). Fine-grained overlap is NPU-only.
+        defer_shared = self._shared_after_pre_dispatch and not fine_grained_overlap
+
+        def issue_shared_after_mega(pre_dispatch_done):
+            global _SHARED_AFTER_PRE_DISPATCH_LOGGED
+            issue_shared(wait_event=pre_dispatch_done)
+            # Log the first real submission only: issue_shared returns early
+            # on a rank with no local tokens.
+            if shared_event is None or _SHARED_AFTER_PRE_DISPATCH_LOGGED:
+                return
+            _SHARED_AFTER_PRE_DISPATCH_LOGGED = True
+            reserved_sms = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get()
+            logger.info(
+                "K3 SBO shared experts submitted after MegaMoE, waiting on "
+                "pre_dispatch (layer %d, %d tokens, reserved SMs %d)",
+                self.layer_idx,
+                hidden_states.shape[0],
+                reserved_sms,
+            )
+            if reserved_sms < 8:
+                # The shared MLP only gets the SMs MegaMoE leaves free.
+                logger.warning(
+                    "SGLANG_K3_SBO_SHARED_AFTER_PRE_DISPATCH with "
+                    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS=%d leaves the "
+                    "shared MLP too few SMs; it will likely become the "
+                    "critical path. Raise RESERVED_SMS (e.g. 16).",
+                    reserved_sms,
+                )
+
+        if not (_is_npu and self._sbo_shared_overlap) and not defer_shared:
             issue_shared()
 
         if not self.use_latent_moe:

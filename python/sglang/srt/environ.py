@@ -1849,6 +1849,13 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Submit K3's side-stream (SBO) shared-expert MLP behind MegaMoE, waiting
+    # only on MegaMoE's pre_dispatch, instead of before the routed path, so
+    # MegaMoE normally takes its SMs first and the shared MLP runs on the
+    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS spare SMs. Raise RESERVED_SMS
+    # with it (e.g. 16): at the default 2 the shared MLP becomes the critical
+    # path. Replicated (tp1) shared experts only.
+    SGLANG_K3_SBO_SHARED_AFTER_PRE_DISPATCH = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
