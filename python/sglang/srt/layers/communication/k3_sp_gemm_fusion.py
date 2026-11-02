@@ -296,8 +296,8 @@ def create_ag_gemm_fusion_manager(
         (
             "sm100_device_uuid",
             "sm100_check_peer_access",
-            "sm100_ag_gemm_resident_cluster_capacity",
-            "sm100_ag_gemm_pull",
+            "sm100_ag_gemm_warp_pull_resident_cluster_capacity",
+            "sm100_ag_gemm_warp_pull",
         ),
     ):
         return None
