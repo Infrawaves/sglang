@@ -8,6 +8,7 @@
 //! with a pending response from a timed-out request.
 
 use super::options::ChatEncodingOptions;
+use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,6 +27,10 @@ pub enum EncodeError {
     /// The worker returned a valid error response and remains usable.
     #[error("Kimi-K3 tokenizer reported an internal error: {0}")]
     Internal(String),
+    #[error("Kimi-K3 tokenizer deadline elapsed waiting for a process")]
+    QueueTimeout,
+    #[error("Kimi-K3 tokenizer response timed out: {0:#}")]
+    Timeout(anyhow::Error),
     #[error("Kimi-K3 encoder unavailable: {0:#}")]
     Unavailable(#[from] anyhow::Error),
 }
@@ -48,6 +53,7 @@ struct Process {
 
 enum ExchangeError {
     BeforeDispatch,
+    Timeout(anyhow::Error),
     Failed(anyhow::Error),
 }
 
@@ -128,7 +134,7 @@ impl Process {
                 ExchangeError::BeforeDispatch => {
                     anyhow::anyhow!("Kimi-K3 tokenizer startup deadline elapsed before dispatch")
                 }
-                ExchangeError::Failed(error) => error,
+                ExchangeError::Timeout(error) | ExchangeError::Failed(error) => error,
             })?;
         if let Some(error) = reply.error {
             bail!("tokenizer startup failed: {error}");
@@ -153,15 +159,20 @@ impl Process {
             .map_err(|_| ExchangeError::Failed(anyhow::anyhow!("tokenizer I/O thread stopped")))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(ExchangeError::Failed(anyhow::anyhow!(
+            return Err(ExchangeError::Timeout(anyhow::anyhow!(
                 "Kimi-K3 tokenizer deadline elapsed after request dispatch"
             )));
         }
-        let reply = self
-            .replies
-            .recv_timeout(remaining)
-            .context("tokenizer response timeout or process exit")
-            .map_err(ExchangeError::Failed)?;
+        let reply = self.replies.recv_timeout(remaining).map_err(|error| {
+            let timed_out = matches!(error, mpsc::RecvTimeoutError::Timeout);
+            let error =
+                anyhow::Error::new(error).context("tokenizer response timeout or process exit");
+            if timed_out {
+                ExchangeError::Timeout(error)
+            } else {
+                ExchangeError::Failed(error)
+            }
+        })?;
         reply.map_err(ExchangeError::Failed)
     }
 }
@@ -200,10 +211,20 @@ pub struct KimiK3Pool {
     /// Worker `--default-chat-template-kwargs`, sent to every process at startup.
     defaults: Value,
     shared: Arc<PoolShared>,
+    metrics: Arc<EncoderMetrics>,
 }
 
 impl KimiK3Pool {
     pub fn new(source: &str, options: &ChatEncodingOptions, defaults: Value) -> Result<Self> {
+        Self::new_with_metrics(source, options, defaults, EncoderMetrics::new(source))
+    }
+
+    pub(crate) fn new_with_metrics(
+        source: &str,
+        options: &ChatEncodingOptions,
+        defaults: Value,
+        metrics: Arc<EncoderMetrics>,
+    ) -> Result<Self> {
         let count = options
             .tokenizer_workers
             .map_or(1, std::num::NonZeroUsize::get);
@@ -220,6 +241,7 @@ impl KimiK3Pool {
             source: source.into(),
             options: options.clone(),
             defaults,
+            metrics,
             shared: Arc::new(PoolShared {
                 state: Mutex::new(PoolState {
                     slots: processes
@@ -236,6 +258,33 @@ impl KimiK3Pool {
     }
 
     pub fn encode(&self, request: &Value, deadline: Instant) -> Result<Vec<u32>, EncodeError> {
+        self.encode_queued(request, deadline, self.metrics.queue())
+    }
+
+    pub(crate) fn metrics(&self) -> Arc<EncoderMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    pub(crate) fn process_counts(&self) -> [usize; 4] {
+        let state = self.shared.state.lock().expect("tokenizer pool lock");
+        let mut counts = [0; 4];
+        for slot in &state.slots {
+            counts[match slot {
+                ProcessSlot::Ready { .. } => 0,
+                ProcessSlot::InUse => 1,
+                ProcessSlot::Starting { .. } => 2,
+                ProcessSlot::Empty { .. } => 3,
+            }] += 1;
+        }
+        counts
+    }
+
+    pub(crate) fn encode_queued(
+        &self,
+        request: &Value,
+        deadline: Instant,
+        mut queue: EncoderQueueGuard,
+    ) -> Result<Vec<u32>, EncodeError> {
         let slot_count = self
             .shared
             .state
@@ -250,10 +299,7 @@ impl KimiK3Pool {
             // A request that expired while waiting for the blocking task to
             // start must not take and then retire an otherwise healthy process.
             if deadline <= Instant::now() {
-                return Err(anyhow::anyhow!(
-                    "Kimi-K3 tokenizer deadline elapsed waiting for a process"
-                )
-                .into());
+                return Err(EncodeError::QueueTimeout);
             }
 
             if let Some(index) = state
@@ -325,15 +371,13 @@ impl KimiK3Pool {
             drop(guard);
         };
 
+        queue.start_encoding();
+        let started = Instant::now();
         let exchange = process.exchange(request.clone(), deadline);
+        self.metrics.observe_encoding(started);
         let (result, restart) = match exchange {
-            Err(ExchangeError::BeforeDispatch) => (
-                Err(
-                    anyhow::anyhow!("Kimi-K3 tokenizer deadline elapsed before request dispatch")
-                        .into(),
-                ),
-                false,
-            ),
+            Err(ExchangeError::BeforeDispatch) => (Err(EncodeError::QueueTimeout), false),
+            Err(ExchangeError::Timeout(error)) => (Err(EncodeError::Timeout(error)), true),
             Err(ExchangeError::Failed(error)) => {
                 // Once dispatched, a timed-out or malformed exchange may leave
                 // a late reply in the stream, so this worker cannot be reused.
@@ -387,6 +431,7 @@ impl KimiK3Pool {
         let source = self.source.clone();
         let options = self.options.clone();
         let defaults = self.defaults.clone();
+        let metrics = Arc::clone(&self.metrics);
         let startup_timeout = Duration::from_secs(options.tokenizer_startup_timeout_secs);
         let worker = std::thread::Builder::new()
             .name("kimi-tokenizer-restart".into())
@@ -397,6 +442,7 @@ impl KimiK3Pool {
                         .context("Kimi-K3 tokenizer startup timeout is too large")?;
                     Process::start(&source, &options, &defaults, deadline)
                 })();
+                metrics.restart(result.is_ok());
                 let new_slot = match result {
                     Ok(process) => ProcessSlot::Ready {
                         generation,
@@ -417,6 +463,7 @@ impl KimiK3Pool {
                 }
             });
         if let Err(error) = worker {
+            self.metrics.restart(false);
             let mut state = self.shared.state.lock().expect("tokenizer pool lock");
             state.slots[slot_index] = ProcessSlot::Empty {
                 generation,
@@ -427,12 +474,23 @@ impl KimiK3Pool {
     }
 }
 
+/// Request-supplied templates stay on the workers, which gate them behind
+/// `--trust-request-chat-template`; serving reads them from `chat_template_kwargs`.
+fn has_request_chat_template(request: &Value) -> bool {
+    let is_set = |v: &Value| !v.is_null();
+    request.get("chat_template").is_some_and(is_set)
+        || request
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("chat_template"))
+            .is_some_and(is_set)
+}
+
 /// Text and image Chat requests can share the worker's K3 prompt encoder.
 /// Image URLs remain in messages for worker-side loading and placeholder
 /// expansion. Audio, video and custom templates retain worker-side encoding.
 pub fn is_supported_request(request: &Value) -> bool {
     request.get("input_ids").is_none_or(Value::is_null)
-        && request.get("chat_template").is_none_or(Value::is_null)
+        && !has_request_chat_template(request)
         && request
             .get("messages")
             .and_then(Value::as_array)
@@ -476,4 +534,38 @@ pub fn requires_media_processing(request: &Value) -> bool {
                     })
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat(extra: Value) -> Value {
+        let mut request = json!({"messages": [{"role": "user", "content": "hi"}]});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        request
+    }
+
+    #[test]
+    fn request_chat_templates_bypass_the_encoder() {
+        for extra in [
+            json!({"chat_template": "{{ custom }}"}),
+            json!({"chat_template_kwargs": {"chat_template": "{{ custom }}"}}),
+            json!({"chat_template_kwargs": {"chat_template": "", "custom_flag": 1}}),
+        ] {
+            assert!(!is_supported_request(&chat(extra.clone())), "{extra}");
+        }
+        for extra in [
+            json!({}),
+            json!({"chat_template": null}),
+            json!({"chat_template_kwargs": null}),
+            json!({"chat_template_kwargs": {"chat_template": null}}),
+            json!({"chat_template_kwargs": {"custom_flag": "retained"}}),
+        ] {
+            assert!(is_supported_request(&chat(extra.clone())), "{extra}");
+        }
+    }
 }

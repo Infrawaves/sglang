@@ -8,6 +8,7 @@ mod kimi;
 pub mod kimi_k3;
 pub mod options;
 
+use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
@@ -121,7 +122,12 @@ impl TokenizerRegistry {
                 .tokenizer_workers
                 .map_or(1, std::num::NonZeroUsize::get);
             let defaults = serde_json::to_value(&m.default_chat_template_kwargs)?;
-            let pool = kimi_k3::KimiK3Pool::new(&m.tokenizer_path, &options, defaults)?;
+            let pool = kimi_k3::KimiK3Pool::new_with_metrics(
+                &m.tokenizer_path,
+                &options,
+                defaults,
+                EncoderMetrics::new(&m.id),
+            )?;
             me.kimi_encoders.insert(m.id.clone(), Arc::new(pool));
             // Python processes are heavyweight; default to one instead of all CPUs.
             me.kimi_encode_slots = Arc::new(Semaphore::new(count));
@@ -185,6 +191,24 @@ impl TokenizerRegistry {
         self.kimi_encoders.contains_key(model_id)
     }
 
+    pub(crate) fn kimi_metrics(&self, model_id: &str) -> Option<Arc<EncoderMetrics>> {
+        self.kimi_encoders.get(model_id).map(|pool| pool.metrics())
+    }
+
+    pub(crate) fn render_kimi_metrics(&self) -> String {
+        let mut pools: Vec<_> = self
+            .kimi_encoders
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        pools.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let snapshots: Vec<_> = pools
+            .into_iter()
+            .map(|(_, pool)| (pool.metrics(), pool.process_counts()))
+            .collect();
+        EncoderMetrics::render(&snapshots)
+    }
+
     pub fn encode_kimi_request(
         &self,
         model_id: &str,
@@ -197,6 +221,21 @@ impl TokenizerRegistry {
             .map(|entry| Arc::clone(&*entry))
             .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
         pool.encode(request, deadline)
+    }
+
+    pub(crate) fn encode_kimi_request_queued(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        deadline: std::time::Instant,
+        queue: EncoderQueueGuard,
+    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
+        let pool = self
+            .kimi_encoders
+            .get(model_id)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
+        pool.encode_queued(request, deadline, queue)
     }
 
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {

@@ -291,7 +291,11 @@ Add these flags to your existing router command (keep your discovery/P/D flags):
 ```
 
 `--tokenizer-path` is the model/tokenizer **directory** or HF repository for this
-encoder, rather than a `tokenizer.json` file. Use `--tokenizer-revision` when
+encoder, rather than a `tokenizer.json` file. It must include a loadable model
+configuration (`config.json`): tokenizer-only directories are insufficient.
+Startup checks that SGLang resolves its chat encoder to Kimi-K3 before loading
+and warming the tokenizer. Configuration-loading errors report the path,
+revision and underlying failure. Use `--tokenizer-revision` when
 loading a pinned HF snapshot. `--trust-remote-code` must match your tokenizer's
 requirements. Match `--default-chat-template-kwargs` to P/D exactly.
 `--tokenizer-python` (default `python3`) must be an executable in the router
@@ -305,17 +309,25 @@ native renderer. `--default-chat-template-kwargs` is the same flag the native
 renderer uses.
 The default is one Python process; tune `--tokenizer-workers` to your CPU and
 memory budget. Initial startup waits for all processes to initialize, bounded
-by `--tokenizer-startup-timeout-secs`. Queue wait and encoding share each
-request's `--tokenizer-timeout-secs` budget. After a worker fails, its
+by `--tokenizer-startup-timeout-secs`. Body parsing, queue wait and encoding
+share each request's `--tokenizer-timeout-secs` budget, including time spent
+waiting for a blocking thread. Workers are selected after encoding finishes. After a worker fails, its
 replacement starts in the background with the startup timeout; requests wait
 only until their own deadline, and later requests can use the replacement once
 it is ready.
 The `--tokenizer-*` and `--trust-remote-code` flags above only apply to this
 encoder; startup fails if any is set without `--chat-encoder kimi-k3`.
-`--disable-input-ids-forwarding` still applies: IDs are then used for routing
-only.
+`--disable-input-ids-forwarding` still applies: text IDs are then used for
+routing only, and image requests skip the encoder.
 Encoding errors are returned before either P/D request is sent: request errors
 return 400; process/protocol failures return 503 `encoder_unavailable`.
+`/metrics` exposes `sgl_router_encoder_requests_total` for preparation results,
+`sgl_router_encoder_queue_duration_seconds` and
+`sgl_router_encoder_encode_duration_seconds` for queue and encoding latency,
+`sgl_router_encoder_waiting_requests`, `sgl_router_encoder_processes` by pool
+state, and `sgl_router_encoder_restarts_total`. Failures rejected before
+dispatch are counted here; the existing input-ID forwarding metrics continue
+to describe dispatched requests.
 
 Supported inputs include string content, text/image content arrays (`image_url`,
 including data URLs), tool history, request/message tools, reasoning options,
@@ -323,14 +335,40 @@ response format and assistant continuation. The shared Python helper follows
 worker preprocessing, including
 schema normalization and K3's custom `apply_chat_template(tokenize=True)`.
 Caller-supplied `input_ids` are preserved. Audio, video (including `image_url`
-parts with `modalities: "video"`) and per-request `chat_template` overrides keep
-worker-side encoding.
+parts with `modalities: "video"`) and per-request template overrides
+(`chat_template_kwargs.chat_template`) keep worker-side encoding, where
+`--trust-request-chat-template` still gates them.
 
 For images, the router encodes the template with one image placeholder per
-image and preserves the image URLs and options in `messages`. Both P/D workers
-must run this checkout: they recover image data from the messages, load and
-process the images, then expand placeholders through the existing K3
-multimodal processor. Image loading and vision processing remain on the workers.
+image and sends those IDs in the dedicated `kimi_k3_media_input_ids` field,
+preserving the image URLs and options in `messages`. Compatible workers recover
+image data from the messages, load and process the images, then expand the
+placeholders through the existing K3 multimodal processor. Older worker schemas
+ignore the dedicated field and encode the original messages, including images.
+No generic `input_ids` is added for this optimization, so the same fallback
+works when a capability advertisement becomes stale during a rolling upgrade.
+Image loading and vision processing remain on the workers.
+
+The field is an internal router-to-worker protocol extension. API clients should
+send `messages` and let the router construct it.
+
+The router attempts this optimization when `/server_info` advertises
+`kimi_k3_media_input_ids_version: 1`. If no compatible plain worker or complete
+P/D pair is currently available, it skips Python image encoding. After encoding,
+it checks the actual selected workers again: if either P/D worker lacks the
+capability, both receive the original messages for worker-side encoding.
+The dedicated field keeps older workers safe even if the registry changes
+after this check. Caller-supplied `input_ids` retain their existing behavior.
+The capability does not verify tokenizer snapshots or template defaults; those
+must still match P/D.
+
+Capability fallbacks use `outcome="ineligible_worker_capability"` in
+`sgl_router_input_ids_forwarding_total`. With a mixed fleet or changing worker
+capabilities, a request can also record `outcome="encoded"` in
+`sgl_router_encoder_requests_total`: encoding completed, then the selected
+workers required a fallback. These counters describe preparation and dispatch
+respectively. When the initial capability check skips encoding, preparation
+records `outcome="bypassed"`.
 Workers still encode the short image-size framing; the existing CPU HF-processor
 fallback may also encode its expanded text internally.
 These unexpanded IDs are forwarded only; image requests skip router prefix-cache
@@ -351,6 +389,10 @@ reasoning, continuation and image cases, including worker-side image expansion.
 Model-free process/P/D tests run with
 `cargo test --test proxy kimi_k3_input_ids`; shared-helper tests are in
 `experimental/sgl-router/tests/test_kimi_k3_tokenization.py` (run with `python3`).
+The SGLang CPU suite runs the real-schema image tests in strict mode, without
+waiting for the router's Rust build or GPU tests. The SGLang-equipped router
+e2e job also runs the helper tests with `SGLANG_REQUIRE_KIMI_K3_SCHEMA_TESTS=1`;
+missing real-schema dependencies fail these checks instead of skipping them.
 
 ## HTTP/2
 

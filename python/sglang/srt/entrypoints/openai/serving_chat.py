@@ -156,6 +156,7 @@ def _warn_k3_unsupported_reasoning_effort(value: Any) -> None:
         key,
     )
 
+
 _truncate_kimi_k3_videos = kimi_k3_tokenization.truncate_kimi_k3_videos
 
 
@@ -1146,6 +1147,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    def supports_kimi_k3_media_input_ids(self) -> bool:
+        processor = self.tokenizer_manager.mm_processor
+        return (
+            self.chat_encoding_spec == "kimi_k3"
+            and self.tokenizer_manager.model_config.is_multimodal
+            and processor is not None
+            and processor.kimi_k3_media_input_ids_version == 1
+            and self.tokenizer_manager.server_args.chat_template is None
+            and self.template_manager.chat_template_name is None
+            and self.default_chat_template_kwargs.get("chat_template") is None
+        )
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -1259,7 +1272,19 @@ class OpenAIServingChat(OpenAIServingBase):
         # Precomputed K3 IDs still contain one placeholder per image. Preserve
         # the media so the MM processor can expand those IDs using image sizes
         # and features, exactly as for a prompt encoded locally.
-        if request.input_ids is not None:
+        input_ids = request.input_ids
+        if (
+            input_ids is None
+            and request.kimi_k3_media_input_ids is not None
+            and is_multimodal
+            and self.supports_kimi_k3_media_input_ids()
+            and (request.chat_template_kwargs or {}).get("chat_template") is None
+        ):
+            # Unsupported workers must encode messages locally. In particular,
+            # an old worker ignores this dedicated field instead of accepting
+            # input_ids and silently discarding the accompanying images.
+            input_ids = request.kimi_k3_media_input_ids
+        if input_ids is not None:
             image_data, video_data, audio_data, modalities = [], [], [], []
             if self.chat_encoding_spec == "kimi_k3" and is_multimodal:
                 # Apply the same video truncation as local encoding so media
@@ -1271,7 +1296,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result = MessageProcessingResult(
                 prompt="",
-                prompt_ids=request.input_ids,
+                prompt_ids=input_ids,
                 image_data=image_data or None,
                 audio_data=audio_data or None,
                 video_data=video_data or None,

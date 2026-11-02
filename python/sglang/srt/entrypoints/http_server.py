@@ -857,17 +857,17 @@ async def model_info():
 
 
 @app.get("/get_server_info")
-async def get_server_info():
+async def get_server_info(raw_request: Request = None):
     """Get the server information (deprecated - use /server_info instead)."""
     logger.warning(
         "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
         "Please use '/server_info' instead."
     )
-    return await server_info()
+    return await server_info(raw_request)
 
 
 @app.get("/server_info")
-async def server_info():
+async def server_info(raw_request: Request = None):
     """The startup configuration, plus live scheduler state.
 
     Two surfaces, deliberately both: the field values are the resolution
@@ -884,6 +884,14 @@ async def server_info():
     ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
+    serving_chat = (
+        raw_request.app.state.openai_serving_chat if raw_request is not None else None
+    )
+    kimi_k3_media_input_ids_version = (
+        1
+        if serving_chat is not None and serving_chat.supports_kimi_k3_media_input_ids()
+        else None
+    )
 
     return msgspec_to_builtins(
         {
@@ -894,6 +902,7 @@ async def server_info():
             "internal_states": internal_states,
             "version": __version__,
             "frontend": "python",
+            "kimi_k3_media_input_ids_version": kimi_k3_media_input_ids_version,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.

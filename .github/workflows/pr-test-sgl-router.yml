@@ -60,6 +60,13 @@ jobs:
               - 'experimental/sgl-router/**'
               # Shared with the router's Kimi-K3 encoder processes.
               - 'python/sglang/srt/entrypoints/openai/kimi_k3_tokenization.py'
+              - 'python/sglang/srt/entrypoints/openai/chat_encoding.py'
+              - 'python/sglang/srt/entrypoints/openai/protocol.py'
+              - 'python/sglang/srt/entrypoints/openai/serving_chat.py'
+              - 'python/sglang/srt/function_call/utils.py'
+              - 'python/sglang/srt/entrypoints/http_server.py'
+              - 'python/sglang/srt/multimodal/processors/kimi_k3.py'
+              - 'test/registered/unit/entrypoints/test_kimi_k3_router_tokenization.py'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
@@ -370,6 +377,14 @@ jobs:
       - name: Install e2e test dependencies
         run: |
           python3 -m pip install -r experimental/sgl-router/tests/e2e/requirements.txt
+
+      # Tier-2 can skip the actual request schema when SGLang is unavailable.
+      # Run it again in the installed checkout and fail on missing dependencies.
+      - name: Kimi-K3 tokenizer tests with real request schema
+        working-directory: experimental/sgl-router
+        env:
+          SGLANG_REQUIRE_KIMI_K3_SCHEMA_TESTS: "1"
+        run: python3 -m unittest discover -s tests -p 'test_kimi_k3*.py' -v
 
       # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
       # suite is owned by the `sgl-router-k8s-integration` job which has

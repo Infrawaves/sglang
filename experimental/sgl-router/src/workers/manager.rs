@@ -540,7 +540,7 @@ async fn register_one(
     // `protocol` rides beside the spec rather than on it: `WorkerSpec` is the
     // serde wire type for `DiscoveryEvent`, and no discovery backend can know
     // a worker's protocol.
-    if let Err(e) = registry.add_with_cb(spec, cb, protocol) {
+    if let Err(e) = registry.add_with_capabilities(spec, cb, protocol, info.capabilities) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -719,8 +719,11 @@ mod tests {
     /// carries that as a single `ModelId`.
     #[tokio::test]
     async fn manager_resolves_model_id_from_server_info() {
-        let (worker_url, _shutdown) =
-            spawn_fake_server_info_worker(json!({"served_model_name": "Qwen3-0.6B"})).await;
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+            "served_model_name": "Qwen3-0.6B",
+            "kimi_k3_media_input_ids_version": 1,
+        }))
+        .await;
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
@@ -746,6 +749,7 @@ mod tests {
             loop {
                 if let Some(w) = registry.get(&spec.id) {
                     if w.model_ids.iter().any(|m| m.0 == "Qwen3-0.6B") {
+                        assert!(w.supports_kimi_k3_media_input_ids());
                         return true;
                     }
                 }

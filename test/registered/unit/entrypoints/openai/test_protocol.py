@@ -17,7 +17,7 @@ import json
 import unittest
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, create_model
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentAudioPart,
@@ -76,6 +76,49 @@ class TestCompletionRequest(unittest.TestCase):
 
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
+
+    def test_kimi_k3_media_input_ids_use_a_separate_optional_field(self):
+        body = {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "image-1", "detail": "high"},
+                            "modalities": "image",
+                        }
+                    ],
+                }
+            ],
+            "kimi_k3_media_input_ids": [101, 999, 102],
+        }
+        request = ChatCompletionRequest.model_validate(body)
+        self.assertEqual(request.kimi_k3_media_input_ids, [101, 999, 102])
+        self.assertIsNone(request.input_ids)
+        self.assertEqual(
+            request.model_dump(exclude_none=True)["messages"], body["messages"]
+        )
+
+        # Reconstruct the pre-extension schema from the actual field types and
+        # config. Its unknown-field handling must preserve the original media
+        # and leave generic input_ids unset, so old workers encode locally.
+        legacy_schema = create_model(
+            "LegacyChatCompletionRequest",
+            __config__=ChatCompletionRequest.model_config,
+            **{
+                name: (field.annotation, field)
+                for name, field in ChatCompletionRequest.model_fields.items()
+                if name != "kimi_k3_media_input_ids"
+            },
+        )
+        legacy = legacy_schema.model_validate(body)
+        self.assertIsNone(legacy.input_ids)
+        self.assertNotIn("kimi_k3_media_input_ids", legacy.model_dump())
+        self.assertEqual(
+            legacy.model_dump(exclude_none=True)["messages"], body["messages"]
+        )
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
         constraint = ("full_assistant_ebnf", 'root ::= "generated"')

@@ -967,6 +967,8 @@ class KimiK3ImageProcessor(
     MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
+    # Router ABI: unexpanded kimi_k3_media_input_ids plus media in messages.
+    kimi_k3_media_input_ids_version = 1
     models = [KimiK3ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0

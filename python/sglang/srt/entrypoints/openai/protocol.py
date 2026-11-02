@@ -975,6 +975,10 @@ class ChatCompletionRequest(BaseModel):
     # provide one unexpanded image placeholder per image for its MM processor.
     input_ids: Optional[List[int]] = None
 
+    # Internal router-worker K3 media protocol v1; clients should not set it.
+    # Older workers encode messages locally; caller input_ids takes precedence.
+    kimi_k3_media_input_ids: Optional[List[int]] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification

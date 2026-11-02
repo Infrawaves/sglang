@@ -21,7 +21,7 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::{compute_block_hashes, HashTree, KvWorkerId};
 use sgl_router::tokenizer::options::{ChatEncoderKind, ChatEncodingOptions};
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{WireProtocol, Worker, WorkerCapabilities, WorkerRegistry};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
@@ -92,6 +92,13 @@ for line in sys.stdin:
     if reply == "__stall__":
         time.sleep(30)
         reply = '{{"input_ids": [999]}}'
+    elif reply == "__slow__":
+        time.sleep(1)
+        reply = json.dumps({{"input_ids": {generated_ids}}})
+    elif reply == "__wait_for_release__":
+        while not Path({release}).exists():
+            time.sleep(0.005)
+        reply = json.dumps({{"input_ids": {generated_ids}}})
     print(reply, flush=True)
 "#,
             requests = serde_json::to_string(&requests.to_str().unwrap()).unwrap(),
@@ -100,6 +107,9 @@ for line in sys.stdin:
             counter = serde_json::to_string(&counter.to_str().unwrap()).unwrap(),
             replies = serde_json::to_string(replies).unwrap(),
             restart_delay_seconds = (restart_delay_millis as f64) / 1000.0,
+            generated_ids = serde_json::to_string(GENERATED_IDS).unwrap(),
+            release =
+                serde_json::to_string(&directory.path().join("release").to_str().unwrap()).unwrap(),
         );
         fs::write(&executable, script).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -185,7 +195,23 @@ for line in sys.stdin:
         tokenizer_timeout_secs: u64,
         tokenizer_startup_timeout_secs: u64,
     ) -> Arc<AppContext> {
-        let cfg = self.config();
+        self.context_with_config(
+            prefill,
+            decode,
+            self.config(),
+            tokenizer_timeout_secs,
+            tokenizer_startup_timeout_secs,
+        )
+    }
+
+    fn context_with_config(
+        &self,
+        prefill: &MockWorker,
+        decode: &MockWorker,
+        cfg: Config,
+        tokenizer_timeout_secs: u64,
+        tokenizer_startup_timeout_secs: u64,
+    ) -> Arc<AppContext> {
         let options = ChatEncodingOptions {
             chat_encoder: ChatEncoderKind::KimiK3,
             tokenizer_python: self.executable.to_str().unwrap().into(),
@@ -203,13 +229,20 @@ for line in sys.stdin:
             (decode, WorkerMode::Decode, None),
         ] {
             registry
-                .add(WorkerSpec {
-                    id: WorkerId(worker.url.clone()),
-                    url: worker.url.clone(),
-                    mode,
-                    model_ids: vec![ModelId(MODEL.into())],
-                    bootstrap_port: port,
-                })
+                .add_with_capabilities(
+                    WorkerSpec {
+                        id: WorkerId(worker.url.clone()),
+                        url: worker.url.clone(),
+                        mode,
+                        model_ids: vec![ModelId(MODEL.into())],
+                        bootstrap_port: port,
+                    },
+                    None,
+                    WireProtocol::default(),
+                    WorkerCapabilities {
+                        kimi_k3_media_input_ids_version: Some(1),
+                    },
+                )
                 .unwrap();
         }
         let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
@@ -226,6 +259,49 @@ async fn send(ctx: Arc<AppContext>, body: &Value) -> StatusCode {
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     build_router(ctx).oneshot(request).await.unwrap().status()
+}
+
+async fn metrics(ctx: &Arc<AppContext>) -> String {
+    let response = build_router(Arc::clone(ctx))
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+fn assert_encoder_outcome(metrics: &str, outcome: &str, count: u64) {
+    let sample = format!(
+        "sgl_router_encoder_requests_total{{model_id=\"{MODEL}\",outcome=\"{outcome}\"}} {count}"
+    );
+    assert!(
+        metrics.lines().any(|line| line == sample),
+        "missing {sample}\n{metrics}"
+    );
+}
+
+fn assert_encoder_idle(metrics: &str) {
+    for sample in [
+        format!("sgl_router_encoder_waiting_requests{{model_id=\"{MODEL}\"}} 0"),
+        format!("sgl_router_encoder_processes{{model_id=\"{MODEL}\",state=\"ready\"}} 1"),
+        format!("sgl_router_encoder_processes{{model_id=\"{MODEL}\",state=\"in_use\"}} 0"),
+    ] {
+        assert!(
+            metrics.lines().any(|line| line == sample),
+            "missing {sample}\n{metrics}"
+        );
+    }
 }
 
 async fn captured_body(worker: &MockWorker) -> Value {
@@ -408,11 +484,157 @@ async fn kimi_k3_images_encode_once_and_preserve_image_payloads_for_pd() {
     });
     assert_eq!(send(ctx, &request).await, StatusCode::OK);
     for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-        assert_eq!(body["input_ids"], json!(GENERATED_IDS));
+        assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
+        // Old schemas ignore the dedicated field and encode the messages.
+        assert!(body.get("input_ids").is_none());
         assert_eq!(body["messages"], request["messages"]);
         assert_eq!(body["reasoning_effort"], request["reasoning_effort"]);
     }
     assert_eq!(tokenizer.captured_requests(), vec![request]);
+}
+
+#[tokio::test]
+async fn kimi_k3_media_ids_require_capability_on_both_pd_workers() {
+    for (prefill_version, decode_version) in [
+        (None, Some(1)),
+        (Some(1), None),
+        (None, None),
+        (Some(0), Some(1)),
+        (Some(1), Some(2)),
+    ] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = tokenizer.context(&prefill, &decode);
+        for (worker, mode, version) in [
+            (&prefill, WorkerMode::Prefill, prefill_version),
+            (&decode, WorkerMode::Decode, decode_version),
+        ] {
+            register_with_media_capability(&ctx.registry, worker, mode, version);
+        }
+        let mut request = text_request();
+        request["messages"][0]["content"] = json!([
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U=", "detail": "high"}}
+        ]);
+        assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+        // The whole PD pair must use local encoding if either side is old.
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            assert!(body.get("input_ids").is_none());
+            assert!(body.get("kimi_k3_media_input_ids").is_none());
+            assert_eq!(body["messages"], request["messages"]);
+        }
+        let exposed = metrics(&ctx).await;
+        assert_encoder_outcome(&exposed, "encoded", 0);
+        assert_encoder_outcome(&exposed, "bypassed", 1);
+        assert!(tokenizer.captured_requests().is_empty());
+        assert!(exposed.contains(&format!(
+            "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"ineligible_worker_capability\"}} 1"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn kimi_k3_media_capability_gate_covers_plain_workers_and_preserves_caller_ids() {
+    for version in [None, Some(1), Some(2)] {
+        for caller_ids in [false, true] {
+            let tokenizer = FakeTokenizer::successful();
+            let plain = MockWorker::start(vec![]).await;
+            let unused = MockWorker::start(vec![]).await;
+            let ctx = tokenizer.context(&plain, &unused);
+            ctx.registry.remove(&WorkerId(plain.url.clone()));
+            ctx.registry.remove(&WorkerId(unused.url.clone()));
+            register_with_media_capability(&ctx.registry, &plain, WorkerMode::Plain, version);
+            let mut request = text_request();
+            request["messages"][0]["content"] = json!([
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+            ]);
+            if caller_ids {
+                request["input_ids"] = json!([17, 18, 19]);
+            }
+            assert_eq!(send(ctx, &request).await, StatusCode::OK);
+            let body = captured_body(&plain).await;
+            assert_eq!(body["messages"], request["messages"]);
+            if caller_ids {
+                assert_eq!(body["input_ids"], request["input_ids"]);
+                assert!(body.get("kimi_k3_media_input_ids").is_none());
+                assert!(tokenizer.captured_requests().is_empty());
+            } else if version == Some(1) {
+                assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
+                assert!(body.get("input_ids").is_none());
+            } else {
+                assert!(body.get("input_ids").is_none());
+                assert!(body.get("kimi_k3_media_input_ids").is_none());
+                assert!(tokenizer.captured_requests().is_empty());
+            }
+            assert!(unused.captured.lock().unwrap().last_body.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn kimi_k3_media_capability_is_rechecked_after_encoding() {
+    let tokenizer = FakeTokenizer::new("__wait_for_release__");
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context_with_timeout(&prefill, &decode, 30);
+    let mut request = text_request();
+    request["messages"][0]["content"] = json!([
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+    ]);
+    let sending = {
+        let ctx = Arc::clone(&ctx);
+        let request = request.clone();
+        tokio::spawn(async move { send(ctx, &request).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tokenizer.captured_requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("supported workers should allow image encoding to start");
+
+    // A replacement can lose support while the prompt is being encoded.
+    register_with_media_capability(&ctx.registry, &prefill, WorkerMode::Prefill, None);
+    fs::write(tokenizer.directory.path().join("release"), "").unwrap();
+    assert_eq!(sending.await.unwrap(), StatusCode::OK);
+    for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+        assert!(body.get("input_ids").is_none());
+        assert!(body.get("kimi_k3_media_input_ids").is_none());
+        assert_eq!(body["messages"], request["messages"]);
+    }
+    let exposed = metrics(&ctx).await;
+    // Encoding succeeded and consumed CPU even though its result was discarded.
+    assert_encoder_outcome(&exposed, "encoded", 1);
+    assert_encoder_outcome(&exposed, "bypassed", 0);
+    assert!(exposed.contains(&format!(
+        "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"ineligible_worker_capability\"}} 1"
+    )));
+}
+
+fn register_with_media_capability(
+    registry: &WorkerRegistry,
+    worker: &MockWorker,
+    mode: WorkerMode,
+    version: Option<u32>,
+) {
+    registry
+        .add_with_capabilities(
+            WorkerSpec {
+                id: WorkerId(worker.url.clone()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId(MODEL.into())],
+                bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+            },
+            None,
+            WireProtocol::default(),
+            WorkerCapabilities {
+                kimi_k3_media_input_ids_version: version,
+            },
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -439,6 +661,128 @@ async fn kimi_k3_audio_and_video_requests_bypass_encoder() {
         }
         assert!(tokenizer.captured_requests().is_empty());
     }
+}
+
+#[tokio::test]
+async fn kimi_k3_request_chat_templates_bypass_encoder() {
+    for extra in [
+        json!({"chat_template_kwargs": {"chat_template": "{{ custom }}"}}),
+        json!({"chat_template": "{{ custom }}"}),
+    ] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = tokenizer.context(&prefill, &decode);
+        let mut request = text_request();
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(send(ctx, &request).await, StatusCode::OK, "{extra}");
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            assert!(body.get("input_ids").is_none(), "{extra}");
+            assert_eq!(body["messages"], request["messages"]);
+            assert_eq!(
+                body["chat_template_kwargs"],
+                request["chat_template_kwargs"]
+            );
+        }
+        assert!(tokenizer.captured_requests().is_empty(), "{extra}");
+    }
+}
+
+#[tokio::test]
+async fn kimi_k3_disabled_forwarding_skips_image_encoding() {
+    let tokenizer = FakeTokenizer::successful();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let mut cfg = tokenizer.config();
+    cfg.model.disable_input_ids_forwarding = true;
+    let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What is in this picture?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]}],
+    });
+    assert_eq!(send(ctx, &request).await, StatusCode::OK);
+    for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+        assert!(body.get("input_ids").is_none());
+        assert_eq!(body["messages"], request["messages"]);
+    }
+    // Image IDs never drive routing and are not forwarded here, so encoding is waste.
+    assert!(tokenizer.captured_requests().is_empty());
+}
+
+#[tokio::test]
+async fn kimi_k3_workers_are_selected_after_encoding_finishes() {
+    let tokenizer = FakeTokenizer::new("__slow__");
+    let old_prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let new_prefill = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context(&old_prefill, &decode);
+    let sending = {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move { send(ctx, &text_request()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokenizer.captured_requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("encoding must start");
+
+    // Rolling replacement while the request is still encoding.
+    ctx.registry
+        .add(WorkerSpec {
+            id: WorkerId(new_prefill.url.clone()),
+            url: new_prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId(MODEL.into())],
+            bootstrap_port: Some(8998),
+        })
+        .unwrap();
+    ctx.registry.remove(&WorkerId(old_prefill.url.clone()));
+
+    assert_eq!(sending.await.unwrap(), StatusCode::OK);
+    assert_eq!(
+        captured_body(&new_prefill).await["input_ids"],
+        json!(GENERATED_IDS)
+    );
+    assert!(old_prefill.captured.lock().unwrap().last_body.is_none());
+}
+
+#[test]
+fn kimi_k3_preparation_deadline_bounds_a_congested_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let tokenizer = FakeTokenizer::successful();
+    runtime.block_on(async {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = tokenizer.context_with_timeout(&prefill, &decode, 1);
+        // Hold the only blocking thread well past the 1s request deadline.
+        let _busy = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(3)));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            send(ctx, &text_request()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(2500),
+            "request outlived its deadline: {:?}",
+            start.elapsed()
+        );
+        assert!(prefill.captured.lock().unwrap().last_body.is_none());
+        assert!(decode.captured.lock().unwrap().last_body.is_none());
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
 }
 
 #[derive(Debug)]
@@ -524,7 +868,13 @@ async fn kimi_k3_image_ids_are_forwarded_but_excluded_from_cache_and_exact_lengt
             }
             assert_eq!(send(ctx, &request).await, StatusCode::OK);
             for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-                assert_eq!(body["input_ids"], json!(GENERATED_IDS));
+                if caller_ids {
+                    assert_eq!(body["input_ids"], json!(GENERATED_IDS));
+                    assert!(body.get("kimi_k3_media_input_ids").is_none());
+                } else {
+                    assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
+                    assert!(body.get("input_ids").is_none());
+                }
                 assert_eq!(body["messages"], request["messages"]);
             }
             assert!(selections.load(Ordering::Relaxed) > 0);
@@ -540,28 +890,37 @@ async fn kimi_k3_image_ids_are_forwarded_but_excluded_from_cache_and_exact_lengt
 #[tokio::test]
 async fn kimi_k3_invalid_encoder_results_never_dispatch_partial_ids_and_can_recover() {
     let success = json!({"input_ids": GENERATED_IDS}).to_string();
-    for (reply, expected_status, keep_worker) in [
+    for (reply, expected_status, keep_worker, outcome) in [
         (
             r#"{"error":"tokenizer rejected the request","error_type":"request"}"#,
             StatusCode::BAD_REQUEST,
             true,
+            "request_error",
         ),
         (
             r#"{"error":"tokenizer failed","error_type":"internal"}"#,
             StatusCode::SERVICE_UNAVAILABLE,
             true,
+            "internal_error",
         ),
         (
             r#"{"input_ids":[]}"#,
             StatusCode::SERVICE_UNAVAILABLE,
             false,
+            "unavailable",
         ),
         (
             r#"{"input_ids":[10,"invalid",20]}"#,
             StatusCode::SERVICE_UNAVAILABLE,
             false,
+            "unavailable",
         ),
-        ("invalid-json", StatusCode::SERVICE_UNAVAILABLE, false),
+        (
+            "invalid-json",
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            "unavailable",
+        ),
     ] {
         let tokenizer = FakeTokenizer::with_replies(&[reply, &success]);
         let prefill = MockWorker::start(vec![]).await;
@@ -586,6 +945,11 @@ async fn kimi_k3_invalid_encoder_results_never_dispatch_partial_ids_and_can_reco
             vec![request.clone()],
             "{reply}"
         );
+        let exposed = metrics(&ctx).await;
+        assert_encoder_outcome(&exposed, outcome, 1);
+        assert_encoder_outcome(&exposed, "encoded", 0);
+        assert!(!exposed.contains("sgl_router_ingress_tokenize_errors_total{"));
+        assert!(!exposed.contains("sgl_router_input_ids_forwarding_total{"));
 
         // A well-formed worker error response leaves the JSONL protocol in
         // sync, so the worker should remain alive. Transport/protocol failures
@@ -594,7 +958,20 @@ async fn kimi_k3_invalid_encoder_results_never_dispatch_partial_ids_and_can_reco
 
         // A later request must be able to obtain a healthy encoder instead of
         // keeping the pool wedged after an invalid response or process failure.
-        assert_eq!(send(ctx, &request).await, StatusCode::OK, "{reply}");
+        assert_eq!(
+            send(Arc::clone(&ctx), &request).await,
+            StatusCode::OK,
+            "{reply}"
+        );
+        let exposed = metrics(&ctx).await;
+        assert_encoder_outcome(&exposed, outcome, 1);
+        assert_encoder_outcome(&exposed, "encoded", 1);
+        assert_encoder_idle(&exposed);
+        for name in ["queue_duration_seconds", "encode_duration_seconds"] {
+            assert!(exposed.contains(&format!(
+                "sgl_router_encoder_{name}_count{{model_id=\"{MODEL}\"}} 2"
+            )));
+        }
         assert_eq!(
             tokenizer.started_processes().len(),
             expected_process_count,
@@ -630,13 +1007,21 @@ async fn kimi_k3_timeout_reaps_stalled_process_and_restarts_without_stale_ids() 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
+    assert_encoder_outcome(&metrics(&ctx).await, "encode_timeout", 1);
     #[cfg(target_os = "linux")]
-    assert!(
-        !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
-        "timed-out tokenizer process must be killed and reaped"
-    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while std::path::Path::new(&format!("/proc/{first_pid}")).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed-out tokenizer process must be killed and reaped");
 
-    assert_eq!(send(ctx, &request).await, StatusCode::OK);
+    assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+    let exposed = metrics(&ctx).await;
+    assert_encoder_outcome(&exposed, "encode_timeout", 1);
+    assert_encoder_outcome(&exposed, "encoded", 1);
+    assert_encoder_idle(&exposed);
     let process_ids = tokenizer.started_processes();
     assert_eq!(
         process_ids.len(),
@@ -652,6 +1037,63 @@ async fn kimi_k3_timeout_reaps_stalled_process_and_restarts_without_stale_ids() 
         tokenizer.captured_requests(),
         vec![request.clone(), request]
     );
+}
+
+#[tokio::test]
+async fn kimi_k3_cancelled_request_keeps_process_in_use_until_encoding_exits() {
+    let success = json!({"input_ids": GENERATED_IDS}).to_string();
+    let tokenizer = FakeTokenizer::with_replies(&["__wait_for_release__", &success]);
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context_with_timeout(&prefill, &decode, 30);
+    let sending = {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move { send(ctx, &text_request()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tokenizer.captured_requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("encoding must start before cancellation");
+
+    sending.abort();
+    assert!(sending.await.unwrap_err().is_cancelled());
+    let exposed = metrics(&ctx).await;
+    assert_encoder_outcome(&exposed, "cancelled", 1);
+    assert_encoder_outcome(&exposed, "encoded", 0);
+    assert!(exposed.contains(&format!(
+        "sgl_router_encoder_processes{{model_id=\"{MODEL}\",state=\"in_use\"}} 1"
+    )));
+    assert!(!exposed.contains("sgl_router_input_ids_forwarding_total{"));
+    assert!(prefill.captured.lock().unwrap().last_body.is_none());
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
+
+    // The blocking job still owns its slot after the HTTP future is gone.
+    // A later request waits for it and reuses the now-synchronized process.
+    let retrying = {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move { send(ctx, &text_request()).await })
+    };
+    let waiting = format!("sgl_router_encoder_waiting_requests{{model_id=\"{MODEL}\"}} 1");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !metrics(&ctx).await.lines().any(|line| line == waiting) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("later request must wait for the cancelled job's process");
+    fs::write(tokenizer.directory.path().join("release"), "").unwrap();
+    assert_eq!(retrying.await.unwrap(), StatusCode::OK);
+    let exposed = metrics(&ctx).await;
+    assert_encoder_outcome(&exposed, "cancelled", 1);
+    assert_encoder_outcome(&exposed, "encoded", 1);
+    assert_encoder_idle(&exposed);
+    assert_eq!(tokenizer.started_processes().len(), 1);
+    assert!(exposed.contains(&format!(
+        "sgl_router_encoder_encode_duration_seconds_count{{model_id=\"{MODEL}\"}} 2"
+    )));
 }
 
 #[tokio::test]
@@ -712,6 +1154,11 @@ async fn kimi_k3_restart_finishes_after_request_timeout_for_later_request() {
     assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
     assert_eq!(tokenizer.started_processes().len(), 2);
     assert_eq!(tokenizer.captured_requests().len(), 2);
+    let exposed = metrics(&ctx).await;
+    assert_encoder_outcome(&exposed, "unavailable", 1);
+    assert_encoder_outcome(&exposed, "queue_timeout", 1);
+    assert_encoder_outcome(&exposed, "encoded", 1);
+    assert_encoder_idle(&exposed);
     for body in [captured_body(&prefill).await, captured_body(&decode).await] {
         assert_eq!(body["input_ids"], json!(GENERATED_IDS));
         assert_eq!(body["messages"], request["messages"]);

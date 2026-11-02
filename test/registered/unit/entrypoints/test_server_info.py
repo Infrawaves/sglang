@@ -30,6 +30,7 @@ import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
@@ -106,6 +107,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    serving_chat: OpenAIServingChat | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -139,12 +141,75 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
-        return asyncio.run(http_server.server_info())
+        raw_request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(openai_serving_chat=serving_chat))
+        )
+        return asyncio.run(http_server.server_info(raw_request))
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
         if published:
             reset_context()
+
+
+class TestServerInfoKimiK3MediaInputIds(CustomTestCase):
+    def test_capability_requires_native_multimodal_k3_serving(self):
+        """Custom default templates must keep router media encoding disabled."""
+        for (
+            spec,
+            multimodal,
+            processor_version,
+            explicit_template,
+            conversation_template,
+            default_template,
+            expected,
+        ) in [
+            ("kimi_k3", True, 1, None, None, None, 1),
+            (None, True, 1, None, None, None, None),
+            ("dsv4", True, 1, None, None, None, None),
+            ("kimi_k3", False, 1, None, None, None, None),
+            ("kimi_k3", True, 1, "custom.jinja", None, None, None),
+            ("kimi_k3", True, 1, None, "custom-conversation", None, None),
+            ("kimi_k3", True, None, None, None, None, None),
+            ("kimi_k3", True, "no-processor", None, None, None, None),
+            ("kimi_k3", True, 2, None, None, None, None),
+            ("kimi_k3", True, 1, None, None, "{{ custom }}", None),
+            ("kimi_k3", True, 1, None, None, "", None),
+        ]:
+            with self.subTest(
+                spec=spec,
+                multimodal=multimodal,
+                processor_version=processor_version,
+                explicit_template=explicit_template,
+                conversation_template=conversation_template,
+                default_template=default_template,
+            ):
+                args = ServerArgs(model_path="dummy", chat_template=explicit_template)
+                serving_chat = OpenAIServingChat.__new__(OpenAIServingChat)
+                serving_chat.chat_encoding_spec = spec
+                serving_chat.tokenizer_manager = SimpleNamespace(
+                    model_config=SimpleNamespace(is_multimodal=multimodal),
+                    mm_processor=(
+                        None
+                        if processor_version == "no-processor"
+                        else SimpleNamespace(
+                            kimi_k3_media_input_ids_version=processor_version
+                        )
+                    ),
+                    server_args=args,
+                )
+                serving_chat.template_manager = SimpleNamespace(
+                    chat_template_name=conversation_template
+                )
+                serving_chat.default_chat_template_kwargs = {
+                    "chat_template": default_template
+                }
+                info = _call_server_info_with(args, serving_chat=serving_chat)
+                self.assertEqual(info["kimi_k3_media_input_ids_version"], expected)
+
+    def test_missing_serving_handler_does_not_advertise_capability(self):
+        info = _call_server_info_with(ServerArgs(model_path="dummy"))
+        self.assertIsNone(info["kimi_k3_media_input_ids_version"])
 
 
 class TestServerInfoKvEventsField(CustomTestCase):

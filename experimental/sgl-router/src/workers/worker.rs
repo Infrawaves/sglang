@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,16 @@ pub enum WireProtocol {
     /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
     /// reports `--enable-http2` on a cleartext URL.
     H2c,
+}
+
+/// Versioned request semantics advertised by the worker, independent of its
+/// package version. Missing or unknown versions keep media encoding local.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct WorkerCapabilities {
+    /// Version 1 accepts unexpanded IDs in `kimi_k3_media_input_ids` and
+    /// recovers the media payloads from the accompanying messages.
+    #[serde(default)]
+    pub kimi_k3_media_input_ids_version: Option<u32>,
 }
 
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
@@ -162,6 +173,7 @@ pub struct Worker {
     /// Forwarding wire protocol, resolved from `/server_info` before this
     /// worker was constructed. Immutable: see [`WireProtocol`].
     protocol: WireProtocol,
+    capabilities: WorkerCapabilities,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -194,6 +206,15 @@ impl Worker {
         cb: Option<CircuitBreakerConfig>,
         protocol: WireProtocol,
     ) -> Self {
+        Self::with_capabilities(spec, cb, protocol, WorkerCapabilities::default())
+    }
+
+    pub fn with_capabilities(
+        spec: crate::discovery::WorkerSpec,
+        cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
+        capabilities: WorkerCapabilities,
+    ) -> Self {
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
             None => Arc::new(CircuitBreaker::new()),
@@ -206,6 +227,7 @@ impl Worker {
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
             protocol,
+            capabilities,
             model_ids: spec.model_ids,
             breaker,
             active_requests,
@@ -213,6 +235,11 @@ impl Worker {
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
         }
+    }
+
+    /// Whether this worker understands the router's unexpanded K3 image IDs.
+    pub fn supports_kimi_k3_media_input_ids(&self) -> bool {
+        self.capabilities.kimi_k3_media_input_ids_version == Some(1)
     }
 
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.

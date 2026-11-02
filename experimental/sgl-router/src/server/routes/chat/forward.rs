@@ -37,11 +37,21 @@ pub(super) struct SelectedWorkers {
 
 pub(super) async fn forward_chat_request(
     ctx: &AppContext,
-    request: PreparedChatRequest,
+    mut request: PreparedChatRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     request_started_at: Instant,
 ) -> Result<Response<Body>, ApiError> {
+    // Both sides of a PD pair must understand the dedicated media IDs field;
+    // otherwise preserve local encoding for the whole pair. The dedicated
+    // field also keeps old workers safe if a cached capability becomes stale.
+    request.retain_media_input_ids_if_supported(
+        workers.prefill.supports_kimi_k3_media_input_ids()
+            && workers
+                .decode
+                .as_ref()
+                .is_none_or(|worker| worker.supports_kimi_k3_media_input_ids()),
+    );
     let SelectedWorkers {
         prefill,
         decode,

@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import types
@@ -299,6 +300,20 @@ class EncodingTests(unittest.TestCase):
                 {"messages": [{"role": "assistant", "content": content}]}
             )
 
+    def test_request_chat_templates_are_never_rendered_by_the_router(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        for extra in (
+            {"chat_template": "{{ custom }}"},
+            {"chat_template_kwargs": {"chat_template": "{{ custom }}"}},
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                k3.validate_request({"messages": messages, **extra})
+        for extra in (
+            {"chat_template_kwargs": {"chat_template": None}},
+            {"chat_template_kwargs": {"custom_flag": "retained"}},
+        ):
+            k3.validate_request({"messages": messages, **extra})
+
     def test_image_encoder_rejects_audio_video_unknown_and_invalid_image_parts(self):
         invalid_parts = [
             {"type": "video_url", "video_url": {"url": "video"}},
@@ -372,10 +387,26 @@ class RequestPreparationTests(unittest.TestCase):
         get_tokenizer = Mock(return_value=tokenizer)
         module = types.ModuleType("sglang.srt.utils.hf_transformers.tokenizer")
         module.get_tokenizer = get_tokenizer
+        config_module = types.ModuleType("sglang.srt.utils.hf_transformers.config")
+        hf_config = types.SimpleNamespace(
+            architectures=["KimiK3ForConditionalGeneration"]
+        )
+        config_module.get_config = Mock(return_value=hf_config)
+        encoding_module = types.ModuleType(
+            "sglang.srt.entrypoints.openai.chat_encoding"
+        )
+        encoding_module.resolve_chat_encoding_spec = Mock(return_value="kimi_k3")
         defaults = {"thinking": False}
         warmup = Mock(return_value=[10, 20])
         with (
-            patch.dict(sys.modules, {module.__name__: module}),
+            patch.dict(
+                sys.modules,
+                {
+                    module.__name__: module,
+                    config_module.__name__: config_module,
+                    encoding_module.__name__: encoding_module,
+                },
+            ),
             patch.object(k3, "encode_request", warmup),
         ):
             actual_tokenizer, actual_defaults = k3._load_tokenizer(
@@ -386,6 +417,12 @@ class RequestPreparationTests(unittest.TestCase):
                     "default_chat_template_kwargs": defaults,
                 }
             )
+        config_module.get_config.assert_called_once_with(
+            "/models/k3", trust_remote_code=True, revision="abc123"
+        )
+        encoding_module.resolve_chat_encoding_spec.assert_called_once_with(
+            hf_config=hf_config, tokenizer=None
+        )
         get_tokenizer.assert_called_once_with(
             "/models/k3",
             trust_remote_code=True,
@@ -397,6 +434,79 @@ class RequestPreparationTests(unittest.TestCase):
         warmup.assert_called_once_with(
             tokenizer, {"messages": [{"role": "user", "content": "Hello"}]}, defaults
         )
+
+    def test_loader_rejects_other_encoders_before_tokenizer_or_warmup(self):
+        for spec in (None, "dsv4"):
+            with self.subTest(spec=spec):
+                config_module = types.ModuleType(
+                    "sglang.srt.utils.hf_transformers.config"
+                )
+                hf_config = types.SimpleNamespace(architectures=["OtherModel"])
+                config_module.get_config = Mock(return_value=hf_config)
+                encoding_module = types.ModuleType(
+                    "sglang.srt.entrypoints.openai.chat_encoding"
+                )
+                encoding_module.resolve_chat_encoding_spec = Mock(return_value=spec)
+                tokenizer_module = types.ModuleType(
+                    "sglang.srt.utils.hf_transformers.tokenizer"
+                )
+                tokenizer_module.get_tokenizer = Mock()
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            config_module.__name__: config_module,
+                            encoding_module.__name__: encoding_module,
+                            tokenizer_module.__name__: tokenizer_module,
+                        },
+                    ),
+                    patch.object(k3, "encode_request") as warmup,
+                    self.assertRaisesRegex(ValueError, "Kimi-K3 model configuration"),
+                ):
+                    k3._load_tokenizer({"tokenizer_path": "/models/other"})
+                encoding_module.resolve_chat_encoding_spec.assert_called_once_with(
+                    hf_config=hf_config, tokenizer=None
+                )
+                tokenizer_module.get_tokenizer.assert_not_called()
+                warmup.assert_not_called()
+
+    def test_loader_explains_missing_model_configuration(self):
+        config_module = types.ModuleType("sglang.srt.utils.hf_transformers.config")
+        cause = OSError("config.json not found")
+        config_module.get_config = Mock(side_effect=cause)
+        encoding_module = types.ModuleType(
+            "sglang.srt.entrypoints.openai.chat_encoding"
+        )
+        encoding_module.resolve_chat_encoding_spec = Mock()
+        tokenizer_module = types.ModuleType(
+            "sglang.srt.utils.hf_transformers.tokenizer"
+        )
+        tokenizer_module.get_tokenizer = Mock()
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    config_module.__name__: config_module,
+                    encoding_module.__name__: encoding_module,
+                    tokenizer_module.__name__: tokenizer_module,
+                },
+            ),
+            self.assertRaises(ValueError) as caught,
+        ):
+            k3._load_tokenizer(
+                {"tokenizer_path": "/models/tokenizer-only", "revision": "abc123"}
+            )
+        self.assertIs(caught.exception.__cause__, cause)
+        for context in (
+            "/models/tokenizer-only",
+            "abc123",
+            "loadable config.json",
+            "tokenizer-only directories are insufficient",
+            "config.json not found",
+        ):
+            self.assertIn(context, str(caught.exception))
+        encoding_module.resolve_chat_encoding_spec.assert_not_called()
+        tokenizer_module.get_tokenizer.assert_not_called()
 
 
 class RealSchemaImageTests(unittest.TestCase):
@@ -411,6 +521,8 @@ class RealSchemaImageTests(unittest.TestCase):
                 normalize_json_schema_types,  # noqa: F401
             )
         except ModuleNotFoundError as exc:
+            if os.environ.get("SGLANG_REQUIRE_KIMI_K3_SCHEMA_TESTS") == "1":
+                raise
             raise unittest.SkipTest(
                 f"SGLang Python dependencies unavailable: {exc}"
             ) from exc
@@ -450,7 +562,10 @@ class RealSchemaImageTests(unittest.TestCase):
         original = copy.deepcopy(body)
         tokenizer = RecordingTokenizer()
         router_ids = k3.encode_request(tokenizer, body)
-        validated = self.request_class.model_validate(copy.deepcopy(body))
+        forwarded = {**copy.deepcopy(body), "kimi_k3_media_input_ids": router_ids}
+        validated = self.request_class.model_validate(forwarded)
+        self.assertIsNone(validated.input_ids)
+        self.assertEqual(validated.kimi_k3_media_input_ids, router_ids)
         baseline = RecordingTokenizer()
         worker_ids = k3.encode_kimi_k3_messages(
             baseline,

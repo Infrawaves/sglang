@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::workers::worker::{WireProtocol, Worker};
+use crate::workers::worker::{WireProtocol, Worker, WorkerCapabilities};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -86,6 +86,17 @@ impl WorkerRegistry {
         cb: Option<CircuitBreakerConfig>,
         protocol: WireProtocol,
     ) -> Result<(), AddWorkerError> {
+        self.add_with_capabilities(spec, cb, protocol, WorkerCapabilities::default())
+    }
+
+    /// Register introspected capabilities atomically with worker visibility.
+    pub fn add_with_capabilities(
+        &self,
+        spec: WorkerSpec,
+        cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
+        capabilities: WorkerCapabilities,
+    ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
@@ -123,7 +134,7 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb, protocol));
+        let w = Arc::new(Worker::with_capabilities(spec, cb, protocol, capabilities));
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {

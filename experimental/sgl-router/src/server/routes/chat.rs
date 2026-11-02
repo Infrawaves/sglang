@@ -68,14 +68,20 @@ async fn chat_completions_legacy(
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
+    // Checked first so an empty pool fails fast without encoding.
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let candidates = resolver
+    resolver
         .prefill_candidates(&model)
         .map_err(|error| pool_error(error, &model))?;
 
     let request =
         PreparedChatRequest::prepare_async(ctx, model, fields, body, policy.needs_request_tokens())
             .await?;
+
+    // K3 encoding can take seconds; pick from the pool as it is now, not as it was.
+    let candidates = resolver
+        .prefill_candidates(&request.model)
+        .map_err(|error| pool_error(error, &request.model))?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(

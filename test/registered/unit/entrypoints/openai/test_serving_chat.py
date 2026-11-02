@@ -842,6 +842,162 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.tokenizer.encode.assert_not_called()
         self.tm.tokenizer.decode.assert_not_called()
 
+    def test_kimi_k3_media_input_ids_preserve_images_without_encoding_prompt(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = None
+        self.tm.model_config.is_multimodal = True
+        self.tm.mm_processor = Mock(kimi_k3_media_input_ids_version=1)
+        self.tm.server_args.chat_template = None
+        self.template_manager.chat_template_name = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "image-1", "detail": "high"},
+                        },
+                    ],
+                }
+            ],
+            kimi_k3_media_input_ids=[101, 999, 102],
+        )
+        original_messages = request.model_dump()["messages"]
+        with (
+            patch.object(self.chat, "_encode_messages") as encode,
+            patch.object(self.chat, "_apply_jinja_template") as template,
+            patch.object(self.chat, "_apply_conversation_template") as conversation,
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(
+                request, self.fastapi_request
+            )
+
+        self.assertEqual(adapted.input_ids, [101, 999, 102])
+        self.assertIsNone(adapted.text)
+        self.assertEqual([item.url for item in adapted.image_data], ["image-1"])
+        self.assertEqual(adapted.image_data[0].detail, "high")
+        self.assertEqual(adapted.modalities, ["image"])
+        self.assertIsNone(request.input_ids)
+        self.assertEqual(request.model_dump()["messages"], original_messages)
+        encode.assert_not_called()
+        template.assert_not_called()
+        conversation.assert_not_called()
+
+    def test_kimi_k3_media_input_ids_fall_back_for_incompatible_workers(self):
+        """Custom default templates must preserve local media prompt encoding."""
+        cases = [
+            (None, True, 1, None, None, None, None),
+            ("dsv4", True, 1, None, None, None, None),
+            ("kimi_k3", False, 1, None, None, None, None),
+            ("kimi_k3", True, None, None, None, None, None),
+            ("kimi_k3", True, "no-processor", None, None, None, None),
+            ("kimi_k3", True, 0, None, None, None, None),
+            ("kimi_k3", True, 2, None, None, None, None),
+            ("kimi_k3", True, 1, "custom.jinja", None, None, None),
+            ("kimi_k3", True, 1, None, "custom-conversation", None, None),
+            ("kimi_k3", True, 1, None, None, "{{ custom }}", None),
+            ("kimi_k3", True, 1, None, None, None, "{{ custom }}"),
+            ("kimi_k3", True, 1, None, None, None, ""),
+        ]
+        for (
+            spec,
+            multimodal,
+            version,
+            template,
+            conversation,
+            request_template,
+            default_template,
+        ) in cases:
+            with self.subTest(
+                spec=spec,
+                multimodal=multimodal,
+                version=version,
+                template=template,
+                conversation=conversation,
+                request_template=request_template,
+                default_template=default_template,
+            ):
+                self.chat.chat_encoding_spec = spec
+                self.chat.tool_call_parser = None
+                self.tm.model_config.is_multimodal = multimodal
+                self.tm.mm_processor = (
+                    None
+                    if version == "no-processor"
+                    else Mock(kimi_k3_media_input_ids_version=version)
+                )
+                self.tm.server_args.chat_template = template
+                self.template_manager.chat_template_name = conversation
+                self.chat.default_chat_template_kwargs = {
+                    "chat_template": default_template
+                }
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": "image-1"}}
+                            ],
+                        }
+                    ],
+                    kimi_k3_media_input_ids=[101, 999, 102],
+                    chat_template_kwargs={"chat_template": request_template},
+                )
+                original_messages = request.model_dump()["messages"]
+                local = MessageProcessingResult(
+                    prompt="local prompt",
+                    prompt_ids=[42],
+                    image_data=["local image"],
+                    audio_data=None,
+                    video_data=None,
+                    modalities=["image"],
+                    stop=[],
+                )
+                with (
+                    patch.object(
+                        self.chat, "_apply_jinja_template", return_value=local
+                    ) as jinja,
+                    patch.object(
+                        self.chat, "_apply_conversation_template", return_value=local
+                    ) as conv,
+                ):
+                    result = self.chat._process_messages(request, multimodal)
+
+                self.assertIs(result, local)
+                if conversation is None:
+                    jinja.assert_called_once_with(request, None, multimodal)
+                    conv.assert_not_called()
+                else:
+                    conv.assert_called_once_with(request, multimodal)
+                    jinja.assert_not_called()
+                self.assertIsNone(request.input_ids)
+                self.assertEqual(request.model_dump()["messages"], original_messages)
+
+    def test_caller_input_ids_take_precedence_over_kimi_k3_media_input_ids(self):
+        for spec in (None, "kimi_k3"):
+            with self.subTest(spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.chat.tool_call_parser = None
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    input_ids=[7, 8],
+                    kimi_k3_media_input_ids=[101, 999, 102],
+                )
+                with (
+                    patch.object(self.chat, "_apply_jinja_template") as template,
+                    patch.object(self.chat, "_apply_conversation_template") as conv,
+                ):
+                    result = self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertEqual(result.prompt_ids, [7, 8])
+                self.assertEqual(request.input_ids, [7, 8])
+                template.assert_not_called()
+                conv.assert_not_called()
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [

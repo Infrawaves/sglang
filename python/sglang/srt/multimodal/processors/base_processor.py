@@ -217,6 +217,8 @@ class BaseMultimodalProcessor(ABC):
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
+    # Version of the router media-ID protocol this processor can expand.
+    kimi_k3_media_input_ids_version: Optional[int] = None
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.

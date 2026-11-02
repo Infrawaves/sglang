@@ -31,6 +31,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
+use super::WorkerCapabilities;
 use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
@@ -65,6 +66,7 @@ pub struct ServerInfo {
     /// protocol costs throughput and never correctness. Consumed by
     /// `manager::register_one` to set [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    pub capabilities: WorkerCapabilities,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -167,6 +169,7 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            capabilities: parsed.capabilities,
         }
     }
 
@@ -350,6 +353,8 @@ struct ModelInfoBody {
 /// deserialises; downstream callers handle `None` as "absent".
 #[derive(Debug, Default, Deserialize)]
 struct ServerInfoBody {
+    #[serde(flatten)]
+    capabilities: WorkerCapabilities,
     /// The launch record's value, and the fallback for a worker whose
     /// `/model_info` predates the field.
     #[serde(default)]
@@ -455,6 +460,20 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    #[tokio::test]
+    async fn fetch_media_input_ids_capability_is_explicit_and_versioned() {
+        for version in [None, Some(1), Some(2)] {
+            let mut body = json!({"served_model_name": "kimi-k3"});
+            if let Some(version) = version {
+                body["kimi_k3_media_input_ids_version"] = json!(version);
+            }
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.served_model_name.as_deref(), Some("kimi-k3"));
+            assert_eq!(info.capabilities.kimi_k3_media_input_ids_version, version);
+        }
     }
 
     /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs

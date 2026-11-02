@@ -290,6 +290,12 @@ def validate_request(body: Any, *, allow_images: bool = True) -> None:
         raise ValueError("The chat request must be a JSON object")  # noqa: TRY004
     if body.get("input_ids") is not None:
         raise ValueError("Kimi-K3 encoder expects messages without input_ids")
+    # Request templates are gated by the workers' --trust-request-chat-template.
+    kwargs = body.get("chat_template_kwargs")
+    if body.get("chat_template") is not None or (
+        isinstance(kwargs, dict) and kwargs.get("chat_template") is not None
+    ):
+        raise ValueError("Router Kimi-K3 encoding does not run request chat templates")
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a nonempty array")
@@ -388,6 +394,8 @@ def _validate_token_ids(token_ids: Any) -> list[int]:
 
 
 def _load_tokenizer(config: dict):
+    from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
+    from sglang.srt.utils.hf_transformers.config import get_config
     from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
     tokenizer_path = config.get("tokenizer_path")
@@ -396,6 +404,27 @@ def _load_tokenizer(config: dict):
     defaults = config.get("default_chat_template_kwargs") or {}
     if not isinstance(defaults, dict):
         raise TypeError("default_chat_template_kwargs must be a JSON object")
+    try:
+        hf_config = get_config(
+            tokenizer_path,
+            trust_remote_code=config.get("trust_remote_code", False),
+            revision=config.get("revision"),
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Failed to load Kimi-K3 model configuration from "
+            f"tokenizer_path={tokenizer_path!r}, revision={config.get('revision')!r}. "
+            "Use a model/tokenizer directory or HF repository containing a "
+            "loadable config.json; tokenizer-only directories are insufficient. "
+            f"Original error: {exc}"
+        ) from exc
+    # Resolve from the checkpoint before loading its tokenizer. A generic HF
+    # tokenizer can pass the warmup while rendering incompatible K3 semantics.
+    if resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=None) != "kimi_k3":
+        raise ValueError(
+            "Kimi-K3 chat encoding requires a Kimi-K3 model configuration at "
+            f"tokenizer_path: {tokenizer_path}"
+        )
     tokenizer = get_tokenizer(
         tokenizer_path,
         trust_remote_code=config.get("trust_remote_code", False),

@@ -44,6 +44,12 @@
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
+//! | `sgl_router_encoder_requests_total` | Counter | `model_id`, `outcome` |
+//! | `sgl_router_encoder_waiting_requests` | Gauge | `model_id` |
+//! | `sgl_router_encoder_queue_duration_seconds` | Histogram | `model_id` |
+//! | `sgl_router_encoder_encode_duration_seconds` | Histogram | `model_id` |
+//! | `sgl_router_encoder_processes` | Gauge | `model_id`, `state` |
+//! | `sgl_router_encoder_restarts_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
@@ -93,13 +99,23 @@
 //! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
 //!   no chat formatter, or a renderer not verified against SGLang, such as
 //!   DeepSeek-V4.1).
-//! - `ineligible_multimodal` — the chat carries image, video, or audio content
-//!   parts, which only the engine's multimodal processor can tokenize.
+//! - `ineligible_multimodal` — the chat carries media unsupported by this
+//!   encoder. K3 image chats can forward IDs to workers that support expansion.
+//! - `ineligible_worker_capability` — selected workers have not advertised the
+//!   media-placeholder expansion protocol needed for K3 image ID forwarding.
 //! - `ineligible` — the forwarding guard excluded some other request shape
 //!   (tools, non-string content, caller `input_ids`, template controls, ...;
 //!   only caller `input_ids` on models that forward all text chats).
 //! - `tokenize_failed` — eligible, but ingress rendering failed (the same
 //!   requests `sgl_router_ingress_tokenize_errors_total` counts).
+//!
+//! The K3-only `sgl_router_encoder_*` families also cover failures before
+//! dispatch. Request outcomes separate client errors, unavailable processes,
+//! encoder internal errors, phase-specific timeouts and cancellation. Queue
+//! time covers admission, blocking-thread scheduling and process availability;
+//! execution time covers only the process exchange. Queue guards remain with
+//! detached blocking jobs after cancellation. Process states are sampled from
+//! the pool; a busy `in_use` process is healthy, not an unavailable process.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -113,8 +129,9 @@ use crate::config::PolicyKind;
 use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Histogram bucket upper bounds (seconds) for
 /// `sgl_router_request_duration_seconds`. Standard latency ladder spanning
@@ -412,6 +429,7 @@ pub enum InputIdsForwarding {
     Disabled,
     Ineligible,
     IneligibleMultimodal,
+    IneligibleWorkerCapability,
     TokenizeFailed,
 }
 
@@ -422,6 +440,7 @@ impl InputIdsForwarding {
             Self::Disabled => "disabled",
             Self::Ineligible => "ineligible",
             Self::IneligibleMultimodal => "ineligible_multimodal",
+            Self::IneligibleWorkerCapability => "ineligible_worker_capability",
             Self::TokenizeFailed => "tokenize_failed",
         }
     }
@@ -606,6 +625,211 @@ impl Histogram {
         }
         self.sum += value;
         self.count += 1;
+    }
+}
+
+/// One terminal result for every K3 preparation attempt, including attempts
+/// rejected before worker dispatch. These do not change forwarding/fallback metrics.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EncoderOutcome {
+    Encoded,
+    Bypassed,
+    RequestError,
+    PreparationTimeout,
+    QueueTimeout,
+    EncodeTimeout,
+    Unavailable,
+    InternalError,
+    Cancelled,
+}
+
+impl EncoderOutcome {
+    const ALL: [Self; 9] = [
+        Self::Encoded,
+        Self::Bypassed,
+        Self::RequestError,
+        Self::PreparationTimeout,
+        Self::QueueTimeout,
+        Self::EncodeTimeout,
+        Self::Unavailable,
+        Self::InternalError,
+        Self::Cancelled,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Encoded => "encoded",
+            Self::Bypassed => "bypassed",
+            Self::RequestError => "request_error",
+            Self::PreparationTimeout => "preparation_timeout",
+            Self::QueueTimeout => "queue_timeout",
+            Self::EncodeTimeout => "encode_timeout",
+            Self::Unavailable => "unavailable",
+            Self::InternalError => "internal_error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Metrics owned by the pool, so state is visible even before its first request.
+pub(crate) struct EncoderMetrics {
+    model_id: String,
+    requests: [AtomicU64; EncoderOutcome::ALL.len()],
+    waiting: AtomicI64,
+    queue_duration: Mutex<Histogram>,
+    encode_duration: Mutex<Histogram>,
+    restarts: [AtomicU64; 2],
+}
+
+impl EncoderMetrics {
+    pub(crate) fn new(model_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            model_id: model_id.into(),
+            requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            waiting: AtomicI64::new(0),
+            queue_duration: Mutex::new(Histogram::new(TTFT_BUCKETS)),
+            encode_duration: Mutex::new(Histogram::new(TTFT_BUCKETS)),
+            restarts: std::array::from_fn(|_| AtomicU64::new(0)),
+        })
+    }
+
+    pub(crate) fn request(self: &Arc<Self>) -> EncoderRequestGuard {
+        EncoderRequestGuard {
+            metrics: Arc::clone(self),
+            outcome: EncoderOutcome::Cancelled,
+        }
+    }
+
+    pub(crate) fn queue(self: &Arc<Self>) -> EncoderQueueGuard {
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        EncoderQueueGuard {
+            metrics: Arc::clone(self),
+            enqueued: Instant::now(),
+            encoding_started: Arc::new(AtomicBool::new(false)),
+            waiting: true,
+        }
+    }
+
+    pub(crate) fn observe_encoding(&self, started: Instant) {
+        self.encode_duration
+            .lock()
+            .observe(started.elapsed().as_secs_f64());
+    }
+
+    pub(crate) fn restart(&self, ready: bool) {
+        self.restarts[usize::from(!ready)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts for ready, in-use, starting and empty slots come from one pool lock.
+    pub(crate) fn render(snapshots: &[(Arc<Self>, [usize; 4])]) -> String {
+        if snapshots.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for (name, kind, help) in [
+            ("requests_total", "counter", "K3 preparation attempts by terminal outcome, including failures before worker dispatch."),
+            ("waiting_requests", "gauge", "K3 jobs waiting for admission, a blocking thread, or a usable encoder process."),
+            ("queue_duration_seconds", "histogram", "K3 admission and process wait time, excluding parsing and encoding."),
+            ("encode_duration_seconds", "histogram", "K3 process exchange time, excluding admission and process waits."),
+            ("processes", "gauge", "Current K3 encoder pool slots by state; in-use processes remain serviceable."),
+            ("restarts_total", "counter", "Completed K3 encoder restart attempts by outcome."),
+        ] {
+            out.push_str(&format!("# HELP sgl_router_encoder_{name} {help}\n# TYPE sgl_router_encoder_{name} {kind}\n"));
+        }
+        for (metrics, states) in snapshots {
+            let model = format!("model_id=\"{}\"", escape_label(&metrics.model_id));
+            for outcome in EncoderOutcome::ALL {
+                out.push_str(&format!(
+                    "sgl_router_encoder_requests_total{{{model},outcome=\"{}\"}} {}\n",
+                    outcome.as_str(),
+                    metrics.requests[outcome as usize].load(Ordering::Relaxed)
+                ));
+            }
+            out.push_str(&format!(
+                "sgl_router_encoder_waiting_requests{{{model}}} {}\n",
+                metrics.waiting.load(Ordering::Relaxed)
+            ));
+            render_histogram(
+                &mut out,
+                "sgl_router_encoder_queue_duration_seconds",
+                &model,
+                &metrics.queue_duration.lock(),
+            );
+            render_histogram(
+                &mut out,
+                "sgl_router_encoder_encode_duration_seconds",
+                &model,
+                &metrics.encode_duration.lock(),
+            );
+            for (state, count) in ["ready", "in_use", "starting", "empty"]
+                .into_iter()
+                .zip(states)
+            {
+                out.push_str(&format!(
+                    "sgl_router_encoder_processes{{{model},state=\"{state}\"}} {count}\n"
+                ));
+            }
+            for (index, outcome) in ["ready", "failed"].into_iter().enumerate() {
+                out.push_str(&format!(
+                    "sgl_router_encoder_restarts_total{{{model},outcome=\"{outcome}\"}} {}\n",
+                    metrics.restarts[index].load(Ordering::Relaxed)
+                ));
+            }
+        }
+        out
+    }
+}
+
+pub(crate) struct EncoderRequestGuard {
+    metrics: Arc<EncoderMetrics>,
+    outcome: EncoderOutcome,
+}
+
+impl EncoderRequestGuard {
+    pub(crate) fn finish(&mut self, outcome: EncoderOutcome) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for EncoderRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.requests[self.outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Travels with the actual blocking job after its HTTP caller is cancelled.
+pub(crate) struct EncoderQueueGuard {
+    metrics: Arc<EncoderMetrics>,
+    enqueued: Instant,
+    encoding_started: Arc<AtomicBool>,
+    waiting: bool,
+}
+
+impl EncoderQueueGuard {
+    pub(crate) fn encoding_started(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.encoding_started)
+    }
+
+    pub(crate) fn start_encoding(&mut self) {
+        self.encoding_started.store(true, Ordering::Relaxed);
+        self.finish_waiting();
+    }
+
+    fn finish_waiting(&mut self) {
+        if self.waiting {
+            self.metrics
+                .queue_duration
+                .lock()
+                .observe(self.enqueued.elapsed().as_secs_f64());
+            self.metrics.waiting.fetch_sub(1, Ordering::Relaxed);
+            self.waiting = false;
+        }
+    }
+}
+
+impl Drop for EncoderQueueGuard {
+    fn drop(&mut self) {
+        self.finish_waiting();
     }
 }
 
@@ -1401,7 +1625,7 @@ impl MetricsRegistry {
 
         // input_ids_forwarding_total
         out.push_str(
-            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).\n",
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible_worker_capability, ineligible, tokenize_failed).\n",
         );
         out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
         let guard = self.input_ids_forwarding_total.lock();
@@ -1492,6 +1716,97 @@ mod tests {
             output.lines().any(|line| line == expected),
             "missing metric line `{expected}`; got:\n{output}"
         );
+    }
+
+    #[test]
+    fn encoder_request_guards_count_terminal_results_and_cancellation_once() {
+        let metrics = EncoderMetrics::new("k3");
+        {
+            let mut request = metrics.request();
+            request.finish(EncoderOutcome::RequestError);
+        }
+        drop(metrics.request());
+        let out = EncoderMetrics::render(&[(metrics, [1, 0, 0, 0])]);
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_requests_total{model_id="k3",outcome="request_error"} 1"#,
+        );
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_requests_total{model_id="k3",outcome="cancelled"} 1"#,
+        );
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_requests_total{model_id="k3",outcome="encoded"} 0"#,
+        );
+    }
+
+    #[test]
+    fn encoder_queue_guard_tracks_actual_job_after_caller_cancellation() {
+        let metrics = EncoderMetrics::new("k3");
+        let request = metrics.request();
+        let mut job_queue = metrics.queue();
+        let phase = job_queue.encoding_started();
+        drop(request);
+        assert!(!phase.load(Ordering::Relaxed));
+        assert_eq!(metrics.waiting.load(Ordering::Relaxed), 1);
+        job_queue.start_encoding();
+        assert!(phase.load(Ordering::Relaxed));
+        assert_eq!(metrics.waiting.load(Ordering::Relaxed), 0);
+        metrics.observe_encoding(Instant::now());
+        drop(job_queue);
+        // A request cancelled before execution still contributes its queue wait.
+        drop(metrics.queue());
+        let out = EncoderMetrics::render(&[(metrics, [0, 1, 0, 0])]);
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_waiting_requests{model_id="k3"} 0"#,
+        );
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_queue_duration_seconds_count{model_id="k3"} 2"#,
+        );
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_encode_duration_seconds_count{model_id="k3"} 1"#,
+        );
+        assert_metric_line(
+            &out,
+            r#"sgl_router_encoder_requests_total{model_id="k3",outcome="cancelled"} 1"#,
+        );
+    }
+
+    #[test]
+    fn encoder_metrics_render_pool_states_restarts_and_escaped_models() {
+        assert!(EncoderMetrics::render(&[]).is_empty());
+        let metrics = EncoderMetrics::new("k3\"\n");
+        metrics.restart(true);
+        metrics.restart(false);
+        let out = EncoderMetrics::render(&[
+            (metrics, [1, 2, 3, 4]),
+            (EncoderMetrics::new("other"), [0, 1, 0, 0]),
+        ]);
+        assert_eq!(
+            out.matches("# TYPE sgl_router_encoder_requests_total counter")
+                .count(),
+            1
+        );
+        for (state, count) in [("ready", 1), ("in_use", 2), ("starting", 3), ("empty", 4)] {
+            assert_metric_line(
+                &out,
+                &format!(
+                    r#"sgl_router_encoder_processes{{model_id="k3\"\n",state="{state}"}} {count}"#
+                ),
+            );
+        }
+        for outcome in ["ready", "failed"] {
+            assert_metric_line(
+                &out,
+                &format!(
+                    r#"sgl_router_encoder_restarts_total{{model_id="k3\"\n",outcome="{outcome}"}} 1"#
+                ),
+            );
+        }
     }
 
     #[test]
