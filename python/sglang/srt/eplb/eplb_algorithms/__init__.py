@@ -3,7 +3,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_aware
+from sglang.srt.eplb.eplb_algorithms import (
+    deepinfer,
+    deepseek,
+    deepseek_vec,
+    elasticity_aware,
+)
 
 
 class EplbAlgorithm(Enum):
@@ -13,6 +18,8 @@ class EplbAlgorithm(Enum):
     deepseek_vec_hierarchical = auto()
     elasticity_aware = auto()
     elasticity_aware_hierarchical = auto()
+    # DeepInfer's per-step greedy placement; flat over all EP ranks.
+    deepinfer = auto()
     # TODO may have more algorithm later
 
 
@@ -45,6 +52,13 @@ def rebalance_experts(
             num_groups=num_groups,
             num_nodes=num_nodes,
             enable_hierarchical=algorithm == EplbAlgorithm.deepseek_vec_hierarchical,
+        )
+
+    if algorithm == EplbAlgorithm.deepinfer:
+        return deepinfer.rebalance_experts(
+            tokens_per_expert=tokens_per_expert,
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
         )
 
     if algorithm in [
