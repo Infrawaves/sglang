@@ -79,16 +79,18 @@ class DispatchTableTest(unittest.TestCase):
         self.assertEqual(table.select(13000), self.PULL)
 
     def test_checked_in_tp8_tables(self):
+        pull_128 = DispatchConfig("pull", KernelConfig(128, 2))
         # GB300 TP8 mirrors the B300 TP8 dispatch.
         for device in ("NVIDIA_B300_SXM6_AC", "NVIDIA_GB300"):
             with self.subTest(device=device):
                 kda = ag_gemm.load_dispatch_table(8, 7168, 6144, device)
                 mla = ag_gemm.load_dispatch_table(8, 7168, 2112, device)
                 self.assertEqual((kda.k, kda.n, mla.k, mla.n), (7168, 6144, 7168, 2112))
-                self.assertIsNone(kda.select(4095))
-                self.assertEqual(kda.select(4096), self.PULL)
-                self.assertIsNone(mla.select(8191))
-                self.assertEqual(mla.select(8192), self.PULL)
+                self.assertIsNone(kda.select(8191))
+                self.assertEqual(kda.select(8192), self.PULL)
+                self.assertIsNone(mla.select(2047))
+                self.assertEqual(mla.select(2048), pull_128)
+                self.assertEqual(mla.select(12288), self.PULL)
                 self.assertIsNone(ag_gemm.load_dispatch_table(4, 7168, 6144, device))
 
 
@@ -124,14 +126,13 @@ class GatheredInputTest(unittest.TestCase):
         operator = _operator()
         operator._payload_peer_ptrs = tuple(range(8))
         names = (
-            "_shard_ready_flags",
+            "_ag_counters",
             "_barrier_state",
             "_barrier_flags",
             "_barrier_peer_ptrs",
         )
         for name in names:
             setattr(operator, name, Mock(name=name))
-        operator._copy_handles = (11, 12, 13)
         dispatch = DispatchConfig("pull", KernelConfig(256, 2))
         operator._prepared_kernel_grids = {(512, 6144, dispatch): 77}
         pull = Mock()
@@ -141,18 +142,18 @@ class GatheredInputTest(unittest.TestCase):
         with patch.object(
             context.torch,
             "ops",
-            SimpleNamespace(mega_ops=SimpleNamespace(sm100_ag_gemm_pull=pull)),
+            SimpleNamespace(mega_ops=SimpleNamespace(sm100_ag_gemm_warp_pull=pull)),
         ):
             self.assertIs(operator(local_input, weight, output, dispatch), output)
         args = pull.call_args.args
-        # Order of sm100_ag_gemm_pull in MegaAttention-v2 torch_bindings.cpp.
+        # Order of sm100_ag_gemm_warp_pull in MegaAttention-v2 torch_bindings.cpp.
         self.assertIs(args[0], local_input)
         self.assertIs(args[1], weight)
         self.assertIs(args[2], output)
         self.assertEqual(tuple(args[3].shape), (8, 64, 128))
         self.assertEqual(args[4], tuple(range(8)))
         self.assertEqual(args[5:9], tuple(getattr(operator, n) for n in names))
-        self.assertEqual(args[9:], (3, 8, 256, 2, 77, 11, 12, 13))
+        self.assertEqual(args[9:], (3, 8, 256, 2, 77))
 
 
 if __name__ == "__main__":

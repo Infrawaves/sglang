@@ -15,12 +15,12 @@
     "device": "NVIDIA GB300",
     "gpus_per_node": 4,
     "consumer": "KDA fused_qkvg_proj",
-    "note": "Not measured on GB300; dispatch mirrors the B300 TP8 table (world=8,K=7168,N=6144,device_name=NVIDIA_B300_SXM6_AC.json). B300 note: B300 TP8, K=7168, N=6144, AG + GEMM, ms (nccl / fused pull): 2048 0.168/0.222; 4096 0.326/0.258; 8192 0.546/0.427; 12288 0.798/0.608; 16384 1.048/0.820. Native baseline below 4K, fused pull from 4K.",
+    "note": "Not measured on GB300; buckets come from B300 TP8 warp_pull, K=7168, N=6144, tile_m=256, ms (nccl / warp_pull): 2048 0.169/0.156; 4096 0.327/0.254; 8192 0.561/0.487; 12288 0.838/0.720; 16384 1.087/0.952. Native baseline below 8K, warp_pull from 8K.",
     "nodes": 2
   },
   "validation": {
     "shared_workspace_gpu_validated": false,
-    "note": "All buckets forced to native baseline: fused AG+GEMM deadlocked on GB300 TP8 (2026-10-30, TP0/TP4 stuck in Sm100AgGemmKernel, peers in finish_all_gather_epoch).",
+    "note": "Fused buckets run the in-kernel warp_pull AllGather; the copy-engine path that deadlocked on GB300 TP8 (2026-10-30) is no longer called.",
     "gb300_measured": false
   },
   "configs": {
@@ -45,19 +45,34 @@
       "status": "native_baseline"
     },
     "8192": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "12288": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
     },
     "16384": {
-      "mode": "baseline",
+      "mode": "pull",
       "enabled": true,
-      "status": "native_baseline"
+      "status": "measured_on_b300",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2
     }
   }
 }
