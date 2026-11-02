@@ -89,11 +89,25 @@ class EPLBManager:
 
     # can be more complex if needed
     def _entrypoint(self):
+        num_iterations = self._first_rebalance_num_iterations()
         while True:
-            for _ in range(self._rebalance_num_iterations):
+            for _ in range(num_iterations):
                 yield
 
             yield from self.rebalance()
+            num_iterations = self._rebalance_num_iterations
+
+    def _first_rebalance_num_iterations(self) -> int:
+        # DeepInfer: the startup layout is trivial, so the first rearrange
+        # runs at 1/4 of the interval.  It still waits for a full recorder
+        # window so the solver never sees an under-filled buffer.
+        if not envs.SGLANG_EPLB_EARLY_FIRST_REBALANCE.get():
+            return self._rebalance_num_iterations
+        return max(
+            self._rebalance_num_iterations // 4,
+            get_exec().moe.expert_distribution_recorder_buffer_size,
+            1,
+        )
 
     def rebalance(self):
         if self._rebalance_disabled_reason is not None:
@@ -139,6 +153,7 @@ class EPLBManager:
             logical_count,
             broadcast_over_world=is_post_scale_rebalance,
         )
+        self._log_predicted_rank_balancedness(logical_count, expert_location_metadata)
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
@@ -307,6 +322,38 @@ class EPLBManager:
             ),
         )
 
+    def _log_predicted_rank_balancedness(
+        self, logical_count, new_expert_location_metadata: ExpertLocationMetadata
+    ):
+        # Rank 0 only and on CPU: a [steps, layers, physical] temporary must
+        # not compete with the weight transfer for device memory.
+        if get_parallel().tp_rank != 0:
+            return
+        old_expert_location_metadata = get_global_expert_location_metadata()
+        if old_expert_location_metadata is None or new_expert_location_metadata is None:
+            return
+        try:
+            logical_count = logical_count.cpu()
+            old = predicted_rank_balancedness(
+                logical_count,
+                old_expert_location_metadata.physical_to_logical_map,
+                old_expert_location_metadata.ep_size,
+            )
+            new = predicted_rank_balancedness(
+                logical_count,
+                new_expert_location_metadata.physical_to_logical_map,
+                new_expert_location_metadata.ep_size,
+            )
+        except Exception as e:  # logging only; never block a rebalance
+            logger.warning("[EPLBManager] predicted balancedness skipped: %s", e)
+            return
+        logger.info(
+            "[EPLBManager] predicted rank balancedness (mean/max, per-step, "
+            "avg over layers) on the recorded window: %.4f -> %.4f",
+            old,
+            new,
+        )
+
     def _log_rebalance_layout_after_update(self, update_layer_ids: List[int]):
         if not self._should_log_expert_location_metadata():
             return
@@ -376,3 +423,37 @@ def update_expert_location_with_recovery(
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):
         yield items[start_index : start_index + chunk_size]
+
+
+def predicted_rank_balancedness(
+    logical_count: torch.Tensor,
+    physical_to_logical_map: torch.Tensor,
+    ep_size: int,
+) -> float:
+    """Mean/max rank load a layout would have had on the recorded window.
+
+    Each logical expert's tokens are split evenly over its replicas (the
+    model DeepInfer's placement optimizes).  Computed per step, then averaged
+    over steps and layers; 1.0 is perfectly balanced.
+    """
+    counts = logical_count.float()
+    if counts.dim() == 2:
+        counts = counts.unsqueeze(0)
+    num_steps, num_layers, num_logical = counts.shape
+    p2l = physical_to_logical_map.to(device=counts.device, dtype=torch.int64)
+    p2l = p2l[:num_layers] % num_logical
+    replicas = torch.zeros(
+        (num_layers, num_logical), dtype=torch.float32, device=counts.device
+    )
+    replicas.scatter_add_(1, p2l, torch.ones_like(p2l, dtype=torch.float32))
+    per_replica = counts / replicas.clamp_min(1)  # [steps, layers, logical]
+    physical_load = per_replica.gather(
+        2, p2l.unsqueeze(0).expand(num_steps, -1, -1)
+    )  # [steps, layers, physical]
+    rank_load = physical_load.view(num_steps, num_layers, ep_size, -1).sum(-1)
+    mean = rank_load.mean(-1)
+    peak = rank_load.amax(-1)
+    active = peak > 0
+    if not bool(active.any()):
+        return 1.0
+    return float((mean[active] / peak[active]).mean())

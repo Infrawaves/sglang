@@ -1235,6 +1235,9 @@ class Envs:
     # (peer copy over NVLink) instead of NCCL P2P.  Cross-node moves keep
     # NCCL.  Falls back to NCCL on every rank if any rank cannot map a peer.
     SGLANG_EPLB_IPC_WEIGHT_TRANSFER = EnvBool(True)
+    # Run the first rebalance after max(interval // 4, recorder buffer size)
+    # forward passes instead of a full interval (DeepInfer's schedule).
+    SGLANG_EPLB_EARLY_FIRST_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
