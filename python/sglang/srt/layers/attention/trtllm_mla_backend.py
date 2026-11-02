@@ -84,6 +84,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +245,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     # Ragged verify: the packed query is front-aligned into the dense
-    # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
+    # [bs, draft_token_num] layout in forward_extend.
     supports_ragged_verify_graph: bool = True
 
     # Opt out when this backend cannot run absorbed MLA with a ragged query under
@@ -689,6 +690,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput] = None,
     ):
         """Shared decode / target-verify / draft-extend capture+replay body.
 
@@ -699,7 +701,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if get_parallel().dcp_enabled:
             return self._apply_dcp_cuda_graph_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode, metadata
+                bs, req_pool_indices, seq_lens, forward_mode, metadata, spec_info
             )
 
         if forward_mode.is_target_verify():
@@ -748,6 +750,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 PAGED_SIZE=self.page_size,
             )
 
+    @staticmethod
+    def _dcp_verify_physical_kv_lens(
+        prefix_lens: torch.Tensor,
+        spec_info: Optional[SpecInput],
+        metadata: TRTLLMMLADecodeMetadata,
+    ) -> torch.Tensor:
+        """Return written KV lengths while keeping the fixed-Q causal end intact."""
+        layout = getattr(spec_info, "ragged_verify_layout", None)
+        if layout is None:
+            return metadata.global_seq_lens_k
+
+        # Read the live layout before graph-tier padding can extend its last row.
+        # Keep the real query lengths in a stable buffer for in-graph pad/unpad.
+        live_bs = 0 if getattr(spec_info, "is_padding_only", False) else layout.bs
+        verify_lens = layout.verify_lens[:live_bs]
+        if metadata.seq_lens_q is None:
+            metadata.seq_lens_q = torch.empty_like(metadata.global_seq_lens_k)
+        metadata.seq_lens_q[:live_bs].copy_(verify_lens)
+        metadata.seq_lens_q[live_bs:].zero_()
+
+        # FlashInfer clears V beyond its physical K. Reporting unwritten KV
+        # inside that boundary would allow a masked 0 * NaN into a real row.
+        physical_lens = torch.empty_like(metadata.global_seq_lens_k)
+        torch.add(prefix_lens[:live_bs], verify_lens, out=physical_lens[:live_bs])
+        physical_lens[live_bs:].zero_()
+        return physical_lens
+
     def _apply_dcp_cuda_graph_metadata(
         self,
         bs: int,
@@ -755,6 +784,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         metadata: TRTLLMMLADecodeMetadata,
+        spec_info: Optional[SpecInput],
     ):
         """DCP variant of the capture+replay body.
 
@@ -768,9 +798,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.num_draft_tokens,
                 out=metadata.global_seq_lens_k,
             )
-            metadata.seq_lens_k.copy_(
-                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
+            physical_lens = self._dcp_verify_physical_kv_lens(
+                seq_lens[:bs], spec_info, metadata
             )
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(physical_lens))
             local_seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
@@ -836,19 +867,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens.device,
             )
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
-            )
-        else:
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
-            )
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            forward_mode=forward_mode,
+            spec_info=getattr(forward_batch, "spec_info", None),
+        )
 
         # Out-of-graph on capture AND every replay-prep, so the in-graph
         # set_mla_kv_buffer captures no translate.
@@ -1014,6 +1039,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.global_seq_lens_k = (
                     self.forward_decode_metadata.seq_lens_k
                 )
+                if get_parallel().dcp_enabled:
+                    seq_lens = self._dcp_verify_physical_kv_lens(
+                        forward_batch.seq_lens,
+                        getattr(forward_batch, "spec_info", None),
+                        self.forward_decode_metadata,
+                    )
             elif forward_batch.forward_mode.is_decode_or_idle():
                 # One int32 conversion per step; forward_decode reads it back
                 # so the per-layer .to(int32) in _run_decode_kernel stays a
@@ -1057,13 +1088,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     or forward_batch.forward_mode.is_decode_or_idle()
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ) and metadata.seq_lens_k is not None:
-                    # The branches above stored the global lengths in
-                    # seq_lens_k; keep them as global_seq_lens_k and derive the
-                    # rank-local view once per step rather than per MLA layer.
-                    metadata.global_seq_lens_k = metadata.seq_lens_k
-                    metadata.seq_lens_k = self._get_dcp_local_seq_lens(
-                        metadata.global_seq_lens_k
-                    )
+                    # Target verify already set the global fixed-Q causal end.
+                    if not forward_batch.forward_mode.is_target_verify():
+                        metadata.global_seq_lens_k = metadata.seq_lens_k
+                    metadata.seq_lens_k = self._get_dcp_local_seq_lens(seq_lens)
                 metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
                     metadata.max_seq_len_k
                 )
@@ -1876,8 +1904,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                             padded_bs=bs, cap=draft_token_num
                         )
                     total_tokens = q.shape[0]
-                    seq_lens_q = torch.clamp(
-                        ragged_layout.verify_lens, max=draft_token_num
+                    seq_lens_q = (
+                        metadata.seq_lens_q
+                        if dcp_enabled
+                        else torch.clamp(ragged_layout.verify_lens, max=draft_token_num)
                     )
                     cu_seqlens_q = ragged_layout.qo_indptr_device
                     padded_q = torch.zeros(
