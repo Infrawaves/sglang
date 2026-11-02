@@ -302,8 +302,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "DSpark dense-draft compact verify under --enable-dp-attention "
                     "with cuda graph needs SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1 "
                     "(every DP rank then replays one verify token tier). Otherwise "
-                    "re-run with --disable-cuda-graph (eager is lossless), or use "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "use SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+            if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+                raise ValueError(
+                    "DSpark compact DP graphs require the scheduler all-gather "
+                    "to agree on request counts and graph eligibility."
                 )
             if not self._dp_synced_verify:
                 # Idle DP ranks learn the shared tier from the dp-global request
@@ -316,6 +320,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "ranks cannot join the token-keyed compact graph; use "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
+        if (
+            self._dp_synced_verify
+            and self._verify_planner.is_compact_mode
+            and not self._decode_graph_allowed
+            and not self._is_pd_prefill
+            and self.model_runner.tp_rank == 0
+        ):
+            logger.warning(
+                "DSpark compact verify with DP-synchronized MLP and disabled "
+                "decode graphs uses the full verify width on every eager step."
+            )
         self._kv_injector = TargetHiddenKvInjector(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -703,11 +718,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
+    def _use_uniform_eager_verify(self, batch: ScheduleBatch) -> bool:
+        # Eager MLP sync expands per-rank request counts at the full verify
+        # width. A DP-local dense target can still execute its packed layout.
+        return (
+            self._dp_synced_verify
+            and self._verify_planner.is_compact_mode
+            and not batch.can_run_decode_cuda_graph
+        )
+
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
-        if self._dp_synced_verify and not batch.can_run_decode_cuda_graph:
-            # Busy ranks verify uniformly this step (see _forward_decode).
+        if self._use_uniform_eager_verify(batch):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
@@ -831,14 +854,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._dp_synced_verify and batch.global_num_tokens is not None
             else None
         )
-        if (
-            global_num_reqs is not None
-            and self._verify_planner.is_compact_mode
-            and not batch.can_run_decode_cuda_graph
-        ):
-            # Eager step (rank-consistent vote): the eager forward sizes its DP
-            # buffers from bs * (gamma + 1) per rank, not from a packed tier, so
-            # every rank verifies uniformly.
+        if self._use_uniform_eager_verify(batch):
             layout = None
         else:
             layout = self._verify_planner.schedule_layout(

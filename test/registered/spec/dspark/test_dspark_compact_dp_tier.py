@@ -318,6 +318,14 @@ class TestWorkerDpTierGate(CustomTestCase):
         for worker, batch in cases:
             self.assertIsNone(worker._dp_verify_tier_num_tokens(batch))
 
+    def test_eager_fallback_only_needs_uniform_width_for_synced_verify(self):
+        batch = self._batch(can_run_decode_cuda_graph=False)
+        self.assertTrue(self._worker()._use_uniform_eager_verify(batch))
+        self.assertFalse(
+            self._worker(dp_synced=False)._use_uniform_eager_verify(batch)
+        )
+        self.assertFalse(self._worker()._use_uniform_eager_verify(self._batch()))
+
     def test_idle_rank_follows_eager_vote(self):
         worker = self._worker()
         batch = self._batch(can_run_decode_cuda_graph=False)

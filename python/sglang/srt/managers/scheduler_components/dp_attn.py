@@ -24,9 +24,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
-    cuda_graph_fully_disabled,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.runtime_context import (
@@ -360,10 +359,33 @@ def _local_decode_cuda_graph_vote(
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
         return False
-    return (
-        local_batch is None
-        or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt()
+    if local_batch is None or local_batch.forward_mode.is_prebuilt():
+        return True
+    if not local_batch.forward_mode.is_decode_or_idle():
+        return False
+    # Mirror request-dependent replay vetoes before ranks select a verify tier.
+    if local_batch.replace_embeds is not None:
+        return False
+    encoder_lens = local_batch.encoder_lens_cpu
+    return encoder_lens is None or all(length > 0 for length in encoder_lens)
+
+
+def _dspark_verify_graph_unavailable(
+    model_runner: ModelRunner, local_batch: Optional[ScheduleBatch]
+) -> bool:
+    runner = model_runner.decode_cuda_graph_runner
+    if runner is None:
+        return True
+    # DSpark verifies with full hidden states. Eager ranks must signal the
+    # same vote even when only the prefill phase has a captured graph.
+    return getattr(runner, "ragged_verify_mode", False) and (
+        not runner.attn_backend.supports_ragged_verify_graph
+        or runner.capture_hidden_mode < CaptureHiddenMode.FULL
+        or (
+            local_batch is not None
+            and local_batch.forward_mode.is_decode()
+            and local_batch.batch_size() > runner.max_bs
+        )
     )
 
 
@@ -649,7 +671,13 @@ class SchedulerDPAttnAdapter:
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=cuda_graph_fully_disabled(),
+            disable_cuda_graph=(
+                check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                or (
+                    self.spec_algorithm.is_dspark()
+                    and _dspark_verify_graph_unavailable(self.model_runner, local_batch)
+                )
+            ),
             require_mlp_tp_gather=require_mlp_tp_gather(),
             draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,

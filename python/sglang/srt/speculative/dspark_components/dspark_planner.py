@@ -133,6 +133,7 @@ class DSparkVerifyPlanner:
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
+        self._budget_tp_group = None
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
@@ -181,6 +182,21 @@ class DSparkVerifyPlanner:
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
+            if (
+                self.is_compact_mode
+                and not self._is_verify_all
+                and not self._dp_tier_gather_enabled
+            ):
+                # Match the group that participates in DSPARK_PLAN. The optional
+                # host budget decides whether that collective is reached at all.
+                parallel = get_parallel()
+                group = (
+                    parallel.attn_tp_group
+                    if is_dp_attention_enabled()
+                    else parallel.tp_group
+                )
+                if group.world_size > 1:
+                    self._budget_tp_group = group
             self._dp_budget_override_count = 0
             if tp_rank == 0:
                 sps_table_source = (
@@ -424,8 +440,6 @@ class DSparkVerifyPlanner:
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
-        # No collective: the budget derives only from the broadcast draft tokens
-        # (via confidence), replicated req_generation, and the static sps table.
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -449,20 +463,25 @@ class DSparkVerifyPlanner:
         resolved: Optional[ResolvedConfidence],
         req_pool_indices_cpu: torch.Tensor,
     ) -> Optional[int]:
+        group = self._budget_tp_group
+        if group is not None and group.rank_in_group != 0:
+            return group.broadcast_object(None)
+        budget = None
         if resolved is None:
             self._budget_planner.note_non_decode_step()
-            return None
-        current_generation = self.model_runner.req_to_token_pool.req_generation[
-            req_pool_indices_cpu.to(torch.int64)
-        ]
-        return int(
-            self._budget_planner.compute_budget(
-                confidence=resolved.confidence,
-                generation=resolved.generation,
-                current_generation=current_generation,
-                req_pool_indices_cpu=req_pool_indices_cpu,
+        else:
+            current_generation = self.model_runner.req_to_token_pool.req_generation[
+                req_pool_indices_cpu.to(torch.int64)
+            ]
+            budget = int(
+                self._budget_planner.compute_budget(
+                    confidence=resolved.confidence,
+                    generation=resolved.generation,
+                    current_generation=current_generation,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                )
             )
-        )
+        return group.broadcast_object(budget) if group is not None else budget
 
     def schedule_layout(
         self,
@@ -492,34 +511,7 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return self._uniform_layout_cache[key]
-        verify_lens = self._schedule_verify_lens(
-            req_pool_indices=req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
-        )
-        if verify_lens is None:
-            assert dp_tier_num_tokens is None, (
-                "dp tier agreement present but local verify lens are None; "
-                "the gathered hint and the local budget diverged"
-            )
-            if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-                return uniform_ragged_layout(
-                    bs=len(req_pool_indices),
-                    device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
-                )
-            return None
-        bs = int(verify_lens.shape[0])
+        bs = int(req_pool_indices.shape[0])
         tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
         if dp_tier_num_tokens is not None:
             assert global_num_reqs is not None, (
@@ -551,8 +543,39 @@ class DSparkVerifyPlanner:
             tier_num_tokens=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        graph_num_tokens = None
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            if self._align_verify_tokens_to_graph_tier and budget is not None:
+                budget = graph_tier_fill_budget(
+                    graph_num_tokens=graph_num_tokens,
+                    bs=bs,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    min_verify_len=self._schedule_cfg.min_verify_len,
+                )
+        verify_lens = self._schedule_verify_lens(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            device=device,
+            confidence=confidence,
+            budget=budget,
+        )
+        if verify_lens is None:
+            assert dp_tier_num_tokens is None, (
+                "dp tier agreement present but local verify lens are None; "
+                "the gathered hint and the local budget diverged"
+            )
+            if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+                return uniform_ragged_layout(
+                    bs=bs,
+                    device=device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                    tier_num_reqs=global_num_reqs,
+                )
+            return None
+        if graph_num_tokens is not None:
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
             )
@@ -567,59 +590,6 @@ class DSparkVerifyPlanner:
             device=device,
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
-        )
-
-    def _budget_aligned_to_graph_tier(
-        self,
-        *,
-        req_pool_indices: torch.Tensor,
-        budget: Optional[int],
-        global_num_reqs: Optional[int],
-        dp_tier_num_tokens: Optional[int],
-    ) -> Optional[int]:
-        # Flag off (default): returns budget unchanged, so the schedule below is
-        # byte-for-byte the original. On: ceils role 1's verify-token total up to the
-        # padded graph tier graph_num_tokens = round_up(dp-max tier, captured token
-        # bucket), which folds in the cuda-graph bucket round-up (H1) and the dp
-        # cross-rank max (H2); role 2 (the single top-k) then admits that many real
-        # draft tokens. graph_num_tokens is derived from the same (request count,
-        # gathered dp tier, original budget) inputs the layout below uses, so the two
-        # agree by construction -- this only feeds the larger budget into the top-k,
-        # it does not touch the layout's own tier computation.
-        if not self._align_verify_tokens_to_graph_tier or budget is None:
-            return budget
-        tier_num_reqs = (
-            int(req_pool_indices.shape[0])
-            if global_num_reqs is None
-            else global_num_reqs
-        )
-        if dp_tier_num_tokens is not None:
-            tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier:
-            tier_num_tokens = local_verify_tier_num_tokens(
-                bs=tier_num_reqs,
-                verify_token_budget=budget,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                min_verify_len=self._schedule_cfg.min_verify_len,
-            )
-        else:
-            tier_num_tokens = None
-        graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
-            num_reqs=tier_num_reqs,
-            ragged_verify_mode=self._ragged_verify_mode,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_num_tokens=tier_num_tokens,
-        )
-        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor <= 0 or capture_num_tokens is None:
-            return budget
-        graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-        return graph_tier_fill_budget(
-            graph_num_tokens=graph_num_tokens,
-            bs=int(req_pool_indices.shape[0]),
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            min_verify_len=self._schedule_cfg.min_verify_len,
         )
 
     def _schedule_verify_lens(
