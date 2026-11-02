@@ -1140,6 +1140,13 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             cpu_buffer.copy_(gpu_physical_count, non_blocking=True)
             copy_done = torch.cuda.Event()
             copy_done.record(self._metric_heatmap_copy_stream)
+        # The source is usually a temporary (e.g. a window sum) that the caller
+        # drops right after this returns.  Without this the caching allocator
+        # hands its block to the next allocation on the forward stream while
+        # the side-stream copy is still pending, and the heatmap reads that
+        # tensor's bytes instead (float32 utilization rates read as int64 show
+        # up as ~4.5e18 per cell).
+        gpu_physical_count.record_stream(self._metric_heatmap_copy_stream)
         try:
             self._metric_heatmap_pending.put_nowait((copy_done, cpu_buffer))
         except queue.Full:
