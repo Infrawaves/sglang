@@ -70,7 +70,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.ragged_verify import unpad_dense_verify_rows
+from sglang.srt.speculative.ragged_verify import unpad_dense_verify_tensors
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_float4_e2m1fn_x2,
@@ -2010,15 +2010,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     # rows before the DCP combine, which is row-wise. Tier
                     # padding rows get out = 0, lse = 0 on every DCP rank, so
                     # they combine to a finite 0.
-                    output = unpad_dense_verify_rows(
-                        output,
-                        cu_seqlens_q=unpad_cu_seqlens_q,
-                        seq_lens_q=unpad_seq_lens_q,
-                        num_tokens=unpad_sum_seq_lens_q,
-                        width=draft_token_num,
-                    )
-                    lse = unpad_dense_verify_rows(
-                        lse,
+                    output, lse = unpad_dense_verify_tensors(
+                        (output, lse),
                         cu_seqlens_q=unpad_cu_seqlens_q,
                         seq_lens_q=unpad_seq_lens_q,
                         num_tokens=unpad_sum_seq_lens_q,
