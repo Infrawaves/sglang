@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from multiprocessing import shared_memory
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import patch
@@ -138,7 +139,18 @@ def _export_draft_ipc(
     return handles, locations
 
 
-def _open_draft_ipc(record: DraftPeerRecord, gpu_id: int) -> List[int]:
+def _close_draft_ipc(base: int, gpu_id: int) -> None:
+    from cuda.bindings import driver as drv
+
+    torch.cuda.set_device(gpu_id)
+    (err,) = drv.cuIpcCloseMemHandle(base)
+    if err != drv.CUresult.CUDA_SUCCESS:
+        logger.error("cuIpcCloseMemHandle(%#x) failed: %s", base, err)
+
+
+def _open_draft_ipc(
+    record: DraftPeerRecord, gpu_id: int, resources: ExitStack
+) -> List[int]:
     from sglang.srt.distributed.device_communicators.cuda_wrapper import (
         CudaRTLibrary,
         cudaIpcMemHandle_t,
@@ -151,7 +163,9 @@ def _open_draft_ipc(record: DraftPeerRecord, gpu_id: int) -> List[int]:
     for raw in record.ipc_handles:
         handle = cudaIpcMemHandle_t.from_buffer_copy(raw)
         # Opens with cudaIpcMemLazyEnablePeerAccess.
-        bases.append(int(lib.cudaIpcOpenMemHandle(handle).value))
+        base = int(lib.cudaIpcOpenMemHandle(handle).value)
+        resources.callback(_close_draft_ipc, base, gpu_id)
+        bases.append(base)
     return [bases[index] + offset for index, offset in record.entry_locations]
 
 
@@ -184,7 +198,7 @@ class DraftPeerGather:
         self._draft_ptrs: Dict[int, List[int]] = {
             local_rank: [int(ptr) for ptr in local_draft_ptrs]
         }
-        self._peer_shms: Dict[int, shared_memory.SharedMemory] = {}
+        self._peer_resources = ExitStack()
         self._peer_ready: Dict[int, npt.NDArray[np.uint64]] = {
             local_rank: self._local_ready
         }
@@ -225,30 +239,37 @@ class DraftPeerGather:
         self._local_ready[0] = self._enqueued_seq
         self._has_pending = False
 
-    def open_peers(self, peer_ranks: Sequence[int]) -> None:
-        """Map ``peer_ranks``' draft pools and seq shm; raise if any cannot be."""
+    @contextmanager
+    def prepare_peers(self, peer_ranks: Sequence[int]):
+        """Publish new mappings only after the registration succeeds."""
         host = self.records[self.local_rank].hostname
-        for rank in peer_ranks:
-            if rank in self._peer_ready:
-                continue
-            record = self.records[rank]
-            if record.hostname != host:
-                raise RuntimeError(
-                    "PD DCP draft peer gather needs node-local peers, but attn-TP "
-                    f"rank {rank} is on {record.hostname} and rank "
-                    f"{self.local_rank} is on {host}"
-                )
-            if record.export_error is not None:
-                raise RuntimeError(
-                    f"PD DCP draft peer gather cannot map attn-TP rank {rank}'s "
-                    f"draft KV over CUDA IPC: {record.export_error}"
-                )
-            # Attach the shm first: a failed attach must not leave an opened
-            # IPC handle that a later registration would open again.
-            shm = _attach_seq_shm(record.seq_shm_name)
-            self._draft_ptrs[rank] = _open_draft_ipc(record, self.gpu_id)
-            self._peer_shms[rank] = shm
-            self._peer_ready[rank] = _ready_view(shm)
+        new_ptrs = {}
+        new_ready = {}
+        with ExitStack() as resources:
+            for rank in peer_ranks:
+                if rank in self._peer_ready:
+                    continue
+                record = self.records[rank]
+                if record.hostname != host:
+                    raise RuntimeError(
+                        "PD DCP draft peer gather needs node-local peers, but attn-TP "
+                        f"rank {rank} is on {record.hostname} and rank "
+                        f"{self.local_rank} is on {host}"
+                    )
+                if record.export_error is not None:
+                    raise RuntimeError(
+                        f"PD DCP draft peer gather cannot map attn-TP rank {rank}'s "
+                        f"draft KV over CUDA IPC: {record.export_error}"
+                    )
+                shm = _attach_seq_shm(record.seq_shm_name)
+                resources.callback(shm.close)
+                new_ptrs[rank] = _open_draft_ipc(record, self.gpu_id, resources)
+                new_ready[rank] = _ready_view(shm)
+            yield
+            self._draft_ptrs.update(new_ptrs)
+            self._peer_ready.update(new_ready)
+            if new_ptrs:
+                self._peer_resources.enter_context(resources.pop_all())
 
     def draft_ptrs(self, rank: int) -> List[int]:
         return self._draft_ptrs[rank]
@@ -288,9 +309,8 @@ class DraftPeerGather:
             sleeps += 1
 
     def close(self) -> None:
-        for shm in self._peer_shms.values():
-            shm.close()
-        self._peer_shms.clear()
+        self._peer_ready.clear()
+        self._peer_resources.close()
         self._seq_shm.close()
         self._seq_shm.unlink()
 
@@ -328,31 +348,6 @@ def init_draft_peer_gather(
         seq_shm=seq_shm,
         gpu_id=gpu_id,
     )
-
-
-def init_draft_pack_buffers(
-    *,
-    register_fn: Callable[[int, int], None],
-    count: int,
-    gpu_id: int,
-    max_tokens: int,
-    draft_row_nbytes: int,
-) -> list:
-    """One registered pack buffer per transfer queue, ``max_tokens`` decode rows."""
-    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-    from sglang.srt.disaggregation.common.staging_handler import (
-        _get_custom_mem_pool,
-    )
-
-    device = f"cuda:{gpu_id}"
-    custom_mem_pool, _ = _get_custom_mem_pool(device)
-    size_bytes = max_tokens * draft_row_nbytes
-    buffers = []
-    for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        register_fn(buf.get_ptr(), buf.get_size())
-        buffers.append(buf)
-    return buffers
 
 
 def _launch_gather(

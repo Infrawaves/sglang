@@ -344,7 +344,9 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         ipc = patch.object(
             draft_peer_gather,
             "_open_draft_ipc",
-            side_effect=lambda record, gpu_id: ptrs_by_shm[record.seq_shm_name],
+            side_effect=lambda record, gpu_id, resources: ptrs_by_shm[
+                record.seq_shm_name
+            ],
         )
         ipc.start()
         self.addCleanup(ipc.stop)
@@ -423,7 +425,11 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         manager.failure_lock = threading.Lock()
         manager.failure_records = {}
         manager.transfer_queues = [queue.Queue()]
-        manager.engine = SimpleNamespace(batch_register=MagicMock())
+        manager._registered_pack_buffers = {}
+        manager.engine = SimpleNamespace(
+            batch_register=MagicMock(return_value=0),
+            batch_deregister=MagicMock(return_value=0),
+        )
         manager.server_socket = None
         manager.bootstrap_port = 30000
         manager._send_multipart_locked = MagicMock()
@@ -474,13 +480,12 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
 
         with (
             patch.object(manager, "_make_worker_recv", return_value=recv),
-            patch.object(manager, "_register_staging_memory"),
             patch(
                 "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
                 return_value=(None, None),
             ),
             patch(
-                "sglang.srt.disaggregation.common.staging_buffer.StagingBuffer",
+                "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer",
                 side_effect=self._pack_buffer,
             ),
         ):
@@ -735,7 +740,8 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         unless an earlier chunk still waits on an unsynced forward."""
         cluster = self._build(2, 1)
         sender, peer = (m._draft_peer_gather for m in cluster.managers)
-        sender.open_peers([0, 1])
+        with sender.prepare_peers([0, 1]):
+            pass
         ready = dict(peer_ranks=[0, 1], timeout_s=0, is_cancelled=lambda: False)
 
         def enqueue(wait_event=None):
@@ -766,7 +772,8 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
         with envs.SGLANG_DISAGG_DRAFT_PEER_WAIT_STATS_INTERVAL.override(1e-9):
             cluster = self._build(2, 1)
         sender, peer = (m._draft_peer_gather for m in cluster.managers)
-        sender.open_peers([0, 1])
+        with sender.prepare_peers([0, 1]):
+            pass
         ready = dict(peer_ranks=[0, 1], timeout_s=60, is_cancelled=lambda: False)
         with self.assertLogs(draft_peer_gather.logger, "INFO") as logs:
             self.assertTrue(
@@ -797,6 +804,70 @@ class TestMooncakeDcpPageDraftPeerGather(CustomTestCase):
             dst_dcp_size=self.dcp_size,
             dst_kv_item_lens=[0] + [draft_item_len] * self.num_draft,
         )
+
+    def test_invalidated_registration_retires_queued_chunk_without_io(self):
+        for retry_registered in (False, True):
+            with self.subTest(retry_registered=retry_registered):
+                self._cluster = cluster = self._build(4, 2)
+                self._register_all(cluster, 2)
+                sender = cluster.managers[0]
+                self._enqueue(sender, 0)
+                if retry_registered:
+                    sender.decode_kv_args_table[self._session(0)].registration_epoch = 1
+                else:
+                    del sender.decode_kv_args_table[self._session(0)]
+                self._drain(sender)
+                self.assertEqual(sender.request_status[self.room], KVPoll.Failed)
+                self.assertIn(
+                    "No valid KV registration", sender.failure_records[self.room]
+                )
+                self.assertTrue(sender._transfer_lifetime.is_drained(self.room))
+                self.assertEqual(sender._transfer_data.bytes_sent, 0)
+
+    def test_pack_registration_rolls_back_and_can_retry(self):
+        self._cluster = cluster = self._build(4, 2)
+        manager = cluster.managers[0]
+        info = self._registration_info(2, self.draft_src_width * 2)
+        manager.transfer_queues *= 2
+        manager.engine.batch_register.side_effect = [0, -7, 0, 0]
+        with (
+            get_context().override_server_args(chunked_prefill_size=5),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.allocate_pack_buffers",
+                side_effect=lambda gpu_id, count, nbytes: [
+                    self._pack_buffer(nbytes) for _ in range(count)
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "registration failed.*-7"):
+                manager._resolve_draft_peer_ranks(info)
+            first_ptrs = manager.engine.batch_register.call_args_list[0].args[0]
+            manager.engine.batch_deregister.assert_called_once_with(first_ptrs)
+            self.assertIsNone(manager._draft_pack_buffers)
+            self.assertEqual(manager._registered_pack_buffers, {})
+            self.assertEqual(manager._resolve_draft_peer_ranks(info), [0, 1])
+            self.assertEqual(len(manager._draft_pack_buffers), 2)
+
+    def test_partial_ipc_open_rolls_back_new_peers(self):
+        cluster = self._build(4, 1)
+        gather = cluster.managers[0]._draft_peer_gather
+        closed = []
+
+        def open_peer(record, gpu_id, resources):
+            resources.callback(closed.append, record.seq_shm_name)
+            if record is gather.records[2]:
+                raise RuntimeError("second IPC mapping failed")
+            return [1234]
+
+        with patch.object(draft_peer_gather, "_open_draft_ipc", side_effect=open_peer):
+            with self.assertRaisesRegex(RuntimeError, "second IPC mapping failed"):
+                with gather.prepare_peers([0, 1, 2]):
+                    pass
+        self.assertEqual(closed, [gather.records[i].seq_shm_name for i in (2, 1)])
+        self.assertEqual(set(gather._peer_ready), {0})
+        with gather.prepare_peers([0, 1, 2]):
+            pass
+        self.assertEqual(set(gather._peer_ready), {0, 1, 2})
 
     def test_registration_rejects_staging(self):
         cluster = self._build(4, 2)

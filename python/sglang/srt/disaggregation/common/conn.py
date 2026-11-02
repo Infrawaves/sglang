@@ -435,6 +435,10 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
+    def _register_pack_buffers(self, buffers) -> None:
+        for buf in buffers:
+            self._register_staging_memory(buf.get_ptr(), buf.get_size())
+
     def _init_dcp_pack_buffers_once(
         self, dcp_size: int, *, include_draft: bool = False
     ) -> None:
@@ -447,7 +451,7 @@ class CommonKVManager(BaseKVManager):
         max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
         max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
-            self._register_staging_memory,
+            self._register_pack_buffers,
             self.kv_args,
             len(self.transfer_queues),
             dcp_size,
@@ -1893,9 +1897,11 @@ class CommonKVSender(BaseKVSender):
         for peer, info in self.kv_mgr.transfer_infos.get(
             self.bootstrap_room, {}
         ).items():
+            registration = self.kv_mgr.decode_kv_args_table.get(peer)
             if (
                 not info.is_dummy
-                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
+                and registration is not None
+                and registration.requires_dcp_relayout
             ):
                 return self.kv_mgr._dcp_pack_max_tokens
         return None
