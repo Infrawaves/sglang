@@ -84,75 +84,66 @@ class GroupReadPlan(msgspec.Struct, frozen=True):
         return chain, end
 
 
-def _group_candidates(
-    group_idx: int, group: int, start_page: int, end_page: int
-) -> list[Segment]:
-    """Every segment of one group ending in (start_page, end_page]."""
-    base = group_idx * group
-    return [
-        (base + a, base + b)
-        for b in range(1, group + 1)
-        if start_page < base + b <= end_page
-        for a in range(b)
-    ]
-
-
 def plan_group_reads(
     start_page: int,
     num_pages: int,
     group: int,
     probe: Callable[[list[Segment]], list[bool]],
 ) -> GroupReadPlan:
-    """Longest segment chain from ``start_page`` in at most two probe rounds.
-
-    Round 1 probes the full key of every inner group and every segment of a
-    partial edge group. Round 2 probes the segments of a missing inner group
-    whose left neighbour holds data, i.e. a radix node boundary. A missing
-    group right after another missing one (a cold tail, or two boundaries in
-    adjacent groups) is not expanded, so the chain stops there.
-    """
-    if num_pages == 0:
-        return GroupReadPlan(reach={})
-    end_page = start_page + num_pages
-    groups = range(start_page // group, (end_page - 1) // group + 1)
-
-    def is_inner(g: int) -> bool:
-        return g * group >= start_page and (g + 1) * group <= end_page
-
-    def full(g: int) -> Segment:
-        return g * group, (g + 1) * group
-
-    round1 = [
+    """Probe whole groups and likely node boundaries in batches, then follow
+    reachable segment ends until the first gap."""
+    spans = group_segments(start_page, num_pages, group)
+    whole = [span for span in spans if span[1] - span[0] == group]
+    exists = dict(zip(whole, probe(whole))) if whole else {}
+    # A radix node boundary often splits just one otherwise hot group. Probe
+    # both halves for every possible cut in one RPC across all such groups.
+    # A long run of full-key misses adds speculative probes only at its edges.
+    boundary_segments = [
         segment
-        for g in groups
-        for segment in (
-            [full(g)]
-            if is_inner(g)
-            else _group_candidates(g, group, start_page, end_page)
-        )
+        for lo, hi in whole
+        if not exists[(lo, hi)]
+        and (exists.get((lo - group, lo)) or exists.get((hi, hi + group)))
+        for cut in range(lo + 1, hi)
+        for segment in ((lo, cut), (cut, hi))
     ]
-    exists = dict(zip(round1, probe(round1)))
+    while boundary_segments:
+        exists.update(zip(boundary_segments, probe(boundary_segments)))
+        # A group with more than one split may also have segments between
+        # internal cuts. Follow confirmed ends across all hot groups together.
+        starts = {hi for lo, hi in boundary_segments if hi % group and exists[(lo, hi)]}
+        boundary_segments = [
+            (start, end)
+            for start in starts
+            for end in range(start + 1, (start // group + 1) * group)
+            if (start, end) not in exists
+        ]
+    hits = []
+    for lo, hi in spans:
+        if exists.get((lo, hi)):
+            hits.append((lo, hi))
+            continue
 
-    def left_has_data(g: int) -> bool:
-        left = g - 1
-        if left < groups.start:
-            return True
-        if is_inner(left):
-            return exists[full(left)]
-        return any(ok and seg[1] == g * group for seg, ok in exists.items())
-
-    round2 = [
-        segment
-        for g in groups
-        if is_inner(g) and not exists[full(g)] and left_has_data(g)
-        for segment in _group_candidates(g, group, start_page, end_page)
-        if segment != full(g)
-    ]
-    if round2:
-        exists.update(zip(round2, probe(round2)))
-    return GroupReadPlan(
-        reach=_reach(start_page, [seg for seg, ok in exists.items() if ok])
-    )
+        # A partial first group may begin before the query (leading pages go
+        # to scratch). Later segments must start exactly at a reachable end.
+        frontier = set(range(lo - lo % group, lo + 1))
+        visited = set(frontier)
+        while frontier:
+            candidates = [
+                (start, end)
+                for start in frontier
+                for end in range(max(lo, start) + 1, hi + 1)
+            ]
+            found = [seg for seg in candidates if exists.get(seg)]
+            missing = [seg for seg in candidates if seg not in exists]
+            if missing:
+                found.extend(seg for seg, ok in zip(missing, probe(missing)) if ok)
+            hits.extend(found)
+            ends = {end for _, end in found}
+            frontier = ends - visited - {hi}
+            visited.update(ends)
+        if hi not in visited:
+            break
+    return GroupReadPlan(reach=_reach(start_page, hits))
 
 
 def _reach(start_page: int, segments: list[Segment]) -> dict[int, Segment]:
