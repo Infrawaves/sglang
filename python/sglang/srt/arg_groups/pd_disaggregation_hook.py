@@ -36,9 +36,12 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
             "Prefill servers do not need this option; they send KV "
             "according to the decode layout."
         )
-    if cfg.disaggregation_transfer_backend != "mooncake":
+    # Fake moves no KV, so page layout only affects the decode-side pool and
+    # attention kernels; Mooncake is the only real backend with page relayout.
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "fake"):
         raise ValueError(
-            "--dcp-kv-layout page requires --disaggregation-transfer-backend mooncake."
+            "--dcp-kv-layout page requires --disaggregation-transfer-backend "
+            "mooncake, or fake for synthetic benchmarking."
         )
     # DSPARK verifies on the target's decode kernel and transfers its
     # replicated draft KV alongside the target pages.
