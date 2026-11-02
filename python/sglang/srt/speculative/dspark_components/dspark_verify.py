@@ -248,6 +248,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=idle_layout,
+            is_padding_only=idle_layout is not None,
         )
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device

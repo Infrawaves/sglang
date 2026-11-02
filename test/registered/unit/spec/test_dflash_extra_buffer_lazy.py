@@ -151,6 +151,60 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
         self.assertEqual(calls, ["init_new"])
         self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
 
+    def test_idle_dspark_compact_replay_treats_dummy_slots_as_padding(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            build_replay_fb_view,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            TargetVerifyExecutor,
+        )
+
+        executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
+        executor.model_runner = SimpleNamespace(device="cpu")
+        executor.target_worker = mock.Mock()
+        executor.verify_epilogue = None
+        executor.verify_num_draft_tokens = 4
+        runner = executor.target_worker.model_runner.decode_cuda_graph_runner
+        runner.can_run_graph.return_value = True
+        batch = SimpleNamespace(forward_mode=ForwardMode.IDLE, reqs=[])
+        layout = SimpleNamespace(verify_lens=torch.tensor([2, 4]), graph_num_tokens=8)
+
+        with (
+            mock.patch.object(dflash_info, "_is_npu", False),
+            mock.patch(
+                "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify"
+            ) as prepare_track,
+            mock.patch.object(dflash_info.ForwardBatch, "init_new") as init_new,
+        ):
+            executor.run_idle_participation(batch=batch, idle_layout=layout)
+
+        prepare_track.assert_not_called()
+        runner.load_batch.assert_called_once_with(init_new.return_value)
+        self.assertEqual(batch.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertEqual(batch.input_ids.numel(), layout.graph_num_tokens)
+
+        forward_batch = init_new.return_value
+        forward_batch.lora_ids = None
+        # The same captured tier has four padded slots on the idle rank and
+        # only two on a peer that owns two real requests.
+        for spec_info, expected_padding in (
+            (batch.spec_info, 4),
+            (self._spec_input(), 2),
+        ):
+            forward_batch.spec_info = spec_info
+            replay_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=mock.MagicMock(),
+                bs=4,
+                raw_bs=batch.seq_lens.numel(),
+                num_tokens=layout.graph_num_tokens,
+                global_num_tokens_cpu=None,
+                seq_len_fill_value=1,
+                capture_forward_mode=ForwardMode.TARGET_VERIFY,
+                is_encoder_decoder=False,
+            )
+            self.assertEqual(replay_view.num_padding, expected_padding)
+
 
 if __name__ == "__main__":
     unittest.main()

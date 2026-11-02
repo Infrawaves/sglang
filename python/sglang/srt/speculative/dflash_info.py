@@ -51,6 +51,8 @@ class DFlashVerifyInput(SpecInput):
     live_seq_lens_cpu: Optional[torch.Tensor] = None
     # Conservative request-lifetime bound for candidate graph dispatch.
     candidate_max_seq_len_upper_bound: Optional[int] = None
+    # An idle DP rank can replay the busy peers' verify graph with dummy rows.
+    is_padding_only: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -90,7 +92,7 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        if not batch.forward_mode.is_idle():
+        if not batch.forward_mode.is_idle() and not self.is_padding_only:
             # Rebuild mamba track indices (lazy: gather the positions planned
             # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
             # before init_new snapshots them into the verify ForwardBatch.
