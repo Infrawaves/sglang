@@ -295,10 +295,15 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.attn_dcp_size > 1
+                and not forward_batch.forward_mode.is_target_verify()
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
             ):
-                # prepare kv cache buffer for dcp to gather kv cache
+                # Prefill gathers the prefix KV. Target verify reads the local
+                # shard using the decode backend's metadata.
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,

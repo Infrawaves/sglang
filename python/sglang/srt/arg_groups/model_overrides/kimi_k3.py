@@ -53,6 +53,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
         overrides = {}
+        prefill_backend, decode_backend = attention_backends_of(cfg)
         if cfg.enable_symm_mem:
             logger.warning(
                 "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
@@ -80,6 +81,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     "SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1 "
                     f"(got {ragged_mode.value!r})."
                 )
+            if compact_allowed and decode_backend == "aiter":
+                raise ValueError(
+                    "Kimi-K3 AITER DCP verify requires fixed-width queries. "
+                    "Use SGLANG_RAGGED_VERIFY_MODE=static."
+                )
 
             # DSPARK target-verify + draft-extend must run on the decode
             # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
@@ -88,7 +94,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
-        prefill_backend, decode_backend = attention_backends_of(cfg)
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
