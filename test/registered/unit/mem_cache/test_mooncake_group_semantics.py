@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
@@ -283,6 +284,29 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_grouped_reads_require_every_component_to_fill_its_buffers(self):
+        store, backend = _make_store(is_mla_model=False)
+        store.storage_page_group = 2
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        pages = [f"page{i}" for i in range(6)]
+        store.batch_set_v1(pages, torch.arange(6))
+
+        # The first segment includes an eight-byte scratch page per component.
+        extra = HiCacheStorageExtraInfo(start_page=1)
+        extra.storage_plans = store.batch_exists_v2(
+            pages[1:], extra_info=extra
+        ).storage_plans
+        for byte_counts, expected in (
+            ([16, 16, 16, 16, 16, 16], [True] * 5),
+            ([8, 16, 16, 16, 16, 16], [False] * 5),
+            ([16, 16, 16, 8, 16, 16], [True, False, False, False, False]),
+        ):
+            with self.subTest(byte_counts=byte_counts):
+                backend.batch_get_into_multi_buffers = lambda *_: byte_counts
+                self.assertEqual(
+                    store.batch_get_v1(pages[1:], torch.arange(5), extra), expected
+                )
+
     def test_only_mla_data_owners_register_with_mooncake(self):
         """A mapped follower must not register the leader's MLA storage."""
         for read_only in (True, False):
@@ -611,6 +635,10 @@ class TestMooncakeReadFailureMetrics(CustomTestCase):
         store = self._store_with_reads([8, 8])
         self.assertEqual(self._read(store)[PoolName.INDEXER], [True, True])
         self.assertEqual(store.get_stats().read_failed_keys, {})
+
+    def test_short_sidecar_object_is_a_miss(self):
+        store = self._store_with_reads([4, 8])
+        self.assertEqual(self._read(store)[PoolName.INDEXER], [False, True])
 
     def test_get_stats_drains_so_counts_are_not_exported_twice(self):
         store = self._store_with_reads([-800, 8])
