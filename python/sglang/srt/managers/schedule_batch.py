@@ -2499,6 +2499,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None
     spec_verify_tier_num_tokens: int = -1
+    # DSpark compact verify: the budget computed before the MLP sync (so the sync
+    # can carry it), and whether that happened for the batch about to run.
+    spec_verify_token_budget_presync: Optional[int] = None
+    spec_verify_budget_presync: bool = False
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2551,6 +2555,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Per DP rank: its attention-TP rank 0's verify budget + 1 (0 = no budget).
+    global_spec_verify_token_budget_enc: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None

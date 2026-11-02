@@ -604,11 +604,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            ragged_mode = read_ragged_verify_mode()
+            compact_allowed = (
+                ragged_mode is RaggedVerifyMode.COMPACT
+                and envs.SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER.get()
+            )
+            if ragged_mode is not RaggedVerifyMode.STATIC and not compact_allowed:
                 raise ValueError(
                     "DSpark with dp attention + "
                     f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "SGLANG_RAGGED_VERIFY_MODE=static (compact is available "
+                    "behind SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1)."
                 )
         if cfg.attn_cp_size > 1:
             raise ValueError(

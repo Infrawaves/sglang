@@ -1711,6 +1711,7 @@ class Scheduler(
         )
 
         self._confidence_budget_prepare = None
+        self._confidence_budget_pre_sync = None
         if (
             needs_confidence_relay
             and self.enable_overlap
@@ -1718,6 +1719,9 @@ class Scheduler(
         ):
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
+            )
+            self._confidence_budget_pre_sync = (
+                self.draft_worker.get_confidence_budget_pre_sync()
             )
 
         if use_mlx():
@@ -3846,6 +3850,8 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
+        if need_mlp_sync:
+            self.prepare_verify_budget_pre_sync(ret)
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
@@ -4504,6 +4510,17 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def prepare_verify_budget_pre_sync(self, batch: Optional[ScheduleBatch]) -> None:
+        """DSpark compact verify under DP attention: compute the verify budget
+        before the MLP sync so the sync carries it to every DP rank. Call right
+        before the MLP sync, after the decode batch's request set is final."""
+        if (
+            self._confidence_budget_pre_sync is not None
+            and batch is not None
+            and batch.forward_mode.is_decode()
+        ):
+            self._confidence_budget_pre_sync(batch, self.future_map)
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(

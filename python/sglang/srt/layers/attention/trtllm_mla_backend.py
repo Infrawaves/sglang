@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.ragged_verify import unpad_dense_verify_rows
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_float4_e2m1fn_x2,
@@ -1861,7 +1862,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     0 if dcp_enabled else draft_token_num
                 )
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
-                if ragged_layout is None or dcp_enabled:
+                if ragged_layout is None:
                     q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
                 else:
@@ -1971,6 +1972,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     self._dense_q_indptr(bs, draft_token_num),
                     draft_token_num,
                 )
+                if needs_unpad:
+                    # Compact verify: the packed q was padded to the dense
+                    # [bs, draft_token_num] layout for the fixed-length page
+                    # kernel (row j of a request stays bounded by prefix + j + 1
+                    # through causal_seqs). Bring out and lse back to the packed
+                    # rows before the DCP combine, which is row-wise. Tier
+                    # padding rows get out = 0, lse = 0 on every DCP rank, so
+                    # they combine to a finite 0.
+                    output = unpad_dense_verify_rows(
+                        output,
+                        cu_seqlens_q=unpad_cu_seqlens_q,
+                        seq_lens_q=unpad_seq_lens_q,
+                        num_tokens=unpad_sum_seq_lens_q,
+                        width=draft_token_num,
+                    )
+                    lse = unpad_dense_verify_rows(
+                        lse,
+                        cu_seqlens_q=unpad_cu_seqlens_q,
+                        seq_lens_q=unpad_seq_lens_q,
+                        num_tokens=unpad_sum_seq_lens_q,
+                        width=draft_token_num,
+                    )
                 return output.flatten(1), lse
 
             raw_out = self._run_decode_kernel(

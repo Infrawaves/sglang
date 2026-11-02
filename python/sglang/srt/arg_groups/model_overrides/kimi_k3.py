@@ -61,17 +61,24 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["enable_symm_mem"] = False
 
         if cfg.speculative_algorithm == "DSPARK":
+            from sglang.srt.environ import envs
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
             )
 
             ragged_mode = read_ragged_verify_mode()
-            if ragged_mode is not RaggedVerifyMode.STATIC:
+            compact_allowed = (
+                ragged_mode is RaggedVerifyMode.COMPACT
+                and envs.SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER.get()
+            )
+            if ragged_mode is not RaggedVerifyMode.STATIC and not compact_allowed:
                 raise ValueError(
                     "Kimi-K3 DCP + DSPARK currently requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
-                    f"not validated under DCP (got {ragged_mode.value!r})."
+                    "SGLANG_RAGGED_VERIFY_MODE=static; cap-accept is not "
+                    "supported under DCP, and compact needs "
+                    "SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1 "
+                    f"(got {ragged_mode.value!r})."
                 )
 
             # DSPARK target-verify + draft-extend must run on the decode

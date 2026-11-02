@@ -195,6 +195,40 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
 
+def unpad_dense_verify_rows(
+    dense: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens_q: torch.Tensor,
+    num_tokens: int,
+    width: int,
+    fill_value: float = 0.0,
+) -> torch.Tensor:
+    """Gather rows of a dense ``[bs * width, ...]`` verify result back into the
+    packed (compact) row order.
+
+    Packed row ``t`` belongs to request ``r`` with ``cu_seqlens_q[r] <= t <
+    cu_seqlens_q[r + 1]`` and reads dense row ``r * width + (t - cu_seqlens_q[r])``.
+    Rows past the packed tail (graph-tier padding) and rows at or beyond a
+    request's ``seq_lens_q`` get ``fill_value``. Inverse of the dense pad of the
+    query; no host sync, so it is CUDA-graph capturable.
+    """
+    bs = int(seq_lens_q.shape[0])
+    device = dense.device
+    rows = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    starts = cu_seqlens_q[:-1].to(device=device, dtype=torch.int64)
+    ends = cu_seqlens_q[1:].to(device=device, dtype=torch.int64)
+    req = torch.searchsorted(ends, rows, right=True)
+    valid = req < bs
+    req = req.clamp(max=max(bs - 1, 0))
+    within = rows - starts[req]
+    valid = valid & (within < seq_lens_q.to(device=device, dtype=torch.int64)[req])
+    src = req * width + within.clamp(min=0, max=width - 1)
+    out = dense.index_select(0, src)
+    mask = valid.view(-1, *([1] * (dense.dim() - 1)))
+    return out.masked_fill(~mask, fill_value)
+
+
 def build_capture_verify_lens(
     *,
     num_tokens: int,

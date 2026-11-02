@@ -118,6 +118,13 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    # DSpark compact verify, carried here so every DP rank agrees on one verify
+    # token tier per step without a collective of its own. 0 is neutral (no
+    # decode rows on this rank); -1 is a decode rank without a budget, which
+    # turns the tier off for the step. The budget is stored as budget + 1 so a
+    # missing budget is 0, keeping the neutral row all-zero.
+    spec_verify_tier_num_tokens: int = 0
+    spec_verify_token_budget_enc: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -126,6 +133,9 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    # Per attention-DP rank, read from each DP's attention-TP rank 0.
+    global_spec_verify_tier_num_tokens: list[int] = None
+    global_spec_verify_token_budget_enc: list[int] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -139,6 +149,8 @@ class MLPSyncBatchInfo:
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
+                self.spec_verify_tier_num_tokens,
+                self.spec_verify_token_budget_enc,
             ],
             device=device,
             dtype=dtype,
@@ -156,6 +168,8 @@ class MLPSyncBatchInfo:
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
+                0,  # spec_verify_tier_num_tokens
+                0,  # spec_verify_token_budget_enc
             ],
             device=device,
             dtype=dtype,
@@ -166,6 +180,8 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_spec_verify_tier_num_tokens = [self.spec_verify_tier_num_tokens]
+        self.global_spec_verify_token_budget_enc = [self.spec_verify_token_budget_enc]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -239,6 +255,8 @@ class MLPSyncBatchInfo:
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
+        self.global_spec_verify_tier_num_tokens = tp0_info_cpu[:, 9].tolist()
+        self.global_spec_verify_token_budget_enc = tp0_info_cpu[:, 10].tolist()
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -286,6 +304,12 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+        batch.global_spec_verify_tier_num_tokens = getattr(
+            mlp_sync_info, "global_spec_verify_tier_num_tokens", None
+        )
+        batch.global_spec_verify_token_budget_enc = getattr(
+            mlp_sync_info, "global_spec_verify_token_budget_enc", None
+        )
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -293,6 +317,24 @@ def _update_gather_batch(
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
+    )
+
+
+def local_spec_verify_tier(local_batch: Optional[ScheduleBatch]) -> tuple[int, int]:
+    """(verify token tier, budget + 1) this rank reports to the MLP sync.
+
+    Only a decode batch whose DSpark verify budget was computed before this sync
+    reports a tier; any other decode batch reports -1, which disables the
+    DP-shared tier for the step on every rank.
+    """
+    if local_batch is None or not local_batch.forward_mode.is_decode():
+        return 0, 0
+    if not getattr(local_batch, "spec_verify_budget_presync", False):
+        return -1, 0
+    budget = local_batch.spec_verify_token_budget_presync
+    return (
+        int(local_batch.spec_verify_tier_num_tokens),
+        0 if budget is None else int(budget) + 1,
     )
 
 
@@ -505,6 +547,9 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
     skip_all_gather = should_skip_scheduler_all_gather(dp_size)
+    spec_verify_tier_num_tokens, spec_verify_token_budget_enc = local_spec_verify_tier(
+        local_batch
+    )
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -519,6 +564,8 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        spec_verify_tier_num_tokens=spec_verify_tier_num_tokens,
+        spec_verify_token_budget_enc=spec_verify_token_budget_enc,
     )
 
     if dp_size == 1:

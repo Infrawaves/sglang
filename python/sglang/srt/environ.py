@@ -594,6 +594,11 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Allow SGLANG_RAGGED_VERIFY_MODE=compact for a dense DSpark draft under DP
+    # attention (MoE a2a backends, CUDA graphs, PD decode) and under Kimi-K3 DCP.
+    # Every DP rank replays the same verify token tier, agreed through the MLP
+    # sync. cap-accept stays rejected. Off by default until validated.
+    SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
