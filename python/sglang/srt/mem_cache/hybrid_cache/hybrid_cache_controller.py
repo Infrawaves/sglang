@@ -1363,14 +1363,25 @@ class HybridCacheController(BaseHiCacheController):
         kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
-        self._page_transfer_sidecar(operation, kv_completed_pages)
+        if operation.pool_transfers is None:
+            return
+        try:
+            pool_hits = self._page_transfer_sidecar(operation, kv_completed_pages)
+        except Exception:
+            logger.exception(
+                "Prefetch sidecar read failed for request %s", operation.request_id
+            )
+            pool_hits = {}
+        # Every rank reduces the sidecar ACK, even if it read no usable pools.
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id, operation=operation, pool_hits=pool_hits
+            )
+        )
 
     def _page_transfer_sidecar(
         self, operation: PrefetchOperation, kv_completed_pages: int
-    ) -> None:
-        if operation.pool_transfers is None:
-            return
-
+    ) -> dict[str, int]:
         # Extra pools only after KV fully completes. If KV terminated early
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
@@ -1411,17 +1422,7 @@ class HybridCacheController(BaseHiCacheController):
                     self.storage_backend.batch_get_v2(transfers, extra_info=extra_info)
                 )
             pool_hits = count_pool_hits(results)
-        # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
-        # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
-        # to perform all_reduce.
-        self.prefetch_sync_queue.put(
-            PrefetchAck(
-                rid=operation.request_id,
-                operation=operation,
-                pool_hits=pool_hits,
-            )
-        )
-        return
+        return pool_hits
 
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;

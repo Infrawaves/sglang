@@ -1155,13 +1155,23 @@ class HiCacheController:
 
                 operation.kv_last_ts = time.monotonic()
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    # This rank can only vouch for earlier batches. Continue the
+                    # normal short-read path so every rank issues the same ACKs.
+                    logger.exception(
+                        "Prefetch KV read failed for request %s at page %d",
+                        operation.request_id,
+                        operation.start_page + i,
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False

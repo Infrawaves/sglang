@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -34,6 +35,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
+        c.storage_page_group = 1
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
@@ -252,6 +254,47 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertTrue(c.is_pp_prefetch_ready("hit"))
         self.assertEqual(c.pp_prefetch_states["next"].operation.completed_tokens, 8)
         self.assertEqual(c.prefetch_tokens_occupied, 8)
+
+    def test_read_failures_preserve_ack_sequence_and_next_request(self):
+        c = self.c
+        for rid in ("kv-failure", "sidecar-failure", "success"):
+            operation = PrefetchOperation(
+                CacheRequestHandle(rid, 0),
+                list(range(12)),
+                pool_transfers=[PoolTransfer(PoolName.SWA, keys=["h2"])],
+            )
+            operation.hash_value = ["h0", "h1", "h2"]
+            operation.host_indices = torch.arange(12)
+            c.prefetch_buffer.put(operation)
+
+        c.page_get_func = Mock(
+            side_effect=[1, RuntimeError("scratch registration failed")] + [1] * 6
+        )
+        c.storage_backend = Mock()
+        c.storage_backend.batch_get_v2.side_effect = [
+            KeyError("sidecar read failed"),
+            {PoolName.SWA: [True]},
+        ]
+        with (
+            patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
+            patch.object(
+                c.storage_stop_event, "is_set", side_effect=[False] * 3 + [True]
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            c.prefetch_io_aux_func()
+
+        for rid, tokens, hits in (
+            ("kv-failure", [4, 4, 4], {}),
+            ("sidecar-failure", [4, 8, 12], {}),
+            ("success", [4, 8, 12], {PoolName.SWA: 1}),
+        ):
+            acks = [c.prefetch_sync_queue.get_nowait() for _ in range(5)]
+            self.assertEqual([ack.rid for ack in acks], [rid] * 5)
+            self.assertEqual([ack.completed_tokens for ack in acks[:3]], tokens)
+            self.assertEqual(acks[3].pool_hits, hits)
+            self.assertTrue(acks[4].completed_req)
+        self.assertTrue(c.prefetch_sync_queue.empty())
 
     def test_cancel_before_ticket_defers_free_until_final_ack(self):
         c, cache = self.c, self.cache
