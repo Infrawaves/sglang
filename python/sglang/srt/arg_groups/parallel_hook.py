@@ -176,6 +176,8 @@ def handle_shared_experts_tp(server_args: Any):
     model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch != "KimiK3ForConditionalGeneration":
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if size == 1 and envs.SGLANG_K3_TP_SP.get() and cfg.moe_a2a_backend == "none":
+        return
     if cfg.moe_a2a_backend not in (
         "deepep",
         "megamoe",
@@ -185,7 +187,8 @@ def handle_shared_experts_tp(server_args: Any):
     ):
         raise ValueError(
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
-            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori), "
+            "or size 1 with SGLANG_K3_TP_SP=1 and moe-a2a-backend=none."
         )
 
 

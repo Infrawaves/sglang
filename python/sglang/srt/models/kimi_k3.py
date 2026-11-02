@@ -686,9 +686,9 @@ class KimiK3MoE(nn.Module):
         shared_tp = requested_shared_tp
         if shared_tp is None and parallel.enable_shared_experts_attn_tp:
             shared_tp = parallel.attn_tp_size
-        if requested_shared_tp is not None and not self._ep_a2a:
-            raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
-        self._shared_experts_tp1 = self._ep_a2a and shared_tp in (None, 1)
+        self._shared_experts_tp1 = (enable_tp_sp and requested_shared_tp == 1) or (
+            self._ep_a2a and shared_tp in (None, 1)
+        )
         self._shared_experts_tp_comm = (
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
@@ -810,6 +810,9 @@ class KimiK3MoE(nn.Module):
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
         if not self.use_latent_moe:
+            return
+        # The joint fused tail would reduce the replicated shared output again.
+        if self._shared_experts_tp1 and not self._ep_a2a:
             return
         # These merged layouts feed CUDA-only fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
@@ -1331,12 +1334,14 @@ class KimiK3MoE(nn.Module):
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
             wait_and_finalize_shared_experts()
-            if shared_output is not None:
+            if shared_output is not None and not self._shared_experts_tp1:
                 expert_output = expert_output + shared_output
             # EP combine and the shared-expert subgroup have already completed
             # each source token. A global TP reduction would mix token shards.
-            if self.tp_size > 1 and not self._ep_a2a:
+            if self._routed_needs_reduce:
                 expert_output = tensor_model_parallel_all_reduce(expert_output)
+            if shared_output is not None and self._shared_experts_tp1:
+                expert_output = expert_output + shared_output
             if prefix_sum is not None:
                 expert_output = expert_output + prefix_sum
             return expert_output
@@ -1371,11 +1376,7 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
-            if (
-                self.tp_size > 1
-                and not self._shared_experts_tp1
-                and not self._shared_experts_tp_comm
-            ):
+            if self._routed_needs_reduce and not self._shared_experts_tp1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             out = _add3(out, shared_output, prefix_sum)
             return out
@@ -1605,22 +1606,29 @@ class KimiK3MoE(nn.Module):
     ) -> torch.Tensor:
         """Local front -> gathered TP experts -> reduced local latent tail."""
         hidden_size = hidden_states.shape[1]
-        # Gather the wide shared input directly, avoiding its pack/unpack copies.
+        # TP-sharded shared experts gather the wide input without pack/unpack.
         # Start the shared AG before the local front. Submit routed pack and AG
         # before shared GEMMs, then submit routed unpack, joining at the tail.
         shared_input = None
         shared_on_alt = False
         shared_output = None
         shared_event = None
-        if self.shared_experts is not None and self.use_latent_moe:
-            if self.alt_stream is not None:
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
-                hidden_states.record_stream(self.alt_stream)
-                with torch.cuda.stream(self.alt_stream):
+        if self.shared_experts is not None:
+            if self._shared_experts_tp1:
+                if shard.local_size:
+                    shared_input = hidden_states
+                    if self.alt_stream is not None:
+                        # Depend only on the local input, before routed work.
+                        self.alt_stream.wait_stream(torch.cuda.current_stream())
+            elif self.use_latent_moe:
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    hidden_states.record_stream(self.alt_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_input = shard.all_gather(hidden_states)
+                    shared_on_alt = True
+                else:
                     shared_input = shard.all_gather(hidden_states)
-                shared_on_alt = True
-            else:
-                shared_input = shard.all_gather(hidden_states)
         if shard.local_size:
             router_logits = self.gate(hidden_states)
             topk = self.sp_topk(hidden_states, router_logits)
@@ -1635,12 +1643,23 @@ class KimiK3MoE(nn.Module):
         routed_tensors = (routed_input, topk.topk_weights, topk.topk_ids)
         packed = shard.pack_moe_inputs(*routed_tensors)
         gathered = shard.all_gather(packed)
-        if shared_on_alt:
-            shared_output, shared_event = self._launch_shared_experts(shared_input)
+        if shared_input is not None and self.alt_stream is not None:
+            shared_output, shared_event = self._launch_shared_experts(
+                shared_input,
+                wait_stream=(
+                    None
+                    if shared_on_alt or self._shared_experts_tp1
+                    else torch.cuda.current_stream()
+                ),
+            )
         routed_input, topk_weights, topk_ids = shard.unpack_moe_inputs(
             gathered, *routed_tensors
         )
-        if self.shared_experts is not None and not self.use_latent_moe:
+        if (
+            self.shared_experts is not None
+            and not self.use_latent_moe
+            and not self._shared_experts_tp1
+        ):
             shared_input = routed_input
         topk = StandardTopKOutput(
             topk_weights=topk_weights,
@@ -1648,15 +1667,15 @@ class KimiK3MoE(nn.Module):
             router_logits=None,
         )
 
-        # Both calls return TP partial sums. Never normalize a partial latent.
-        if self.shared_experts is not None and shared_event is None:
+        # Routed output is TP-partial; replicated shared output is already local.
+        if shared_input is not None and shared_event is None:
             shared_output = self.shared_experts(shared_input)
         expert_output = self.experts(routed_input, topk)
-        if shared_event is not None:
+        if shared_event is not None and not self._shared_experts_tp1:
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
             shared_output.record_stream(current_stream)
-        if shared_output is not None:
+        if shared_output is not None and not self._shared_experts_tp1:
             if expert_output.dtype == shared_output.dtype:
                 # Pack per token, not [all latent rows | all shared rows].
                 if shard.num_tokens < shard.padded_size:
@@ -1693,6 +1712,10 @@ class KimiK3MoE(nn.Module):
             else expert_output
         )
         if shared_output is not None:
+            if shared_event is not None and self._shared_experts_tp1:
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_event(shared_event)
+                shared_output.record_stream(current_stream)
             out = out + shared_output
         if prefix_sum is not None:
             out = out + prefix_sum
