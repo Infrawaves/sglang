@@ -1,8 +1,8 @@
 """One Mooncake object per page per node for MHA draft KV.
 
 Each node's ranks share one memfd draft host buffer of shape
-(node_size, 2, page_num, layer, page_size, head, dim): rank r owns, pins and
-D2H/H2Ds slice r exactly like a private pool. The node's last rank
+(node_size, *private_pool_dims): rank r owns, pins and D2H/H2Ds slice r
+exactly like a private pool. The node's last rank
 (``leader_mha``) does every L3 exists/get/put for the node, scatter-gathering
 the 2 * node_size K/V segments of a page into one object; other ranks do no
 draft L3 IO and report every page present, so the cache-group all_reduce(MIN)
@@ -31,6 +31,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
+
+# Host layouts whose get_page_buffer_meta yields one contiguous (K, V) pair per
+# page; page_head also does but is untested with the node merge.
+DRAFT_NODE_MERGE_LAYOUTS = ("page_first", "page_first_direct")
 
 
 class DraftNodeMerge(msgspec.Struct, frozen=True):
@@ -138,7 +142,7 @@ def node_page_buffer_meta(
     stride = host_pool.kv_buffer.nbytes
     offsets = [(slot - merge.node_slot) * stride for slot in range(merge.node_size)]
     node_ptrs, node_sizes = [], []
-    # get_page_buffer_meta yields (K, V) per page for page_first_direct.
+    # get_page_buffer_meta yields (K, V) per page for DRAFT_NODE_MERGE_LAYOUTS.
     for page in range(0, len(ptr_list), 2):
         k_ptr, v_ptr = ptr_list[page], ptr_list[page + 1]
         node_ptrs.append([p + off for off in offsets for p in (k_ptr, v_ptr)])
@@ -149,7 +153,7 @@ def node_page_buffer_meta(
 
 
 def log_draft_node_merge(host_pool: MHATokenToKVPoolHost, merge: DraftNodeMerge):
-    page_bytes = host_pool.kv_buffer[:, 0].nbytes
+    page_bytes = host_pool.page_size * host_pool.size_per_token
     logger.info(
         "draft node merge: role=%s node_ranks=%s key_suffix=%s object_bytes=%d",
         "leader_mha" if merge.is_leader else "follower",
