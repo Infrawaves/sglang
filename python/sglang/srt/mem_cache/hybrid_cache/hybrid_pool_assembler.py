@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 import torch.distributed as dist
 
 from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DRAFT_NODE_MERGE_LAYOUTS,
     DraftNodeShareAllocator,
     log_draft_node_merge,
     maybe_create_draft_node_merge,
@@ -1508,10 +1509,11 @@ def _build_mha_mla_host_pool(
                 "--hicache-draft-node-merge supports only the symmetric "
                 "non-MXFP8 MHA draft host pool."
             )
-        if layout != "page_first_direct":
+        # Also checked at launch; kept for callers that bypass server args.
+        if layout not in DRAFT_NODE_MERGE_LAYOUTS:
             raise ValueError(
-                "--hicache-draft-node-merge requires the page_first_direct "
-                f"HiCache layout, got {layout!r}."
+                "--hicache-draft-node-merge requires --hicache-mem-layout in "
+                f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
             )
         return MHATokenToKVPoolHost(pool, host_allocator=host_allocator, **kwargs)
     if isinstance(pool, MHATokenToKVPool):

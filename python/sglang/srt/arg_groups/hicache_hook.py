@@ -71,6 +71,8 @@ def handle_hicache(server_args: Any):
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    if cfg.hicache_draft_node_merge:
+        validate_hicache_draft_node_merge_layout(server_args)
     if (
         cfg.disaggregation_decode_host_receive_threshold > 0
         and cfg.hicache_mem_layout != "layer_first"
@@ -121,8 +123,8 @@ def validate_mla_hicache_per_node(server_args: Any):
 
 
 def validate_hicache_draft_node_merge(server_args: Any):
-    # The draft pool class, resolved layout and node size are checked when the
-    # draft host pool is built.
+    # The draft pool class and node size are checked when the draft host pool
+    # is built; the layout once resolution settles it.
     cfg = resolving_view(server_args)
     if not cfg.enable_mla_hicache_per_node:
         raise ValueError(
@@ -143,6 +145,21 @@ def validate_hicache_draft_node_merge(server_args: Any):
         raise ValueError(
             "--hicache-draft-node-merge requires --hicache-write-policy "
             "write_through or write_through_selective."
+        )
+
+
+def validate_hicache_draft_node_merge_layout(server_args: Any):
+    """Reject before model load what the draft host pool build would reject."""
+    # Lazy: the merge module pulls in torch.distributed.
+    from sglang.srt.mem_cache.hicache_draft_node_merge import (
+        DRAFT_NODE_MERGE_LAYOUTS,
+    )
+
+    layout = resolving_view(server_args).hicache_mem_layout
+    if layout not in DRAFT_NODE_MERGE_LAYOUTS:
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-mem-layout in "
+            f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
         )
 
 

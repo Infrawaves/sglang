@@ -2071,7 +2071,8 @@ class TestSSLArgs(unittest.TestCase):
 
 class TestHiCacheArgs(CustomTestCase):
     def test_hicache_draft_node_merge_admission(self):
-        """Draft node merge needs per-node MLA, Mooncake and a write-through policy."""
+        """Draft node merge needs per-node MLA, Mooncake, a write-through policy
+        and a (K, V)-per-page layout, all rejected before model load."""
         mooncake = {
             "hicache_storage_backend": "mooncake",
             "hicache_storage_backend_extra_config": json.dumps(
@@ -2079,19 +2080,35 @@ class TestHiCacheArgs(CustomTestCase):
             ),
         }
         cases = (
-            (True, mooncake, "write_through", None),
-            (True, mooncake, "write_through_selective", None),
-            (True, mooncake, "write_back", "write_through"),
-            (False, mooncake, "write_through", "--enable-mla-hicache-per-node"),
-            (True, {"hicache_storage_backend": "file"}, "write_through", "mooncake"),
+            (True, mooncake, "write_through", "page_first", None),
+            (True, mooncake, "write_through_selective", "page_first_direct", None),
+            (True, mooncake, "write_through", "page_head", "--hicache-mem-layout"),
+            (True, mooncake, "write_back", "page_first", "write_through"),
+            (
+                False,
+                mooncake,
+                "write_through",
+                "page_first",
+                "--enable-mla-hicache-per-node",
+            ),
+            (
+                True,
+                {"hicache_storage_backend": "file"},
+                "write_through",
+                "page_first",
+                "mooncake",
+            ),
         )
-        for per_node, storage, policy, error in cases:
-            with self.subTest(per_node=per_node, storage=storage, policy=policy):
+        for per_node, storage, policy, layout, error in cases:
+            with self.subTest(
+                per_node=per_node, storage=storage, policy=policy, layout=layout
+            ):
                 args = self._make_args(
                     enable_hierarchical_cache=True,
                     enable_mla_hicache_per_node=per_node,
                     hicache_draft_node_merge=True,
                     hicache_write_policy=policy,
+                    hicache_mem_layout=layout,
                     **storage,
                 )
                 if error is not None:
