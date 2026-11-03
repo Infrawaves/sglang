@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import functools
 import io
 import pickle
@@ -25,6 +26,7 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k3_vl import Learnable2DInterpPosEmbDividedFixed
 from sglang.srt.models.kimi_k25 import (
@@ -238,6 +240,81 @@ def test_kimi_gpu_preprocess_frees_the_uint8_sources_before_patchify():
 
     assert len(sources) == len(images)
     assert live_at_post_resize and all(n == 0 for n in live_at_post_resize)
+
+
+@pytest.mark.parametrize("chunk", [1, 2, None])
+def test_kimi_gpu_preprocess_streamed_group_matches_the_single_image_path(chunk):
+    # The batched branch now resizes and patchifies a group in chunks written
+    # into one preallocated output. Every chunk size must give exactly what the
+    # one-image path gives, with each image on its own index. Two source sizes
+    # share one target group, and RGBA sources only become RGB in post_resize,
+    # so the output's channel count is unknown until the first chunk ran.
+    torch.manual_seed(0)
+    patch_size = 4
+    config = {"new_height": 16, "new_width": 12, "pad_height": 4, "pad_width": 4}
+    images = [
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 28, 20), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 16, 12), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 28, 20), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+    ]
+    resize_configs = [config] * len(images)
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.full((1, 3, 1, 1), -0.5)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    drop_alpha = lambda x: x[:, :3]  # noqa: E731 - RGBA -> RGB like K3
+
+    batch_sizes = []
+    real_patchify = normalize_and_patchify
+
+    def record_patchify(x, *args, **kwargs):
+        batch_sizes.append(x.shape[0])
+        return real_patchify(x, *args, **kwargs)
+
+    # None leaves the CPU default: the whole group in one chunk.
+    chunk_patch = (
+        patch(
+            "sglang.srt.multimodal.processors.kimi_k25._group_chunk_size",
+            return_value=chunk,
+        )
+        if chunk is not None
+        else contextlib.nullcontext()
+    )
+    with chunk_patch, patch(
+        "sglang.srt.multimodal.processors.kimi_k25.normalize_and_patchify",
+        side_effect=record_patchify,
+    ):
+        pixel_values, grid_thws = _gpu_preprocess_images(
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+            post_resize=drop_alpha,
+        )
+
+    if chunk is not None:
+        assert max(batch_sizes) <= chunk
+    assert sum(batch_sizes) == len(images)
+    count = (20 // patch_size) * (16 // patch_size)
+    assert pixel_values.shape[0] == count * len(images)
+    offset = 0
+    for image in images:
+        reference = _process_single_image(
+            image,
+            config,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+            post_resize=drop_alpha,
+        )
+        assert torch.equal(pixel_values[offset : offset + count], reference)
+        offset += count
 
 
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
