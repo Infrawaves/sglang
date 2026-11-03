@@ -87,6 +87,9 @@ _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Tensor-dict metadata: these tensors already belong to the destination rank.
+PP_SHARDED_KEYS = "__pp_sharded_keys__"
+
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
@@ -1825,13 +1828,19 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        sharded_keys = tensor_dict.get(PP_SHARDED_KEYS, ())
+        tensor_keys = (k for k, v in metadata_list if isinstance(v, TensorMetadata))
+        for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                key not in sharded_keys
+                and all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1865,6 +1874,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
+        sharded_keys = dict(recv_metadata_list).get(PP_SHARDED_KEYS, ())
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1876,7 +1886,8 @@ class GroupCoordinator:
 
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
-                    all_gather_group is not None
+                    key not in sharded_keys
+                    and all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
                 )
 
@@ -1979,6 +1990,7 @@ class GroupCoordinator:
             req.wait()
 
         recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+        recv_sharded_keys = dict(recv_metadata_list).get(PP_SHARDED_KEYS, ())
 
         # ---- 2. Prepare recv buffers and collect all tensor ops ----
         recv_tensor_dict: Dict[str, Any] = {}
@@ -1995,7 +2007,8 @@ class GroupCoordinator:
                     continue
 
                 use_all_gather = (
-                    recv_all_gather_group is not None
+                    key not in recv_sharded_keys
+                    and recv_all_gather_group is not None
                     and tensor.numel() % recv_all_gather_group.world_size == 0
                 )
                 orig_shape = None
@@ -2019,12 +2032,17 @@ class GroupCoordinator:
                 recv_tensor_dict[key] = value
 
         # Add send ops
-        for tensor in send_tensor_list:
+        send_sharded_keys = send_tensor_dict.get(PP_SHARDED_KEYS, ())
+        send_tensor_keys = (
+            k for k, v in send_metadata_list if isinstance(v, TensorMetadata)
+        )
+        for key, tensor in zip(send_tensor_keys, send_tensor_list):
             if tensor.numel() == 0:
                 continue
             send_t = tensor
             if (
-                send_all_gather_group is not None
+                key not in send_sharded_keys
+                and send_all_gather_group is not None
                 and send_t.numel() % send_all_gather_group.world_size == 0
             ):
                 send_t = send_t.reshape(send_all_gather_group.world_size, -1)[

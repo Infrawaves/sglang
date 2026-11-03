@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import PP_SHARDED_KEYS
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
@@ -286,6 +287,21 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     group = get_parallel().attn_tp_group
     lo = group.rank_in_group * hidden_states.shape[0]
     return slice(lo, lo + hidden_states.shape[0])
+
+
+def _pp_sp_rows(layout, num_tokens: int, group) -> slice:
+    """Validate rank-local PP rows using host metadata only."""
+    wire_kind, wire_tokens, start, world_size = layout
+    shard_size = _cdiv(num_tokens, group.world_size)
+    expected_start = min(group.rank_in_group * shard_size, num_tokens)
+    if (
+        wire_kind != "tp"
+        or wire_tokens != num_tokens
+        or world_size != group.world_size
+        or start != expected_start
+    ):
+        raise ValueError(f"Incompatible K3 PP token layout: {layout}")
+    return slice(start, min(start + shard_size, num_tokens))
 
 
 class _TPTokenShard:
@@ -3222,6 +3238,15 @@ class KimiK3LinearModel(nn.Module):
         self._trim_padded_attn = require_mlp_sync()
         parallel = get_parallel()
         self._tp_sp = envs.SGLANG_K3_TP_SP.get()
+        self._pp_sp_direct = (
+            self._tp_sp
+            and self.pp_group.world_size > 1
+            and get_exec().graph.cuda_graph_config.prefill.backend == "disabled"
+            and not self._dp_attention
+            and parallel.attn_cp_size == 1
+            and parallel.moe_dp_size == 1
+            and parallel.dwdp_size == 1
+        )
         if self._tp_sp:
             if parallel.tp_size <= 1:
                 raise ValueError("SGLANG_K3_TP_SP requires tp_size > 1.")
@@ -3307,6 +3332,7 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        pp_layout = None
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -3317,6 +3343,7 @@ class KimiK3LinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            pp_layout = pp_proxy_tensors.tensors.get("__k3_sp_layout__")
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
@@ -3344,17 +3371,38 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
+        num_tokens = hidden_states.shape[0] if pp_layout is None else pp_layout[1]
+        pp_sp_direct = (
+            self._pp_sp_direct
+            and self.dspark_layers_to_capture is None
+            and self.config.attn_res_block_size is not None
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and num_tokens > 0
+        )
+        if pp_layout is not None:
+            if not pp_sp_direct:
+                raise ValueError("K3 PP token shards received on an unsupported path")
+            rows = _pp_sp_rows(pp_layout, positions.shape[0], get_parallel().tp_group)
+            local_tokens = rows.stop - rows.start
+            if (
+                hidden_states.shape[0] != local_tokens
+                or residual is None
+                or residual.shape[0] != local_tokens
+            ):
+                raise ValueError("K3 PP tensor rows do not match the token layout")
+
         tp_token_shard = None
         if (
             self._tp_sp
             and self.config.attn_res_block_size is not None
             and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-            and hidden_states.shape[0] > 0
+            and num_tokens > 0
         ):
-            tp_token_shard = _TPTokenShard(hidden_states.shape[0])
-            hidden_states = hidden_states[tp_token_shard.rows]
-            if residual is not None:
-                residual = residual[tp_token_shard.rows]
+            tp_token_shard = _TPTokenShard(num_tokens)
+            if pp_layout is None:
+                hidden_states = hidden_states[tp_token_shard.rows]
+                if residual is not None:
+                    residual = residual[tp_token_shard.rows]
 
         attn_res = None
         if self.config.attn_res_block_size is not None:
@@ -3416,6 +3464,7 @@ class KimiK3LinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
+            outgoing_layout = None
             assert not sp_sharded
             if attn_res is not None:
                 if residual is not None:
@@ -3423,12 +3472,23 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-                if tp_token_shard is not None:
+                if pp_sp_direct and tp_token_shard is not None:
+                    residual = residual[:, : attn_res.num_valid_blocks].contiguous()
+                    outgoing_layout = (
+                        "tp",
+                        num_tokens,
+                        tp_token_shard.rows.start,
+                        tp_token_shard.group.world_size,
+                    )
+                elif tp_token_shard is not None:
                     hidden_states = tp_token_shard.all_gather(hidden_states)
                     residual = tp_token_shard.all_gather(
                         residual[:, : attn_res.num_valid_blocks]
                     )
             proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if outgoing_layout is not None:
+                proxy_tensors[PP_SHARDED_KEYS] = ("hidden_states", "residual")
+                proxy_tensors["__k3_sp_layout__"] = outgoing_layout
             if aux_hidden_states:
                 proxy_tensors["dspark_hidden_states"] = torch.cat(
                     aux_hidden_states, dim=-1
