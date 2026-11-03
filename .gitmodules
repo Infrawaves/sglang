@@ -1,0 +1,3 @@
+[submodule "3rdparty/sglang-plugin-ppu"]
+	path = 3rdparty/sglang-plugin-ppu
+	url = https://github.com/Infrawaves/sglang-plugin-ppu
