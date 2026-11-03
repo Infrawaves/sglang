@@ -378,7 +378,7 @@ def _preprocess_group_streamed(
                     dtype=output_dtype or patches.dtype,
                     device=patches.device,
                 )
-            out[part] = patches
+            out[part] = patches.to(out.dtype)
             del patches
     return out
 
