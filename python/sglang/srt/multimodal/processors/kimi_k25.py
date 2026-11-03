@@ -337,6 +337,8 @@ def _preprocess_group_streamed(
     by_source_shape = defaultdict(list)
     for position, (_, image) in enumerate(indexed_images):
         by_source_shape[(tuple(image.shape), image.dtype)].append(position)
+    # The loop variable would keep the last source alive until we return.
+    image = None
 
     out = None
     for positions in by_source_shape.values():
