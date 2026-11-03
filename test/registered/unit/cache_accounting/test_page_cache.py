@@ -17,8 +17,10 @@ import textwrap
 import time
 import unittest
 import uuid
+from array import array
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 # Load this dependency-free module without importing sglang.__init__, which
@@ -310,6 +312,135 @@ class TestPageCachePlan(unittest.TestCase):
             page_size=cache._MAX_SAFE_INTEGER,
         )
         self.assertIsNone(cache._validate_plan(largest))
+
+
+class TestFrozenMultimodalPageCachePlan(unittest.TestCase):
+    """Final scheduler metadata must retain the accounting page identities."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Keep NumPy loaded outside patch.dict's temporary module registry;
+        # re-importing its extension modules later is not supported.
+        importlib.import_module("numpy")
+        spec = importlib.util.spec_from_file_location(
+            "_page_cache_multimodal_test", _SOURCE.with_name("multimodal.py")
+        )
+        cls.media = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {spec.name: cls.media}):
+            spec.loader.exec_module(cls.media)
+
+    @staticmethod
+    def item(pad_value, offsets, digest):
+        return SimpleNamespace(
+            pad_value=pad_value,
+            offsets=offsets,
+            model_specific_data={"cache_accounting_digest": digest},
+        )
+
+    def freeze_plan(self, tokens, items):
+        frozen = self.media.freeze_cache_input_metadata(
+            tokens, SimpleNamespace(mm_items=items)
+        )
+        self.assertNotIn("error", frozen)
+        actual = plan(
+            frozen["input_ids"],
+            page_size=256,
+            media_spans=[cache.CacheMediaSpan(*span) for span in frozen["media_spans"]],
+        )
+        return frozen, actual
+
+    def test_adjacent_same_pad_keeps_distinct_sorted_media_identities(self):
+        pad = 1 << 40
+        tokens = list(range(768))
+        tokens[250:300] = [pad] * 50
+        frozen, actual = self.freeze_plan(
+            tokens,
+            [
+                self.item(pad, [(260, 299)], "B" * 64),
+                self.item(pad, [(250, 259)], "sha256:" + "A" * 64),
+            ],
+        )
+        expected_spans = [(250, 260, "a" * 64), (260, 300, "b" * 64)]
+        self.assertEqual(frozen["input_ids"], array("q", tokens))
+        self.assertEqual(frozen["media_spans"], expected_spans)
+        self.assertEqual(
+            actual,
+            plan(
+                tokens,
+                page_size=256,
+                media_spans=[cache.CacheMediaSpan(*span) for span in expected_spans],
+            ),
+        )
+        # Equal projected pad IDs do not permit merging distinct media or
+        # changing which digest belongs to either side of the boundary.
+        for spans in (
+            [cache.CacheMediaSpan(250, 300, "a" * 64)],
+            [
+                cache.CacheMediaSpan(250, 260, "b" * 64),
+                cache.CacheMediaSpan(260, 300, "a" * 64),
+            ],
+        ):
+            with self.subTest(spans=spans):
+                self.assertNotEqual(
+                    actual.page_keys,
+                    plan(tokens, page_size=256, media_spans=spans).page_keys,
+                )
+
+    def test_multiblock_media_and_tail_keep_explicit_page_plan(self):
+        pad, tail_pad = 1 << 40, -(1 << 40)
+        tokens = list(range(1025))
+        tokens[255:514] = [pad] * 259
+        tokens[768:771] = [pad] * 3
+        tokens[1024] = tail_pad
+        media_item = self.item(pad, [(768, 770), (255, 513)], "a" * 64)
+        frozen, actual = self.freeze_plan(
+            tokens, [self.item(tail_pad, [(1024, 1024)], "b" * 64), media_item]
+        )
+        expected_spans = [
+            (255, 514, "a" * 64),
+            (768, 771, "a" * 64),
+            (1024, 1025, "b" * 64),
+        ]
+        self.assertEqual(frozen["media_spans"], expected_spans)
+        self.assertEqual(
+            actual,
+            plan(
+                tokens,
+                page_size=256,
+                media_spans=[cache.CacheMediaSpan(*span) for span in expected_spans],
+            ),
+        )
+        self.assertEqual(actual.prompt_tokens, 1025)
+        self.assertEqual(len(actual.page_keys), 4)
+        _, changed_tail = self.freeze_plan(
+            tokens, [media_item, self.item(tail_pad, [(1024, 1024)], "c" * 64)]
+        )
+        self.assertEqual(actual.page_keys, changed_tail.page_keys)
+
+    def test_span_length_in_partial_tail_still_identifies_complete_page(self):
+        pad = 1 << 40
+        tokens = list(range(513))
+        tokens[510:513] = [pad] * 3
+        frozen, actual = self.freeze_plan(
+            tokens, [self.item(pad, [(510, 512)], "a" * 64)]
+        )
+        self.assertEqual(frozen["media_spans"], [(510, 513, "a" * 64)])
+        self.assertEqual(
+            actual,
+            plan(
+                tokens,
+                page_size=256,
+                media_spans=[cache.CacheMediaSpan(510, 513, "a" * 64)],
+            ),
+        )
+        _, truncated = self.freeze_plan(
+            tokens[:512], [self.item(pad, [(510, 511)], "a" * 64)]
+        )
+        self.assertEqual(len(actual.page_keys), 2)
+        self.assertEqual(actual.page_keys[0], truncated.page_keys[0])
+        # The media length is part of its first complete block's identity,
+        # even when its last token lies in an otherwise unaccounted tail.
+        self.assertNotEqual(actual.page_keys[1], truncated.page_keys[1])
 
 
 class TestRedisBoundary(unittest.IsolatedAsyncioTestCase):
