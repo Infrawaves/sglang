@@ -289,21 +289,6 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
-def _pp_sp_rows(layout, num_tokens: int, group) -> slice:
-    """Validate rank-local PP rows using host metadata only."""
-    wire_kind, wire_tokens, start, world_size = layout
-    shard_size = _cdiv(num_tokens, group.world_size)
-    expected_start = min(group.rank_in_group * shard_size, num_tokens)
-    if (
-        wire_kind != "tp"
-        or wire_tokens != num_tokens
-        or world_size != group.world_size
-        or start != expected_start
-    ):
-        raise ValueError(f"Incompatible K3 PP token layout: {layout}")
-    return slice(start, min(start + shard_size, num_tokens))
-
-
 class _TPTokenShard:
     """Contiguous token layout shared across TP-SP layers; pad only collectives."""
 
@@ -316,6 +301,11 @@ class _TPTokenShard:
         stop = min(start + self.shard_size, num_tokens)
         self.rows = slice(start, stop)
         self.local_size = stop - start
+
+    @property
+    def pp_layout(self) -> tuple[str, int, int, int]:
+        """Host metadata identifying this rank's token shard on the PP wire."""
+        return ("tp", self.num_tokens, self.rows.start, self.group.world_size)
 
     @staticmethod
     def _pad(x: torch.Tensor, size: int) -> torch.Tensor:
@@ -3242,10 +3232,6 @@ class KimiK3LinearModel(nn.Module):
             self._tp_sp
             and self.pp_group.world_size > 1
             and get_exec().graph.cuda_graph_config.prefill.backend == "disabled"
-            and not self._dp_attention
-            and parallel.attn_cp_size == 1
-            and parallel.moe_dp_size == 1
-            and parallel.dwdp_size == 1
         )
         if self._tp_sp:
             if parallel.tp_size <= 1:
@@ -3371,26 +3357,7 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
-        num_tokens = hidden_states.shape[0] if pp_layout is None else pp_layout[1]
-        pp_sp_direct = (
-            self._pp_sp_direct
-            and self.dspark_layers_to_capture is None
-            and self.config.attn_res_block_size is not None
-            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-            and num_tokens > 0
-        )
-        if pp_layout is not None:
-            if not pp_sp_direct:
-                raise ValueError("K3 PP token shards received on an unsupported path")
-            rows = _pp_sp_rows(pp_layout, positions.shape[0], get_parallel().tp_group)
-            local_tokens = rows.stop - rows.start
-            if (
-                hidden_states.shape[0] != local_tokens
-                or residual is None
-                or residual.shape[0] != local_tokens
-            ):
-                raise ValueError("K3 PP tensor rows do not match the token layout")
-
+        num_tokens = hidden_states.shape[0] if pp_layout is None else positions.shape[0]
         tp_token_shard = None
         if (
             self._tp_sp
@@ -3399,10 +3366,28 @@ class KimiK3LinearModel(nn.Module):
             and num_tokens > 0
         ):
             tp_token_shard = _TPTokenShard(num_tokens)
-            if pp_layout is None:
-                hidden_states = hidden_states[tp_token_shard.rows]
-                if residual is not None:
-                    residual = residual[tp_token_shard.rows]
+
+        pp_sp_direct = (
+            self._pp_sp_direct
+            and self.dspark_layers_to_capture is None
+            and tp_token_shard is not None
+        )
+        if pp_layout is not None:
+            if not pp_sp_direct:
+                raise ValueError("K3 PP token shards received on an unsupported path")
+            if pp_layout != tp_token_shard.pp_layout:
+                raise ValueError(f"Incompatible K3 PP token layout: {pp_layout}")
+            if (
+                hidden_states.shape[0] != tp_token_shard.local_size
+                or residual is None
+                or residual.shape[0] != tp_token_shard.local_size
+            ):
+                raise ValueError("K3 PP tensor rows do not match the token layout")
+
+        if tp_token_shard is not None and pp_layout is None:
+            hidden_states = hidden_states[tp_token_shard.rows]
+            if residual is not None:
+                residual = residual[tp_token_shard.rows]
 
         attn_res = None
         if self.config.attn_res_block_size is not None:
@@ -3474,12 +3459,7 @@ class KimiK3LinearModel(nn.Module):
                 residual = attn_res.block_residual  # raw bank across ranks
                 if pp_sp_direct and tp_token_shard is not None:
                     residual = residual[:, : attn_res.num_valid_blocks].contiguous()
-                    outgoing_layout = (
-                        "tp",
-                        num_tokens,
-                        tp_token_shard.rows.start,
-                        tp_token_shard.group.world_size,
-                    )
+                    outgoing_layout = tp_token_shard.pp_layout
                 elif tp_token_shard is not None:
                     hidden_states = tp_token_shard.all_gather(hidden_states)
                     residual = tp_token_shard.all_gather(
