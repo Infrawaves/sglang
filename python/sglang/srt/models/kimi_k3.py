@@ -898,6 +898,10 @@ class KimiK3MoE(nn.Module):
         )
         from sglang.srt.runtime_context import get_parallel
 
+        # For SAIL(PPU) MegaMoE, use the SAIL-specilaized path.
+        if envs.SGLANG_USE_SAIL.get():
+            return self._forward_sail_mega_experts(routed_input, topk_output)
+
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
         # the fused a2a below dispatches each token exactly once. On the
@@ -960,6 +964,29 @@ class KimiK3MoE(nn.Module):
                 fast_math=True,
             )
         y = y[:num_tokens]
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if (
+                self.routed_scaling_factor is not None
+                and self.routed_scaling_factor != 1.0
+            ):
+                y.mul_(self.routed_scaling_factor)
+        return y
+
+    def _forward_sail_mega_experts(
+        self, routed_input: torch.Tensor, topk_output
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mega_moe_sail import forward_sail_mega_experts
+
+        y = forward_sail_mega_experts(
+            experts=self.experts,
+            routed_input=routed_input,
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+            hidden=self.moe_hidden_size,
+            intermediate_hidden=self._mega_intermediate_size,
+            top_k=self._mega_top_k,
+            activation="situ",
+        )
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
                 self.routed_scaling_factor is not None

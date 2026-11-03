@@ -647,6 +647,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer._mxfp4_backend = "marlin"
             return
 
+        if self.use_mega_moe and envs.SGLANG_USE_SAIL.get():
+            from sglang.srt.layers.moe.mega_moe_sail import build_sail_mega_moe_weights
+
+            build_sail_mega_moe_weights(layer)
+            return
+
         if self.use_deep_gemm or self.use_mega_moe:
             from deep_gemm import transform_sf_into_required_layout
 
