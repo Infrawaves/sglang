@@ -917,6 +917,12 @@ class Envs:
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
     # ===================================================================
+    # T-Head PPU (SAIL)
+    # ===================================================================
+    # Selects DeepGEMM-for-sail kernels; MegaMoE also needs --moe-a2a-backend megamoe.
+    SGLANG_USE_SAIL = EnvBool(False)
+
+    # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
