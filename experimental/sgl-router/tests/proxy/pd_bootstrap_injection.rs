@@ -49,6 +49,8 @@ fn config() -> Config {
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
@@ -763,8 +765,7 @@ async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
         }
     }
     let _servers = TestServers([p_task, d_task]);
-    let mut cfg = config();
-    cfg.model.tokenizer_path = None;
+    let cfg = config();
     let ctx = build_ctx_with_config(
         vec![
             WorkerSpec {

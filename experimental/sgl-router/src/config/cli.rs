@@ -14,10 +14,11 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LoadBasedMetric,
+    LoadBasedTokenGate, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS, DEFAULT_LOAD_BASED_TOKEN_SLACK,
+    DEFAULT_LOAD_BASED_TOKEN_TIE_BAND,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -194,6 +195,23 @@ pub struct RoutingArgs {
     /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Load unit for load_based (--policy, sticky fallback, and --fuse term).
+    /// `tokens` ranks prefill workers by prompt tokens still to prefill.
+    #[arg(long, value_enum, default_value = "requests")]
+    pub load_based_metric: LoadBasedMetric,
+
+    /// With --load-based-metric tokens: skip prefill workers whose request count
+    /// (waiting + bootstrap + running) exceeds the fleet minimum by more than this.
+    /// 0 keeps only the fewest-request workers (tokens still rank among them);
+    /// a large value disables the gate.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_SLACK)]
+    pub load_based_token_slack: u64,
+
+    /// With --load-based-metric tokens: token loads within this many tokens of the
+    /// minimum tie and rank by request count. Defaults to one 16K prefill chunk.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_TIE_BAND)]
+    pub load_based_token_tie_band: u64,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -451,6 +469,11 @@ impl Cli {
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                load_based_metric: self.routing.load_based_metric,
+                load_based_token_gate: LoadBasedTokenGate {
+                    slack: self.routing.load_based_token_slack,
+                    tie_band: self.routing.load_based_token_tie_band,
+                },
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -2498,6 +2521,72 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn load_based_metric_defaults_to_requests_and_accepts_tokens() {
+        let default_config = cfg_of("--policy load_based").unwrap();
+        assert_eq!(
+            default_config.model.load_based_metric,
+            LoadBasedMetric::Requests
+        );
+
+        let tokens_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            tokens_config.model.load_based_metric,
+            LoadBasedMetric::Tokens
+        );
+
+        assert!(cfg_of("--load-based-metric blocks").is_err());
+    }
+
+    #[test]
+    fn load_based_token_gate_defaults_and_overrides() {
+        let default_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            default_config.model.load_based_token_gate,
+            LoadBasedTokenGate::default()
+        );
+
+        let tuned = cfg_of(
+            "--policy load_based --load-based-metric tokens \
+             --load-based-token-slack 3 --load-based-token-tie-band 0",
+        )
+        .unwrap();
+        assert_eq!(
+            tuned.model.load_based_token_gate,
+            LoadBasedTokenGate {
+                slack: 3,
+                tie_band: 0
+            }
+        );
+    }
+
+    /// `tokens` only changes `load_based`; a config with no `load_based`
+    /// instance must fail loudly instead of silently ranking by requests.
+    #[test]
+    fn load_based_metric_tokens_requires_a_load_based_instance() {
+        for ok in [
+            "--policy load_based --load-based-metric tokens",
+            "--policy fused_score --fuse load_based --load-based-metric tokens",
+            "--policy score_policy --load-based-metric tokens", // DEFAULT_FUSE has load_based
+            "--policy sticky --sticky-fallback-policy load_based --load-based-metric tokens",
+        ] {
+            assert!(cfg_of(ok).is_ok(), "{ok}: {:?}", cfg_of(ok).err());
+        }
+        for bad in [
+            "--policy power_of_two --load-based-metric tokens",
+            "--policy fused_score --fuse prefix_cache --load-based-metric tokens",
+            "--policy sticky --load-based-metric tokens", // round_robin fallback
+        ] {
+            let err = cfg_of(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("--load-based-metric tokens has no effect"),
+                "{bad}: {err}"
+            );
+        }
+        // `requests` is the default and never needs a load_based instance.
+        assert!(cfg_of("--policy power_of_two --load-based-metric requests").is_ok());
     }
 
     #[test]

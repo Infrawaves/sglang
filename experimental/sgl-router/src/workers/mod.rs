@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod cold_ratio;
 pub mod introspect;
 pub mod manager;
 pub mod registry;

@@ -2181,6 +2181,26 @@ class UnifiedRadixCache(BasePrefixCache):
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
 
+    def get_pending_storage_hit_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        # Read from the scheduler thread; the prefetch thread sets
+        # storage_hit_count once, so a stale read only sees 0.
+        info = self.ongoing_prefetch.get(handle)
+        if info is not None:
+            if info.operation.storage_hit_count <= 0:
+                return None
+            return info.operation.storage_start + info.operation.storage_hit_count
+        # A completed fetch leaves ongoing_prefetch before admission: cache mode
+        # parks the loaded span here (possibly empty after dedup), buffer mode
+        # stages it in the pipeline.
+        start = self.prefetch_loaded_storage_start_by_reqid.get(handle)
+        if start is not None:
+            return start + self.prefetch_loaded_tokens_by_reqid.get(handle, 0)
+        if self.buffer_pipeline is not None:
+            staged = self.buffer_pipeline.staged_prefetches.get(handle)
+            if staged is not None and staged.num_tokens > 0:
+                return staged.matched_len + staged.num_tokens
+        return None
+
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:
@@ -2370,7 +2390,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
-        if loaded_from_storage > 0:
+        # Kept even when a concurrent fetch already inserted the whole span
+        # (loaded 0): the load reporter still needs where the L2 hit ends.
+        if not insert_result.host_insert_dropped and completed_tokens > 0:
             self.prefetch_loaded_storage_start_by_reqid[request] = (
                 operation.storage_start + insert_result.prefix_len
             )
