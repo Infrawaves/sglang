@@ -259,6 +259,75 @@ def _resize_images_by_source_shape(
     return [resized_by_index[index] for index, _ in indexed_images]
 
 
+def _group_chunk_size(source: torch.Tensor, per_image_bytes: int, count: int) -> int:
+    """Images per streamed chunk; the whole group off CUDA, where VRAM is not the limit."""
+    if not source.is_cuda:
+        return count
+    return _resize_chunk_size(source, per_image_bytes)
+
+
+def _preprocess_group_streamed(
+    indexed_images: list[tuple[int, torch.Tensor]],
+    target_height: int,
+    target_width: int,
+    padded_height: int,
+    padded_width: int,
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
+    patch_size: int,
+    post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> torch.Tensor:
+    """Resize, post_resize and patchify one target-size group chunk by chunk.
+
+    Each chunk's patches are written into one preallocated output, so the group
+    never holds a full-size float intermediate: the old path kept the resized
+    group, its concat copy and the patchify output alive together, which is
+    where a request of many same-size images ran out of memory.
+
+    ``indexed_images`` is consumed: each uint8 source is dropped once its chunk
+    is stacked, so the caller must not read the list afterwards. Returns patches
+    in the order of ``indexed_images``.
+    """
+    by_source_shape = defaultdict(list)
+    for position, (_, image) in enumerate(indexed_images):
+        by_source_shape[(tuple(image.shape), image.dtype)].append(position)
+
+    out = None
+    for positions in by_source_shape.values():
+        source = indexed_images[positions[0]][1]
+        # resized float image + float patchify output, plus the float cast of
+        # the source when a real resize runs
+        per_image_bytes = 4 * (
+            source.numel() + 2 * source.shape[-3] * padded_height * padded_width
+        )
+        chunk = _group_chunk_size(source, per_image_bytes, len(positions))
+        del source
+        for start in range(0, len(positions), chunk):
+            part = positions[start : start + chunk]
+            batch = torch.stack([indexed_images[p][1] for p in part])
+            for p in part:
+                indexed_images[p] = (indexed_images[p][0], None)
+            x = _resize_bicubic_if_needed(batch, target_height, target_width)
+            del batch
+            if post_resize is not None:
+                x = post_resize(x)
+            patches = normalize_and_patchify(
+                x, image_scale, image_bias, patch_size, padded_height, padded_width
+            )
+            del x
+            if out is None:
+                # Allocated after the first chunk: post_resize may change the
+                # channel count (K3 turns RGBA into RGB).
+                out = torch.empty(
+                    (len(indexed_images), *patches.shape[1:]),
+                    dtype=patches.dtype,
+                    device=patches.device,
+                )
+            out[part] = patches
+            del patches
+    return out
+
+
 def _gpu_preprocess_images(
     images: list[Union[torch.Tensor, Image.Image]],
     resize_configs: list[dict],
@@ -308,36 +377,24 @@ def _gpu_preprocess_images(
         else:
             indexed_images = [(idx, to_chw(image)) for idx, image, _ in group]
 
-            # One NaViT target group can include several original resolutions.
-            # Batch only source-compatible images, which removes redundant
-            # bicubic launches for common multi-image requests without padding
-            # random-size inputs to a larger source resolution.
-            resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
-            # Same as the single-image path: the resized parts never alias the
-            # uint8 sources, which would otherwise stay bound until the next
-            # group -- across patchify.
-            del indexed_images
-            if post_resize is not None:
-                # Before the concat: a hook may change the channel count (K3
-                # composites RGBA onto a background and returns RGB), and mixed
-                # 3/4-channel sources cannot be concatenated first.
-                resized = [post_resize(part) for part in resized]
-            batch = torch.cat(resized, dim=0)
-            # The concat already copied every part. Holding the list alive
-            # keeps a second full-size copy resident across patchify, which is
-            # where this group's peak allocation lands.
-            del resized
-
-            T = 1
-            gh, gw = padded_h // patch_size, padded_w // patch_size
-            batch = normalize_and_patchify(
-                batch,
+            # One NaViT target group can include several original resolutions;
+            # only source-compatible images share a resize launch. Streamed so
+            # no full-group float intermediate exists.
+            batch = _preprocess_group_streamed(
+                indexed_images,
+                target_h,
+                target_w,
+                padded_h,
+                padded_w,
                 image_scale,
                 image_bias,
                 patch_size,
-                padded_h,
-                padded_w,
+                post_resize=post_resize,
             )
+            del indexed_images
+
+            T = 1
+            gh, gw = padded_h // patch_size, padded_w // patch_size
 
             grid = (T, gh, gw)
             for i, (idx, _, _) in enumerate(group):
