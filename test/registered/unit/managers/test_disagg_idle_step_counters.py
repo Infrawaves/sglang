@@ -282,6 +282,27 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(scheduler.total_prefill_busy_us, total_us([0.5 - 0.0]))
         self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
 
+    def test_input_counter_adds_cached_prefix_under_the_same_gate(self):
+        # The router's cold ratio is uncached/input; if the input counter skips
+        # the cached prefix, or advances where the uncached one is gated out,
+        # the ratio drifts with no other symptom.
+        scheduler = self.make_scheduler([])
+        batch = self.make_batch(ForwardMode.EXTEND)
+        batch.prefill_stats = SimpleNamespace(log_hit_tokens=3072)
+        self.launch_batch(scheduler, batch, 0.0)
+        self.record_result(scheduler, batch, 0.5)
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+        self.assertEqual(scheduler.total_prefill_input_tokens, 1024 + 3072)
+
+        # A result at the previous result's instant spans 0us, outside
+        # (0, STEP_MAX_US), and advances neither counter.
+        late = self.make_batch(ForwardMode.EXTEND)
+        late.prefill_stats = SimpleNamespace(log_hit_tokens=3072)
+        self.launch_batch(scheduler, late, 0.2)
+        self.record_result(scheduler, late, 0.5)
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+        self.assertEqual(scheduler.total_prefill_input_tokens, 1024 + 3072)
+
     def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
         # An overlapped launch can precede the previous prefill's result; the
         # span already charged to that prefill must not be charged twice.
@@ -418,10 +439,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
+        scheduler.total_prefill_input_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.chunked_req = None
+        scheduler.enable_chunked_prefill_round_robin = False
         scheduler.waiting_queue = []
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(

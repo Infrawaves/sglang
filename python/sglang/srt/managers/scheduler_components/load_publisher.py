@@ -81,7 +81,8 @@ class LoadStat(
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
     num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank,
     num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
-    total_prefill_uncached_tokens, total_prefill_busy_us]``.
+    total_prefill_uncached_tokens, total_prefill_busy_us,
+    total_prefill_input_tokens]``.
 
     The first six positions are the #34608-compatible prefix. Current routers
     ignore appended fields, so extending the payload preserves compatibility.
@@ -99,6 +100,7 @@ class LoadStat(
     max_running_requests: int = 0  # Scheduler running-request limit
     total_prefill_uncached_tokens: int = 0  # Cumulative uncached prefill tokens
     total_prefill_busy_us: int = 0  # Cumulative prefill step time in microseconds
+    total_prefill_input_tokens: int = 0  # Cumulative prefilled prompt tokens, hits included
 
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
@@ -240,6 +242,7 @@ class SchedulerLoadPublisher:
                 load.max_running_requests,
                 load.total_prefill_uncached_tokens,
                 load.total_prefill_busy_us,
+                load.total_prefill_input_tokens,
             )
             if (
                 counts == self._last_counts
@@ -258,6 +261,7 @@ class SchedulerLoadPublisher:
                     max_running_requests=counts[6],
                     total_prefill_uncached_tokens=counts[7],
                     total_prefill_busy_us=counts[8],
+                    total_prefill_input_tokens=counts[9],
                 )
             )
             seq = next(self._seq).to_bytes(8, "big")

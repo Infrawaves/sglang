@@ -94,6 +94,7 @@ fn report(
                 max_running_requests: 100,
                 total_prefill_uncached_tokens: 0,
                 total_prefill_busy_us: 0,
+                total_prefill_input_tokens: None,
             }),
         },
         at,

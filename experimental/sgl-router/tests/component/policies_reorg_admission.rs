@@ -38,6 +38,7 @@ fn report(running: u64, waiting: u64, kv_tokens: u64, pending: u64) -> LoadStat 
             max_running_requests: 100,
             total_prefill_uncached_tokens: 0,
             total_prefill_busy_us: 0,
+            total_prefill_input_tokens: None,
         }),
     }
 }
