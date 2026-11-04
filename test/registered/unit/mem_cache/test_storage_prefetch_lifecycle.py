@@ -24,7 +24,11 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -883,6 +887,127 @@ class TestPrefetchRankSpread(CustomTestCase):
         op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
         self.assertEqual(op.storage_hit_count, 128)
         self.assertFalse(hasattr(op, "query_rank_spread"))
+
+
+class TestHybridRestorableIntersection(CustomTestCase):
+    PAGE = 64
+
+    def _prefetch(self, *, peer_hit_pages, peer_restorable, own_restorable):
+        """Run one prefetch on rank 0 of a two-rank group whose peer is a
+        stand-in that answers each collective by tensor shape."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.pp_prefetch_command_group = None
+        ctrl.enable_diagnostic_metrics = False
+        ctrl.prefetch_hits_sync_groups = []
+        ctrl.page_size = self.PAGE
+        ctrl.storage_stop_event = threading.Event()
+        ctrl.storage_stop_event.set()
+        ctrl.prefetch_queue = Queue()
+        ctrl.prefetch_hit_queue = Queue()
+        own_hit_pages = max(own_restorable)
+        ctrl._storage_hit_query = lambda op: (
+            ["h"] * own_hit_pages,
+            own_hit_pages * self.PAGE,
+        )
+        self.reduces = 0
+
+        def reduce(tensor, op, groups):
+            assert op == torch.distributed.ReduceOp.MIN
+            self.reduces += 1
+            peer_tokens = peer_hit_pages * self.PAGE
+            if tensor.dim() == 0:
+                peer = torch.tensor(peer_tokens, dtype=torch.int)
+            elif tensor.numel() == 2:
+                peer = torch.tensor([peer_tokens, -peer_tokens], dtype=torch.int)
+            else:
+                peer = torch.zeros_like(tensor)
+                peer[[p for p in peer_restorable if p < tensor.numel()]] = 1
+            tensor.copy_(torch.minimum(tensor, peer))
+
+        ctrl._all_reduce = reduce
+        ctrl.prefetch_queue.put(
+            SimpleNamespace(
+                is_terminated=lambda: False, restorable_prefix_pages=own_restorable
+            )
+        )
+        HybridCacheController.prefetch_thread_func(ctrl)
+        return ctrl.prefetch_hit_queue.get_nowait()
+
+    def test_ranks_settle_on_a_length_every_rank_can_restore(self):
+        """Rank-sharded KDA state leaves each rank with a different set of
+        restorable prefix lengths. Reducing the per-rank maxima picked 8 pages
+        here, a length rank 0 cannot restore, which discarded the prefetch;
+        the ranks must settle on 5, the longest length both hold."""
+        op = self._prefetch(
+            peer_hit_pages=8, peer_restorable=[5, 8], own_restorable=[5, 10]
+        )
+        self.assertEqual(op.storage_hit_count, 5 * self.PAGE)
+        self.assertEqual(op.hash_value, ["h"] * 5)
+
+    def test_agreeing_ranks_use_a_single_collective(self):
+        """Ranks that already agree on the hit count must not pay for the
+        extra per-page collective: it runs on every prefetch query."""
+        op = self._prefetch(
+            peer_hit_pages=10, peer_restorable=[5, 10], own_restorable=[5, 10]
+        )
+        self.assertEqual(op.storage_hit_count, 10 * self.PAGE)
+        self.assertEqual(self.reduces, 1)
+
+
+class TestKDANodeAggregatedRead(CustomTestCase):
+    def _read(self, *, peer_slot, kv_completed_pages=2):
+        """Run one sidecar read on the node leader with a stand-in exchange."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.kda_node_aggregate = SimpleNamespace(is_leader=True, prefetch_group="pg")
+        ctrl.storage_backend = Mock()
+        ctrl.storage_backend.batch_get_v2.return_value = {}
+        ctrl.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=SimpleNamespace(page_size=1))
+            }
+        )
+        ctrl.prefetch_sync_queue = Queue()
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["__placeholder__"],
+            host_indices=torch.tensor([3]),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        operation = SimpleNamespace(
+            request_id="r",
+            is_terminated=lambda: False,
+            hash_value=["h0", "h1"],
+            skip_reason=None,
+            pool_transfers=[mamba],
+            prefix_keys=None,
+            sidecar_hash_values=None,
+            sidecar_hit_pages=0,
+            sidecar_ts=None,
+        )
+        exchange = Mock(side_effect=lambda group, slot: [slot, peer_slot])
+        ctrl._exchange_node_slot = exchange
+        ctrl._page_transfer_sidecar(operation, kv_completed_pages)
+        return ctrl, operation, exchange, ctrl.prefetch_sync_queue.get_nowait()
+
+    def test_peer_skip_stops_leader_io_and_reports_no_mamba_hit(self):
+        """A peer without a slot cannot receive the leader's write into its
+        share, so the leader must not read the node object and the node must
+        report a Mamba miss instead of restoring stale state on that rank."""
+        ctrl, operation, exchange, ack = self._read(peer_slot=-1)
+        exchange.assert_called_once_with("pg", 3)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        self.assertEqual(ack.pool_hits, {PoolName.MAMBA: 0})
+        self.assertEqual(operation.skip_reason, "node_peer_skip")
+
+    def test_locally_skipped_rank_still_joins_the_exchange(self):
+        """A rank whose KV read fell short must still run the exchange once,
+        or its node peers block in the collective forever."""
+        ctrl, operation, exchange, ack = self._read(peer_slot=5, kv_completed_pages=1)
+        exchange.assert_called_once_with("pg", -1)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        ctrl.storage_backend.batch_get_v2.assert_not_called()
+        self.assertEqual(ack.pool_hits, {})
+        self.assertEqual(operation.skip_reason, "kv_short")
 
 
 if __name__ == "__main__":

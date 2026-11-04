@@ -336,6 +336,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                     conv_buffer=[conv],
                     temporal_state_elem_size=1,
                     get_hybrid_pool_buffer=lambda: [temporal, conv],
+                    node_aggregate=None,
                 )
                 registrations = []
 
@@ -375,6 +376,121 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                 self.assertEqual(
                     store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 0
                 )
+
+    def test_mamba_state_is_not_queried_past_the_kv_hit(self):
+        """Restore points beyond the KV hit are never used, so querying their
+        Mamba state only adds Master load. Here KV ends after page0."""
+        store, backend = _make_store(is_mla_model=True, mla_host_read_only=False)
+        store.mem_pool_host.kv_buffer = torch.empty(1)
+        temporal, conv = torch.empty(1), torch.empty(1)
+        mamba_pool = SimpleNamespace(
+            temporal_buffer=temporal,
+            conv_buffer=[conv],
+            temporal_state_elem_size=1,
+            get_hybrid_pool_buffer=lambda: [temporal, conv],
+            node_aggregate=None,
+        )
+        with patch.object(backend, "register_buffer", return_value=0):
+            store.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
+        backend.existing_keys.update(["page0__k", "page0_0_temporal", "page0_0_conv_0"])
+        queried = []
+        original = backend.batch_is_exist
+        backend.batch_is_exist = lambda keys: (queried.extend(keys), original(keys))[1]
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["page2"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        result = store.batch_exists_v2(["page0", "page1", "page2"], [transfer])
+        self.assertEqual(result.restorable_prefix_pages, [1])
+        mamba_queries = [k for k in queried if "temporal" in k or "conv" in k]
+        self.assertEqual(mamba_queries, ["page0_0_temporal", "page0_0_conv_0"])
+
+    def test_node_aggregated_leader_writes_one_object_spanning_node_ranks(self):
+        """The leader writes each KDA checkpoint as one object whose buffers are
+        every node rank's slot in node-rank order, temporal then conv per rank;
+        followers read their shares back from these offsets."""
+        store, backend = _make_store(
+            is_mla_model=True, tp_size=2, mla_host_read_only=False
+        )
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+        # Two ranks; temporal slot = 2 layers * 3 elems * 2 B, conv slot = 2 * 5 * 1 B.
+        temporal = torch.empty((4, 2, 1, 3), dtype=torch.bfloat16)
+        conv = torch.empty((4, 2, 1, 5), dtype=torch.int8)
+        peer_bases = {
+            temporal.data_ptr(): [10_000, 20_000],
+            conv.data_ptr(): [30_000, 40_000],
+        }
+        full_buffers = [torch.empty(8), torch.empty(8)]
+        ctx = SimpleNamespace(
+            is_leader=True,
+            node_index=1,
+            num_nodes=2,
+            allocator=SimpleNamespace(
+                full_buffers=lambda: full_buffers,
+                peer_base_ptrs=lambda t: peer_bases[t.data_ptr()],
+            ),
+        )
+        pool = SimpleNamespace(
+            layout="page_first",
+            num_mamba_layers=2,
+            temporal_buffer=temporal,
+            temporal_state_elem_size=3,
+            temporal_dtype=temporal.dtype,
+            conv_buffer=[conv],
+            conv_state_elem_sizes=[5],
+            conv_dtype=conv.dtype,
+            node_aggregate=ctx,
+        )
+        pool.get_node_page_buffer_meta = lambda slots: (
+            MambaPoolHost.get_node_page_buffer_meta(pool, slots)
+        )
+        registrations = []
+
+        def register(ptr, size):
+            registrations.append(ptr)
+            return 0
+
+        with patch.object(backend, "register_buffer", side_effect=register):
+            store.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+        self.assertEqual(registrations, [buf.data_ptr() for buf in full_buffers])
+
+        transfer = PoolTransfer(name=PoolName.MAMBA, keys=["page7"])
+        result = store.batch_io_node_aggregated_mamba(transfer, [[3, 1]], is_set=True)
+        self.assertEqual(result, [True])
+        call = backend.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(call["keys"], ["page7_kdanode1of2_tp2_v1"])
+        self.assertEqual(
+            call["ptrs"], [[10_000 + 3 * 12, 30_000 + 3 * 10, 20_000 + 12, 40_000 + 10]]
+        )
+        self.assertEqual(call["sizes"], [[12, 10, 12, 10]])
+        self.assertEqual(call["args"][0].group_ids, ["sglang-hicache:page7"])
+
+    def test_node_aggregated_follower_skips_mamba_queries_keeps_kv_limit(self):
+        """Only the leader queries node objects; a follower must not add Master
+        load, yet its own KV hit still bounds the restorable set."""
+        store, backend = _make_store(
+            is_mla_model=True, tp_rank=1, tp_size=2, mla_host_read_only=False
+        )
+        store.mem_pool_host.kv_buffer = torch.empty(1)
+        pool = SimpleNamespace(node_aggregate=SimpleNamespace(is_leader=False))
+        with patch.object(backend, "register_buffer", side_effect=AssertionError):
+            store.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+        backend.existing_keys.update(["page0__k", "page1__k"])
+        queried = []
+        original = backend.batch_is_exist
+        backend.batch_is_exist = lambda keys: (queried.extend(keys), original(keys))[1]
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["page2"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        result = store.batch_exists_v2(["page0", "page1", "page2"], [transfer])
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2])
+        self.assertEqual([k for k in queried if not k.endswith("__k")], [])
 
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()

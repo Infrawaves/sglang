@@ -229,6 +229,10 @@ class Memory(msgspec.Struct):
             choices=["broadcast", "shm"],
         ),
     ] = "broadcast"
+    enable_kda_hicache_node_aggregate: A[
+        bool,
+        "Store each KDA/Mamba HiCache L3 checkpoint as one Mooncake object per node, written and read by the node leader from node-shared host memory.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
