@@ -627,8 +627,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
-            # KDANodeAggregateContext of the registered Mamba pool, if any.
-            self.kda_node_aggregate = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -754,14 +752,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
 
-        if host_pool_name == PoolName.MAMBA and host_pool.node_aggregate is not None:
-            self.kda_node_aggregate = host_pool.node_aggregate
-            # Only the leader does Mamba L3 IO, over the whole node's shares.
-            if self.kda_node_aggregate.is_leader:
-                for buf in self.kda_node_aggregate.allocator.full_buffers():
-                    super().register_buffer(buf)
-            return
-
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
@@ -806,13 +796,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         suffixes = []
         if pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
-        elif pool_name == PoolName.MAMBA and self.kda_node_aggregate is not None:
-            # One object per node; get_node_page_buffer_meta orders its buffers.
-            ctx = self.kda_node_aggregate
-            suffixes = [
-                f"_kdanode{ctx.node_index}of{ctx.num_nodes}"
-                f"_tp{self.storage_config.tp_size}_v1"
-            ]
         elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
@@ -916,14 +899,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
-            if self._is_kda_node_follower(transfer):
-                # The leader's real stop points win the cache-group MIN.
-                page_exists = [True] * kv_pages
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            component_keys = self._tag_keys(component_keys)
+            ex = self._batch_exist(component_keys, extra_info)
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(kv_pages)
+                ]
             else:
-                # Pages past the KV hit are never consulted below, so do not query them.
-                page_exists = self._hybrid_page_exists(
-                    keys[:kv_pages], transfer, extra_info
-                )
+                page_exists = [False] * kv_pages
             boundary = 0
             pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
@@ -954,90 +944,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _is_kda_node_follower(self, transfer: PoolTransfer) -> bool:
-        return (
-            transfer.name == PoolName.MAMBA
-            and self.kda_node_aggregate is not None
-            and not self.kda_node_aggregate.is_leader
-        )
-
-    def _hybrid_page_exists(
-        self,
-        page_keys: List[str],
-        transfer: PoolTransfer,
-        extra_info: Optional[HiCacheStorageExtraInfo],
-    ) -> List[bool]:
-        component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-            page_keys, transfer
-        )
-        component_keys = self._tag_keys(component_keys)
-        ex = self._batch_exist(component_keys, extra_info)
-        if key_multiplier <= 0:
-            return [False] * len(page_keys)
-        return [
-            all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-            for i in range(len(page_keys))
-        ]
-
-    def batch_io_node_aggregated_mamba(
-        self,
-        transfer: PoolTransfer,
-        node_slots_per_page: List[List[int]],
-        *,
-        is_set: bool,
-    ) -> List[bool]:
-        """Leader-only: one object per page spanning every node rank's slot."""
-        assert self.kda_node_aggregate is not None and self.kda_node_aggregate.is_leader
-        assert len(transfer.keys) == len(node_slots_per_page)
-        host_pool = self.registered_pools[PoolName.MAMBA]
-        tagged_page_keys = self._tag_keys(transfer.keys)
-        key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-            transfer.keys, transfer
-        )
-        assert key_multiplier == 1
-        key_strs = self._tag_keys(key_strs)
-        ptr_list, element_size_list = [], []
-        for slots in node_slots_per_page:
-            ptrs, sizes = host_pool.get_node_page_buffer_meta(slots)
-            ptr_list.append(ptrs)
-            element_size_list.append(sizes)
-
-        if is_set:
-            group_ids = (
-                self._expand_group_ids(tagged_page_keys, 1)
-                if self._can_use_group_semantics()
-                else None
-            )
-            exist_result = self._batch_exist(key_strs)
-            io_results = [0 if state == 1 else -1 for state in exist_result]
-            missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-            if missing_idx:
-                put_results = self._put_batch_zero_copy_impl(
-                    [key_strs[i] for i in missing_idx],
-                    [ptr_list[i] for i in missing_idx],
-                    [element_size_list[i] for i in missing_idx],
-                    self._filter_group_ids(group_ids, missing_idx),
-                )
-                for i, res in zip(missing_idx, put_results):
-                    io_results[i] = res
-        else:
-            io_results = self._get_batch_zero_copy_impl(
-                key_strs, ptr_list, element_size_list, pool=str(transfer.name)
-            )
-        return self._batch_postprocess(
-            io_results, is_set_operate=is_set, key_multiplier=1
-        )
-
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
-            if transfer.name == PoolName.MAMBA and self.kda_node_aggregate is not None:
-                raise RuntimeError(
-                    "Node-aggregated KDA state must go through "
-                    "batch_io_node_aggregated_mamba on the node leader."
-                )
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
