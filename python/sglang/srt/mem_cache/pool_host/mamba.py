@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -81,6 +82,7 @@ class MambaPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
+        host_allocator: Optional[HostTensorAllocator] = None,
     ):
         self.device_pool = device_pool
         self.page_size = 1
@@ -93,7 +95,14 @@ class MambaPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = (
+            host_allocator
+            if host_allocator is not None
+            else get_allocator_from_storage(allocator_type)
+        )
+        # KDANodeAggregateContext, set by the assembler when this pool's
+        # buffers are node-shared shares.
+        self.node_aggregate = None
         self.num_mamba_layers = device_pool.num_mamba_layers
 
         self.conv_state_shapes = [
@@ -814,6 +823,42 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+        return ptr_list, element_size_list
+
+    def get_node_page_buffer_meta(
+        self, node_slots: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Buffers of one checkpoint across the node, for one storage object.
+
+        ``node_slots`` holds each node rank's host slot, in node-rank order;
+        pointers are in this (leader) process's view of the shared buffers.
+        """
+        assert self.layout in ["page_first", "page_first_direct"], self.layout
+        allocator = self.node_aggregate.allocator
+        # Same component order as get_page_buffer_meta, repeated per rank.
+        components = []
+        if self.temporal_state_elem_size > 0:
+            components.append(
+                (
+                    allocator.peer_base_ptrs(self.temporal_buffer),
+                    self.num_mamba_layers
+                    * self.temporal_state_elem_size
+                    * self.temporal_dtype.itemsize,
+                )
+            )
+        for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
+            components.append(
+                (
+                    allocator.peer_base_ptrs(buf),
+                    self.num_mamba_layers * elem_size * self.conv_dtype.itemsize,
+                )
+            )
+        ptr_list = []
+        element_size_list = []
+        for node_rank, slot in enumerate(node_slots):
+            for peer_bases, slot_bytes in components:
+                ptr_list.append(peer_bases[node_rank] + slot * slot_bytes)
+                element_size_list.append(slot_bytes)
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:

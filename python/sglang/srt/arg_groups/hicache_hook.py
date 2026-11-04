@@ -25,6 +25,14 @@ def handle_hicache(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.enable_mla_hicache_per_node:
         validate_mla_hicache_per_node(server_args)
+    if cfg.enable_kda_hicache_node_aggregate and (
+        not cfg.enable_hierarchical_cache or cfg.hicache_storage_backend != "mooncake"
+    ):
+        # Checked before the early returns below, which skip the full validation.
+        raise ValueError(
+            "--enable-kda-hicache-node-aggregate requires --enable-hierarchical-cache "
+            "with --hicache-storage-backend mooncake."
+        )
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -78,6 +86,46 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+    if cfg.enable_kda_hicache_node_aggregate:
+        # After step 2: the layout check needs the resolved layout.
+        validate_kda_hicache_node_aggregate(server_args)
+
+
+def validate_kda_hicache_node_aggregate(server_args: Any):
+    cfg = resolving_view(server_args)
+    flag = "--enable-kda-hicache-node-aggregate"
+    if cfg.hicache_mem_layout not in ("page_first", "page_first_direct"):
+        raise ValueError(
+            f"{flag} requires --hicache-mem-layout page_first or "
+            f"page_first_direct, got {cfg.hicache_mem_layout!r}."
+        )
+    if cfg.hicache_host_memory_mode == "buffer_only":
+        raise ValueError(
+            f"{flag} does not support --hicache-host-memory-mode buffer_only."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(f"{flag} requires --pp-size 1.")
+    if cfg.enable_dp_attention:
+        raise ValueError(f"{flag} does not support --enable-dp-attention.")
+    if cfg.attn_cp_size > 1:
+        raise ValueError(f"{flag} requires --attn-cp-size 1.")
+    # Lazy: only node-aggregated launches pay for these imports.
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStoreConfig,
+    )
+
+    extra_config = HybridCacheController.parse_storage_backend_extra_config(
+        cfg.hicache_storage_backend_extra_config
+    )[0]
+    if MooncakeStoreConfig.load(extra_config).standalone_storage:
+        raise ValueError(
+            f"{flag} is incompatible with Mooncake standalone_storage=True, "
+            "which requires MooncakeHostTensorAllocator."
+        )
 
 
 def validate_mla_hicache_per_node(server_args: Any):
