@@ -1620,9 +1620,9 @@ class HybridCacheController(BaseHiCacheController):
             self.storage_backend_type != "mooncake"
             or kv_entry is None
             or not isinstance(kv_entry.host_pool, MLATokenToKVPoolHost)
-            # Prefill runs the default page_first; page_first_direct orders a
-            # page layer-major, so equal keys would carry reordered bytes.
-            or kv_entry.host_pool.layout != "page_first"
+            # Pages are stored as raw host bytes, so P and D must share the same
+            # --hicache-mem-layout; nothing cross-checks it.
+            or kv_entry.host_pool.layout not in ("page_first", "page_first_direct")
             or mamba_entry is None
             or mamba_entry.host_pool.layout not in ("page_first", "page_first_direct")
         ):
