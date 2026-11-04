@@ -43,14 +43,25 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
+def full_coverage_graph_slots(
+    max_live_bs: int, graph_num_tokens: int, verify_width: int
+) -> int:
+    """Minimum slots that keep every full-coverage padding row within verify_width."""
+    # The idle layout has one anchor per shared request slot. A busy rank has
+    # at least one token per live request. With B equal to the shared maximum,
+    # reserving ceil((G - B) / W) dummy rows covers both cases on every DP.
+    padding_tokens = max(0, graph_num_tokens - max_live_bs)
+    return max_live_bs + (padding_tokens + verify_width - 1) // verify_width
+
+
 def needs_full_width_ragged_graph(
-    runner, max_live_bs: int, graph_num_tokens: int
+    runner, max_live_bs: int, graph_num_tokens: int, verify_width: int
 ) -> bool:
-    """A full-coverage backend at capacity has no spare request for graph padding."""
+    """Switch all DPs to uniform lengths if the compact padding cannot fit."""
     return (
         getattr(runner, "reserve_ragged_padding_slot", False)
-        and max_live_bs == runner.max_bs
-        and graph_num_tokens > max_live_bs
+        and full_coverage_graph_slots(max_live_bs, graph_num_tokens, verify_width)
+        > runner.max_bs
     )
 
 

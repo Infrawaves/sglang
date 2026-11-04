@@ -116,6 +116,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.ragged_verify import (
+    full_coverage_graph_slots,
     needs_full_width_ragged_graph,
     resolve_ragged_verify_layout,
 )
@@ -682,10 +683,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _ragged_graph_slots(self, num_tokens: int, max_bs: int) -> Optional[int]:
         slots = self._ragged_slots_by_tokens.get(num_tokens, ())
-        # The number of live tokens can vary per rank. Reserve using only the
-        # shared geometry, even on a rank that happened to fill the entire tier.
-        required_slots = max_bs + int(
-            self.reserve_ragged_padding_slot and num_tokens > max_bs
+        required_slots = (
+            full_coverage_graph_slots(max_bs, num_tokens, self.captured_req_width)
+            if self.reserve_ragged_padding_slot
+            else max_bs
         )
         idx = bisect_left(slots, required_slots)
         return slots[idx] if 0 < max_bs and idx < len(slots) else None
@@ -694,15 +695,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # On synchronized DP the planner carries the same maximum on busy
         # and idle ranks; DP-local execution only needs the local request count.
         max_bs = layout.graph_max_bs if layout.graph_max_bs is not None else layout.bs
-        if needs_full_width_ragged_graph(self, max_bs, layout.graph_num_tokens):
-            # At the absolute capacity there is nowhere to put a dummy row.
-            # The planner switches every rank to its full-width layout.
+        if needs_full_width_ragged_graph(
+            self, max_bs, layout.graph_num_tokens, self.captured_req_width
+        ):
+            # Every rank switched to uniform lengths. The smallest captured
+            # slot bucket can hold the rounded full-width tier, including when
+            # the shared live count falls between two capture batch sizes.
+            buckets = self._ragged_slots_by_tokens.get(layout.graph_num_tokens, ())
             if (
-                max_bs >= layout.bs
-                and layout.graph_num_tokens == max_bs * self.captured_req_width
+                buckets
+                and 0 < layout.bs <= max_bs
+                and layout.graph_num_tokens >= max_bs * self.captured_req_width
                 and layout.total_verify_tokens == layout.bs * self.captured_req_width
             ):
-                return max_bs, layout.graph_num_tokens
+                return buckets[0], layout.graph_num_tokens
             return None
         slots = self._ragged_graph_slots(layout.graph_num_tokens, max_bs)
         if slots is None or max_bs < layout.bs:

@@ -18,6 +18,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (  # noqa: E402
+    DecodeCudaGraphRunner,
+    ragged_verify_slot_buckets,
+)
 from sglang.srt.speculative.dspark_components import dspark_planner  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_planner import (  # noqa: E402
     DSparkVerifyPlanner,
@@ -328,6 +332,70 @@ class TestWorkerDpTierGate(CustomTestCase):
         worker = self._worker()
         batch = self._batch(can_run_decode_cuda_graph=False)
         self.assertIsNone(worker._idle_verify_ragged_layout(batch))
+
+    def test_full_coverage_replay_bounds_every_query_on_busy_and_idle_ranks(self):
+        device = torch.device("cpu")
+        # The 40-request DP needs 240 tokens. The 63-request DP only verifies
+        # its anchors, so 177 tokens must fit in dummy rows on that rank.
+        counts = [63, 40, 0]
+        batch = self._batch(
+            global_num_tokens=counts, global_spec_verify_tier_num_tokens=[63, 240, 0]
+        )
+        for max_bs, expected_shape in ((256, (128, 240)), (64, (64, 384))):
+            with self.subTest(max_bs=max_bs):
+                runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+                runner.ragged_verify_mode = True
+                runner.reserve_ragged_padding_slot = True
+                runner.captured_req_width = _WIDTH
+                runner.max_bs = max_bs
+                runner.capture_num_tokens = sorted({240, 384, max_bs * _WIDTH})
+                runner._ragged_slots_by_tokens = {
+                    g: ragged_verify_slot_buckets(g, _WIDTH, max_bs)
+                    for g in runner.capture_num_tokens
+                }
+                worker = self._worker()
+                worker.device = device
+                worker.verify_num_draft_tokens = _WIDTH
+                worker.model_runner = SimpleNamespace(decode_cuda_graph_runner=runner)
+                planner = _planner()
+                planner.model_runner = worker.model_runner
+                planner._ragged_verify_mode = dspark_planner.RaggedVerifyMode.COMPACT
+                planner._align_verify_tokens_to_graph_tier = False
+
+                idle = worker._idle_verify_ragged_layout(batch)
+                rows = [(idle, counts[0], 1)]
+                tier = worker._dp_verify_tier_num_tokens(batch)
+                for bs, length in ((63, 1), (40, _WIDTH)):
+                    planner._schedule_verify_lens = Mock(
+                        return_value=torch.full((bs,), length, dtype=torch.int32)
+                    )
+                    active = planner.schedule_layout(
+                        req_pool_indices=torch.arange(bs),
+                        prefix_lens=torch.ones(bs),
+                        device=device,
+                        confidence=None,
+                        budget=bs * (length - 1),
+                        global_num_reqs=max(counts),
+                        dp_tier_num_tokens=tier,
+                    )
+                    rows.append((active, bs, length))
+
+                self.assertIn(expected_shape, runner._capture_sizes())
+                for layout, bs, length in rows:
+                    shape = runner._ragged_replay_shape(layout)
+                    self.assertIsNotNone(shape)
+                    slots, tokens = shape
+                    padded = layout.padded_to_bucket(padded_bs=slots)
+                    lengths = padded.qo_indptr_device.diff().tolist()
+                    # If the capture cannot fit the slack at G=240, all DPs
+                    # switch to full width, including the synthetic idle rows.
+                    expected_length = _WIDTH if tokens == 384 else length
+                    self.assertEqual(lengths[:bs], [expected_length] * bs)
+                    self.assertEqual(len(lengths), slots)
+                    self.assertEqual(sum(lengths), tokens)
+                    self.assertGreaterEqual(min(lengths), 0)
+                    self.assertLessEqual(max(lengths), _WIDTH)
+                    self.assertEqual(shape, expected_shape)
 
     def test_uneven_active_and_idle_ranks_share_graph_dimensions(self):
         worker = self._worker()

@@ -551,6 +551,7 @@ class DSparkVerifyPlanner:
                 self.model_runner.decode_cuda_graph_runner,
                 tier_num_reqs,
                 graph_num_tokens,
+                self.verify_num_draft_tokens,
             ):
                 return uniform_ragged_layout(
                     bs=bs,
@@ -744,6 +745,7 @@ def idle_ragged_layout(
             model_runner.decode_cuda_graph_runner,
             tier_num_reqs,
             round_up_grid(dp_tier_num_tokens, grid),
+            verify_num_draft_tokens,
         ):
             dp_tier_num_tokens = None
     if dp_tier_num_tokens is None:
