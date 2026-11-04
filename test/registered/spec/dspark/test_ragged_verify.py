@@ -85,6 +85,15 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(padded.verify_lens.tolist(), [8, 1, 7])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
 
+    def test_capped_layout_keeps_slack_out_of_last_real_row(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[4, 1, 2], device=_DEVICE, grid=[12]
+        )
+        packed = layout.padded_to_bucket(padded_bs=3, cap=6)
+        self.assertEqual(packed.verify_lens.tolist(), [4, 1, 2])
+        self.assertEqual(packed.qo_indptr_device.tolist(), [0, 4, 5, 7])
+        self.assertEqual(packed.graph_num_tokens, 12)
+
     def test_padded_layout_zero_len_pad_rows(self):
         raw = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[8, 8],

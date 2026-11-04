@@ -321,15 +321,80 @@ class TestWorkerDpTierGate(CustomTestCase):
     def test_eager_fallback_only_needs_uniform_width_for_synced_verify(self):
         batch = self._batch(can_run_decode_cuda_graph=False)
         self.assertTrue(self._worker()._use_uniform_eager_verify(batch))
-        self.assertFalse(
-            self._worker(dp_synced=False)._use_uniform_eager_verify(batch)
-        )
+        self.assertFalse(self._worker(dp_synced=False)._use_uniform_eager_verify(batch))
         self.assertFalse(self._worker()._use_uniform_eager_verify(self._batch()))
 
     def test_idle_rank_follows_eager_vote(self):
         worker = self._worker()
         batch = self._batch(can_run_decode_cuda_graph=False)
         self.assertIsNone(worker._idle_verify_ragged_layout(batch))
+
+    def test_uneven_active_and_idle_ranks_share_graph_dimensions(self):
+        worker = self._worker()
+        worker.device = torch.device("cpu")
+        worker.verify_num_draft_tokens = _WIDTH
+        worker.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=SimpleNamespace(
+                ragged_verify_mode=True,
+                capture_num_tokens=[60, 192, 240, 360],
+                max_bs=60,
+            )
+        )
+        planner = _planner()
+        planner.model_runner = worker.model_runner
+        planner._ragged_verify_mode = dspark_planner.RaggedVerifyMode.COMPACT
+        planner._dynamic_graph_tier = False
+        planner._align_verify_tokens_to_graph_tier = True
+        counts = [57, 60, 0]
+        for reserve, tiers, expected_tokens in (
+            (False, [171, 239, 0], 240),
+            (False, [171, -1, 0], 360),
+            # At capacity, a backend that needs a ghost slot must use a
+            # full-width layout on every rank, even one with fewer requests.
+            (True, [171, 239, 0], 360),
+            # The largest DP verifies exactly one anchor per request.
+            (True, [57, 60, 0], 60),
+        ):
+            with self.subTest(reserve=reserve, tiers=tiers):
+                worker.model_runner.decode_cuda_graph_runner.reserve_ragged_padding_slot = reserve
+                batch = self._batch(
+                    global_num_tokens=counts, global_spec_verify_tier_num_tokens=tiers
+                )
+                shared_tier = worker._dp_verify_tier_num_tokens(batch)
+                layouts = [worker._idle_verify_ragged_layout(batch)]
+                for bs in counts[:2]:
+                    planner._schedule_verify_lens = Mock(
+                        return_value=(
+                            torch.full(
+                                (bs,), 1 if shared_tier == 60 else 3, dtype=torch.int32
+                            )
+                            if shared_tier is not None
+                            else None
+                        )
+                    )
+                    layouts.append(
+                        planner.schedule_layout(
+                            req_pool_indices=torch.arange(bs),
+                            prefix_lens=torch.ones(bs),
+                            device=worker.device,
+                            confidence=None,
+                            budget=2 * bs if shared_tier is not None else None,
+                            global_num_reqs=max(counts),
+                            dp_tier_num_tokens=shared_tier,
+                        )
+                    )
+                self.assertEqual(
+                    {
+                        (layout.graph_max_bs, layout.graph_num_tokens)
+                        for layout in layouts
+                    },
+                    {(60, expected_tokens)},
+                )
+                if expected_tokens == 360:
+                    for layout in layouts:
+                        self.assertEqual(
+                            layout.verify_lens.tolist(), [_WIDTH] * layout.bs
+                        )
 
 
 def _info(*, num_tokens: int, tier: int, budget_enc: int) -> dp_attn.MLPSyncBatchInfo:

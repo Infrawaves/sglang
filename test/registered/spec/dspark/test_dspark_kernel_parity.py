@@ -9,6 +9,7 @@ exactly, or with the tolerance the kernel is specified to meet.
 
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -23,6 +24,7 @@ from sglang.kernels.ops.speculative.dspark import (
     dspark_schedule,
     dspark_verify_window,
 )
+from sglang.srt.speculative import dflash_utils
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
@@ -535,6 +537,89 @@ _CASES = [
 
 
 class TestDsparkKernelParity(CustomTestCase):
+    def test_top_p_only_sees_valid_verify_rows(self):
+        width, vocab = 6, 128
+        lens = torch.arange(1, width + 1, device=DEVICE, dtype=torch.int32)
+        bs = lens.numel()
+        candidates = torch.arange(bs * width, device=DEVICE).view(bs, width)
+        next_ids = torch.cat(
+            (candidates[:, 1:], torch.arange(bs, device=DEVICE)[:, None] + 90),
+            dim=1,
+        )
+        target = torch.full((bs, width, vocab), -20.0, device=DEVICE)
+        target.scatter_(2, next_ids.unsqueeze(2), 20.0)
+        draft = torch.zeros_like(target).scatter_(2, next_ids.unsqueeze(2), 1.0)
+        # Request 2 rejects before its cap. Request 4 has a nontrivial
+        # rejection probability to exercise the per-position RNG mapping.
+        target[2, 0, next_ids[2, 0]] = -20
+        target[2, 0, 100] = 20
+        target[4, :4, 96:100] = torch.linspace(19.25, 20, 4, device=DEVICE)
+        target[torch.arange(width, device=DEVICE)[None, :] >= lens[:, None]] = 0
+        layout = _layout(lens, graph_num_tokens=24)
+        sampling = types.SimpleNamespace(
+            temperatures=torch.linspace(0.7, 1.2, bs, device=DEVICE)[:, None],
+            top_ps=torch.linspace(0.65, 0.95, bs, device=DEVICE),
+            top_ks=torch.arange(3, 3 + bs, dtype=torch.int32, device=DEVICE),
+            need_top_p_sampling=True,
+            need_top_k_sampling=False,
+        )
+        kwargs = dict(
+            candidates=candidates,
+            target_logits=target.flatten(0, 1),
+            draft_probs=draft,
+            sampling_info=sampling,
+            draft_input=types.SimpleNamespace(max_top_k=8, uniform_top_k_value=None),
+            gamma=width - 1,
+            verify_num_draft_tokens=width,
+            cutoff_verify_lens=lens,
+        )
+        valid_rows = width * (width + 1) // 2
+        valid = (torch.arange(width, device=DEVICE)[None, :] < lens[:, None]).flatten()
+        for seed, use_top_k, root_bonus in (
+            (321, False, 1),
+            (17, True, 101),
+            (7, False, 101),
+            (63, True, 1),
+        ):
+            # At L=1, the sole verified row must supply the bonus both when
+            # the first proposal is accepted and when it is rejected.
+            target[0, 0].fill_(-20)
+            target[0, 0, root_bonus] = 20
+            sampling.need_top_k_sampling = use_top_k
+            with (
+                self.subTest(seed=seed, top_k=use_top_k),
+                patch.object(
+                    dflash_utils,
+                    "_dflash_top_p_renorm_prob",
+                    wraps=dflash_utils._dflash_top_p_renorm_prob,
+                ) as top_p,
+            ):
+                torch.manual_seed(seed)
+                expected = dspark_accept.AcceptSampling.execute(**kwargs)
+                expected_len, expected_bonus = (x.clone() for x in expected[:2])
+                next_rng = torch.rand(8, device=DEVICE)
+                torch.manual_seed(seed)
+                actual_len, actual_bonus, _ = dspark_accept.AcceptSampling.execute(
+                    **kwargs,
+                    verify_row_indptr=layout.qo_indptr_device,
+                    num_valid_rows=valid_rows,
+                )
+                self.assertEqual(
+                    [call.args[0].shape[0] for call in top_p.call_args_list],
+                    [bs * width, valid_rows],
+                )
+                dense_args, packed_args = (call.args for call in top_p.call_args_list)
+                for dense, packed in zip(dense_args, packed_args):
+                    torch.testing.assert_close(packed, dense[valid])
+                self._eq(actual_len, expected_len)
+                self._eq(actual_bonus, expected_bonus)
+                self._eq(torch.rand(8, device=DEVICE), next_rng)
+                self.assertEqual(actual_len[[0, 2, 3, 5]].tolist(), [0, 0, 3, 5])
+                self.assertEqual(
+                    actual_bonus[[0, 2, 3, 5]].tolist(),
+                    [root_bonus, 100, int(next_ids[3, 3]), int(next_ids[5, 5])],
+                )
+
     def _eq(self, got, ref):
         """Exact comparison of tensors, tuples, and msgspec result structs."""
         if isinstance(ref, tuple):

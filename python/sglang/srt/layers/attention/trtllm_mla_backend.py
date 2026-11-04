@@ -243,6 +243,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # Ragged verify: the packed query is front-aligned into the dense
     # [bs, draft_token_num] layout in forward_extend.
     supports_ragged_verify_graph: bool = True
+    ragged_verify_needs_padding_slot: bool = False
 
     # Opt out when this backend cannot run absorbed MLA with a ragged query under
     # a piecewise prefill CUDA graph.

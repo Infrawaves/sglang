@@ -36,6 +36,7 @@ from sglang.srt.speculative.dspark_components.dspark_sts import (
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
+    needs_full_width_ragged_graph,
     read_ragged_verify_mode,
     round_up_grid,
 )
@@ -546,6 +547,19 @@ class DSparkVerifyPlanner:
         graph_num_tokens = None
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            if needs_full_width_ragged_graph(
+                self.model_runner.decode_cuda_graph_runner,
+                tier_num_reqs,
+                graph_num_tokens,
+            ):
+                return uniform_ragged_layout(
+                    bs=bs,
+                    device=device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                    tier_num_reqs=tier_num_reqs,
+                )
             if self._align_verify_tokens_to_graph_tier and budget is not None:
                 budget = graph_tier_fill_budget(
                     graph_num_tokens=graph_num_tokens,
@@ -577,7 +591,9 @@ class DSparkVerifyPlanner:
             return None
         if graph_num_tokens is not None:
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                graph_max_bs=tier_num_reqs,
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -590,6 +606,7 @@ class DSparkVerifyPlanner:
             device=device,
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
+            graph_max_bs=tier_num_reqs,
         )
 
     def _schedule_verify_lens(
@@ -719,8 +736,16 @@ def idle_ragged_layout(
     verify_num_draft_tokens: int,
     model_runner,
 ) -> Optional[RaggedVerifyLayout]:
-    if ragged_capture_num_tokens(model_runner=model_runner) is None:
+    grid = ragged_capture_num_tokens(model_runner=model_runner)
+    if grid is None:
         dp_tier_num_tokens = None
+    elif dp_tier_num_tokens is not None and dp_tier_num_tokens <= grid[-1]:
+        if needs_full_width_ragged_graph(
+            model_runner.decode_cuda_graph_runner,
+            tier_num_reqs,
+            round_up_grid(dp_tier_num_tokens, grid),
+        ):
+            dp_tier_num_tokens = None
     if dp_tier_num_tokens is None:
         return uniform_ragged_layout(
             bs=tier_num_reqs,
@@ -747,6 +772,7 @@ def idle_ragged_layout(
         device=device,
         grid=grid,
         graph_num_tokens_floor=dp_tier_num_tokens,
+        graph_max_bs=tier_num_reqs,
     )
 
 
@@ -783,6 +809,7 @@ def uniform_ragged_layout(
         device=device,
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
+        graph_max_bs=tier_num_reqs,
     )
 
 
