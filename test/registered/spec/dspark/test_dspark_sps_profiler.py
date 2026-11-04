@@ -1,5 +1,8 @@
+import random
 import unittest
+from unittest.mock import MagicMock, patch
 
+from sglang.benchmark import dspark_sps_profiler
 from sglang.benchmark.dspark_sps_profiler import (
     LoadInfo,
     ServerContext,
@@ -10,8 +13,10 @@ from sglang.benchmark.dspark_sps_profiler import (
     postprocess_round,
     resolve_cuda_graph_max_bs,
     round_summary_dict,
+    start_load,
     validate_sweep_against_server,
 )
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -259,6 +264,68 @@ class TestCountAlignedSteps(CustomTestCase):
         self.assertEqual(
             count_aligned_steps(rank_rows=[rows], batch_size_per_rank=4), 0
         )
+
+
+def run_load_with_response(
+    response: MagicMock, *, num_requests: int = 2, dp_size: int = 1
+) -> MagicMock:
+    with patch.object(
+        dspark_sps_profiler.requests, "post", return_value=response
+    ) as post:
+        thread = start_load(
+            base_url="http://localhost:30000",
+            num_requests=num_requests,
+            dp_size=dp_size,
+            input_len=4,
+            max_new_tokens=8,
+            temperature=1.0,
+            vocab_size=4096,
+            rng=random.Random(0),
+        )
+        thread.join(timeout=10)
+    return post
+
+
+class TestStartLoad(CustomTestCase):
+    def test_load_payload_targets_the_fake_transfer_path(self):
+        """A PD decode server built the KV receiver address from bootstrap_host
+        and crashed its scheduler on None; the fake host routes the load through
+        the fake transfer path instead."""
+        post = run_load_with_response(MagicMock(status_code=200, text="[]"))
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
+
+    def test_rejected_load_logs_status_and_server_message(self):
+        """A 400 from /generate used to be dropped silently, so the round waited
+        out its timeout with no hint of the cause."""
+        response = MagicMock(
+            status_code=400,
+            text='{"error":{"message":"exceeding --max-batch-outputs=1024."}}',
+        )
+        with self.assertLogs(dspark_sps_profiler.logger, level="ERROR") as logs:
+            run_load_with_response(response)
+        self.assertIn("HTTP 400", logs.output[0])
+        self.assertIn("--max-batch-outputs=1024", logs.output[0])
+
+    def test_load_pins_an_equal_share_to_every_dp_rank(self):
+        """Round-robin dispatch of one batch was shifted by a /health probe
+        landing mid-batch, leaving ranks at B-1 / B+1 so the round never
+        aligned; each rank now gets its own pinned share."""
+        post = run_load_with_response(
+            MagicMock(status_code=200, text="[]"), num_requests=8, dp_size=4
+        )
+        payloads = [call.kwargs["json"] for call in post.call_args_list]
+        self.assertEqual(
+            sorted(payload["routed_dp_rank"] for payload in payloads), [0, 1, 2, 3]
+        )
+        self.assertTrue(all(len(payload["input_ids"]) == 2 for payload in payloads))
+        prompts = [tuple(ids) for payload in payloads for ids in payload["input_ids"]]
+        self.assertEqual(len(set(prompts)), 8)
+
+    def test_single_dp_load_leaves_routing_to_the_server(self):
+        post = run_load_with_response(MagicMock(status_code=200, text="[]"))
+        self.assertEqual(post.call_count, 1)
+        self.assertNotIn("routed_dp_rank", post.call_args.kwargs["json"])
 
 
 class TestMinSteadySteps(CustomTestCase):
