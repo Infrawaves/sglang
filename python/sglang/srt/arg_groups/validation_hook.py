@@ -236,9 +236,23 @@ def check_server_args(server_args: Any):
         assert cfg.schedule_policy in [
             "fcfs",
             "lof",
+            "hrrn",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof' or 'hrrn'. '{cfg.schedule_policy}' is not supported."
         )
+        if cfg.schedule_policy == "hrrn":
+            assert cfg.disaggregation_mode != "decode", (
+                "Priority + HRRN requires prefill work; use --schedule-policy fcfs on decode."
+            )
+            assert cfg.disable_priority_preemption, (
+                "Priority + HRRN requires --disable-priority-preemption."
+            )
+            assert not cfg.enable_chunked_prefill_round_robin, (
+                "Priority + HRRN does not support --enable-chunked-prefill-round-robin."
+            )
+            assert not cfg.enable_hrrn_prefill_chunk_limit, (
+                "Priority + HRRN does not support --enable-hrrn-prefill-chunk-limit."
+            )
         if cfg.default_priority_value is None:
             logger.warning(
                 "--default-priority-value is not set while --enable-priority-scheduling is enabled. "

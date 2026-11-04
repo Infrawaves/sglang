@@ -287,7 +287,7 @@ class SchedulePolicy:
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
 
-        if self.policy == CacheAgnosticPolicy.FCFS:
+        if policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
@@ -306,7 +306,10 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
             elif policy == CacheAwarePolicy.HRRN:
                 SchedulePolicy._sort_by_hrrn(
-                    waiting_queue, temporary_deprioritized, processed_tokens
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens,
+                    self.priority_sign if self.enable_priority_scheduling else None,
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
@@ -549,6 +552,7 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         temporary_deprioritized: Set[int],
         processed_tokens: int,
+        priority_sign: Optional[int] = None,
     ) -> None:
         """Highest Response Ratio Next, with token-based aging.
 
@@ -564,19 +568,31 @@ class SchedulePolicy:
 
         Call sites that omit `processed_tokens` (dllm, disagg decode)
         degrade to rid-lexicographic order; those queues carry no prefill work.
+
+        With priority scheduling, HRRN and cache shortcuts apply only within
+        each priority tier. Equal scores in a tier use FIFO order.
         """
 
         def _key(r: Req):
             rid = r.rid
             if rid in temporary_deprioritized:
-                return (float("inf"), rid)
-            uncached = SchedulePolicy._uncached_len(r)
-            if uncached <= 0:
-                # No prefill work; drain immediately.
-                return (-float("inf"), rid)
-            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-            ratio_delta = waited_tokens / uncached
-            return (-ratio_delta, rid)
+                score = float("inf")
+            else:
+                uncached = SchedulePolicy._uncached_len(r)
+                if uncached <= 0:
+                    # No prefill work; drain immediately within the tier.
+                    score = -float("inf")
+                else:
+                    waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+                    score = -waited_tokens / uncached
+            if priority_sign is not None:
+                return (
+                    r.priority * priority_sign,
+                    score,
+                    r.time_stats.wait_queue_entry_time,
+                    rid,
+                )
+            return (score, rid)
 
         waiting_queue.sort(key=_key)
 
