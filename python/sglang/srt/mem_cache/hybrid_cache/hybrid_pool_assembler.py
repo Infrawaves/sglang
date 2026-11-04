@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.mla_host_node_leader import (
-    maybe_create_kda_node_aggregate_context,
     maybe_create_node_leader_context,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
@@ -1218,24 +1217,13 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    # WORLD-collective on every rank when enabled; launch validation already
-    # pinned the backend to Mooncake, so this gate is rank-independent.
-    kda_node_aggregate = (
-        maybe_create_kda_node_aggregate_context(tp_cache_group=params.tp_cache_group)
-        if storage_backend == "mooncake"
-        else None
-    )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=mamba_layout,
-        host_allocator=(
-            None if kda_node_aggregate is None else kda_node_aggregate.allocator
-        ),
     )
-    mamba_host_pool.node_aggregate = kda_node_aggregate
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1278,7 +1266,6 @@ def build_hybrid_mamba_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
         node_leader_broadcast=None if node_leader is None else node_leader.broadcast,
-        kda_node_aggregate=kda_node_aggregate,
     )
     return host_pool_group, cache_controller
 
@@ -2305,13 +2292,6 @@ def attach_hybrid_pool_to_unified_cache(
         ):
             raise ValueError(
                 "--enable-mla-hicache-per-node supports only hybrid MLA + "
-                f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
-            )
-        if get_memory().enable_kda_hicache_node_aggregate and not (
-            isinstance(strategy, _MambaStrategy) and kvcache.use_mla
-        ):
-            raise ValueError(
-                "--enable-kda-hicache-node-aggregate supports only hybrid MLA + "
                 f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
             )
         result = strategy.build(
