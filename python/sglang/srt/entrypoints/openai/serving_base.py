@@ -4,6 +4,8 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -16,13 +18,46 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.process_request_preprocessor import ProcessRequestPreprocessor
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_disagg, get_observability
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def http_stream_admission_enabled() -> bool:
+    prefill_enabled = envs.SGLANG_DISAGGREGATION_PREFILL_REJECT_ON_TIMEOUT.get()
+    decode_enabled = envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get()
+    if not prefill_enabled and not decode_enabled:
+        return False
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        return prefill_enabled and envs.SGLANG_REQ_WAITING_TIMEOUT.get() > 0
+    return mode == "decode" and decode_enabled
+
+
+async def check_http_stream_admission(
+    iterator: AsyncGenerator[Any, None], first: Any
+) -> None:
+    """Check the first engine result before sending HTTP stream headers."""
+    if not http_stream_admission_enabled():
+        return
+    output = first if isinstance(first, dict) else getattr(first, "last_output", None)
+    meta = (output.get("meta_info") or {}) if isinstance(output, dict) else {}
+    reason = meta.get("finish_reason") or getattr(first, "finish_reason", None)
+    if (
+        isinstance(reason, dict)
+        and reason.get("type") == "abort"
+        and reason.get("status_code") == HTTPStatus.TOO_MANY_REQUESTS
+        and not meta.get("completion_tokens", 0)
+    ):
+        await iterator.aclose()
+        raise HTTPException(
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            detail=reason.get("message", "Request rejected by admission control."),
+        )
 
 
 def warn_if_slow_preprocessing(

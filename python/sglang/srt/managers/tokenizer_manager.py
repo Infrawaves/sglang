@@ -2472,6 +2472,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if finish_reason.get("type") == "abort" and finish_reason.get(
             "status_code"
         ) in (
+            HTTPStatus.TOO_MANY_REQUESTS,
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
@@ -2483,6 +2484,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Mark ongoing LoRA request as finished.
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
+            if finish_reason["status_code"] == HTTPStatus.TOO_MANY_REQUESTS:
+                logger.info(
+                    "Request rejected with HTTP 429: rid=%s, reason=%s",
+                    state.obj.rid,
+                    finish_reason.get("message"),
+                )
+                # Keep the original reason for internal logs and metrics.
+                finish_reason = {
+                    **finish_reason,
+                    "message": "The server is busy. Please try again later.",
+                }
+                out = {
+                    **out,
+                    "meta_info": {**out["meta_info"], "finish_reason": finish_reason},
+                }
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],

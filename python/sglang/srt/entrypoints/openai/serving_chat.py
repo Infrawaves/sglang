@@ -78,6 +78,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import (
     OpenAIServingBase,
+    check_http_stream_admission,
     warn_if_slow_preprocessing,
 )
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
@@ -2143,9 +2144,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
+            engine_stream = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
-            ):
+            )
+            async for content in engine_stream:
+                if not stream_started:
+                    await check_http_stream_admission(engine_stream, content)
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(

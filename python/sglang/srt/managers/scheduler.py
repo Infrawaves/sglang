@@ -3466,8 +3466,20 @@ class Scheduler(
         """
         aborts: List[AbortReq] = []
 
+        if (
+            envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get()
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            aborts.extend(self.disagg_decode_prealloc_queue.poll_pool_full_aborts())
+
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
+            status_code = (
+                HTTPStatus.TOO_MANY_REQUESTS
+                if envs.SGLANG_DISAGGREGATION_PREFILL_REJECT_ON_TIMEOUT.get()
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+                else HTTPStatus.SERVICE_UNAVAILABLE
+            )
             for req in self.waiting_queue:
                 entry_time = req.time_stats.wait_queue_entry_time
                 if 0 < entry_time < deadline:
@@ -3477,7 +3489,7 @@ class Scheduler(
                             abort_message="Request waiting timeout reached.",
                             finished_reason={
                                 "type": "abort",
-                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "status_code": status_code,
                                 "message": "Request waiting timeout reached.",
                             },
                         )
@@ -5642,6 +5654,17 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and recv_req.finished_reason is not None
+            and recv_req.finished_reason.get("status_code") == HTTPStatus.TOO_MANY_REQUESTS
+            and self.disagg_decode_prealloc_queue.reject_pool_full_request(recv_req)
+        ):
+            return
+        abort_status_code = (recv_req.finished_reason or {}).get(
+            "status_code",
+            HTTPStatus.SERVICE_UNAVAILABLE if recv_req.abort_message else None,
+        )
         handled_round_robin_reqs = set()
         if self.enable_chunked_prefill_round_robin:
             candidates = list(self.iter_round_robin_requests())
@@ -5661,7 +5684,7 @@ class Scheduler(
                 if req in self._pending_round_robin_actions or is_aborted(req):
                     continue
                 req.to_finish = (
-                    FINISH_ABORT(recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE)
+                    FINISH_ABORT(recv_req.abort_message, abort_status_code)
                     if recv_req.abort_message
                     else FINISH_ABORT()
                 )
@@ -5702,11 +5725,7 @@ class Scheduler(
                 prepare_abort(
                     req,
                     recv_req.abort_message or "Aborted by AbortReq.",
-                    status_code=(
-                        HTTPStatus.SERVICE_UNAVAILABLE
-                        if recv_req.abort_message
-                        else None
-                    ),
+                    status_code=abort_status_code,
                 )
                 self.beam_coordinator.retire_group(req)
                 self.queue_aborted_prefill_transfer(req)
@@ -5819,9 +5838,10 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
-                    # Timeout aborts carry an SLA message + 503 for the client.
+                    # Keep the initiator's status; ordinary running timeouts
+                    # still carry 503, while admission failures retain 429.
                     req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        recv_req.abort_message, abort_status_code
                     )
                 else:
                     req.to_finish = FINISH_ABORT()

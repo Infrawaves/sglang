@@ -79,6 +79,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     label_developer_content,
 )
+from sglang.srt.entrypoints.openai.serving_base import (
+    check_http_stream_admission,
+    http_stream_admission_enabled,
+)
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -682,9 +686,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return response
 
             if request.stream:
-                if cache_params:
+                prefetch_results = bool(cache_params) or http_stream_admission_enabled()
+                if prefetch_results:
                     try:
                         first_result = await anext(result_generator)
+                        await check_http_stream_admission(result_generator, first_result)
                     except HTTPException as e:
                         await result_generator.aclose()
                         return self.create_error_response(
@@ -737,7 +743,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         require_reasoning=require_reasoning,
                         cache_context=cache_context,
                     )
-                if not cache_params:
+                if not prefetch_results:
                     return stream
 
                 async def close_stream():
@@ -748,6 +754,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         await stream.aclose()
                         await stream_results.aclose()
                         await result_generator.aclose()
+
+                if not cache_params:
+                    return close_stream()
 
                 headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
                 if cache_context.get("usage") is not None:

@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -352,6 +353,7 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     host_staged: bool = False
+    reject_on_pool_full: bool = False
 
     # Cancellation retries are independent of the quarantine warning interval.
     _abort_retry_deadline: float = 0.0
@@ -786,6 +788,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )
+            decode_req.reject_on_pool_full = (
+                envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get()
+                and not _is_fake_transfer(req)
+                and not is_health_check_req(req)
+                and not (
+                    is_rebootstrap
+                    or req.is_retracted
+                    or req.time_stats.forward_entry_time > 0
+                )
+            )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req):
@@ -800,6 +812,125 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def poll_pool_full_aborts(self) -> List[AbortReq]:
+        """Inspect capacity on the input rank; broadcast aborts before cleanup.
+
+        KV is full when the normal preallocation budget cannot fit one page,
+        after accounting for decode reservations and evictable cache. Published
+        destinations are never rejected.
+        """
+        if not envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get():
+            return []
+        candidates = [
+            r
+            for r in self.queue
+            if r.reject_on_pool_full
+            and not _is_fake_transfer(r.req)
+            and not is_health_check_req(r.req)
+            and r.metadata_buffer_index < 0
+            and not r.host_staged
+            and not r.req.finished()
+        ]
+        if not candidates:
+            return []
+
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+        if self._uses_swa_reservation():
+            full_budget, swa_budget = self._swa_aware_allocatable_token_budgets(
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=sum(
+                    self._swa_retractable_len(r)
+                    for r in self.scheduler.running_batch.reqs
+                ),
+                count_retracted=True,
+            )
+        else:
+            full_budget = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            )
+            swa_budget = None
+        full_budget -= self._hicache_pending_restore_tokens()
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kv_pool_full = not self._prealloc_reservation_fits(
+            page_size,
+            page_size,
+            full_allocatable_tokens=full_budget,
+            swa_allocatable_tokens=swa_budget,
+        )
+        if self.scheduler.enable_hisparse:
+            physical_slots = (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+                // self.scheduler.hisparse_coordinator.padded_buffer_size
+            )
+            kv_pool_full |= physical_slots <= len(self.transfer_queue.queue)
+
+        if not kv_pool_full:
+            return []
+
+        aborts = []
+        host_threshold = get_disagg().disaggregation_decode_host_receive_threshold
+        host_receive_active = (
+            host_threshold > 0
+            and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
+            >= host_threshold
+        )
+        for decode_req in candidates:
+            can_receive_on_host = (
+                host_receive_active
+                and decode_req.kv_receiver.supports_host_destination
+            )
+            if not can_receive_on_host:
+                message = "The decode KV pool is full."
+                aborts.append(
+                    AbortReq(
+                        rid=decode_req.req.rid,
+                        abort_message=message,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                            "message": message,
+                        },
+                    )
+                )
+        return aborts
+
+    def reject_pool_full_request(self, recv_req: AbortReq) -> bool:
+        """Retire an unallocated request after the input-rank broadcast."""
+        rejected_ids = set()
+        for decode_req in self.queue:
+            if not (
+                decode_req.reject_on_pool_full
+                and not _is_fake_transfer(decode_req.req)
+                and not is_health_check_req(decode_req.req)
+                and decode_req.metadata_buffer_index < 0
+                and not decode_req.host_staged
+                and not decode_req.req.finished()
+                and decode_req.req.rid == recv_req.rid
+            ):
+                continue
+            req = decode_req.req
+            # No destination was published. Let the router cancel P after it
+            # receives D's 429; a remote ABORT here could make P return 500 first
+            # and mask the capacity rejection.
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            prepare_abort(
+                req,
+                recv_req.abort_message,
+                status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            )
+            self.scheduler.retire_unadmitted_request(req)
+            rejected_ids.add(id(decode_req))
+        if rejected_ids:
+            self.queue = [r for r in self.queue if id(r) not in rejected_ids]
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in rejected_ids
+            ]
+        return bool(rejected_ids)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
