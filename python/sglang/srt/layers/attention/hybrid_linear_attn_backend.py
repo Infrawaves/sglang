@@ -1192,6 +1192,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @property
+    def ragged_verify_needs_padding_slot(self) -> bool:
+        return (
+            self.full_attn_backend.ragged_verify_needs_padding_slot
+            or self.linear_attn_backend.ragged_verify_needs_padding_slot
+        )
+
+    @property
     def use_mha(self) -> bool:
         return getattr(self.full_attn_backend, "use_mha", False)
 

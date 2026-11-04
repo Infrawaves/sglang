@@ -943,6 +943,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             verify_ids_2d=verify_ids_2d,
             target_logits=logits_output.next_token_logits,
+            num_valid_rows=target_verify.num_valid_sampling_rows(),
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,

@@ -60,6 +60,12 @@ class HybridAttnBackend(AttentionBackend):
         )
         return backend.supports_ragged_verify_graph
 
+    @property
+    def ragged_verify_needs_padding_slot(self) -> bool:
+        return self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).ragged_verify_needs_padding_slot
+
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
         Select the appropriate attention backend based on the forward mode.

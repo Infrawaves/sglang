@@ -43,6 +43,28 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
+def full_coverage_graph_slots(
+    max_live_bs: int, graph_num_tokens: int, verify_width: int
+) -> int:
+    """Minimum slots that keep every full-coverage padding row within verify_width."""
+    # The idle layout has one anchor per shared request slot. A busy rank has
+    # at least one token per live request. With B equal to the shared maximum,
+    # reserving ceil((G - B) / W) dummy rows covers both cases on every DP.
+    padding_tokens = max(0, graph_num_tokens - max_live_bs)
+    return max_live_bs + (padding_tokens + verify_width - 1) // verify_width
+
+
+def needs_full_width_ragged_graph(
+    runner, max_live_bs: int, graph_num_tokens: int, verify_width: int
+) -> bool:
+    """Switch all DPs to uniform lengths if the compact padding cannot fit."""
+    return (
+        getattr(runner, "reserve_ragged_padding_slot", False)
+        and full_coverage_graph_slots(max_live_bs, graph_num_tokens, verify_width)
+        > runner.max_bs
+    )
+
+
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     verify_lens: torch.Tensor
     graph_num_tokens: int
@@ -58,6 +80,8 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     # Per-row upper bound (capped padded variant); rows never exceed it, so
     # dense [bs, cap] consumers stay in bounds. None = full-coverage variant.
     cap: Optional[int] = None
+    # Maximum live request count across the DPs sharing this verify graph.
+    graph_max_bs: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.verify_lens_cpu is None:
@@ -98,6 +122,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
         cap: Optional[int] = None,
+        graph_max_bs: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -113,6 +138,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
             cap=cap,
+            graph_max_bs=graph_max_bs,
         )
 
     @classmethod
@@ -123,6 +149,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         total_verify_tokens: int,
         graph_num_tokens: int,
         device: torch.device,
+        graph_max_bs: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         verify_lens = torch.tensor(verify_lens_cpu, dtype=torch.int32, device=device)
         return cls._assemble_device(
@@ -130,6 +157,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=graph_num_tokens,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            graph_max_bs=graph_max_bs,
         )
 
     @classmethod
@@ -138,9 +166,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        graph_max_bs: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            graph_max_bs=graph_max_bs,
         )
 
     @classmethod
@@ -151,6 +182,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         device: torch.device,
         grid: Sequence[int],
         graph_num_tokens_floor: int = 0,
+        graph_max_bs: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
         total_verify_tokens = sum(verify_lens_list)
@@ -162,6 +194,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             total_verify_tokens=total_verify_tokens,
             graph_num_tokens=graph_num_tokens,
             device=device,
+            graph_max_bs=graph_max_bs,
         )
 
     def padded_to_bucket(
@@ -178,12 +211,18 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             PaddedToBucket,
         )
 
-        padded = PaddedToBucket.execute(
-            verify_lens=self.verify_lens,
-            graph_num_tokens=self.graph_num_tokens,
-            bs=self.bs,
-            padded_bs=padded_bs,
-        )
+        # At an exact request bucket there is no dummy request to own token
+        # padding. Dense consumers must leave it uncovered, even when the last
+        # real request has room below the fixed verify width.
+        if cap is not None and padded_bs == self.bs:
+            padded = self.verify_lens
+        else:
+            padded = PaddedToBucket.execute(
+                verify_lens=self.verify_lens,
+                graph_num_tokens=self.graph_num_tokens,
+                bs=self.bs,
+                padded_bs=padded_bs,
+            )
         if cap is not None:
             padded = torch.clamp(padded, max=cap)
 
@@ -192,6 +231,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
+            graph_max_bs=self.graph_max_bs,
         )
 
 
@@ -314,7 +354,7 @@ def compute_target_verify_graph_key(
     bs: int,
     num_draft_tokens: int,
     ragged_layout: Optional[RaggedVerifyLayout],
-) -> Tuple[int, int]:
+) -> Tuple[int | tuple[int, int], int]:
     num_tokens_full_block = num_draft_tokens * bs
     if ragged_layout is None:
         return bs, num_tokens_full_block
@@ -329,7 +369,7 @@ def compute_target_verify_graph_key(
             f"ragged verify total_verify_tokens={total_verify_tokens} exceeds the "
             f"round-up bucket graph_num_tokens={graph_num_tokens}"
         )
-    return graph_num_tokens, graph_num_tokens
+    return (bs, graph_num_tokens), graph_num_tokens
 
 
 class VerifyExtendLengths(msgspec.Struct, frozen=True):

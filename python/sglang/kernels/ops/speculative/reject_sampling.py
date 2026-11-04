@@ -14,6 +14,7 @@ def speculative_sampling_classic_kernel(
     UniformSamplesFinal,
     TargetProbs,
     DraftProbs,
+    TargetRowIndptr,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -29,6 +30,7 @@ def speculative_sampling_classic_kernel(
     stride_dp_v,
     # Constants
     NUM_SLOTS: tl.constexpr,
+    PACKED: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
@@ -44,26 +46,32 @@ def speculative_sampling_classic_kernel(
     last_accepted_global_idx = root_global_idx
 
     num_accept = 0
+    if PACKED:
+        first_row = tl.load(TargetRowIndptr + pid)
+        valid_rows = tl.load(TargetRowIndptr + pid + 1) - first_row
+        target_base = TargetProbs + first_row.to(tl.int64) * stride_tp_s
+        # The decision at row L-1 still uses its original rejection coin:
+        # an accepted candidate here becomes the bonus after the cap.
+        step_limit = tl.minimum(NUM_SLOTS, valid_rows + 1)
+    else:
+        target_base = TargetProbs + pid * stride_tp_b
+        step_limit = NUM_SLOTS
 
     # Verification Loop
     step = 1
     continue_verifying = 1
 
-    while (step < NUM_SLOTS) and (continue_verifying == 1):
+    while (step < step_limit) and (continue_verifying == 1):
         draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
 
-        offset_prob = (
-            (pid * stride_tp_b)
-            + (cur_prob_row * stride_tp_s)
-            + (draft_token * stride_tp_v)
-        )
+        offset_prob = cur_prob_row * stride_tp_s + draft_token * stride_tp_v
         offset_draft = (
             (pid * stride_dp_b)
             + (cur_prob_row * stride_dp_s)
             + (draft_token * stride_dp_v)
         )
 
-        p = tl.load(TargetProbs + offset_prob)
+        p = tl.load(target_base + offset_prob)
         q = tl.load(DraftProbs + offset_draft)
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
@@ -93,13 +101,20 @@ def speculative_sampling_classic_kernel(
             continue_verifying = 0
 
     tl.store(AcceptTokenNum + pid, num_accept)
+    if PACKED:
+        if num_accept == valid_rows:
+            # Predicts at the last valid index already holds the bonus. There
+            # is no target distribution for a later request row. CapCorrectLen
+            # counts this boundary acceptance as one trimmed draft; unverified
+            # tail decisions do not contribute to compact block-accept stats.
+            return
 
     # Final Sampling
     all_drafts_accepted = continue_verifying
     coin_final = tl.load(UniformSamplesFinal + pid)
     norm_sum = 0.0
 
-    tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
+    tp_base_ptr = target_base + cur_prob_row * stride_tp_s
     # DraftProbs has only num_steps rows (TargetProbs has num_steps + 1). When
     # all drafts are accepted cur_prob_row == num_steps is out of bounds for
     # DraftProbs, but the all-accepted branch samples pure target p and never
@@ -185,6 +200,7 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    target_row_indptr=None,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
@@ -200,6 +216,7 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        target_row_indptr,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -207,12 +224,15 @@ def chain_speculative_sampling_triton(
         uniform_samples.stride(0),
         uniform_samples.stride(1),
         target_probs.stride(0),
-        target_probs.stride(1),
+        target_probs.stride(0)
+        if target_row_indptr is not None
+        else target_probs.stride(1),
         target_probs.stride(2),
         draft_probs.stride(0),
         draft_probs.stride(1),
         draft_probs.stride(2),
         NUM_SLOTS=num_slots,
+        PACKED=target_row_indptr is not None,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
     )
