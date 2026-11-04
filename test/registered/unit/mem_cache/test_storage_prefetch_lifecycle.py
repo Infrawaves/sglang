@@ -385,6 +385,63 @@ def _two_rank_retry_trace(rank, rendezvous):
 
 
 class TestStagedPrefetchLifecycle(unittest.TestCase):
+    def test_pending_hit_end_survives_prefetch_completion(self):
+        # A completed fetch leaves ongoing_prefetch before admission; the load
+        # reporter must keep discounting the loaded L3 span, or a queued request
+        # re-counts it as uncached work.
+        cache, pipeline, _ = _staged_fixture()
+        self.assertEqual(cache.get_pending_storage_hit_end(_REQ), 8)
+
+        # The admission scan pops the loaded span; buffer mode still stages it.
+        cache.pop_prefetch_loaded_span(_REQ)
+        self.assertEqual(cache.get_pending_storage_hit_end(_REQ), 8)
+
+        pipeline.staged_prefetches.clear()
+        self.assertIsNone(cache.get_pending_storage_hit_end(_REQ))
+
+    def test_cache_mode_pending_hit_end_survives_concurrent_dedup(self):
+        # When a concurrent fetch of the same prefix already inserted it into L2,
+        # this completion loads nothing new; the span is still cached, so the
+        # load reporter must not re-count it as uncached work.
+        for prefix_len, dropped, expected in (
+            (8, False, 10),  # full dedup: loaded 0
+            (3, False, 10),  # partial dedup: loaded 5
+            (0, True, None),  # insert dropped: nothing is cached
+        ):
+            with self.subTest(prefix_len=prefix_len, dropped=dropped):
+                cache = Mock()
+                cache.page_size = 1
+                cache.enable_storage_metrics = False
+                cache.buffer_pipeline = None
+                cache._check_hybrid_prefetch_result.return_value = True
+                cache.cache_controller.prefetch_tokens_occupied = 100
+                cache.prefetch_loaded_tokens_by_reqid = {}
+                cache.prefetch_loaded_storage_start_by_reqid = {}
+                cache.tree_core.insert_host.return_value = SimpleNamespace(
+                    cache_actions=[],
+                    prefix_len=prefix_len,
+                    host_insert_dropped=dropped,
+                )
+                operation = SimpleNamespace(
+                    handle=_REQ,
+                    completed_tokens=8,
+                    hash_value=[f"h{i}" for i in range(8)],
+                    storage_start=2,
+                    pool_storage_result=None,
+                )
+                cache.ongoing_prefetch = {
+                    _REQ: _OngoingPrefetch(
+                        0, list(range(8)), torch.arange(8), operation, None, {}
+                    )
+                }
+
+                UnifiedRadixCache._handle_prefetch_result(cache, operation)
+                self.assertNotIn(_REQ, cache.ongoing_prefetch)
+                self.assertEqual(
+                    UnifiedRadixCache.get_pending_storage_hit_end(cache, _REQ),
+                    expected,
+                )
+
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):
             for trims in ((2,), (2, 2), (8,), (2, 6)):

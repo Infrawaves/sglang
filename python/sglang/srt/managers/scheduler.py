@@ -2956,6 +2956,7 @@ class Scheduler(
 
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
+        self.total_prefill_input_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step: Optional[Tuple[int, float, bool]] = None
@@ -3004,6 +3005,10 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_pending_storage_hit_end=lambda req: (
+                self.tree_cache.get_pending_storage_hit_end(req.cache_request_handle)
+            ),
+            get_total_prefill_input_tokens=lambda: self.total_prefill_input_tokens,
         )
 
     def init_kv_weight_version_tracker(self) -> None:
@@ -5867,6 +5872,14 @@ class Scheduler(
         if is_prefill:
             self.total_prefill_busy_us += step_us
             self.total_prefill_uncached_tokens += batch.extend_num_tokens
+            # log_hit_tokens counts a request's cached prefix only on its first
+            # chunk (continuations pass prefix_len=0), so each prompt counts once.
+            hit_tokens = (
+                batch.prefill_stats.log_hit_tokens
+                if batch.prefill_stats is not None
+                else 0
+            )
+            self.total_prefill_input_tokens += batch.extend_num_tokens + hit_tokens
         else:
             batch_size = len(batch.reqs)
             _accumulate_decode_moment(

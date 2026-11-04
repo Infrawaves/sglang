@@ -248,6 +248,53 @@ class TestSchedulerLoadInquirer(CustomTestCase):
         self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 20)
         get_storage_span.assert_called_once_with(req.cache_request_handle)
 
+    def test_prefill_bootstrap_queue_tokens_use_enqueue_time_match(self):
+        bootstrapping = [
+            SimpleNamespace(seqlen=200, storage_prefetch_last_match_len=150),
+            SimpleNamespace(seqlen=40, storage_prefetch_last_match_len=None),
+        ]
+        inquirer = replace(
+            self.make_inquirer(disaggregation_mode=DisaggregationMode.PREFILL),
+            get_request_lists=lambda: {ListKind.PD_BOOTSTRAP: bootstrapping},
+        )
+
+        # 120 as above, plus (200 - 150) + 40: bootstrap uses the enqueue-time
+        # match, falls back to full length without one, and ignores the
+        # (0.75) recent hit rate.
+        self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 210)
+
+    def test_queried_l3_hit_extends_the_cached_prefix_without_double_counting(self):
+        base = self.make_inquirer(disaggregation_mode=DisaggregationMode.PREFILL)
+        waiting_req = base.get_waiting_queue()[0]
+        overtaken = SimpleNamespace(seqlen=200, storage_prefetch_last_match_len=150)
+        cold = SimpleNamespace(seqlen=40, storage_prefetch_last_match_len=None)
+        storage_hit_ends = {id(waiting_req): 90, id(overtaken): 120, id(cold): 32}
+        inquirer = replace(
+            base,
+            get_request_lists=lambda: {ListKind.PD_BOOTSTRAP: [overtaken, cold]},
+            get_pending_storage_hit_end=lambda req: storage_hit_ends.get(id(req)),
+        )
+
+        # The L3 end is an absolute prefix length, so it is max-ed with the
+        # device+host match, never added: waiting 100 - 90, bootstrap
+        # 200 - max(150, 120) and 40 - 32, plus the 40-token chunk remainder.
+        self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 10 + 50 + 8 + 40)
+
+    def test_bootstrap_queue_is_read_only_in_prefill_mode(self):
+        def unreachable():
+            raise AssertionError("non-prefill modes must not read the bootstrap queue")
+
+        for mode, expected in (
+            (DisaggregationMode.NULL, 120),
+            (DisaggregationMode.DECODE, 0),
+        ):
+            with self.subTest(mode=mode):
+                inquirer = replace(
+                    self.make_inquirer(disaggregation_mode=mode),
+                    get_request_lists=unreachable,
+                )
+                self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), expected)
+
 
 class TestContextLengthLoad(CustomTestCase):
     def make_inquirer(
@@ -307,7 +354,11 @@ class TestContextLengthLoad(CustomTestCase):
 
     @staticmethod
     def req(length):
-        return SimpleNamespace(seqlen=length, waiting_for_input=False)
+        return SimpleNamespace(
+            seqlen=length,
+            waiting_for_input=False,
+            storage_prefetch_last_match_len=None,
+        )
 
     def get_loads(self, inquirer):
         with (

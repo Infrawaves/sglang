@@ -229,12 +229,22 @@ async fn prepare<'a>(
             let (model, body) = canonicalize_model_alias(ctx, model, body)?;
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_token_count = routing.needs_token_count();
             let request = if grpc && matches!(endpoint, Endpoint::Completions) {
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
             } else {
-                PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
+                PreparedRequest::openai(
+                    ctx,
+                    path,
+                    model,
+                    fields,
+                    headers,
+                    body,
+                    needs_tokens,
+                    needs_token_count,
+                )?
             };
             (routing, request)
         }
@@ -338,6 +348,14 @@ impl<'a> ModelRouting<'a> {
             // The same predicate gates `--no-tokenizer` at startup,
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
+        }
+    }
+
+    /// Whether routing weighs requests by a prompt-length estimate.
+    fn needs_token_count(&self) -> bool {
+        match self {
+            Self::Legacy(policy) => policy.needs_token_count(),
+            Self::Reorg(_) => false,
         }
     }
 

@@ -9,18 +9,23 @@
 //! while the router is warming up so the "router started but no workers
 //! discovered" failure mode is observable.
 
-use crate::discovery::WorkerMode;
+use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::admission::engine_pending_prefill_tokens;
 use crate::server::app_context::AppContext;
-use crate::server::metrics::{escape_label, WorkerSnapshot};
+use crate::server::metrics::{escape_label, PrefillLoadView, WorkerSnapshot};
 use crate::state::kv_events::bootstrap::{
     BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
 };
 use crate::state::kv_events::{KvIndexMetrics, ReplayOutcome, Tiers, ACCOUNTING_REASONS};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
+use crate::workers::Worker;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Content-Type per Prometheus exposition format spec.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -29,11 +34,17 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
     // Sample the live registry into a snapshot for the worker gauges. These
     // are pull-on-scrape (not pushed) so removed workers stop emitting series
     // immediately; see `MetricsRegistry::render_with_workers`.
-    let workers: Vec<WorkerSnapshot> = ctx
-        .registry
-        .all()
+    let all_workers = ctx.registry.all();
+    let engine_load = all_workers
+        .iter()
+        .any(|w| w.mode() == WorkerMode::Prefill)
+        .then(|| ctx.engine_reported_load.capture_snapshot(Instant::now()));
+    let engine_models = engine_comparable_models(&all_workers, engine_load.as_ref());
+    let workers: Vec<WorkerSnapshot> = all_workers
         .into_iter()
         .map(|w| {
+            let prefill_load = (w.mode() == WorkerMode::Prefill)
+                .then(|| prefill_load_view(&w, engine_load.as_ref(), &engine_models));
             // One lock acquisition for both health + state so the two gauges
             // can't report a torn (self-contradictory) pair for one scrape.
             let cb = w.breaker.snapshot();
@@ -50,6 +61,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                 // underflow would wrap usize and render as a nonsensical
                 // negative gauge; clamp to a large positive ceiling instead.
                 inflight: i64::try_from(w.router_inflight_load()).unwrap_or(i64::MAX),
+                prefill_load,
             }
         })
         .collect();
@@ -190,6 +202,60 @@ fn push_closed_counter(
             .find(|(k, _)| *k == value)
             .map_or(0, |(_, n)| *n);
         out.push_str(&format!("{name}{{{label}=\"{value}\"}} {n}\n"));
+    }
+}
+
+/// Models whose prefill workers all have a fresh engine sample: the only case
+/// in which routing compares engine values, since one stale candidate sends the
+/// whole selection to router-local tokens.
+fn engine_comparable_models(
+    workers: &[Arc<Worker>],
+    engine_load: Option<&EngineReportedLoadSnapshot>,
+) -> HashSet<ModelId> {
+    let mut stale = HashSet::new();
+    let mut seen = HashSet::new();
+    for w in workers.iter().filter(|w| w.mode() == WorkerMode::Prefill) {
+        let fresh =
+            engine_load.is_some_and(|s| s.fresh_native_cache_load_for_url(&w.url).is_some());
+        for model in &w.model_ids {
+            seen.insert(model.clone());
+            if !fresh {
+                stale.insert(model.clone());
+            }
+        }
+    }
+    seen.retain(|m| !stale.contains(m));
+    seen
+}
+
+/// Reads the cold ratio without feeding the estimator, so scrapes do not move
+/// the window routing relies on.
+fn prefill_load_view(
+    worker: &Worker,
+    engine_load: Option<&EngineReportedLoadSnapshot>,
+    engine_models: &HashSet<ModelId>,
+) -> PrefillLoadView {
+    let cold_ratio = worker.measured_prefill_cold_ratio();
+    let load = engine_load.and_then(|s| s.fresh_native_cache_load_for_url(&worker.url));
+    let engine_path = load.is_some()
+        && !worker.model_ids.is_empty()
+        && worker.model_ids.iter().all(|m| engine_models.contains(m));
+    let (pending_prefill_tokens, pending_source) = match load.filter(|_| engine_path) {
+        Some(load) => (
+            engine_pending_prefill_tokens(
+                load,
+                worker.prefill_tokens_acquired_since(load.captured_at),
+                cold_ratio.unwrap_or(1.0),
+            ),
+            "engine",
+        ),
+        None => (worker.router_inflight_prefill_tokens(), "local"),
+    };
+    PrefillLoadView {
+        sample_age_seconds: load.map(|l| l.captured_at.elapsed().as_secs_f64()),
+        pending_prefill_tokens,
+        pending_source,
+        cold_ratio,
     }
 }
 
@@ -710,6 +776,94 @@ mod tests {
         assert!(body.contains(r#"sgl_router_worker_cb_state{worker_url="http://p0:30000"} 0"#));
         assert!(
             body.contains(r#"sgl_router_worker_inflight_requests{worker_url="http://p0:30000"} 0"#)
+        );
+    }
+
+    /// Pending tokens must follow routing's source choice: one stale prefill
+    /// worker sends the whole model to router-local tokens, so a fresh peer
+    /// must not show its engine value then.
+    #[tokio::test]
+    async fn metrics_endpoint_pending_tokens_follow_routing_source() {
+        use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+        use crate::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+
+        let ctx = Arc::new(AppContext::stub());
+        for id in ["p0", "p1"] {
+            ctx.registry
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:30000"),
+                    mode: WorkerMode::Prefill,
+                    model_ids: vec![ModelId("m".into())],
+                    bootstrap_port: None,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let sample = |waiting_uncached| LoadStat {
+            num_running_reqs: 0,
+            num_waiting_reqs: 3,
+            num_tokens: 0,
+            max_total_num_tokens: 100_000,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: waiting_uncached,
+                num_total_tokens: 0,
+                max_running_requests: 16,
+                total_prefill_uncached_tokens: 0,
+                total_prefill_busy_us: 0,
+                total_prefill_input_tokens: Some(0),
+            }),
+        };
+        // Dispatched before p0's sample, so the engine path does not add it.
+        let p0 = ctx.registry.get(&WorkerId("p0".into())).unwrap();
+        let _inflight = p0.timestamped_load_guard(700);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ctx.engine_reported_load
+            .set("http://p0:30000", 0, sample(4_096), Instant::now());
+
+        let scrape = || async {
+            let res = crate::server::app::build_router(Arc::clone(&ctx))
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+        let has = |body: &str, line: &str| {
+            assert!(
+                body.lines().any(|l| l == line),
+                "missing `{line}`; got:\n{body}"
+            )
+        };
+
+        let body = scrape().await;
+        has(
+            &body,
+            r#"sgl_router_worker_engine_load_fresh{worker_url="http://p0:30000"} 1"#,
+        );
+        has(
+            &body,
+            r#"sgl_router_worker_engine_load_fresh{worker_url="http://p1:30000"} 0"#,
+        );
+        has(
+            &body,
+            r#"sgl_router_worker_pending_prefill_tokens{worker_url="http://p0:30000",source="local"} 700"#,
+        );
+        assert!(body.contains(
+            r#"sgl_router_worker_engine_load_age_seconds{worker_url="http://p0:30000"} "#
+        ));
+
+        ctx.engine_reported_load
+            .set("http://p1:30000", 0, sample(0), Instant::now());
+        let body = scrape().await;
+        has(
+            &body,
+            r#"sgl_router_worker_pending_prefill_tokens{worker_url="http://p0:30000",source="engine"} 4096"#,
         );
     }
 }

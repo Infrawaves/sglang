@@ -201,6 +201,7 @@ async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops(
                     max_running_requests: 10,
                     total_prefill_uncached_tokens: 0,
                     total_prefill_busy_us: 0,
+                    total_prefill_input_tokens: None,
                 }),
             },
             Instant::now(),

@@ -138,6 +138,8 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),
