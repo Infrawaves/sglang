@@ -1137,6 +1137,7 @@ def build_dflash_verify_target_probs(
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
     row_to_request: Optional[torch.Tensor] = None,
+    logit_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     def expand(values: torch.Tensor) -> torch.Tensor:
         if row_to_request is not None:
@@ -1146,7 +1147,17 @@ def build_dflash_verify_target_probs(
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    scaled_logits = next_token_logits / expand(sampling_info.temperatures)
+    temperatures = expand(sampling_info.temperatures)
+    if logit_rows is None:
+        scaled_logits = next_token_logits / temperatures
+    else:
+        # The gather owns this storage. Reuse it when division preserves its
+        # dtype, and drop it before softmax when division needs promotion.
+        scaled_logits = next_token_logits.index_select(0, logit_rows)
+        if torch.result_type(scaled_logits, temperatures) == scaled_logits.dtype:
+            scaled_logits.div_(temperatures)
+        else:
+            scaled_logits = scaled_logits / temperatures
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:

@@ -123,13 +123,14 @@ def _accept_sampling_core(
             rows - verify_row_indptr.index_select(0, request_ids)
         )
         target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits.index_select(0, strided_rows),
+            next_token_logits=target_logits,
             sampling_info=sampling_info,
             draft_token_num=1,
             bs=num_valid_rows,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
             row_to_request=request_ids,
+            logit_rows=strided_rows,
         )
         if _is_npu:
             # The external NPU kernel takes a valid distribution on every

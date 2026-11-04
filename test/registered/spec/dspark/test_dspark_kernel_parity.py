@@ -537,6 +537,66 @@ _CASES = [
 
 
 class TestDsparkKernelParity(CustomTestCase):
+    def test_near_full_top_p_sampling_memory_and_parity(self):
+        bs, width, vocab = 16, 6, 8192
+        torch.manual_seed(27)
+        candidates = torch.randint(vocab, (bs, width), device=DEVICE)
+        draft = torch.randn(bs, width - 1, vocab, device=DEVICE).softmax(-1)
+        temperatures = torch.linspace(0.3, 1.3, bs, device=DEVICE)[:, None]
+        sampling = types.SimpleNamespace(
+            temperatures=temperatures,
+            top_ps=torch.linspace(0.6, 0.95, bs, device=DEVICE),
+            need_top_p_sampling=True,
+            need_top_k_sampling=False,
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            logits = torch.randn(bs * width, vocab, dtype=dtype, device=DEVICE)
+            original = logits.clone()
+            for missing in (0, 1):
+                with self.subTest(dtype=dtype, missing=missing):
+                    lens = torch.full((bs,), width, dtype=torch.int32, device=DEVICE)
+                    lens[0] -= missing
+                    rows = bs * width - missing
+                    packed = dict(
+                        num_valid_rows=rows,
+                        verify_row_indptr=_layout(lens, rows).qo_indptr_device,
+                    )
+                    kwargs = dict(
+                        candidates=candidates,
+                        target_logits=logits,
+                        draft_probs=draft,
+                        sampling_info=sampling,
+                        draft_input=types.SimpleNamespace(
+                            max_top_k=None, uniform_top_k_value=None
+                        ),
+                        gamma=width - 1,
+                        verify_num_draft_tokens=width,
+                        cutoff_verify_lens=lens,
+                    )
+
+                    def measure(row_args):
+                        torch.manual_seed(421)
+                        torch.cuda.synchronize(DEVICE)
+                        start = torch.cuda.memory_allocated(DEVICE)
+                        torch.cuda.reset_peak_memory_stats(DEVICE)
+                        length, bonus, _ = dspark_accept.AcceptSampling.execute(
+                            **kwargs, **row_args
+                        )
+                        peak = torch.cuda.max_memory_allocated(DEVICE) - start
+                        next_rng = torch.rand(8, device=DEVICE)
+                        return (length.clone(), bonus.clone(), next_rng), peak
+
+                    # Warm both shapes so the peak excludes first-use workspaces.
+                    for row_args in ({}, packed):
+                        dspark_accept.AcceptSampling.execute(**kwargs, **row_args)
+                    expected, dense_peak = measure({})
+                    actual, packed_peak = measure(packed)
+                    self._eq(actual, expected)
+                    self.assertTrue(torch.equal(logits, original))
+                    # Index vectors cost KiB. An extra full-vocabulary copy
+                    # here costs 1.48 MiB (bf16) or 2.97 MiB (float32).
+                    self.assertLessEqual(packed_peak, dense_peak + 256 * 1024)
+
     def test_top_p_only_sees_valid_verify_rows(self):
         width, vocab = 6, 128
         lens = torch.arange(1, width + 1, device=DEVICE, dtype=torch.int32)
