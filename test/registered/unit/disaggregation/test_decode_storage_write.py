@@ -8,8 +8,12 @@ from sglang.srt.disaggregation.decode_storage_write import (
     MambaStateMeta,
     StorageWriteTarget,
     build_write_plan,
+    local_skip_count,
+    local_sub_page_keys,
     mamba_put_objects,
+    prompt_stored_end,
     resolve_target,
+    skip_sub_pages,
     sub_page_hashes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -125,6 +129,48 @@ class TestStorageKeys(CustomTestCase):
             prefix_chunks=(), token_ids=tokens, seed=None, sub_page_size=64
         )
         self.assertNotEqual(unseeded, whole)
+
+
+class TestPromptSkip(CustomTestCase):
+    def test_dcp_ranks_together_send_exactly_the_pages_past_the_prompt(self):
+        """Every rank drops only its own sub-pages below the prompt boundary, so
+        the union over DCP ranks is the global sub-pages >= skip, none twice."""
+        for dcp in (1, 8):
+            for num_sub in (dcp, 3 * dcp):
+                for prompt_end in range(0, 64 * (num_sub + 2), 64):
+                    for node_start in (0, 64 * dcp):
+                        skip = skip_sub_pages(
+                            node_start=node_start,
+                            prompt_end_abs=prompt_end,
+                            sub_page_size=64,
+                            num_sub_pages=num_sub,
+                        )
+                        sent = []
+                        for rank in range(dcp):
+                            keys = local_sub_page_keys(
+                                list(range(num_sub)), dcp_size=dcp, dcp_rank=rank
+                            )
+                            k = local_skip_count(skip=skip, dcp_size=dcp, dcp_rank=rank)
+                            sent += keys[k:]
+                        want = [
+                            i
+                            for i in range(num_sub)
+                            if node_start + 64 * i >= prompt_end
+                        ]
+                        self.assertEqual(sorted(sent), want)
+
+    def test_boundary_never_passes_what_prefill_stored(self):
+        """Prefill caches up to a Mamba checkpoint depth (multiple of the chunk
+        size); the boundary must not exceed it or the hash chain breaks."""
+        self.assertEqual(
+            prompt_stored_end(prompt_len=32_100, prefill_page_size=64, grid=64), 32_064
+        )
+        for grid in (64, 128, 256):
+            for prompt_len in range(0, 2_000, 37):
+                end = prompt_stored_end(
+                    prompt_len=prompt_len, prefill_page_size=64, grid=grid
+                )
+                self.assertLessEqual(end, prompt_len // grid * grid)
 
 
 class TestWriteState(CustomTestCase):

@@ -16,13 +16,16 @@ import torch
 
 from sglang.srt.disaggregation.decode_storage_write import (
     DecodeStorageAnchor,
+    DecodeStorageWriteMetrics,
     MambaStateMeta,
     StorageWritePlan,
     StorageWriteTarget,
     build_write_plan,
     get_decode_storage_write_state,
+    local_skip_count,
     local_sub_page_keys,
     mamba_put_objects,
+    skip_sub_pages,
     sub_page_hashes,
 )
 from sglang.srt.managers.cache_controller import (
@@ -185,6 +188,9 @@ class StorageOperation(BaseStorageOperation):
         self.pool_storage_result = PoolTransferResult.empty()
         # Set only by decode storage write: the backup goes out in the prefill layout.
         self.decode_storage_anchor = decode_storage_anchor
+        self.decode_enqueue_time = (
+            time.monotonic() if decode_storage_anchor is not None else None
+        )
 
 
 class PrefetchOperation(StorageOperation):
@@ -316,6 +322,8 @@ class HybridCacheController(BaseHiCacheController):
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         # Decode storage write plans per frozen prefill target; backup thread only.
         self._decode_storage_plans: dict[StorageWriteTarget, StorageWritePlan] = {}
+        # Set by the cache at init when decode storage write is enabled.
+        self.decode_storage_write_metrics: Optional[DecodeStorageWriteMetrics] = None
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -1542,6 +1550,11 @@ class HybridCacheController(BaseHiCacheController):
         plan = self._decode_storage_plan(target)
         if plan is None:
             return
+        metrics = self.decode_storage_write_metrics
+        assert metrics is not None
+        metrics.observe_seconds(
+            stage="queue", seconds=time.monotonic() - operation.decode_enqueue_time
+        )
         anchor = operation.decode_storage_anchor
         sub_hashes = sub_page_hashes(
             prefix_chunks=anchor.prefix_chunks,
@@ -1551,27 +1564,58 @@ class HybridCacheController(BaseHiCacheController):
         )
         if not sub_hashes:
             return
-        if plan.writes_kv and not self._decode_storage_put_kv(
-            host_indices=operation.host_indices, sub_hashes=sub_hashes, plan=plan
-        ):
-            logger.warning(
-                "Decode storage write: KV put failed for %d pages", len(sub_hashes)
+        # Hashes cover the whole node since the chain needs every page; only
+        # the pages past what prefill already stored are sent.
+        skip = (
+            None
+            if anchor.prompt_end_abs is None
+            else skip_sub_pages(
+                node_start=sum(len(chunk) for chunk in anchor.prefix_chunks),
+                prompt_end_abs=anchor.prompt_end_abs,
+                sub_page_size=plan.sub_page_size,
+                num_sub_pages=len(sub_hashes),
             )
+        )
+        if plan.writes_kv:
+            kv_start = time.monotonic()
+            if not self._decode_storage_put_kv(
+                host_indices=operation.host_indices,
+                sub_hashes=sub_hashes,
+                skip=skip,
+                plan=plan,
+                metrics=metrics,
+            ):
+                logger.warning(
+                    "Decode storage write: KV put failed for %d pages",
+                    len(sub_hashes),
+                )
+                metrics.add_failure(op="kv_put")
+            metrics.observe_seconds(stage="kv_put", seconds=time.monotonic() - kv_start)
         for transfer in operation.pool_transfers or []:
             if transfer.name == PoolName.MAMBA and transfer.host_indices is not None:
+                mamba_start = time.monotonic()
                 if not self._decode_storage_put_mamba(
                     slot=int(transfer.host_indices[-1]),
                     page_key=sub_hashes[-1],
                     plan=plan,
                 ):
                     logger.warning("Decode storage write: Mamba state put failed")
+                    metrics.add_failure(op="mamba_put")
+                metrics.observe_seconds(
+                    stage="mamba_put", seconds=time.monotonic() - mamba_start
+                )
+        metrics.observe_seconds(
+            stage="total", seconds=time.monotonic() - operation.decode_enqueue_time
+        )
 
     def _decode_storage_put_kv(
         self,
         *,
         host_indices: torch.Tensor,
         sub_hashes: list[str],
+        skip: Optional[int],
         plan: StorageWritePlan,
+        metrics: DecodeStorageWriteMetrics,
     ) -> bool:
         from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 
@@ -1582,6 +1626,21 @@ class HybridCacheController(BaseHiCacheController):
         rows = maybe_dcp_kernel_indices(host_indices, plan.dcp_size, plan.dcp_rank)
         page = plan.sub_page_size
         assert len(rows) == len(keys) * page, (len(rows), len(keys), page)
+        # Local key j is global sub-page dcp_rank + j * dcp_size, row page j.
+        local_skip = (
+            0
+            if skip is None
+            else local_skip_count(
+                skip=skip, dcp_size=plan.dcp_size, dcp_rank=plan.dcp_rank
+            )
+        )
+        keys = keys[local_skip:]
+        rows = rows[local_skip * page :]
+        metrics.add_pages(kind="skipped_prompt", count=local_skip)
+        metrics.add_pages(kind="submitted", count=len(keys))
+        # None: the node had no recorded prompt boundary and is written whole.
+        if skip is None:
+            metrics.add_pages(kind="no_boundary", count=len(keys))
         for i in range(0, len(keys), STORAGE_BATCH_SIZE):
             batch_keys = keys[i : i + STORAGE_BATCH_SIZE]
             batch_rows = rows[i * page : (i + len(batch_keys)) * page]
