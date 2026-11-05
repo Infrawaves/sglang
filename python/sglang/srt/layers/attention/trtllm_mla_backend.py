@@ -133,26 +133,29 @@ def _quantize_fp8_qkv(q, k, v, layer):
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
         k_scale = 1.0
-    if k_scale != 1.0:
-        assert hasattr(layer, "k_scale"), "k_scale is not set"
-        k_2d, _ = scaled_fp8_quant(
-            k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
-        )
-        k = k_2d.reshape(k.shape)
-    else:
-        k = k.to(torch.float8_e4m3fn)
+    # Packed FP8 K/V already include their scales; preserve those values.
+    if k.dtype != torch.float8_e4m3fn:
+        if k_scale != 1.0:
+            assert hasattr(layer, "k_scale"), "k_scale is not set"
+            k_2d, _ = scaled_fp8_quant(
+                k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
+            )
+            k = k_2d.reshape(k.shape)
+        else:
+            k = k.to(torch.float8_e4m3fn)
 
     v_scale = getattr(layer, "v_scale_float", None)
     if v_scale is None:
         v_scale = 1.0
-    if v_scale != 1.0:
-        assert hasattr(layer, "v_scale"), "v_scale is not set"
-        v_2d, _ = scaled_fp8_quant(
-            v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
-        )
-        v = v_2d.reshape(v.shape)
-    else:
-        v = v.to(torch.float8_e4m3fn)
+    if v.dtype != torch.float8_e4m3fn:
+        if v_scale != 1.0:
+            assert hasattr(layer, "v_scale"), "v_scale is not set"
+            v_2d, _ = scaled_fp8_quant(
+                v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
+            )
+            v = v_2d.reshape(v.shape)
+        else:
+            v = v.to(torch.float8_e4m3fn)
 
     return q, k, v, k_scale, v_scale
 
@@ -1300,6 +1303,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             **extra_kwargs,
         )
 
+    def pack_mha_kv(self, k_nope, k_pe, v, layer, forward_batch):
+        """Pack expanded K/V directly from BF16/FP16 projection views."""
+        if (
+            type(self) is not TRTLLMMLABackend
+            or self.data_type != torch.float8_e4m3fn
+            or torch.version.cuda is None
+            or not k_nope.is_cuda
+            or k_nope.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            return None
+        from sglang.kernels.ops.attention.mla_kv_pack import pack_mla_kv_fp8
+
+        k_scale = getattr(layer, "k_scale_float", None)
+        v_scale = getattr(layer, "v_scale_float", None)
+        return pack_mla_kv_fp8(
+            k_nope,
+            k_pe,
+            v,
+            k_scale=layer.k_scale if k_scale not in (None, 1.0) else None,
+            v_scale=layer.v_scale if v_scale not in (None, 1.0) else None,
+        )
+
     def _run_prefill_kernel(
         self,
         q: torch.Tensor,
@@ -1318,7 +1343,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
-        in model-native dtype; subclasses do any kernel-specific quantization.
+        in model-native dtype or already packed FP8 with scaling applied;
+        subclasses do any kernel-specific quantization.
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
