@@ -822,6 +822,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        # Queued chunks read KV from forwards up to this batch's: run_batch issues
+        # early sends before launching its forward. copy_done is None only without
+        # overlap, where early sends carry no wait event and are ready at enqueue.
+        self.disagg_prefill_bootstrap_queue.kv_manager.mark_prefill_forward_synced()
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -1445,7 +1449,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.suspended_prefill_queue.append(req)
             self.chunked_req = None
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, allow_send: bool = True
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1457,7 +1463,9 @@ class SchedulerDisaggregationPrefillMixin:
                 0, len(req.prefix_indices) - req.host_hit_length
             )
 
-        if req.pending_bootstrap:
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them (#44070).
+        if req.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.

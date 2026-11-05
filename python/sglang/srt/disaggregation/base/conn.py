@@ -150,6 +150,10 @@ class BaseKVManager(ABC):
             f"{type(self).__name__} does not support PD role switch teardown"
         )
 
+    def mark_prefill_forward_synced(self) -> None:
+        """Prefill scheduler hook: every forward whose KV a queued chunk reads
+        has completed on this rank's GPU."""
+
 
 class BaseKVSender(ABC):
     @abstractmethod

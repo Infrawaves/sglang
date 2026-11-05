@@ -214,6 +214,7 @@ class TestDcpPageHandoffCpu(CustomTestCase):
         manager = object.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
             page_size=2,
+            num_draft_entries=0,
             kv_data_ptrs=[buffer.ctypes.data for buffer in source],
             kv_item_lens=[buffer[0].nbytes * 2 for buffer in source],
             kv_layer_ids=[11, 17],

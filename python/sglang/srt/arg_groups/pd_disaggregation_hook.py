@@ -40,9 +40,11 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
         raise ValueError(
             "--dcp-kv-layout page requires --disaggregation-transfer-backend mooncake."
         )
-    if cfg.speculative_algorithm is not None:
+    # DSPARK verifies on the target's decode kernel and transfers its
+    # replicated draft KV alongside the target pages.
+    if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise ValueError(
-            "--dcp-kv-layout page does not support speculative decoding "
+            "--dcp-kv-layout page supports speculative decoding with DSPARK only "
             f"(got --speculative-algorithm {cfg.speculative_algorithm!r})."
         )
 

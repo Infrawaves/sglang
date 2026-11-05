@@ -56,6 +56,7 @@ class TestDcpKvLayout(CustomTestCase):
 
     def test_page_accepts_final_supported_contract(self):
         validate_dcp_kv_layout(_page_args())
+        validate_dcp_kv_layout(_page_args(speculative_algorithm="DSPARK"))
 
     def test_page_reads_the_resolved_decode_backend(self):
         server_args = _page_args(decode_attention_backend="aiter")
