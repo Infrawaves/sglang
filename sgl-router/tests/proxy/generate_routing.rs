@@ -91,7 +91,9 @@ async fn pd_generate_sends_one_bootstrap_room_to_both_workers() {
 
     let res = send(&app, "POST", &json!({"text": "hi"})).await;
     assert_eq!(res.status(), StatusCode::OK);
-    let (p, d) = (prefill.captured_json().await, decode.captured_json().await);
+    let (mut p, d) = (prefill.captured_json().await, decode.captured_json().await);
+    // Prefill alone is forced non-streaming; otherwise both get the same body.
+    assert_eq!(p.as_object_mut().unwrap().remove("stream"), Some(json!(false)));
     assert_eq!(p, d);
     assert_eq!(p["bootstrap_port"], 8997);
 }
