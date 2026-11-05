@@ -1011,6 +1011,38 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> dict:
         return self._batch_io_v2(transfers, is_set=True)
 
+    def batch_put_absent(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        group_keys: List[str],
+    ) -> List[bool]:
+        """Put fully-suffixed object keys that are not stored yet.
+
+        For writers that build keys in another rank's layout (decode storage write);
+        ``group_keys[i]`` is the logical page key object i belongs to.
+        """
+        key_strs = self._tag_keys(keys)
+        group_ids = (
+            [self._make_group_id(key) for key in self._tag_keys(group_keys)]
+            if self._can_use_group_semantics()
+            else None
+        )
+        exist_result = self._batch_exist(key_strs)
+        results = [state == 1 for state in exist_result]
+        missing = [i for i, state in enumerate(exist_result) if state != 1]
+        if missing:
+            put_results = self._put_batch_zero_copy_impl(
+                [key_strs[i] for i in missing],
+                [buffer_ptrs[i] for i in missing],
+                [buffer_sizes[i] for i in missing],
+                self._filter_group_ids(group_ids, missing),
+            )
+            for i, res in zip(missing, put_results):
+                results[i] = res == 0
+        return results
+
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(

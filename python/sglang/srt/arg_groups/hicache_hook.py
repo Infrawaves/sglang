@@ -23,6 +23,7 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    validate_decode_storage_write(server_args)
     if cfg.enable_mla_hicache_per_node:
         validate_mla_hicache_per_node(server_args)
     if cfg.enable_linker_mla_dedup and (
@@ -78,6 +79,37 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def validate_decode_storage_write(server_args: Any):
+    """Reject local configs that decode storage write cannot serve; runs at startup."""
+    cfg = resolving_view(server_args)
+    if not cfg.disaggregation_decode_enable_storage_write:
+        return
+    flag = "--disaggregation-decode-enable-storage-write"
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError(f"{flag} requires --disaggregation-mode decode.")
+    if not cfg.disaggregation_decode_enable_radix_cache:
+        raise ValueError(f"{flag} requires --disaggregation-decode-enable-radix-cache.")
+    if not cfg.enable_hierarchical_cache:
+        raise ValueError(f"{flag} requires --enable-hierarchical-cache.")
+    if cfg.hicache_storage_backend != "mooncake":
+        raise ValueError(f"{flag} requires --hicache-storage-backend mooncake.")
+    if cfg.hicache_write_policy != "write_through":
+        raise ValueError(f"{flag} requires --hicache-write-policy write_through.")
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        # The offload manager writes storage in the decode layout, rank-0 MLA only.
+        raise ValueError(
+            f"{flag} is incompatible with --disaggregation-decode-enable-offload-kvcache."
+        )
+    if cfg.hicache_host_memory_mode == "buffer_only":
+        raise ValueError(
+            f"{flag} does not support --hicache-host-memory-mode buffer_only."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(f"{flag} requires --pp-size 1.")
+    if cfg.dcp_size > 1 and cfg.dcp_kv_layout != "page":
+        raise ValueError(f"{flag} with --dcp-size > 1 requires --dcp-kv-layout page.")
 
 
 def validate_mla_hicache_per_node(server_args: Any):
@@ -160,7 +192,11 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.hicache_storage_backend is not None:
+    # Decode storage write builds dcp_rank-aware sub-page keys itself.
+    if (
+        cfg.hicache_storage_backend is not None
+        and not cfg.disaggregation_decode_enable_storage_write
+    ):
         raise NotImplementedError(
             "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
             "supported yet: under DCP each rank holds a distinct "
