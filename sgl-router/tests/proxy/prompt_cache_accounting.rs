@@ -141,6 +141,7 @@ fn context(
             },
             model_ids: vec![ModelId(MODEL.into())],
             bootstrap_port: Some(8997),
+            ..Default::default()
         })
         .unwrap();
     if let Some(decode) = decode {
@@ -151,6 +152,7 @@ fn context(
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: None,
+                ..Default::default()
             })
             .unwrap();
     }
