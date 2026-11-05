@@ -14,7 +14,9 @@ async fn chat(State(events): State<Events>, Json(body): Json<Value>) -> (StatusC
     if body["before_headers"] == true || (body["hold"] == true && body["stream"] != true) {
         std::future::pending::<()>().await;
     }
-    let response = if body["hold"] == true {
+    let status = StatusCode::from_u16(body["status"].as_u64().unwrap_or(200) as u16).unwrap();
+    // The router reads a rejected stream's error body to the end, so only a 2xx holds it.
+    let response = if body["hold"] == true && status.is_success() {
         Body::from_stream(futures::stream::pending::<
             Result<bytes::Bytes, std::io::Error>,
         >())
@@ -23,10 +25,7 @@ async fn chat(State(events): State<Events>, Json(body): Json<Value>) -> (StatusC
     } else {
         Body::from("{}")
     };
-    (
-        StatusCode::from_u16(body["status"].as_u64().unwrap_or(200) as u16).unwrap(),
-        response,
-    )
+    (status, response)
 }
 
 async fn abort(
