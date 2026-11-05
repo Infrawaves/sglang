@@ -29,6 +29,10 @@
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
+//! | `sgl_router_worker_engine_load_fresh` | Gauge | `worker_url` (prefill) |
+//! | `sgl_router_worker_engine_load_age_seconds` | Gauge | `worker_url` (prefill) |
+//! | `sgl_router_worker_pending_prefill_tokens` | Gauge | `worker_url` (prefill) |
+//! | `sgl_router_worker_prefill_cold_ratio` | Gauge | `worker_url` (prefill) |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_pd_decode_abort_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
@@ -538,6 +542,22 @@ pub struct WorkerSnapshot {
     pub cb_state: u8,
     /// In-flight request count for this worker (`Worker::router_inflight_load`).
     pub inflight: i64,
+    /// Engine-reported load as `load_based tokens` sees it; prefill workers only.
+    pub prefill_load: Option<PrefillLoadView>,
+}
+
+/// One prefill worker's engine-reported load, rendered as the
+/// `sgl_router_worker_engine_load_*` / `*_prefill_*` gauges.
+#[derive(Debug, Clone)]
+pub struct PrefillLoadView {
+    /// `None` unless this worker has a fresh, rank-complete sample.
+    pub sample_age_seconds: Option<f64>,
+    pub pending_prefill_tokens: u64,
+    /// `"engine"` only when every prefill worker of the worker's models has a
+    /// fresh sample, as routing requires; otherwise `"local"`.
+    pub pending_source: &'static str,
+    /// `None` until the cold-ratio estimator closes its first window.
+    pub cold_ratio: Option<f64>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -1169,6 +1189,8 @@ impl MetricsRegistry {
             ));
         }
 
+        render_prefill_load_gauges(&mut out, &sorted);
+
         // stale_requests_total
         out.push_str(
             "# HELP sgl_router_stale_requests_total Total stale-request cancellations fired by the janitor.\n",
@@ -1442,6 +1464,57 @@ impl MetricsRegistry {
 
         out
     }
+}
+
+/// Prefill-only gauges for `load_based tokens`. A worker without a fresh sample
+/// still reports `fresh 0`: one such candidate sends the whole selection to the
+/// router-local path.
+fn render_prefill_load_gauges(out: &mut String, sorted: &[&WorkerSnapshot]) {
+    let prefill: Vec<(&str, &PrefillLoadView)> = sorted
+        .iter()
+        .filter_map(|w| w.prefill_load.as_ref().map(|v| (w.worker_url.as_str(), v)))
+        .collect();
+    // `value` returns the label body after `worker_url` and the sample.
+    type Sample = Option<(String, String)>;
+    let mut gauge = |name: &str, help: &str, value: &dyn Fn(&PrefillLoadView) -> Sample| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        for (url, view) in &prefill {
+            if let Some((labels, v)) = value(view) {
+                out.push_str(&format!(
+                    "{name}{{worker_url=\"{}\"{labels}}} {v}\n",
+                    escape_label(url)
+                ));
+            }
+        }
+    };
+    gauge(
+        "sgl_router_worker_engine_load_fresh",
+        "1 when the router holds a fresh, rank-complete engine load sample for this prefill worker.",
+        &|v| Some((String::new(), u8::from(v.sample_age_seconds.is_some()).to_string())),
+    );
+    gauge(
+        "sgl_router_worker_engine_load_age_seconds",
+        "Seconds since the router received this prefill worker's oldest-rank engine load sample.",
+        &|v| {
+            v.sample_age_seconds
+                .map(|s| (String::new(), format!("{s:.3}")))
+        },
+    );
+    gauge(
+        "sgl_router_worker_pending_prefill_tokens",
+        "Pending prefill tokens as load_based tokens ranks them. source=engine: engine snapshot plus cold-ratio-scaled dispatches since it, used when every prefill worker of the model has a fresh sample; source=local: router-tracked in-flight prompt tokens otherwise. Candidate filtering (health, circuit breaker) is not modeled.",
+        &|v| {
+            Some((
+                format!(",source=\"{}\"", v.pending_source),
+                v.pending_prefill_tokens.to_string(),
+            ))
+        },
+    );
+    gauge(
+        "sgl_router_worker_prefill_cold_ratio",
+        "Measured fraction of this prefill worker's prompt tokens that miss every cache tier.",
+        &|v| v.cold_ratio.map(|r| (String::new(), format!("{r:.4}"))),
+    );
 }
 
 /// Render one labelled histogram family (`<name>_bucket` / `_sum` /
@@ -1736,6 +1809,7 @@ mod tests {
                 healthy: true,
                 cb_state: 0,
                 inflight: 5,
+                prefill_load: None,
             },
             WorkerSnapshot {
                 worker_url: "http://d0:30000".into(),
@@ -1743,6 +1817,7 @@ mod tests {
                 healthy: false,
                 cb_state: 1,
                 inflight: 0,
+                prefill_load: None,
             },
         ];
         let out = reg.render_with_workers(&workers);
@@ -1763,6 +1838,74 @@ mod tests {
         assert!(
             out.contains(r#"sgl_router_worker_inflight_requests{worker_url="http://d0:30000"} 0"#)
         );
+    }
+
+    /// A prefill worker with no fresh sample must report `fresh 0` and no age
+    /// series; pending tokens always carry their source; the cold ratio is
+    /// absent until measured; decode workers never get these series.
+    #[test]
+    fn prefill_load_gauges_render_only_what_is_known() {
+        let reg = MetricsRegistry::new();
+        let worker = |url: &str, mode, prefill_load| WorkerSnapshot {
+            worker_url: url.into(),
+            mode,
+            healthy: true,
+            cb_state: 0,
+            inflight: 0,
+            prefill_load,
+        };
+        let out = reg.render_with_workers(&[
+            worker(
+                "http://p0:30000",
+                "prefill",
+                Some(PrefillLoadView {
+                    sample_age_seconds: Some(0.25),
+                    pending_prefill_tokens: 12_345,
+                    pending_source: "engine",
+                    cold_ratio: Some(0.31),
+                }),
+            ),
+            worker(
+                "http://p1:30000",
+                "prefill",
+                Some(PrefillLoadView {
+                    sample_age_seconds: None,
+                    pending_prefill_tokens: 700,
+                    pending_source: "local",
+                    cold_ratio: None,
+                }),
+            ),
+            worker("http://d0:30000", "decode", None),
+        ]);
+        for line in [
+            r#"sgl_router_worker_engine_load_fresh{worker_url="http://p0:30000"} 1"#,
+            r#"sgl_router_worker_engine_load_age_seconds{worker_url="http://p0:30000"} 0.250"#,
+            r#"sgl_router_worker_pending_prefill_tokens{worker_url="http://p0:30000",source="engine"} 12345"#,
+            r#"sgl_router_worker_prefill_cold_ratio{worker_url="http://p0:30000"} 0.3100"#,
+            r#"sgl_router_worker_engine_load_fresh{worker_url="http://p1:30000"} 0"#,
+            r#"sgl_router_worker_pending_prefill_tokens{worker_url="http://p1:30000",source="local"} 700"#,
+        ] {
+            assert_metric_line(&out, line);
+        }
+        let new_series = [
+            "sgl_router_worker_engine_load_fresh{",
+            "sgl_router_worker_engine_load_age_seconds{",
+            "sgl_router_worker_pending_prefill_tokens{",
+            "sgl_router_worker_prefill_cold_ratio{",
+        ];
+        // p1 has no sample and no measured ratio; d0 is not a prefill worker.
+        let p1_absent = [
+            "sgl_router_worker_engine_load_age_seconds{",
+            "sgl_router_worker_prefill_cold_ratio{",
+        ];
+        let unexpected: Vec<_> = out
+            .lines()
+            .filter(|l| {
+                (l.contains("http://d0") && new_series.iter().any(|s| l.starts_with(s)))
+                    || (l.contains("http://p1") && p1_absent.iter().any(|s| l.starts_with(s)))
+            })
+            .collect();
+        assert!(unexpected.is_empty(), "{unexpected:?}");
     }
 
     #[test]

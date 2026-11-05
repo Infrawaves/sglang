@@ -689,6 +689,18 @@ fn materially_more_pressured(
             > other_load.num_waiting_uncached_tokens as f64 * relative_threshold
 }
 
+/// Engine-path pending prefill tokens: the cache-discounted snapshot plus raw
+/// dispatches since it, converted by `cold_ratio`. Shared with `/metrics` so
+/// the gauge and routing cannot disagree.
+pub(crate) fn engine_pending_prefill_tokens(
+    load: &EngineReportedSchedulingLoad,
+    raw_inflight_tokens: u64,
+    cold_ratio: f64,
+) -> u64 {
+    let cold = (raw_inflight_tokens as f64 * cold_ratio).round() as u64;
+    load.num_waiting_uncached_tokens.saturating_add(cold)
+}
+
 /// Constant-time request view over one captured load snapshot.
 ///
 /// External values are compared only when every candidate is present. Mixed
@@ -697,6 +709,7 @@ pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
     basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
+    local_prefill_tokens_by_worker_id: HashMap<String, u64>,
     compare_engine: bool,
     compare_basic_engine: bool,
 }
@@ -710,6 +723,10 @@ impl<'a> FreshLoadLookup<'a> {
         let local_active_by_worker_id: HashMap<String, usize> = workers
             .iter()
             .map(|worker| (worker.id.0.clone(), worker.router_inflight_load()))
+            .collect();
+        let local_prefill_tokens_by_worker_id: HashMap<String, u64> = workers
+            .iter()
+            .map(|worker| (worker.id.0.clone(), worker.router_inflight_prefill_tokens()))
             .collect();
         let by_worker_id = snapshot
             .into_iter()
@@ -739,6 +756,7 @@ impl<'a> FreshLoadLookup<'a> {
             by_worker_id,
             basic_by_worker_id,
             local_active_by_worker_id,
+            local_prefill_tokens_by_worker_id,
             compare_engine,
             compare_basic_engine,
         }
@@ -835,6 +853,35 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
+    /// Prompt tokens this worker still has to prefill: the engine's
+    /// `num_waiting_uncached_tokens` plus dispatches after that sample when
+    /// every candidate reports, else router-tracked in-flight tokens for all.
+    pub(crate) fn pending_prefill_tokens(&self, worker: &Arc<Worker>) -> u64 {
+        self.comparable_get(&worker.id)
+            .map(|load| {
+                let raw = worker.prefill_tokens_acquired_since(load.captured_at);
+                let cold_ratio = worker.prefill_cold_ratio(
+                    load.total_prefill_uncached_tokens,
+                    load.total_prefill_input_tokens,
+                );
+                tracing::debug!(
+                    worker = %worker.id.0,
+                    snapshot_tokens = load.num_waiting_uncached_tokens,
+                    inflight_raw_tokens = raw,
+                    cold_ratio,
+                    snapshot_age_ms = load.captured_at.elapsed().as_millis() as u64,
+                    "load_based tokens: pending prefill"
+                );
+                engine_pending_prefill_tokens(load, raw, cold_ratio)
+            })
+            .unwrap_or_else(|| {
+                self.local_prefill_tokens_by_worker_id
+                    .get(worker.id.0.as_str())
+                    .copied()
+                    .unwrap_or(u64::MAX)
+            })
+    }
+
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
@@ -1097,6 +1144,8 @@ mod tests {
                             max_running_requests: 64,
                             prefill_throughput_tokens_per_s: None,
                             estimated_prefill_queue_ms: None,
+                            total_prefill_uncached_tokens: 0,
+                            total_prefill_input_tokens: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1723,6 +1772,8 @@ mod tests {
                 max_running_requests: 64,
                 prefill_throughput_tokens_per_s: None,
                 estimated_prefill_queue_ms: None,
+                total_prefill_uncached_tokens: 0,
+                total_prefill_input_tokens: None,
                 captured_at: Instant::now(),
             }
         };
