@@ -312,11 +312,14 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
             offsets = getattr(item, "offsets", None)
             if not offsets:
                 raise ValueError("Missing final media offsets")
-            pad_value = getattr(item, "pad_value", None)
-            if type(pad_value) is not int:
+            padding = getattr(item, "pad_values", None) or (
+                getattr(item, "pad_value", None),
+            )
+            if any(type(pad) is not int for pad in padding):
                 raise ValueError("Missing final media pad value")
-            pad_in_int64 = -(1 << 63) <= pad_value < (1 << 63)
-            pad_values.add(pad_value)
+            if any(not -(1 << 63) <= pad < (1 << 63) for pad in padding):
+                raise ValueError("Final media offsets cover non-media tokens")
+            pad_values.update(padding)
             for start, inclusive_end in offsets:
                 if (
                     type(start) is not int
@@ -324,11 +327,7 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
                     or not 0 <= start <= inclusive_end < len(ids)
                 ):
                     raise ValueError("Invalid final media offsets")
-                # Check the scalar range before NumPy comparison: an oversized
-                # Python int must not be coerced to a rounded float or wrap.
-                if not pad_in_int64:
-                    raise ValueError("Final media offsets cover non-media tokens")
-                span_records.append((start, inclusive_end + 1, digest, pad_value))
+                span_records.append((start, inclusive_end + 1, digest, padding))
         span_records.sort(key=lambda span: (span[0], span[1]))
         previous_end = 0
         for start, end, _, _ in span_records:
@@ -338,23 +337,42 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
 
         # Validate all spans together: per-span NumPy reductions and per-gap
         # membership checks become expensive with thousands of short spans.
-        # Keep pad IDs attached while sorting so each span keeps its own pad.
+        # Keep padding patterns attached while sorting. Each span restarts its
+        # pattern, matching MultimodalDataItem.padding_sequence().
         starts = np.fromiter(
             (span[0] for span in span_records), dtype=np.intp, count=len(span_records)
         )
         ends = np.fromiter(
             (span[1] for span in span_records), dtype=np.intp, count=len(span_records)
         )
-        span_pads = np.fromiter(
-            (span[3] for span in span_records), dtype="q", count=len(span_records)
+        lengths = ends - starts
+        pattern_lengths = np.fromiter(
+            (len(span[3]) for span in span_records),
+            dtype=np.intp,
+            count=len(span_records),
         )
+        pattern_values = np.fromiter(
+            (pad for span in span_records for pad in span[3]), dtype="q"
+        )
+        if np.all(pattern_lengths == 1):
+            expected_pads = np.repeat(pattern_values, lengths)
+        else:
+            # Index the flattened patterns in NumPy rather than expanding
+            # media tokens in Python. Offsets are relative to each span.
+            indices = np.arange(lengths.sum(), dtype=np.intp)
+            indices -= np.repeat(np.cumsum(lengths) - lengths, lengths)
+            indices %= np.repeat(pattern_lengths, lengths)
+            indices += np.repeat(
+                np.cumsum(pattern_lengths) - pattern_lengths, lengths
+            )
+            expected_pads = pattern_values[indices]
         coverage_delta = np.zeros(len(ids) + 1, dtype=np.int8)
         # Starts and ends are each unique after rejecting overlaps. An end
         # may equal the next start: accumulate both so coverage remains one.
         coverage_delta[starts] += 1
         coverage_delta[ends] -= 1
         covered = np.cumsum(coverage_delta[:-1], dtype=np.int8).astype(bool)
-        if np.any(ids_view[covered] != np.repeat(span_pads, ends - starts)):
+        if np.any(ids_view[covered] != expected_pads):
             raise ValueError("Final media offsets cover non-media tokens")
 
         # Media IDs may lie outside uint32. Only uncovered positions are text,
