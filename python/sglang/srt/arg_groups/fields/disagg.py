@@ -84,8 +84,9 @@ class Disagg(msgspec.Struct):
         bool,
         "Write finished decode KV and recurrent state to the HiCache storage backend "
         "in the prefill server's parallel layout, so the next prefill round can hit "
-        "the decoded tokens (PD mode, decode only). Decode never reads its own cache "
-        "under this flag. Requires --disaggregation-decode-enable-radix-cache, "
+        "the decoded tokens (PD mode, decode only). Decode does not read from the "
+        "storage backend under this flag. "
+        "Requires --disaggregation-decode-enable-radix-cache, "
         "--enable-hierarchical-cache, --hicache-storage-backend mooncake and "
         "--hicache-write-policy write_through.",
     ] = False

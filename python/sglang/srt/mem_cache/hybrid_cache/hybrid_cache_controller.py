@@ -1531,7 +1531,7 @@ class HybridCacheController(BaseHiCacheController):
         return False
 
     def _decode_storage_backup(self, operation) -> None:
-        # Report stored even when skipped: decode never reads the node back,
+        # Report stored even when skipped: decode never reads storage,
         # so the ack only releases the host lock.
         operation.completed_tokens = len(operation.token_ids)
         # The backup thread has no handler; a raise here would stop every

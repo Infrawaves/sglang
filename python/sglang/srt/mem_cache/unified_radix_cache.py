@@ -313,7 +313,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
-        # Decode storage write: back up in the prefill layout and never read back.
+        # Decode storage write: back up in the prefill layout, never read storage.
         self.decode_storage_write = (
             get_disagg().disaggregation_decode_enable_storage_write
         )
@@ -1813,7 +1813,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.decode_storage_write:
             for node_id in publish_node_ids:
                 self._decode_prompt_end.pop(node_id, None)
-            self._release_written_through(publish_node_ids)
 
     def _record_decode_prompt_end(
         self, *, prompt_len: int, last_node_id: NodeId
@@ -1848,18 +1847,6 @@ class UnifiedRadixCache(BasePrefixCache):
             seed=storage_namespace_seed(node.key.extra_key, node.key.cache_salt),
             prompt_end_abs=self._decode_prompt_end.get(node_id),
         )
-
-    def _release_written_through(self, node_ids: list[NodeId]) -> None:
-        # Decode storage write never reads these back; device copies only cost
-        # eviction work later.
-        tracker = {ct: 0 for ct in self.tree_components}
-        for node_id in node_ids:
-            node = self.tree_core.node_by_id(node_id)
-            # The root is never a device leaf, so the walk stops below it.
-            while self.tree_core.is_backed_device_leaf(node.id):
-                parent = node.parent
-                self._demote(node.id, tracker)
-                node = parent
 
     def load_back(
         self,
@@ -2097,6 +2084,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Probe L3 with the request namespace."""
         if (
             not self.enable_storage
+            # Storage holds prefill-layout objects this decode cannot load.
+            or self.decode_storage_write
             or self.cache_controller is None
             or self.cache_controller.prefetch_rate_limited()
         ):
