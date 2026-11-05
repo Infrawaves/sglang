@@ -288,6 +288,12 @@ class DeepseekMHAForwardMixin:
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
+        pack_fn = getattr(backend, "pack_mha_kv", None)
+        if pack_fn is not None:
+            packed = pack_fn(k_nope, k_pe, v, self.attn_mha, forward_batch)
+            if packed is not None:
+                k, v = packed
+                return q, k, v, forward_batch
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
@@ -478,6 +484,7 @@ class DeepseekMHAForwardMixin:
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        pack_mha = getattr(backend, "pack_mha_kv", None)
         get_mla_kv_buffer = (
             self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
         )
@@ -533,7 +540,14 @@ class DeepseekMHAForwardMixin:
                 v_dense = kv[..., self.qk_nope_head_dim :]
                 k_nope = kv[..., : self.qk_nope_head_dim]
 
-                if pack_fn is not None:
+                packed = (
+                    pack_mha(k_nope, k_pe, v_dense, self.attn_mha, forward_batch)
+                    if pack_mha is not None
+                    else None
+                )
+                if packed is not None:
+                    k, v = packed
+                elif pack_fn is not None:
                     k, v = pack_fn(k_nope, k_pe, v_dense)
                 else:
                     v = v_dense
@@ -548,7 +562,7 @@ class DeepseekMHAForwardMixin:
                     )
                     k[..., : self.qk_nope_head_dim] = k_nope
                     k[..., self.qk_nope_head_dim :] = k_pe
-                del kv_a_normed, k_pe, kv, k_nope, v_dense
+                del kv_a_normed, k_pe, kv, k_nope, v_dense, packed
 
             output, lse = self.attn_mha(
                 q,
