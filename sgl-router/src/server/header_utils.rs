@@ -13,6 +13,7 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
         n,
         "authorization"
             | "x-request-id"
+            | "venus-request-id"
             | "x-correlation-id"
             | "traceparent"
             | "tracestate"
@@ -38,6 +39,9 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-request-id"
+        )));
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "venus-request-id"
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-correlation-id"
