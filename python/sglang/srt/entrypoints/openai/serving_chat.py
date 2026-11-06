@@ -10,6 +10,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
+from hashlib import sha256
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -21,7 +22,7 @@ from typing import (
     Optional,
 )
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_disagg, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -61,6 +62,7 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    CacheUsage,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -945,11 +947,59 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
         prompt_tokens = meta_info.get("prompt_tokens", 0)
-        if self.chat_encoding_spec == "kimi_k3":
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and meta_info.get("cache_usage") is None
+        ):
             # K3's three-token assistant generation stub is model input, but the
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
+
+    def _cache_request_params(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> dict[str, Any]:
+        # The gateway sends the same options to both PD workers. Only decode
+        # accounts the request; prefill accepts and ignores these options.
+        if get_disagg().disaggregation_mode == "prefill":
+            return {}
+        # Requests without a gateway identity keep the original API behavior,
+        # including usage fields and response headers, without a cache snapshot.
+        if request.cache_user_id is None:
+            return {}
+        if not getattr(get_serving(), "enable_cache_accounting", False):
+            if (
+                request.prompt_cache_options is None
+                or request.prompt_cache_options.mode == "explicit"
+            ):
+                return {}
+            raise ValueError("Cache accounting is not enabled on this server.")
+        # The gateway supplies its authenticated user's identity independently
+        # of optional engine API authentication. Hash it before dispatch; never
+        # use one shared gateway credential as all users' cache identity.
+        cache_user_id = (
+            "cache-user-id:" + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
+        )
+        # TokenizerManager decides which shapes can use Redis accounting for
+        # identified users.
+        return {
+            "cache_user_id": cache_user_id,
+            "cache_required": (
+                request.prompt_cache_options is not None
+                and request.prompt_cache_options.mode == "implicit"
+            ),
+            "cache_mode": (
+                request.prompt_cache_options.mode
+                if request.prompt_cache_options is not None
+                else "implicit"
+            ),
+            "cache_ttl_seconds": (
+                3600
+                if request.prompt_cache_options is not None
+                and request.prompt_cache_options.ttl == "1h"
+                else 300
+            ),
+        }
 
     @staticmethod
     def _sort_tool_message_run(
@@ -1048,6 +1098,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=content["meta_info"].get("reasoning_tokens", 0),
                     completion_tokens=content["meta_info"].get("completion_tokens", 0),
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 ).model_dump()
             for chunk in encoding_output.stream_chat_chunks(
                 content=content,
@@ -1102,6 +1153,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         cached_tokens=self._continuous_usage_cached_details(content),
+                        cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -1197,6 +1249,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         cached_tokens=self._continuous_usage_cached_details(content),
+                        cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -1232,6 +1285,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=reasoning_tokens.get(index, 0),
                     completion_tokens=completion_tokens.get(index, 0),
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 ).model_dump()
 
             yield build_sse_content(
@@ -1475,7 +1529,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-
+        cache_params = self._cache_request_params(request)
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":
@@ -1562,6 +1616,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            **cache_params,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
@@ -2633,23 +2688,31 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _usage_headers(self, meta_info: Dict[str, Any]) -> Dict[str, str]:
-        """Usage accounting headers, named by SGLANG_USAGE_HEADER_PREFIX.
+        """Return fixed cache-write headers and optional K3 prompt/read headers.
 
-        Lets clients account prompt-side tokens even when the stream drops
-        before the final usage frame. Values come from the first engine event's
-        meta_info and match the final usage (prompt-side counts are fixed after
-        prefill). Only emitted under the kimi_k3 encoding, and only when the
-        prefix is set.
+        Streaming uses the first engine event so prompt-side accounting is
+        available even if the stream ends before the final usage frame.
         """
+        cache_usage = meta_info.get("cache_usage")
+        snapshot = (
+            CacheUsage.model_validate(cache_usage) if cache_usage is not None else None
+        )
+        headers = snapshot.response_headers() if snapshot is not None else {}
         prefix = envs.SGLANG_USAGE_HEADER_PREFIX.get()
-        if self.chat_encoding_spec != "kimi_k3" or not prefix:
-            return {}
-        prompt = self._reported_prompt_tokens(meta_info)
-        cached = meta_info.get("cached_tokens", 0) or 0
-        return {
-            f"{prefix}-Prompt-Tokens": str(prompt),
-            f"{prefix}-Cached-Tokens": str(cached),
-        }
+        if self.chat_encoding_spec == "kimi_k3" and prefix:
+            prompt = self._reported_prompt_tokens(meta_info)
+            cached = (
+                snapshot.read_tokens
+                if snapshot is not None
+                else meta_info.get("cached_tokens", 0) or 0
+            )
+            headers.update(
+                {
+                    f"{prefix}-Prompt-Tokens": str(prompt),
+                    f"{prefix}-Cached-Tokens": str(cached),
+                }
+            )
+        return headers
 
     async def _handle_streaming_request(
         self,
@@ -2723,6 +2786,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        cache_usage = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -2767,6 +2831,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                if content["meta_info"].get("cache_usage") is not None:
+                    cache_usage[index] = content["meta_info"]["cache_usage"]
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -2978,6 +3044,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         completion_tokens=completion_tokens.get(idx, 0),
                         reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
                         cached_tokens=cached_tokens.get(idx, 0) or 0,
+                        cache_usage=cache_usage.get(idx),
                     )
                 yield build_sse_content(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
@@ -3114,6 +3181,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
+                    cache_usage=cache_usage,
                 )
                 usage = self._apply_k3_usage_details(
                     usage,
@@ -3159,6 +3227,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         completion_tokens=completion_tokens.get(0, 0),
                         reasoning_tokens=reasoning_tokens.get(0, 0) or 0,
                         cached_tokens=cached_tokens.get(0, 0) or 0,
+                        cache_usage=cache_usage.get(0),
                     ),
                 )
             else:
@@ -3351,7 +3420,13 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             choice_meta_info = (
-                ret_item["meta_info"] if request.return_meta_info else None
+                {
+                    key: value
+                    for key, value in ret_item["meta_info"].items()
+                    if key != "cache_usage"
+                }
+                if request.return_meta_info
+                else None
             )
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
@@ -3560,6 +3635,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: int,
         reasoning_tokens: int,
         cached_tokens: int,
+        cache_usage: CacheUsage | dict[str, int] | None = None,
     ) -> Dict[str, Any]:
         """A complete K3 usage object.
 
@@ -3574,11 +3650,11 @@ class OpenAIServingChat(OpenAIServingBase):
         the summary frame disagree whenever a prefix-cache hit landed.
         """
         return self._apply_k3_usage_details(
-            UsageInfo(
+            UsageProcessor.calculate_token_usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
                 reasoning_tokens=reasoning_tokens,
+                cache_usage=cache_usage,
             ),
             reasoning_tokens=reasoning_tokens,
             cached_tokens=cached_tokens,
@@ -3600,6 +3676,9 @@ class OpenAIServingChat(OpenAIServingBase):
         usage.completion_tokens_details = CompletionTokensDetails(
             reasoning_tokens=int(reasoning_tokens or 0)
         )
+        if usage.cache_usage is not None:
+            # UsageProcessor has already populated the Redis read/write snapshot.
+            return usage
         if usage.prompt_tokens_details is None:
             usage.prompt_tokens_details = PromptTokensDetails(
                 cached_tokens=int(cached_tokens or 0)
@@ -4228,6 +4307,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -4309,6 +4389,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         completion_tokens=completion_tokens,
                         reasoning_tokens=reasoning_tokens,
                         cached_tokens=self._continuous_usage_cached_details(content),
+                        cache_usage=content["meta_info"].get("cache_usage"),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"

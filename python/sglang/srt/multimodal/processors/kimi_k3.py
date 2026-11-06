@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.cache_accounting.multimodal import CacheArtifactIdentity
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import (
@@ -642,7 +643,10 @@ class KimiK3ImageProcessor(
         items = []
         for artifact, offset in zip(artifacts, offsets):
             model_specific_data = {
-                "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64)
+                "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64),
+                "cache_accounting_artifact_key": CacheArtifactIdentity(
+                    artifact.artifact_key
+                ),
             }
             if artifact.deferred is not None:
                 model_specific_data[DEFERRED_PREPROCESSING_KEY] = artifact.deferred

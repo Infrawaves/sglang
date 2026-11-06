@@ -478,11 +478,15 @@ class _GenerationStreamAccumulator:
     request_stats: list = field(default_factory=list)
     has_request_stats: bool = False
     # OutputSink.RUST only; see BatchTokenIDOutput.prompt_tokens.
-    prompt_tokens: Optional[list] = None
-    cached_tokens: Optional[list] = None
-    image_tokens: Optional[list] = None
-    audio_tokens: Optional[list] = None
-    video_tokens: Optional[list] = None
+    prompt_tokens: list = field(default_factory=list)
+    cached_tokens: list = field(default_factory=list)
+    cache_input_metadata: list = field(default_factory=list)
+    cached_tokens_details: list = field(
+        default_factory=list
+    )  # Detailed breakdown by cache source
+    image_tokens: list = field(default_factory=list)
+    audio_tokens: list = field(default_factory=list)
+    video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
@@ -624,6 +628,24 @@ class _GenerationStreamAccumulator:
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
         self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
+        self.cached_tokens.append(req.cached_tokens)
+        cache_input_metadata = None
+        finish_reason = self.finished_reasons[-1]
+        if (
+            not self.rust_server_mode
+            and len(output_ids_) > 0
+            and (
+                finish_reason is None
+                or finish_reason.get("type") not in ("abort", "error")
+            )
+            and not getattr(req, "cache_input_metadata_sent", False)
+        ):
+            cache_input_metadata = getattr(req, "cache_input_metadata", None)
+            if cache_input_metadata is not None:
+                req.cache_input_metadata_sent = True
+                # The admitted payload owns this one-time snapshot until sent.
+                req.cache_input_metadata = None
+        self.cache_input_metadata.append(cache_input_metadata)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -908,6 +930,12 @@ class _GenerationStreamAccumulator:
             request_stats=self.request_stats if self.has_request_stats else None,
             prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
+            cache_input_metadata=(
+                self.cache_input_metadata
+                if any(item is not None for item in self.cache_input_metadata)
+                else None
+            ),
+            cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,

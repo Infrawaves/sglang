@@ -102,6 +102,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelCard,
     ModelList,
     ResponsesRequest,
+    ResponsesResponse,
     ScoringRequest,
     TokenizeRequest,
     V1RerankReqInput,
@@ -461,6 +462,11 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        close_cache = getattr(
+            _global_state.tokenizer_manager, "close_cache_accounting", None
+        )
+        if close_cache is not None:
+            await close_cache()
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -508,6 +514,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Msh-Usage-Cache-Write-Tokens-5m",
+        "Msh-Usage-Cache-Write-Tokens-1h",
+    ],
 )
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
@@ -2100,6 +2110,16 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             result,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    if (
+        isinstance(result, ResponsesResponse)
+        and result.usage is not None
+        and result.usage.cache_usage is not None
+    ):
+        return ORJSONResponse(
+            content=result.model_dump(mode="json"),
+            headers=result.usage.cache_usage.response_headers(),
         )
 
     return result
