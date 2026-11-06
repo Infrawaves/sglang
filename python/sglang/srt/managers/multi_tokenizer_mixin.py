@@ -775,7 +775,7 @@ class MultiDetokenizerRouter:
                 if one is recv_obj:
                     raise TypeError(f"Cannot split {type(recv_obj)}")
                 one.http_worker_ipcs = [ipcs[index]]
-                self._send(self._pick(recv_obj.rids[index], ipcs[index]), one)
+                self._send(target, one)
             return
 
         for target, output in grouped:
