@@ -817,7 +817,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Inspect capacity on the input rank; broadcast aborts before cleanup.
 
         KV is full when the normal preallocation budget cannot fit one page,
-        after accounting for decode reservations and evictable cache. Published
+        after accounting for decode reservations and evictable cache. Mamba is
+        full when no free or evictable active state slot remains. Published
         destinations are never rejected.
         """
         if not envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get():
@@ -868,23 +869,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             kv_pool_full |= physical_slots <= len(self.transfer_queue.queue)
 
-        if not kv_pool_full:
+        # Pool stats exclude cached int8 checkpoints from evictable active slots.
+        pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        mamba_pool_full = (
+            pool_stats.is_hybrid_ssm
+            and pool_stats.mamba_available_size + pool_stats.mamba_evictable_size <= 0
+        )
+        if not (kv_pool_full or mamba_pool_full):
             return []
 
         aborts = []
         host_threshold = get_disagg().disaggregation_decode_host_receive_threshold
         host_receive_active = (
-            host_threshold > 0
-            and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
-            >= host_threshold
+            host_threshold > 0 and pool_stats.full_token_usage >= host_threshold
         )
         for decode_req in candidates:
             can_receive_on_host = (
-                host_receive_active
-                and decode_req.kv_receiver.supports_host_destination
+                host_receive_active and decode_req.kv_receiver.supports_host_destination
             )
-            if not can_receive_on_host:
-                message = "The decode KV pool is full."
+            if mamba_pool_full or not can_receive_on_host:
+                message = (
+                    "The decode Mamba state pool is full."
+                    if mamba_pool_full
+                    else "The decode KV pool is full."
+                )
                 aborts.append(
                     AbortReq(
                         rid=decode_req.req.rid,
@@ -918,6 +926,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # and mask the capacity rejection.
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            # Prefix matching may COW a state before KV preallocation succeeds.
+            if req.kv.holds_mamba and not req.kv.holds_kv:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
             prepare_abort(
                 req,
                 recv_req.abort_message,

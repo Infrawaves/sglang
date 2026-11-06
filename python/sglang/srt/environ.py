@@ -756,7 +756,7 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     # Return 429 for prefill queue timeouts instead of the default 503.
     SGLANG_DISAGGREGATION_PREFILL_REJECT_ON_TIMEOUT = EnvBool(False)
-    # Reject new decode requests when allocatable KV capacity is exhausted.
+    # Reject new decode requests when allocatable KV or Mamba state capacity is exhausted.
     SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL = EnvBool(False)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
