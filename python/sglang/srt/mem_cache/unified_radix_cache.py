@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 
 import torch
 
+from sglang.srt.disaggregation.decode_storage_write import (
+    DecodeStorageAnchor,
+    DecodeStorageWriteMetrics,
+    decode_prompt_end,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -98,12 +103,18 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
     hicache_diagnostic_metrics_enabled,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 
@@ -320,6 +331,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        # Decode storage write: back up in the prefill layout, never read storage.
+        self.decode_storage_write = (
+            get_disagg().disaggregation_decode_enable_storage_write
+        )
+        # Pending write-through node -> absolute depth prefill already stored.
+        self._decode_prompt_end: dict[NodeId, int] = {}
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -586,6 +603,34 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+            if self.decode_storage_write:
+                self.cache_controller.decode_storage_write_metrics = (
+                    DecodeStorageWriteMetrics(
+                        labels=self._decode_storage_write_metric_labels(
+                            storage_backend=storage_backend
+                        )
+                    )
+                )
+
+    def _decode_storage_write_metric_labels(
+        self, *, storage_backend: str
+    ) -> dict[str, str]:
+        """Same labels as the HiCache storage collector, so dashboards filter alike."""
+        controller = self.cache_controller
+        config = controller.storage_config
+        attn_cp_rank, attn_cp_size = controller.get_attn_cp_rank_and_size()
+        labels = {
+            "storage_backend": storage_backend,
+            "tp_rank": config.tp_rank,
+            "dp_rank": config.dp_rank,
+            "pp_rank": config.pp_rank,
+            "pp_size": config.pp_size,
+            "attn_cp_rank": attn_cp_rank,
+            "attn_cp_size": attn_cp_size,
+        }
+        if self.extra_metric_labels:
+            labels.update(self.extra_metric_labels)
+        return labels
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
@@ -1181,6 +1226,11 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+        if self.decode_storage_write:
+            self._record_decode_prompt_end(
+                prompt_len=len(req.origin_input_ids),
+                last_node_id=result.last_device_node,
+            )
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -1734,6 +1784,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not replaced:
             return
 
+        # The boundary is an absolute depth, valid for every split fragment.
+        prompt_end = self._decode_prompt_end.pop(old_node_id, None)
+        if prompt_end is not None:
+            for node_id in new_node_ids:
+                self._decode_prompt_end[node_id] = prompt_end
+
         self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node_id,
             lock_params,
@@ -1756,6 +1812,43 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        if self.decode_storage_write:
+            for node_id in publish_node_ids:
+                self._decode_prompt_end.pop(node_id, None)
+
+    def _record_decode_prompt_end(
+        self, *, prompt_len: int, last_node_id: NodeId
+    ) -> None:
+        """Tag this request's pending write-through nodes with its prompt boundary."""
+        # Rejected at startup; buffer mode acks bypass _finish_write_through_ack's pop.
+        assert self.buffer_pipeline is None
+        prompt_end = decode_prompt_end(prompt_len=prompt_len)
+        if prompt_end is None:
+            return
+        node = self.tree_core.node_by_id(last_node_id)
+        while node is not None and node is not self.tree_core.root_node:
+            if node.write_through_pending_id is not None:
+                # A shared pending ancestor keeps the deepest boundary: every
+                # depth below it was a prompt token of some prefilled request.
+                self._decode_prompt_end[node.id] = max(
+                    prompt_end, self._decode_prompt_end.get(node.id, 0)
+                )
+            node = node.parent
+
+    def _decode_storage_anchor(self, node_id: NodeId) -> DecodeStorageAnchor:
+        """Ancestor token spans and namespace seed for the prefill hash chain."""
+        node = self.tree_core.node_by_id(node_id)
+        chunks = []
+        parent = node.parent
+        while parent is not None and parent is not self.tree_core.root_node:
+            chunks.append(parent.key.token_ids)
+            parent = parent.parent
+        chunks.reverse()
+        return DecodeStorageAnchor(
+            prefix_chunks=tuple(chunks),
+            seed=storage_namespace_seed(node.key.extra_key, node.key.cache_salt),
+            prompt_end_abs=self._decode_prompt_end.get(node_id),
+        )
 
     def load_back(
         self,
@@ -1953,6 +2046,11 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            decode_storage_anchor=(
+                self._decode_storage_anchor(node_id)
+                if self.decode_storage_write
+                else None
+            ),
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -1988,6 +2086,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Probe L3 with the request namespace."""
         if (
             not self.enable_storage
+            # Storage holds prefill-layout objects this decode cannot load.
+            or self.decode_storage_write
             or self.cache_controller is None
             or self.cache_controller.prefetch_rate_limited()
         ):
