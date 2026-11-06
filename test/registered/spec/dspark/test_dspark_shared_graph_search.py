@@ -30,7 +30,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (  # noqa: E
     compute_verify_token_budget,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (  # noqa: E402
+    SpsAdditiveCostTable,
     SpsCostTable,
+    SpsGraphCostSample,
+    SpsGraphCostTable,
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
@@ -184,6 +187,170 @@ class TestSharedGraphSearch(unittest.TestCase):
             self.assertEqual(lookup.call_count, first_count)
             search.select(batch_sizes=[2, 2], utilities=[curve, curve])
             self.assertEqual(lookup.call_count, first_count + 2)
+
+
+class TestSharedGraphStartup(unittest.TestCase):
+    def _table(self, *, verify_width=3, grid=None):
+        return SpsGraphCostTable(
+            verify_width=verify_width,
+            capture_num_tokens=[3, 6, 9] if grid is None else grid,
+            samples=[
+                SpsGraphCostSample(2, 2, 3, 0.1),
+                SpsGraphCostSample(2, 2, 6, 0.2),
+            ],
+        )
+
+    def _planner(self, *, table=None):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = SimpleNamespace(
+            sps_table=self._table() if table is None else table
+        )
+        planner._shared_graph_search = None
+        planner._dp_tier_gather_enabled = True
+        planner._align_verify_tokens_to_graph_tier = True
+        planner._is_verify_all = False
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=2)
+        planner.verify_num_draft_tokens = 3
+        planner.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=SimpleNamespace(
+                ragged_verify_mode=True,
+                capture_num_tokens=[3, 6, 9],
+                _ragged_slots_by_tokens={3: (1, 2, 3), 6: (2, 3, 6), 9: (3, 6)},
+                captured_req_width=3,
+                max_bs=6,
+                reserve_ragged_padding_slot=False,
+            )
+        )
+        return planner
+
+    def _initialize(self, planner):
+        with patch.object(
+            dspark_planner, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ):
+            return planner.initialize_shared_graph_search()
+
+    def test_graph_table_initializes_and_selects_measured_shape(self):
+        planner = self._planner()
+        self.assertEqual(self._initialize(planner), 4)
+        search = planner._shared_graph_search
+        self.assertIs(search.cost_table, planner._budget_planner.sps_table)
+        curve = search.utilities(torch.ones(2, 2), survival_eps=1e-6)
+        decision = search.select(batch_sizes=[2, 2], utilities=[curve, curve])
+        self.assertEqual(decision.shape.graph_num_tokens, 3)
+        self.assertEqual(decision.step_seconds, 0.1)
+
+    def test_graph_table_rejects_unavailable_scheduler_prerequisites(self):
+        for attr, value, message in (
+            ("_dp_tier_gather_enabled", False, "compact DP tier gathering"),
+            (
+                "_align_verify_tokens_to_graph_tier",
+                False,
+                "--speculative-dspark-align-verify-tokens-to-graph-tier",
+            ),
+            ("_is_verify_all", True, "budget scheduling"),
+            (
+                "_schedule_cfg",
+                DSparkScheduleConfig(gamma=2, min_verify_len=0),
+                "min_verify_len=1",
+            ),
+            (
+                "_schedule_cfg",
+                DSparkScheduleConfig(gamma=2, max_verify_len=2),
+                "max_verify_len=verify_num_draft_tokens",
+            ),
+        ):
+            with self.subTest(attr=attr, value=value):
+                planner = self._planner()
+                setattr(planner, attr, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._initialize(planner)
+                self.assertIsNone(planner._shared_graph_search)
+
+    def test_graph_table_rejects_missing_ragged_capture(self):
+        for case in ("no_runner", "not_ragged", "no_slot_buckets"):
+            with self.subTest(case=case):
+                planner = self._planner()
+                runner = planner.model_runner.decode_cuda_graph_runner
+                if case == "no_runner":
+                    planner.model_runner.decode_cuda_graph_runner = None
+                elif case == "not_ragged":
+                    runner.ragged_verify_mode = False
+                else:
+                    runner._ragged_slots_by_tokens = {}
+                with self.assertRaisesRegex(
+                    ValueError, "captured ragged decode CUDA graphs"
+                ):
+                    self._initialize(planner)
+                self.assertIsNone(planner._shared_graph_search)
+
+    def test_graph_table_still_rejects_width_and_capture_grid_mismatch(self):
+        for table, message in (
+            (self._table(verify_width=4), "verify_width"),
+            (self._table(grid=[3, 6, 12]), "capture_num_tokens"),
+        ):
+            with self.subTest(message=message):
+                planner = self._planner(table=table)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._initialize(planner)
+                self.assertIsNone(planner._shared_graph_search)
+
+    def test_legacy_tables_keep_local_budget_fallback(self):
+        tables = (
+            _search().cost_table,
+            SpsAdditiveCostTable(0.1, [1, 6], [0.0, 0.1], [1, 9], [0.0, 0.1]),
+        )
+        for table in tables:
+            for case in ("no_dp_gather", "no_align", "no_runner"):
+                with self.subTest(table=type(table).__name__, case=case):
+                    planner = self._planner(table=table)
+                    if case == "no_dp_gather":
+                        planner._dp_tier_gather_enabled = False
+                    elif case == "no_align":
+                        planner._align_verify_tokens_to_graph_tier = False
+                    else:
+                        planner.model_runner.decode_cuda_graph_runner = None
+                    self.assertEqual(self._initialize(planner), 0)
+                    self.assertIsNone(planner._shared_graph_search)
+                    decision = compute_verify_token_budget(
+                        history_survival_probs=torch.ones(2, 2),
+                        sps_table=table,
+                        cfg=planner._schedule_cfg,
+                    )
+                    self.assertIsNotNone(decision.budget)
+
+    def test_no_budget_planner_and_verify_all_keep_search_disabled(self):
+        for has_budget_planner in (False, True):
+            with self.subTest(has_budget_planner=has_budget_planner):
+                planner = self._planner(table=_search().cost_table)
+                planner._is_verify_all = True
+                if not has_budget_planner:
+                    planner._budget_planner = None
+                self.assertEqual(self._initialize(planner), 0)
+                self.assertIsNone(planner._shared_graph_search)
+
+    def test_valid_graph_table_preserves_transient_step_fallback(self):
+        planner = self._planner()
+        self._initialize(planner)
+        search = planner._shared_graph_search
+        curve = search.utilities(torch.ones(2, 2), survival_eps=1e-6)
+        for attrs in (
+            {"is_extend_in_batch": True},
+            {"can_run_decode_cuda_graph": False},
+            {"global_spec_graph_utilities": None},
+        ):
+            with self.subTest(attrs=attrs):
+                batch = _batch(
+                    global_num_tokens=[2, 2],
+                    global_spec_graph_utilities=[curve, curve],
+                )
+                planner.finalize_shared_graph_budget(batch)
+                self.assertEqual(batch.spec_shared_graph_tokens, 3)
+                for attr, value in attrs.items():
+                    setattr(batch, attr, value)
+                planner.finalize_shared_graph_budget(batch)
+                self.assertIsNone(batch.spec_shared_graph_tokens)
+                self.assertIsNone(batch.spec_shared_graph_theta)
+                self.assertIs(planner._shared_graph_search, search)
 
 
 class TestSharedGraphHostPlanner(unittest.TestCase):

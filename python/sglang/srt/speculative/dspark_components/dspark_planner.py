@@ -329,19 +329,45 @@ class DSparkVerifyPlanner:
     def initialize_shared_graph_search(self) -> int:
         """Called after target graph capture, before fixing the MLP row width."""
         runner = self.model_runner.decode_cuda_graph_runner
-        if not (
-            self._dp_tier_gather_enabled
-            and self._align_verify_tokens_to_graph_tier
-            and not self._is_verify_all
-            and self._schedule_cfg.min_verify_len == 1
-            and self._schedule_cfg.resolved_max_verify_len()
-            == self.verify_num_draft_tokens
-            and runner is not None
-            and runner.ragged_verify_mode
-            and getattr(runner, "_ragged_slots_by_tokens", None)
-        ):
+        table = (
+            self._budget_planner.sps_table if self._budget_planner is not None else None
+        )
+        requirements = (
+            (
+                self._dp_tier_gather_enabled,
+                "compact DP tier gathering (compact mode, DP attention, MLP sync, "
+                "overlap scheduling, pp_size=1, attn_cp_size=1, and scheduler "
+                "all-gather enabled)",
+            ),
+            (
+                self._align_verify_tokens_to_graph_tier,
+                "--speculative-dspark-align-verify-tokens-to-graph-tier",
+            ),
+            (not self._is_verify_all, "budget scheduling instead of verify-all"),
+            (
+                self._schedule_cfg.min_verify_len == 1
+                and self._schedule_cfg.resolved_max_verify_len()
+                == self.verify_num_draft_tokens,
+                "min_verify_len=1 and max_verify_len=verify_num_draft_tokens",
+            ),
+            (
+                runner is not None
+                and runner.ragged_verify_mode
+                and getattr(runner, "_ragged_slots_by_tokens", None),
+                "captured ragged decode CUDA graphs",
+            ),
+        )
+        missing = [description for ready, description in requirements if not ready]
+        if missing:
+            if isinstance(table, SpsGraphCostTable):
+                # Unlike legacy tables, graph tables have no local-budget
+                # lookup. A permanently disabled search would silently verify
+                # every draft, so reject the configuration at startup. Per-step
+                # fallback remains available after successful initialization.
+                raise ValueError(
+                    "DSpark graph SPS table requires " + "; ".join(missing) + "."
+                )
             return 0
-        table = self._budget_planner.sps_table
         shapes = GraphBudgetShapes.from_runner(runner)
         if isinstance(table, SpsGraphCostTable):
             table.validate_capture(
