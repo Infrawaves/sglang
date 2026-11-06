@@ -1,4 +1,4 @@
-"""Opt-in fixed split-KV planning for FlashInfer 0.6.17/0.6.18/0.7.1 CuTeDSL MLA.
+"""Opt-in fixed split-KV planning for FlashInfer 0.6.17-0.7.2 CuTeDSL MLA.
 
 FlashInfer's public MLA API does not expose a split override. Give this backend
 its own copy of the Python launch wrapper, replacing only its planner. The
@@ -13,9 +13,10 @@ from types import FunctionType
 
 # These releases have the same monolithic wrapper, planner ABI and workspace
 # layout; 0.7.1 only adds an ``lse_scale`` argument whose default keeps the
-# natural-log LSE. Keep an explicit allowlist because this adapter uses a
-# private API.
-SUPPORTED_FLASHINFER_VERSIONS = ("0.6.17", "0.6.18", "0.7.1")
+# natural-log LSE, and 0.7.2 sizes its reducer from the planned split count
+# (capped at 48, above this planner's 32). Keep an explicit allowlist because
+# this adapter uses a private API.
+SUPPORTED_FLASHINFER_VERSIONS = ("0.6.17", "0.6.18", "0.7.1", "0.7.2")
 
 
 @functools.lru_cache(maxsize=1024, typed=True)
