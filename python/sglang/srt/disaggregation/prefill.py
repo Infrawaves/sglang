@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -446,9 +447,53 @@ class PrefillBootstrapQueue:
         if is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
+        if (
+            get_schedule().max_queued_requests is not None
+            and self._reject_on_queued_limit(req)
+        ):
+            return
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
+
+    def _reject_on_queued_limit(self, req: Req) -> bool:
+        limit = self.scheduler.max_queued_requests
+        if (
+            limit is None
+            or is_health_check_req(req)
+            or _is_fake_transfer(req)
+            or req.is_retracted
+            or req.time_stats.forward_entry_time > 0
+            or req.kv.holds_kv
+            or req.kv.holds_mamba
+            or req.metadata_buffer_index >= 0
+            or req.kv.retraction_backup is not None
+        ):
+            return False
+
+        # Bootstrap and ready are disjoint. Count only requests awaiting their
+        # first execution; optimistic retries can reset forward_entry_time.
+        num_queued = sum(
+            1
+            for queue in (self.queue, self.scheduler.waiting_queue)
+            for queued_req in queue
+            if not queued_req.is_retracted
+            and queued_req.time_stats.forward_entry_time == 0
+            and not queued_req.finished()
+            and not is_aborted(queued_req)
+            and not is_health_check_req(queued_req)
+            and not _is_fake_transfer(queued_req)
+        )
+        if num_queued < limit:
+            return False
+
+        prepare_abort(
+            req,
+            "The prefill request queue is full.",
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+        )
+        self.scheduler.retire_unadmitted_request(req)
+        return True
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:

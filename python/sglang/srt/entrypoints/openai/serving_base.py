@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.process_request_preprocessor import ProcessRequestPreprocessor
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_disagg, get_observability
+from sglang.srt.runtime_context import get_disagg, get_observability, get_schedule
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -28,14 +28,13 @@ logger = logging.getLogger(__name__)
 
 
 def http_stream_admission_enabled() -> bool:
-    prefill_enabled = envs.SGLANG_DISAGGREGATION_PREFILL_REJECT_ON_TIMEOUT.get()
-    decode_enabled = envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get()
-    if not prefill_enabled and not decode_enabled:
-        return False
     mode = get_disagg().disaggregation_mode
     if mode == "prefill":
-        return prefill_enabled and envs.SGLANG_REQ_WAITING_TIMEOUT.get() > 0
-    return mode == "decode" and decode_enabled
+        return get_schedule().max_queued_requests is not None or (
+            envs.SGLANG_DISAGGREGATION_PREFILL_REJECT_ON_TIMEOUT.get()
+            and envs.SGLANG_REQ_WAITING_TIMEOUT.get() > 0
+        )
+    return mode == "decode" and envs.SGLANG_DISAGGREGATION_DECODE_REJECT_ON_FULL.get()
 
 
 async def check_http_stream_admission(

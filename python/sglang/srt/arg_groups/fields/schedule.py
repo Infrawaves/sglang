@@ -34,7 +34,7 @@ class Schedule(msgspec.Struct):
     ] = None
     max_queued_requests: A[
         Optional[int],
-        "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+        "The maximum number of queued requests. In prefill mode, counts bootstrap and ready requests awaiting their first execution and rejects new requests with HTTP 429 when full. Ignored in decode mode.",
     ] = None
     max_total_tokens: A[
         Optional[int],
