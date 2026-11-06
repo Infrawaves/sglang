@@ -175,8 +175,9 @@ def install_o_proj_wrapper(o_proj) -> None:
             if fused_output is not None:
                 return fused_output
 
-        output_rows = get_o_proj_output_rows(x.shape[0])
-        if requires_symmetric_rs(output_rows, x.device):
+        # v0.5.22 dropped the padded-row override (attention runs on all rows).
+        output_rows = x.shape[0]
+        if requires_symmetric_rs(output_rows, x.device, x.element_size()):
             output = get_o_proj_output_buffer(output_rows, x.dtype, o_proj.output_size)
             result = native_o_proj_forward(
                 x, *args, output_tensor=output[: x.shape[0]], **kwargs
