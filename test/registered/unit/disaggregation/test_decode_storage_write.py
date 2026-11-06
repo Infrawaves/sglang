@@ -1,5 +1,6 @@
 import ctypes
 import unittest
+from array import array
 
 import numpy as np
 
@@ -118,9 +119,12 @@ class TestStorageKeys(CustomTestCase):
         whole = sub_page_hashes(
             prefix_chunks=(), token_ids=tokens, seed=seed, sub_page_size=64
         )
+        # Decode passes its tree keys, array("q"), uncopied; they must hash
+        # like the token lists prefill hashes.
+        tree_keys = array("q", tokens)
         split = sub_page_hashes(
-            prefix_chunks=(tokens[:256], tokens[256:512]),
-            token_ids=tokens[512:],
+            prefix_chunks=(tree_keys[:256], tree_keys[256:512]),
+            token_ids=tree_keys[512:],
             seed=seed,
             sub_page_size=64,
         )

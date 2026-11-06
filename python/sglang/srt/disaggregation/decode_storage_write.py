@@ -195,12 +195,13 @@ def sub_page_hashes(
     """
     from sglang.srt.mem_cache.utils import get_hash_str
 
+    # array("q") tree keys go in uncopied; list() would box each token under the GIL.
     prior = seed
     for chunk in prefix_chunks:
-        hashes = get_hash_str(list(chunk), prior, page_size=sub_page_size)
+        hashes = get_hash_str(chunk, prior, page_size=sub_page_size)
         if hashes:
             prior = hashes[-1]
-    return get_hash_str(list(token_ids), prior, page_size=sub_page_size)
+    return get_hash_str(token_ids, prior, page_size=sub_page_size)
 
 
 def local_sub_page_keys(
@@ -255,7 +256,7 @@ def skip_sub_pages(
 def local_skip_count(*, skip: int, dcp_size: int, dcp_rank: int) -> int:
     """How many of this DCP rank's local sub-pages fall below global index ``skip``.
 
-    Rank r owns global sub-pages r, r + dcp_size, ...; see local_sub_page_keys.
+    See local_sub_page_keys for which global sub-pages a rank owns.
     """
     return max(0, -(-(skip - dcp_rank) // dcp_size))
 
