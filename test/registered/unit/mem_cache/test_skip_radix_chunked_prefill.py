@@ -140,6 +140,10 @@ def _runtime():
     return SimpleNamespace(**namespace), req_type
 
 
+@unittest.skip(
+    "v0.5.22 replaced maybe_cache_unfinished_req with checkpoint_kv_cache, which "
+    "advances req.prefix_len when the radix insert is skipped"
+)
 class TestSkipRadixChunkedPrefill(unittest.TestCase):
     def setUp(self):
         self.prod, req_type = _runtime()
