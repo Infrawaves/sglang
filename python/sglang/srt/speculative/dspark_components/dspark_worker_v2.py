@@ -752,6 +752,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.can_run_decode_cuda_graph
         ):
             return None
+        shared_graph = getattr(batch, "spec_shared_graph_tokens", None)
+        if shared_graph is not None:
+            return shared_graph
         return dp_global_verify_tier_num_tokens(
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
@@ -1112,3 +1115,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return None
         return self._verify_planner.confidence_budget_pre_sync()
+
+    def get_shared_graph_candidate_count(self) -> int:
+        if not self._hosts_draft:
+            return 0
+        return self._verify_planner.initialize_shared_graph_search()
+
+    def finalize_shared_graph_budget(self, batch: Optional[ScheduleBatch]) -> None:
+        if self._hosts_draft:
+            self._verify_planner.finalize_shared_graph_budget(batch)

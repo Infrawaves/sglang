@@ -58,6 +58,7 @@ def make_obs(
     num_verify_tokens=24,
     predicted_step_ms=None,
     predicted_theta=None,
+    predicted_graph_num_tokens=None,
 ):
     return DecodeStepObservation(
         forward_ct=forward_ct,
@@ -81,6 +82,7 @@ def make_obs(
         cap_trim_lens=torch.zeros((bs,), dtype=torch.int32),
         commit_lens=torch.full((bs,), 4, dtype=torch.int32),
         rids=[f"r{i}" for i in range(bs)],
+        predicted_graph_num_tokens=predicted_graph_num_tokens,
     )
 
 
@@ -243,6 +245,20 @@ class TestPredictedStepFields(CustomTestCase):
         self.assertAlmostEqual(record["predicted_step_ms"], 1.5)
         self.assertAlmostEqual(record["predicted_theta"], 200.0)
 
+    def test_shared_graph_prediction_survives_pending_record(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=1,
+                predicted_step_ms=1.5,
+                predicted_theta=1600.0,
+                predicted_graph_num_tokens=24,
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(record["predicted_graph_num_tokens"], 24)
+        self.assertAlmostEqual(record["predicted_theta"], 1600.0)
+
     def test_predicted_fields_omitted_when_none(self):
         dumper, clock = make_dumper({"core"})
         dumper.observe_decode_step(make_obs(forward_ct=1))
@@ -251,9 +267,12 @@ class TestPredictedStepFields(CustomTestCase):
         record = next(r for r in dumper.dump()["records"] if r["forward_ct"] == 1)
         self.assertNotIn("predicted_step_ms", record)
         self.assertNotIn("predicted_theta", record)
+        self.assertNotIn("predicted_graph_num_tokens", record)
 
 
-def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
+def _pending(
+    *, bs, budget, num_verify_tokens, predicted_step_ms, predicted_graph_num_tokens=None
+):
     return _PendingStep(
         forward_ct=1,
         bs=bs,
@@ -270,6 +289,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         rids=None,
         future=None,
         segment_events={},
+        predicted_graph_num_tokens=predicted_graph_num_tokens,
     )
 
 
@@ -312,6 +332,38 @@ class TestOnlineSpsReporter(CustomTestCase):
                 step_gpu_ms=12.0,
             )
         self.assertTrue(any("M_mismatch_rate=50.0%" in m for m in cm.output))
+
+    def test_graph_prediction_matches_shared_graph_after_align(self):
+        dumper, _ = make_dumper(set(), sps_report_interval=2)
+        # Local B + budget is below the shared replay size when another DP
+        # needs the larger graph. That graph was included in this prediction.
+        dumper._report_sps_prediction(
+            pending=_pending(
+                bs=2,
+                budget=10,
+                num_verify_tokens=24,
+                predicted_step_ms=10.0,
+                predicted_graph_num_tokens=24,
+            ),
+            step_gpu_ms=12.0,
+        )
+        self.assertEqual(dumper._sps_window, [(10.0, 12.0)])
+        self.assertEqual(dumper._sps_mismatched, 0)
+
+    def test_graph_change_excludes_prediction_even_when_local_budget_matches(self):
+        dumper, _ = make_dumper(set(), sps_report_interval=2)
+        dumper._report_sps_prediction(
+            pending=_pending(
+                bs=4,
+                budget=20,
+                num_verify_tokens=24,
+                predicted_step_ms=10.0,
+                predicted_graph_num_tokens=48,
+            ),
+            step_gpu_ms=12.0,
+        )
+        self.assertEqual(dumper._sps_window, [])
+        self.assertEqual(dumper._sps_mismatched, 1)
 
     def test_reporter_skips_steps_missing_prediction_or_actual(self):
         dumper, _ = make_dumper(set(), sps_report_interval=2)

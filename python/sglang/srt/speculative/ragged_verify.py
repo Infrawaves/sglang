@@ -8,6 +8,12 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.dspark_graph_budget import (
+    full_coverage_graph_slots as full_coverage_graph_slots,
+)
+from sglang.srt.speculative.dspark_components.dspark_graph_budget import (
+    requires_full_width_ragged_graph,
+)
 
 
 class RaggedVerifyMode(str, Enum):
@@ -43,25 +49,18 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
-def full_coverage_graph_slots(
-    max_live_bs: int, graph_num_tokens: int, verify_width: int
-) -> int:
-    """Minimum slots that keep every full-coverage padding row within verify_width."""
-    # The idle layout has one anchor per shared request slot. A busy rank has
-    # at least one token per live request. With B equal to the shared maximum,
-    # reserving ceil((G - B) / W) dummy rows covers both cases on every DP.
-    padding_tokens = max(0, graph_num_tokens - max_live_bs)
-    return max_live_bs + (padding_tokens + verify_width - 1) // verify_width
-
-
 def needs_full_width_ragged_graph(
     runner, max_live_bs: int, graph_num_tokens: int, verify_width: int
 ) -> bool:
     """Switch all DPs to uniform lengths if the compact padding cannot fit."""
-    return (
-        getattr(runner, "reserve_ragged_padding_slot", False)
-        and full_coverage_graph_slots(max_live_bs, graph_num_tokens, verify_width)
-        > runner.max_bs
+    if not getattr(runner, "reserve_ragged_padding_slot", False):
+        return False
+    return requires_full_width_ragged_graph(
+        max_live_bs=max_live_bs,
+        graph_num_tokens=graph_num_tokens,
+        verify_width=verify_width,
+        max_graph_slots=runner.max_bs,
+        reserve_padding_slot=True,
     )
 
 

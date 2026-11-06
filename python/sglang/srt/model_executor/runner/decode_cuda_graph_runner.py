@@ -30,7 +30,6 @@ import dataclasses
 import inspect
 import logging
 import os
-from bisect import bisect_left
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
@@ -115,8 +114,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.dspark_components.dspark_graph_budget import (
+    resolve_ragged_graph_slots,
+)
 from sglang.srt.speculative.ragged_verify import (
-    full_coverage_graph_slots,
     needs_full_width_ragged_graph,
     resolve_ragged_verify_layout,
 )
@@ -682,14 +683,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4()
 
     def _ragged_graph_slots(self, num_tokens: int, max_bs: int) -> Optional[int]:
-        slots = self._ragged_slots_by_tokens.get(num_tokens, ())
-        required_slots = (
-            full_coverage_graph_slots(max_bs, num_tokens, self.captured_req_width)
-            if self.reserve_ragged_padding_slot
-            else max_bs
+        return resolve_ragged_graph_slots(
+            self._ragged_slots_by_tokens,
+            graph_num_tokens=num_tokens,
+            max_live_bs=max_bs,
+            verify_width=self.captured_req_width,
+            reserve_padding_slot=self.reserve_ragged_padding_slot,
         )
-        idx = bisect_left(slots, required_slots)
-        return slots[idx] if 0 < max_bs and idx < len(slots) else None
 
     def _ragged_replay_shape(self, layout) -> Optional[tuple[int, int]]:
         # On synchronized DP the planner carries the same maximum on busy

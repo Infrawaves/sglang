@@ -109,6 +109,9 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
+    # With a graph prediction, predicted_theta is the full DP group's expected
+    # output tokens/s. Legacy predictions retain their DP-local throughput.
+    predicted_graph_num_tokens: Optional[int] = None
 
 
 class DecodeStepObservation(msgspec.Struct):
@@ -133,6 +136,7 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    predicted_graph_num_tokens: Optional[int] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -151,6 +155,7 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    predicted_graph_num_tokens: Optional[int] = None
 
 
 class DsparkInfoDumper:
@@ -255,6 +260,7 @@ class DsparkInfoDumper:
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
+            predicted_graph_num_tokens=obs.predicted_graph_num_tokens,
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -350,6 +356,7 @@ class DsparkInfoDumper:
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
+            record.predicted_graph_num_tokens = pending.predicted_graph_num_tokens
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -377,10 +384,15 @@ class DsparkInfoDumper:
         predicted = pending.predicted_step_ms
         if predicted is None or step_gpu_ms is None:
             return
-        matched = (
-            pending.budget is not None
-            and pending.bs + pending.budget == pending.num_verify_tokens
-        )
+        if pending.predicted_graph_num_tokens is not None:
+            matched = (
+                pending.predicted_graph_num_tokens == pending.verify_tokens_graph_key
+            )
+        else:
+            matched = (
+                pending.budget is not None
+                and pending.bs + pending.budget == pending.num_verify_tokens
+            )
         if not matched:
             self._sps_mismatched += 1
             return
@@ -913,6 +925,11 @@ class DsparkStepObservers:
                     verify_tokens_graph_key=num_verify_tokens,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
+                    predicted_graph_num_tokens=(
+                        None
+                        if budget_decision is None
+                        else budget_decision.graph_num_tokens
+                    ),
                     verify_lens=layout.verify_lens if layout is not None else None,
                     confidence=confidence,
                     req_pool_indices=req_pool_indices,
