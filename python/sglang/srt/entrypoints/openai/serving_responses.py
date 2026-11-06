@@ -1365,8 +1365,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             content = final_output
 
         tool_choice = request.effective_tool_choice()
+        # A named function or custom tool is required; an allowlist is not.
         is_required = tool_choice == "required" or (
-            isinstance(tool_choice, dict) and tool_choice["type"] == "function"
+            isinstance(tool_choice, dict) and tool_choice["type"] != "allowed_tools"
         )
         calls: list[ToolCallItem] = []
         parsed_via_native = False
@@ -1550,7 +1551,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         if not chat_tools or not (
             tool_choice == "required"
-            or (isinstance(tool_choice, dict) and tool_choice["type"] == "function")
+            or (
+                isinstance(tool_choice, dict) and tool_choice["type"] != "allowed_tools"
+            )
         ):
             return False
         if not self.tool_call_parser:

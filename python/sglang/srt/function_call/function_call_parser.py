@@ -403,19 +403,6 @@ class FunctionCallParser:
                     ),
                 )
             # Highest priority: model-native structural_tag when available.
-            structural_tag_tools = self.tools
-            if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                structural_tag_tools = [
-                    tool.model_copy(
-                        update={
-                            "function": tool.function.model_copy(
-                                update={"strict": True}
-                            )
-                        }
-                    )
-                    for tool in self.tools
-                ]
-
             if isinstance(tool_choice, AllowedToolChoice):
                 # Request validation guarantees the K3 detector for allowed_tools.
                 structural_tag = self.detector.get_structural_tag(
