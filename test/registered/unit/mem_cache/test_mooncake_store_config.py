@@ -4,6 +4,9 @@ Regression for sgl-project/sglang#23457: runtime attach must resolve
 per-node local_hostname from process environment instead of a shared default.
 """
 
+import json
+import os
+import tempfile
 import unittest
 
 from sglang.srt.environ import envs

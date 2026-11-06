@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
