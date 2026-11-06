@@ -10,6 +10,7 @@ at load time.
 
 import asyncio
 import functools
+import hashlib
 import io
 import logging
 import math
@@ -33,7 +34,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
+from sglang.srt.multimodal.cache import (
+    CONTENT_HASH_PREFIX,
+    resolve_multimodal_item_hash,
+    snapshot_media,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -227,6 +232,9 @@ class _KimiK3VisualItem:
     source_index: int
     in_patch_limit: int
     timestamp_text: str = ""
+    # Digest of the input bytes an image item was loaded from; video chunks
+    # are identified by their sampled frames instead.
+    content_digest: Optional[str] = None
 
     @property
     def size(self) -> tuple[int, int]:
@@ -1688,12 +1696,20 @@ class KimiK3ImageProcessor(
             visual_items = []
             for source_index, modality in enumerate(modalities):
                 if modality == "image":
+                    image = next(image_iter)
                     visual_items.append(
                         _KimiK3VisualItem(
                             media_type="image",
-                            frames=(next(image_iter),),
+                            # MoonViT preprocessing reads the decoded image;
+                            # the loader's digest stays the item's identity.
+                            frames=tuple(unwrap_kimi_images([image])),
                             source_index=source_index,
                             in_patch_limit=int(self.media_proc_cfg["in_patch_limit"]),
+                            content_digest=(
+                                image.content_digest
+                                if isinstance(image, KimiLoadedImage)
+                                else None
+                            ),
                         )
                     )
                     continue
@@ -1792,6 +1808,8 @@ class KimiK3ImageProcessor(
 
     def kimi_content_config_digest(self, media) -> str:
         self._kimi_config_fingerprint()
+        if isinstance(media, _KimiK3VisualItem):
+            return self._visual_item_digest(media)
         digest = (
             media.content_digest
             if isinstance(media, KimiLoadedImage)
@@ -1800,6 +1818,27 @@ class KimiK3ImageProcessor(
         return self._artifact_key(
             digest, media.image if isinstance(media, KimiLoadedImage) else media
         )
+
+    def _visual_item_digest(self, item: _KimiK3VisualItem) -> str:
+        """Identity of one MoonViT grid of a mixed image/video request.
+
+        An image keeps the digest of its source bytes, so it shares cache
+        entries with the same image in an image-only request. A video chunk
+        hashes its sampled frames together with the options that shaped them.
+        """
+        if item.media_type == "image":
+            digest = item.content_digest or snapshot_media(item.frames[0]).content_digest
+            return self._artifact_key(digest, item.frames[0])
+        parts = [
+            "video",
+            str(item.in_patch_limit),
+            item.timestamp_text,
+            *(snapshot_media(frame).content_digest for frame in item.frames),
+        ]
+        digest = CONTENT_HASH_PREFIX + hashlib.sha256(
+            "\n".join(parts).encode()
+        ).hexdigest()
+        return self._artifact_key(digest, {"in_patch_limit": item.in_patch_limit})
 
     async def process_mm_data_async(
         self,
