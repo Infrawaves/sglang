@@ -1919,12 +1919,13 @@ class Envs:
     # and the next layer's SP all-gather with its qkv_proj; keeps the residual
     # stream token-sharded like SGLANG_K3_SP_ATTN_RES, whose fused collectives
     # it replaces. Only enable with SGLANG_K3_SP_COLLECTIVE.
+    # NOTE: not wired into K3's layer_boundary path yet (v0.5.22+); has no
+    # effect on the model forward until re-integrated.
     SGLANG_K3_SP_GEMM_FUSION = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE; ignored when
-    # SGLANG_K3_SP_GEMM_FUSION is set.
+    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one

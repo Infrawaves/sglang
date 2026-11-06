@@ -131,12 +131,15 @@ def _init_state() -> Optional[_State]:
     )
     attn_res_enabled = envs.SGLANG_K3_SP_ATTN_RES.get()
     gemm_fusion_enabled = envs.SGLANG_K3_SP_GEMM_FUSION.get()
-    if attn_res_enabled and gemm_fusion_enabled:
-        logger.info(
-            "K3 SP GEMM fusion shards the attention residual itself; "
-            "SGLANG_K3_SP_ATTN_RES is disabled."
+    if gemm_fusion_enabled:
+        # kimi_k3.py on the layer_boundary design does not call the fused
+        # AG+qkv_proj / o_proj+RS+prefix_add kernels yet, so the flag must not
+        # turn the attention-residual fast path off.
+        logger.warning(
+            "SGLANG_K3_SP_GEMM_FUSION is set but K3's layer_boundary path does "
+            "not use the fused GEMM collectives yet; it has no effect."
         )
-    elif attn_res_enabled:
+    if attn_res_enabled:
         logger.info(
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
@@ -284,7 +287,7 @@ def requires_symmetric_rs(
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
-    if not envs.SGLANG_K3_SP_ATTN_RES.get() or envs.SGLANG_K3_SP_GEMM_FUSION.get():
+    if not envs.SGLANG_K3_SP_ATTN_RES.get():
         return False
     fusion = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -423,7 +426,6 @@ def reduce_scatter_attn_res(
     if (
         state is None
         or not envs.SGLANG_K3_SP_ATTN_RES.get()
-        or envs.SGLANG_K3_SP_GEMM_FUSION.get()
         or not _eligible(state, tensor, residual)
     ):
         return None
@@ -539,7 +541,6 @@ def attn_res_all_gather(
     if (
         state is None
         or not envs.SGLANG_K3_SP_ATTN_RES.get()
-        or envs.SGLANG_K3_SP_GEMM_FUSION.get()
         or prefix.dtype != torch.bfloat16
         or not prefix.is_contiguous()
         or prefix.ndim != 2
