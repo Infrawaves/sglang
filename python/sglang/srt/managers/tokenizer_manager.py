@@ -1005,7 +1005,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "generation without sessions, adapters, embeddings, or beam search"
             )
 
-    def _prepare_cache_plan(
+    async def _prepare_cache_plan(
         self, obj: GenerateReqInput, input_ids: Optional[List[int]]
     ) -> None:
         if obj.cache_ttl_seconds is None:
@@ -1043,7 +1043,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if input_ids is None:
             raise ValueError("Cache accounting requires final input token IDs")
-        plan = build_page_cache_plan(
+        state = self.rid_to_state[obj.rid]
+        # Long text hashing must not run inline on the tokenizer event loop.
+        # Resolve config above and publish the completed plan on this thread.
+        plan = await asyncio.to_thread(
+            build_page_cache_plan,
             input_ids=input_ids,
             cache_user_id=obj.cache_user_id,
             namespace=namespace,
@@ -1051,7 +1055,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ttl_seconds=obj.cache_ttl_seconds,
             mode=obj.cache_mode,
         )
-        self.rid_to_state[obj.rid].cache_plan = plan
+        state.cache_plan = plan
 
     def _start_cache_accounting(
         self,
@@ -1740,6 +1744,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        if isinstance(obj, GenerateReqInput):
+            await self._prepare_cache_plan(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -2011,8 +2017,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
-        if isinstance(obj, GenerateReqInput):
-            self._prepare_cache_plan(obj, input_ids)
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -2185,6 +2189,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_one_request(obj[i], input_ids_list[i])
+            if isinstance(req, GenerateReqInput):
+                await self._prepare_cache_plan(req, input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )

@@ -1557,22 +1557,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 continue
             if tool.type == "function":
-                description, parameters = tool.description, tool.parameters
+                # K3 renders tools with exclude_unset=True. Preserve omitted
+                # fields so equivalent Chat and Responses tools share a prefix.
+                # Muse keeps its existing explicit-default representation.
+                function_fields = tool.model_dump(
+                    include={"name", "description", "parameters", "strict"},
+                    exclude_unset=not is_muse,
+                )
             elif tool.type == "custom" and tool.name:
-                description = custom_tool_description(tool.description, tool.format)
-                parameters = custom_tool_parameters()
+                function_fields = {
+                    "name": tool.name,
+                    "description": custom_tool_description(
+                        tool.description, tool.format
+                    ),
+                    "parameters": custom_tool_parameters(),
+                }
+                if is_muse or "strict" in tool.model_fields_set:
+                    function_fields["strict"] = tool.strict
             else:
                 continue
+            if is_muse:
+                function_fields["defer_loading"] = tool.defer_loading
             chat_tools.append(
                 Tool(
                     type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=description,
-                        parameters=parameters,
-                        strict=tool.strict,
-                        defer_loading=tool.defer_loading if is_muse else None,
-                    ),
+                    function=Function(**function_fields),
                 )
             )
         return chat_tools
@@ -1687,7 +1696,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(
-        cls, message: Any, *, tool_call_parser: Optional[str] = None
+        cls,
+        message: Any,
+        *,
+        tool_call_parser: Optional[str] = None,
+        label_developer_instructions: bool = True,
     ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
@@ -1696,13 +1709,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             return message
 
         # Most chat templates only recognize system/user/assistant/tool; collapse
-        # ``developer`` to ``system`` at the boundary, labelled so the instruction
-        # tier survives the collapse.
+        # ``developer`` to ``system`` at the boundary. K3 treats both roles
+        # identically; an extra label would change its cached prefix.
         if message.get("role") == "developer":
             message = {
                 **message,
                 "role": "system",
-                "content": label_developer_content(message.get("content")),
+                "content": (
+                    label_developer_content(message.get("content"))
+                    if label_developer_instructions
+                    else message.get("content")
+                ),
             }
 
         msg_type = message.get("type")
@@ -1883,7 +1900,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
             normalized = self._normalize_response_message_for_chat(
-                input_item, tool_call_parser=self.tool_call_parser
+                input_item,
+                tool_call_parser=self.tool_call_parser,
+                label_developer_instructions=self.chat_encoding_spec != "kimi_k3",
             )
             if normalized is not None:
                 messages.append(normalized)

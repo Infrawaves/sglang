@@ -144,10 +144,6 @@ POSITIONAL_FIELD_ORDER = (
     "completion_template",
     "file_storage_path",
     "enable_cache_report",
-    "enable_cache_accounting",
-    "cache_redis_url",
-    "cache_namespace",
-    "cache_timeout",
     "return_input_ids",
     "return_output_ids",
     "reasoning_parser",
@@ -562,5 +558,11 @@ POSITIONAL_FIELD_ORDER = (
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
     "enable_flashmla_prefill_token_packing",
+    # Cache accounting additions preserve all existing positional slots.
+    "enable_cache_accounting",
+    "cache_redis_url",
+    "cache_namespace",
+    "cache_timeout",
+    "cache_redis_cluster",
 )
 # fmt: on
