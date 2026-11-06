@@ -4588,9 +4588,20 @@ class DeepseekSparseAttnBackend(
         if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        row_plan = _plan_live_rows(
-            q_all.shape[0], metadata.cache_seqlens_int32.shape[0], forward_batch
+        # Target verify / draft extend run here with is_prefill=True and one q
+        # row per draft token, but cache_seqlens_int32 holds one entry per
+        # request; the per-row lengths are the seq_lens passed in
+        # (dsa_cache_seqlens_int32, bs x draft rows).
+        spec_rows = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
+        meta_rows = (
+            seq_lens.shape[0]
+            if spec_rows and seq_lens is not None
+            else metadata.cache_seqlens_int32.shape[0]
+        )
+        row_plan = _plan_live_rows(q_all.shape[0], meta_rows, forward_batch)
         if row_plan.q_pad_rows:
             if is_prefill:
                 raise AssertionError(
