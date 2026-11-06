@@ -2418,6 +2418,16 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            spec_graph_candidate_count=(
+                self.draft_worker.get_shared_graph_candidate_count()
+                if self.spec_algorithm.is_dspark() and self.draft_worker is not None
+                else 0
+            ),
+            finalize_spec_graph_budget=(
+                self.draft_worker.finalize_shared_graph_budget
+                if self.spec_algorithm.is_dspark() and self.draft_worker is not None
+                else None
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:
