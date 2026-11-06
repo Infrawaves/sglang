@@ -5,6 +5,7 @@ import concurrent.futures
 import dataclasses
 import functools
 import logging
+import random
 import threading
 import time
 import uuid
@@ -1135,12 +1136,40 @@ class CommonKVManager(BaseKVManager):
         self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
     ) -> None:
         rid = payload.get("rid")
+        deadline = time.monotonic() + self.waiting_timeout
+        retrying = False
         try:
-            response = self._get_prefill_recompute_session().post(
+            session = self._get_prefill_recompute_session()
+            response = session.post(
                 prefill_url.rstrip("/") + "/generate",
                 json=payload,
                 timeout=self.waiting_timeout,
             )
+            # This is an already-running D request. P's intake cap may reject
+            # its recompute; retry only 429 within the existing wait budget.
+            delay = 0.1
+            while response.status_code == 429:
+                retrying = True
+                response.close()
+                if not self._can_retry_prefill_recompute(kv_receiver):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(random.uniform(0.5, 1.0) * delay, remaining))
+                if not self._can_retry_prefill_recompute(kv_receiver):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                delay = min(delay * 2, 1.0)
+                response = session.post(
+                    prefill_url.rstrip("/") + "/generate",
+                    json=payload,
+                    timeout=remaining,
+                )
+            if retrying and not self._can_retry_prefill_recompute(kv_receiver):
+                return
             if response.status_code >= 400:
                 logger.error(
                     "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
@@ -1154,10 +1183,21 @@ class CommonKVManager(BaseKVManager):
                     f"(status={response.status_code}).",
                 )
         except Exception:
+            if retrying and not self._can_retry_prefill_recompute(kv_receiver):
+                return
             logger.exception("PD rebootstrap prefill request failed for rid=%s", rid)
             self._fail_prefill_recompute(
                 kv_receiver,
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
+            )
+
+    def _can_retry_prefill_recompute(self, kv_receiver: CommonKVReceiver) -> bool:
+        with self.connection_lock:
+            return (
+                not kv_receiver._setup_cancelled
+                and kv_receiver._owns_room_locked()
+                and self.request_status.get(kv_receiver.bootstrap_room)
+                == KVPoll.WaitingForInput
             )
 
     @staticmethod
