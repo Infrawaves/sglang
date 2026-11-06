@@ -3256,10 +3256,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 self._start_cache_accounting(
                     state,
-                    recv_obj.prompt_tokens[i],
+                    request_stats.prompt_tokens,
                     recv_obj.completion_tokens[i],
                     recv_obj.finished_reasons[i],
-                    cached_tokens=recv_obj.cached_tokens[i],
+                    cached_tokens=request_stats.cached_tokens,
                     cache_input_metadata=(
                         recv_obj.cache_input_metadata[i]
                         if recv_obj.cache_input_metadata is not None

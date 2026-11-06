@@ -478,15 +478,13 @@ class _GenerationStreamAccumulator:
     request_stats: list = field(default_factory=list)
     has_request_stats: bool = False
     # OutputSink.RUST only; see BatchTokenIDOutput.prompt_tokens.
-    prompt_tokens: list = field(default_factory=list)
-    cached_tokens: list = field(default_factory=list)
+    prompt_tokens: Optional[list] = None
+    cached_tokens: Optional[list] = None
+    image_tokens: Optional[list] = None
+    audio_tokens: Optional[list] = None
+    video_tokens: Optional[list] = None
+    # Non-RUST sinks only; see BatchTokenIDOutput.cache_input_metadata.
     cache_input_metadata: list = field(default_factory=list)
-    cached_tokens_details: list = field(
-        default_factory=list
-    )  # Detailed breakdown by cache source
-    image_tokens: list = field(default_factory=list)
-    audio_tokens: list = field(default_factory=list)
-    video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
@@ -628,19 +626,18 @@ class _GenerationStreamAccumulator:
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
         self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
-        self.cached_tokens.append(req.cached_tokens)
         cache_input_metadata = None
         finish_reason = self.finished_reasons[-1]
         if (
-            not self.rust_server_mode
+            self.output_sink is not OutputSink.RUST
             and len(output_ids_) > 0
             and (
                 finish_reason is None
                 or finish_reason.get("type") not in ("abort", "error")
             )
-            and not getattr(req, "cache_input_metadata_sent", False)
+            and not req.cache_input_metadata_sent
         ):
-            cache_input_metadata = getattr(req, "cache_input_metadata", None)
+            cache_input_metadata = req.cache_input_metadata
             if cache_input_metadata is not None:
                 req.cache_input_metadata_sent = True
                 # The admitted payload owns this one-time snapshot until sent.
@@ -935,7 +932,6 @@ class _GenerationStreamAccumulator:
                 if any(item is not None for item in self.cache_input_metadata)
                 else None
             ),
-            cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,
