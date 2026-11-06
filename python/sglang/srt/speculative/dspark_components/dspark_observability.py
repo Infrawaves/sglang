@@ -112,6 +112,14 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     # With a graph prediction, predicted_theta is the full DP group's expected
     # output tokens/s. Legacy predictions retain their DP-local throughput.
     predicted_graph_num_tokens: Optional[int] = None
+    graph_max_bs: Optional[int] = None
+    graph_slots: Optional[int] = None
+    graph_num_tokens: Optional[int] = None
+    can_run_cuda_graph: bool = False
+    # Fixed-phase host boundary after this round's verify/accept enqueue.
+    # Contiguous-window deltas measure steady overlapped cadence; this is
+    # intentionally independent of GPU-event timing and per-step barriers.
+    step_boundary_seconds: Optional[float] = None
 
 
 class DecodeStepObservation(msgspec.Struct):
@@ -137,6 +145,10 @@ class DecodeStepObservation(msgspec.Struct):
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
     predicted_graph_num_tokens: Optional[int] = None
+    graph_max_bs: Optional[int] = None
+    graph_slots: Optional[int] = None
+    graph_num_tokens: Optional[int] = None
+    can_run_cuda_graph: bool = False
 
 
 class _PendingStep(msgspec.Struct):
@@ -156,6 +168,11 @@ class _PendingStep(msgspec.Struct):
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
     predicted_graph_num_tokens: Optional[int] = None
+    graph_max_bs: Optional[int] = None
+    graph_slots: Optional[int] = None
+    graph_num_tokens: Optional[int] = None
+    can_run_cuda_graph: bool = False
+    step_boundary_seconds: Optional[float] = None
 
 
 class DsparkInfoDumper:
@@ -261,6 +278,11 @@ class DsparkInfoDumper:
             future=future,
             segment_events=self._current_segments,
             predicted_graph_num_tokens=obs.predicted_graph_num_tokens,
+            graph_max_bs=obs.graph_max_bs,
+            graph_slots=obs.graph_slots,
+            graph_num_tokens=obs.graph_num_tokens,
+            can_run_cuda_graph=obs.can_run_cuda_graph,
+            step_boundary_seconds=now,
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -357,6 +379,11 @@ class DsparkInfoDumper:
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
             record.predicted_graph_num_tokens = pending.predicted_graph_num_tokens
+            record.graph_max_bs = pending.graph_max_bs
+            record.graph_slots = pending.graph_slots
+            record.graph_num_tokens = pending.graph_num_tokens
+            record.can_run_cuda_graph = pending.can_run_cuda_graph
+            record.step_boundary_seconds = pending.step_boundary_seconds
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -848,6 +875,8 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        graph_max_bs: Optional[int] = None,
+        can_run_cuda_graph: bool = False,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -895,6 +924,15 @@ class DsparkStepObservers:
                 layout=layout,
             )
         if self._info_dumper.enabled:
+            # A resolved key becomes a measured graph sample only when the
+            # target reports a successful graph forward for this exact layout.
+            graph_shape = None
+            if can_run_cuda_graph and layout is not None:
+                graph_shape = (
+                    planner.model_runner.decode_cuda_graph_runner._ragged_replay_shape(
+                        layout
+                    )
+                )
             budget_decision = planner.take_budget_decision()
             predicted_step_ms = (
                 None
@@ -940,6 +978,10 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    graph_max_bs=graph_max_bs,
+                    graph_slots=None if graph_shape is None else graph_shape[0],
+                    graph_num_tokens=None if graph_shape is None else graph_shape[1],
+                    can_run_cuda_graph=can_run_cuda_graph,
                 )
             )
 

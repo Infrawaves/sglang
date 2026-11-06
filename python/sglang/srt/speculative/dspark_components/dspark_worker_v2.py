@@ -567,10 +567,26 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
+    def validate_dspark_forced_graph_tokens(self, tokens: Optional[int]) -> None:
+        if not self._hosts_draft:
+            raise ValueError(
+                "Graph SPS profiling requires a local DSpark draft worker."
+            )
+        self._verify_planner.validate_forced_graph_tokens(tokens)
+
+    def set_dspark_forced_graph_tokens(self, tokens: Optional[int]) -> None:
+        self.validate_dspark_forced_graph_tokens(tokens)
+        self._verify_planner.set_forced_graph_tokens(tokens)
+
     def dump_info_records(self) -> Optional[dict]:
         if not self._hosts_draft:
             return None
-        return self._observers.dump_info_records()
+        dumped = self._observers.dump_info_records()
+        if dumped is not None:
+            dumped["graph_profile"] = self._verify_planner.graph_profile_metadata()
+            dumped["forced_graph_tokens"] = self._verify_planner._forced_graph_tokens
+            dumped["forced_budget_frac"] = self._forced_budget_frac
+        return dumped
 
     def clear_info_records(self) -> None:
         if not self._hosts_draft:
@@ -1015,6 +1031,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            graph_max_bs=bs if global_num_reqs is None else global_num_reqs,
+            can_run_cuda_graph=bool(can_run_cuda_graph),
         )
 
         next_draft_input = make_next_draft_input(
