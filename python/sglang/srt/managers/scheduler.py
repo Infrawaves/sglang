@@ -4280,8 +4280,12 @@ class Scheduler(
                 chunk_limit_budget,
                 self.page_size,
                 max_reqs=adder.reservable_new_reqs(
+                    # Match the admission gate, which gives back the row the
+                    # continuation already holds.
                     self.get_num_allocatable_reqs(
-                        len(running_batch.reqs), running_batch=running_batch
+                        len(running_batch.reqs),
+                        running_batch=running_batch,
+                        num_held_rows=int(self.chunked_req.kv.holds_kv),
                     )
                 ),
             )
