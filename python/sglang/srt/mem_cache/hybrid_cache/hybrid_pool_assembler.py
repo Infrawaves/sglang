@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -46,7 +47,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -207,9 +208,6 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
-    if is_dummy:
-        # Broadcast follower: same token capacity, no retained host data mapping.
-        kwargs["is_dummy"] = True
     if host_allocator is not None:
         kwargs["host_allocator"] = host_allocator
     if host_buffer_read_only:
@@ -237,6 +235,17 @@ def build_kv_host_pool(
         )
     else:
         kwargs.update(mha_kwargs)
+    if is_dummy:
+        # Broadcast follower: same token capacity, no retained host data mapping.
+        # v0.5.23 selects the allocator-only MLA pool by its input type.
+        assert use_mla, "only the MLA host pool has an allocator-only mode"
+        host_input = _mla_host_allocation(
+            host_input,
+            kwargs.pop("draft_buffer_infos"),
+            kwargs["target_layer_num"],
+            override_kv_cache_dim,
+            get_memory().hicache_mem_layout,
+        )
     parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
@@ -259,6 +268,38 @@ def build_kv_host_pool(
     if isinstance(kv_pool, PageInterleaveKVPoolMixin):
         return PageInterleaveHostPool(host_pool, kv_pool.placement)
     return host_pool
+
+
+def _mla_host_allocation(
+    buffer_info, draft_buffer_infos, target_layer_num, override_kv_cache_dim, layout
+) -> MLAHostAllocation:
+    """Allocator-only geometry sized like the real MLA host pool of this rank, so a
+    follower's share matches the leader's per-rank share."""
+    kv_cache_dim = override_kv_cache_dim or (
+        buffer_info.kv_lora_rank + buffer_info.qk_rope_head_dim
+    )
+    itemsize = buffer_info.dtype.itemsize
+    layer_num = target_layer_num + len(draft_buffer_infos)
+    size_per_token = kv_cache_dim * itemsize * layer_num
+    native = buffer_info.buffers
+    if (
+        isinstance(native, MLASplitBuffers)
+        and layout == "page_first_kv_split"
+        and native.index_k is not None
+    ):
+        index_layers = len(native.index_layer_indices)
+        size_per_token += native.index_width * itemsize * index_layers
+        if native.index_scales is not None:
+            size_per_token += 4 * index_layers
+    return MLAHostAllocation(
+        dtype=buffer_info.dtype,
+        kv_lora_rank=buffer_info.kv_lora_rank,
+        qk_rope_head_dim=buffer_info.qk_rope_head_dim,
+        kv_cache_dim=kv_cache_dim,
+        size_per_token=size_per_token,
+        draft_layer_num=len(draft_buffer_infos),
+        packed_fp8=buffer_info.packed_fp8,
+    )
 
 
 def _split_hicache_size(
