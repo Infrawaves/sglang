@@ -287,8 +287,11 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.reservable_new_reqs(0), 0)
         adder.prefill_max_requests = 3
         self.assertEqual(adder.reservable_new_reqs(8), 2)
-        adder.rem_mamba_slots = 1
+        # The mamba slot cap comes from the budget (rem_state_slots, #46977).
+        adder.memory_budget = SimpleNamespace(rem_state_slots=1)
         self.assertEqual(adder.reservable_new_reqs(8), 1)
+        adder.memory_budget = SimpleNamespace(rem_state_slots=None)
+        self.assertEqual(adder.reservable_new_reqs(8), 2)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)

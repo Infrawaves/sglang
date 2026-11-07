@@ -915,8 +915,11 @@ class PrefillAdder:
         num = row_cap - len(self.can_run_list) - 1
         if self.prefill_max_requests is not None:
             num = min(num, self.prefill_max_requests - len(self.can_run_list) - 1)
-        if self.rem_mamba_slots is not None:
-            num = min(num, self.rem_mamba_slots)
+        # #46977 moved the mamba slot budget onto memory_budget; only budgets
+        # with state slots define it (None = no mamba slot cap).
+        rem_state_slots = getattr(self.memory_budget, "rem_state_slots", None)
+        if rem_state_slots is not None:
+            num = min(num, rem_state_slots)
         return max(num, 0)
 
     def budget_state(self):
