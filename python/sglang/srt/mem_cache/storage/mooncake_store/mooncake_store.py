@@ -848,6 +848,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             # Pool name -> registered scratch for pages read before a query start.
             self._group_scratch: dict = {}
+            # --hicache-storage-bundle-pools: KV-derived pools stored inside the
+            # KV object, in this order after the KV buffers; set once the host
+            # pools are registered (on_host_pools_registered).
+            self.storage_bundle_pools = bool(
+                storage_config is not None and storage_config.storage_bundle_pools
+            )
+            self.bundled_pools: tuple = ()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1118,6 +1125,73 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             layout.update(enabled=False, reason="No physical L3 pools are registered")
         return layout
 
+    def _mla_kv_object_suffix(self) -> str:
+        """Suffix of a page's MLA KV object: `_{mla_suffix}_k`, plus the names
+        of the pools bundled into it, so bundle layouts never share keys."""
+        if not self.bundled_pools:
+            return f"_{self.mla_suffix}_k"
+        names = "_".join(name.value for name in self.bundled_pools)
+        return f"_{self.mla_suffix}_kb_{names}"
+
+    # KV-derived pools that MLA writers store per page under mla_suffix.
+    _BUNDLE_CANDIDATES = (PoolName.INDEXER, PoolName.DRAFT, PoolName.DRAFT_INDEXER)
+
+    def _resolve_bundled_pools(self) -> tuple:
+        """Pools that can live in the KV object: same host page as the KV
+        (one page per logical page, same span), written by the same ranks (MLA
+        keys) and required on every page. Anything else keeps its own object."""
+        if not self.storage_bundle_pools or not self.is_mla_backend:
+            return ()
+        host = self.mem_pool_host
+        if (
+            host is None
+            or getattr(host, "kv_buffer", None) is None
+            or not isinstance(host, MLATokenToKVPoolHost)
+        ):
+            return ()
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeSharedHostTensorAllocator,
+        )
+
+        if host.host_buffer_read_only or isinstance(
+            getattr(host, "allocator", None), NodeSharedHostTensorAllocator
+        ):
+            # Per-node MLA: a follower skips the KV read, so it would skip the
+            # bundled pools too. Every rank of the node takes this branch.
+            logger.info(
+                "--hicache-storage-bundle-pools has no effect with per-node MLA "
+                "HiCache; each pool keeps its own Mooncake objects."
+            )
+            return ()
+        span = l3_page_span(host)
+        bundled = []
+        for name in self._BUNDLE_CANDIDATES:
+            pool = self.registered_pools.get(name)
+            if pool is None or isinstance(pool, DevicePoolEntry):
+                continue
+            if l3_page_span(pool) != span:
+                continue
+            if name == PoolName.DRAFT and (
+                not isinstance(pool, MLATokenToKVPoolHost)
+                or pool.kv_buffer is None
+                or self.draft_node_merge is not None
+            ):
+                # An MHA draft is written by every rank; a node-merged one by
+                # the node leader. Neither matches the MLA KV writer.
+                continue
+            bundled.append(name)
+        return tuple(bundled)
+
+    def on_host_pools_registered(self) -> None:
+        self.bundled_pools = self._resolve_bundled_pools()
+        if self.bundled_pools:
+            logger.info(
+                "Mooncake L3 stores %s inside the KV object (one object per page "
+                "instead of %d).",
+                ", ".join(name.value for name in self.bundled_pools),
+                1 + len(self.bundled_pools),
+            )
+
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
@@ -1139,7 +1213,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_name = transfer.name
         suffixes = []
         if pool_name == PoolName.KV:
-            suffixes = [f"_{self.mla_suffix}_k"]
+            suffixes = [self._mla_kv_object_suffix()]
         elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
@@ -1369,6 +1443,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_keys, transfer
         )
         keys = self._tag_keys(component_keys)
+        if transfer.name in self.bundled_pools:
+            # Read and written with the KV object (_get_mla_buffer_meta).
+            return _ObjectLayout(
+                keys=keys, objects_per_page=objects_per_page, skip_io=True
+            )
         merge = self.draft_node_merge if transfer.name == PoolName.DRAFT else None
         if merge is not None and not merge.is_leader:
             return _ObjectLayout(
@@ -1805,7 +1884,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         tagged = self._tag_keys(page_keys)
         if host_indices is None:
             suffixes = (
-                [f"_{self.mla_suffix}_k"]
+                [self._mla_kv_object_suffix()]
                 if self.is_mla_backend
                 else [f"_{self.mha_suffix}_k", f"_{self.mha_suffix}_v"]
             )
@@ -2022,14 +2101,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+        suffix = self._mla_kv_object_suffix()
+        key_list = [f"{key_}{suffix}" for key_ in keys]
+        if self.bundled_pools:
+            return key_list, *self._bundle_buffer_meta(
+                indices, len(keys), ptr_list, element_size_list
+            )
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
+
+    def _bundle_buffer_meta(self, indices, num_pages, kv_ptrs, kv_sizes):
+        """Per page: the KV segments, then each bundled pool's segments for
+        the same host page, as one multi-buffer object."""
+        parts = [(kv_ptrs, kv_sizes)] + [
+            self.registered_pools[name].get_page_buffer_meta(indices)
+            for name in self.bundled_pools
+        ]
+        page_ptrs = [[] for _ in range(num_pages)]
+        page_sizes = [[] for _ in range(num_pages)]
+        for ptrs, sizes in parts:
+            if len(ptrs) % num_pages or len(ptrs) != len(sizes):
+                raise ValueError("Bundled pool page metadata does not match the KV")
+            per_page = len(ptrs) // num_pages
+            for page in range(num_pages):
+                page_ptrs[page].extend(ptrs[page * per_page : (page + 1) * per_page])
+                page_sizes[page].extend(sizes[page * per_page : (page + 1) * per_page])
+        return page_ptrs, page_sizes
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
@@ -2334,7 +2434,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            suffix = self._mla_kv_object_suffix()
+            query_keys = [f"{key}{suffix}" for key in keys]
             key_multiplier = 1
         else:
             query_keys = []

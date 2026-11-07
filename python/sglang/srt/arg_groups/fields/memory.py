@@ -296,6 +296,10 @@ class Memory(msgspec.Struct):
         bool,
         "Store each page's MHA draft KV as one Mooncake object per node, written and read by the node's last rank. Requires --enable-mla-hicache-per-node.",
     ] = False
+    hicache_storage_bundle_pools: A[
+        bool,
+        "Store each page's KV and the KV-derived pools written by the same ranks (DSA indexer, MLA draft) as one Mooncake object, instead of one object per pool. Pools that need other writers (MHA draft, Mamba/KDA state) keep their own objects, so this is a no-op for models without such pools. Off with per-node MLA HiCache. Changes the L3 keys.",
+    ] = False
     hicache_storage_page_size: A[
         Optional[int],
         "Tokens per Mooncake L3 object for the KV and draft pools; a multiple of --page-size whose ratio divides 128. Pages are grouped by absolute position and each radix node writes only its own segments. Unset means --page-size; Mamba/KDA state keeps its per-node objects.",

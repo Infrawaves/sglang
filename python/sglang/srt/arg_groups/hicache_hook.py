@@ -39,6 +39,8 @@ def handle_hicache(server_args: Any):
         validate_hicache_draft_node_merge(server_args)
     if cfg.hicache_storage_page_size is not None:
         validate_hicache_storage_page_size(server_args)
+    if cfg.hicache_storage_bundle_pools:
+        validate_hicache_storage_bundle_pools(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -223,6 +225,25 @@ def validate_hicache_storage_page_size(server_args: Any):
         raise ValueError(
             "--hicache-storage-page-size larger than --page-size is not "
             "supported when: " + ", ".join(reasons) + "."
+        )
+
+
+def validate_hicache_storage_bundle_pools(server_args: Any):
+    # Which pools join the KV object is decided by the Mooncake store once the
+    # host pools are registered; only the deployment-level limits live here.
+    cfg = resolving_view(server_args)
+    unsupported = {
+        "--enable-hierarchical-cache is off": not cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend is not mooncake": (
+            cfg.hicache_storage_backend != "mooncake"
+        ),
+    }
+    reasons = [reason for reason, hit in unsupported.items() if hit]
+    if reasons:
+        raise ValueError(
+            "--hicache-storage-bundle-pools is not supported when: "
+            + ", ".join(reasons)
+            + "."
         )
 
 
