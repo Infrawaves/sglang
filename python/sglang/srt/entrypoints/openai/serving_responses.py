@@ -2471,6 +2471,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         created_time = created_time or int(time.time())
         sequence_number = 0
+        response_cache_options = None
 
         def _send_event(event):
             nonlocal sequence_number
@@ -2478,6 +2479,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 event.sequence_number = sequence_number
             event_type = getattr(event, "type", "unknown")
             payload = event.model_dump()
+            if isinstance(payload.get("response"), dict):
+                if response_cache_options is not None:
+                    payload["response"]["prompt_cache_options"] = response_cache_options
+                else:
+                    payload["response"].pop("prompt_cache_options", None)
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
             if tool_adapter is not None:
@@ -2499,6 +2505,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=None,
             cache_usage=(cache_context or {}).get("usage"),
         )
+        response_cache_options = initial_response.model_dump().get("prompt_cache_options")
         for event_type in ("response.created", "response.in_progress"):
             yield _send_event(
                 ResponsesLifecycleEvent(type=event_type, response=initial_response)
