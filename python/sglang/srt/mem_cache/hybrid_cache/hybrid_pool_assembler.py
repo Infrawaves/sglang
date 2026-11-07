@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
 import torch.distributed as dist
 
+from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DRAFT_NODE_MERGE_LAYOUTS,
+    DraftNodeShareAllocator,
+    log_draft_node_merge,
+    maybe_create_draft_node_merge,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -36,6 +42,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -1292,11 +1299,7 @@ def build_hybrid_mamba_stack(
             capacity_multiplier=(
                 1 if node_leader is None else node_leader.capacity_multiplier
             ),
-            is_dummy=(
-                node_leader is not None
-                and node_leader.is_follower
-                and node_leader.broadcast is not None
-            ),
+            is_dummy=node_leader is not None and node_leader.is_follower,
             host_allocator=None
             if node_leader is None
             else node_leader.shared_allocator,
@@ -1545,6 +1548,7 @@ def _build_mha_mla_host_pool(
     layout: str,
     allocator_type: str,
     pool_label: str,
+    host_allocator: Optional[Any] = None,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -1562,6 +1566,22 @@ def _build_mha_mla_host_pool(
         allocator_type=allocator_type,
         pool_label=pool_label,
     )
+    if host_allocator is not None:
+        if (
+            not isinstance(pool, MHATokenToKVPool)
+            or get_mha_host_pool_cls(pool) is not MHATokenToKVPoolHost
+        ):
+            raise NotImplementedError(
+                "--hicache-draft-node-merge supports only the symmetric "
+                "non-MXFP8 MHA draft host pool."
+            )
+        # Also checked at launch; kept for callers that bypass server args.
+        if layout not in DRAFT_NODE_MERGE_LAYOUTS:
+            raise ValueError(
+                "--hicache-draft-node-merge requires --hicache-mem-layout in "
+                f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
+            )
+        return MHATokenToKVPoolHost(pool, host_allocator=host_allocator, **kwargs)
     if isinstance(pool, MHATokenToKVPool):
         return get_mha_host_pool_cls(pool)(pool, **kwargs)
     return MLATokenToKVPoolHost(
@@ -1590,16 +1610,36 @@ def build_full_draft_pools(
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
 
+    # Every rank runs this in the same order; the node share allocates collectively.
+    merge = maybe_create_draft_node_merge(
+        enabled=get_memory().hicache_draft_node_merge,
+        tp_cache_group=controller.tp_group,
+    )
+    host_allocator = (
+        None
+        if merge is None
+        else DraftNodeShareAllocator(merge=merge, tp_cache_group=controller.tp_group)
+    )
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-    )
+    try:
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_allocator=host_allocator,
+        )
+    except Exception as exc:
+        # A per-rank failure before allocation (e.g. the host budget check)
+        # must still release peers blocked in the node-share collectives.
+        if host_allocator is not None:
+            host_allocator.abort(exc)
+        raise
+    if merge is not None:
+        log_draft_node_merge(draft_host_pool, merge)
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
     specs = [
@@ -1668,6 +1708,10 @@ def build_swa_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
+    if get_memory().hicache_draft_node_merge:
+        raise NotImplementedError(
+            "--hicache-draft-node-merge does not support draft SWA pools."
+        )
     draft_swa_pool = draft_kv_pool.swa_kv_pool
     if draft_swa_pool is None:
         raise NotImplementedError(

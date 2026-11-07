@@ -2,6 +2,34 @@
 # requires-python = ">=3.10"
 # dependencies = ["msgspec", "requests", "plotly", "kaleido", "numpy"]
 # ///
+"""Profile a DSpark SPS cost table against an already-running DSpark server.
+
+The server is launched for profiling, which differs from serving:
+
+  SGLANG_RAGGED_VERIFY_MODE=compact       2D table (--fracs); static for 1D
+  SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1  compact under dp-attention, a2a MoE or DCP
+  SGLANG_DSPARK_ENABLE_SPS_RECORD=1       step records, read via /server_info
+  SGLANG_SIMULATE_ACC_LEN=1.0             every step commits exactly one token
+  --speculative-dspark-sps-table-path <any valid table>
+      without one the planner is verify-all and the uniform layout
+      ignores the pinned budget, so every cell measures full-width verify
+  --cuda-graph-max-bs-decode >= the largest per-rank batch swept
+  --max-batch-outputs >= the largest per-rank batch swept
+      each /generate carries one DP rank's share, so the default 1024 suffices
+  KV capacity per rank >= batch * (--input-len + max_new_tokens)
+
+  Leave --speculative-dspark-align-verify-tokens-to-graph-tier off: it refills
+  the pinned budget up to the graph tier, so the cell would verify more real
+  tokens than the M it is recorded under. A table fitted with it off still
+  serves with it on, since step time follows the replayed tier.
+
+  PD decode only:
+  --disaggregation-transfer-backend fake  load goes straight to decode, no prefill
+
+Serve with the fitted table, without fake transfer, SIMULATE_ACC_LEN or
+SPS_RECORD.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -650,6 +678,7 @@ def run_one_round(
     load_thread = start_load(
         base_url=context.base_url,
         num_requests=batch_size,
+        dp_size=context.dp_size,
         input_len=settings.input_len,
         max_new_tokens=max_new_tokens,
         temperature=settings.temperature,
@@ -713,6 +742,7 @@ def start_load(
     *,
     base_url: str,
     num_requests: int,
+    dp_size: int,
     input_len: int,
     max_new_tokens: int,
     temperature: float,
@@ -726,27 +756,61 @@ def start_load(
         [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
         for _ in range(num_requests)
     ]
-    payload = {
-        "input_ids": input_ids,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_new_tokens,
-            "ignore_eos": True,
-        },
-        "stream": False,
-    }
+    payloads = []
+    for dp_rank in range(dp_size):
+        payload = {
+            "input_ids": input_ids[dp_rank::dp_size],
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+            # PD decode + fake transfer: the decode prealloc queue builds a
+            # NetworkAddress from bootstrap_host, so it must not be None.
+            "bootstrap_host": "2.2.2.2",  # FAKE_BOOTSTRAP_HOST
+            "stream": False,
+        }
+        if dp_size > 1:
+            # Pin each rank's share instead of relying on round-robin: any
+            # other request dispatched mid-batch (e.g. a k8s /health probe,
+            # which issues a 1-token generate) shifts the round-robin counter
+            # and leaves the ranks at B-1 / B+1, so the round never aligns.
+            payload["routed_dp_rank"] = dp_rank
+        payloads.append(payload)
 
-    def _post() -> None:
+    def _post(payload: dict) -> None:
         try:
-            requests.post(base_url + "/generate", json=payload, timeout=DEFAULT_TIMEOUT)
+            response = requests.post(
+                base_url + "/generate", json=payload, timeout=DEFAULT_TIMEOUT
+            )
         except Exception:
             logger.warning(
                 "Load batch POST /generate failed (expected on abort for some "
                 "server versions).",
                 exc_info=True,
             )
+            return
+        # Surface a rejected batch (e.g. over --max-batch-outputs); otherwise the
+        # round only waits out its timeout with no cause.
+        if response.status_code != 200:
+            logger.error(
+                "Load batch POST /generate (routed_dp_rank=%s) rejected: HTTP %s: %s",
+                payload.get("routed_dp_rank"),
+                response.status_code,
+                response.text[:2000],
+            )
 
-    thread = threading.Thread(target=_post, daemon=True)
+    def _post_all() -> None:
+        threads = [
+            threading.Thread(target=_post, args=(payload,), daemon=True)
+            for payload in payloads
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    thread = threading.Thread(target=_post_all, daemon=True)
     thread.start()
     return thread
 

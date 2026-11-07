@@ -1953,6 +1953,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            start_page=spec.start_page,
         )
         self.ongoing_backup[operation_id] = (
             node_id,

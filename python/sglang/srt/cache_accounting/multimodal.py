@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Strong media identities prepared before feature transport or PD disposal.
 
-This module does not import the GPU serving tree. Feature hashing is synchronous
-and should run in the tokenizer's worker thread; freezing final scheduler
-metadata only copies tokens and reads already prepared digests.
+This module uses NumPy for CPU validation without importing the GPU serving tree.
+Feature hashing is synchronous and should run in the tokenizer's worker thread;
+freezing snapshots final tokens and validates spans with already prepared digests.
 """
 
 import hashlib
@@ -13,6 +13,8 @@ from array import array
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+
+import numpy as np
 
 _DIGEST_KEY = "cache_accounting_digest"
 _ARTIFACT_KEY = "cache_accounting_artifact_key"
@@ -294,11 +296,15 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
     Offsets on MultimodalDataItem are inclusive; the wire intervals are half-open.
     """
     try:
+        # Preserve the owned snapshot and array's integer conversion semantics.
+        # View that copy, never the caller's live input, for native validation.
         ids = array("q", input_ids)
+        ids_view = np.frombuffer(ids, dtype="q")
+        ids_view.flags.writeable = False
         items = getattr(mm_inputs, "mm_items", None)
         if not items:
             raise ValueError("Missing media items")
-        spans = []
+        span_records = []
         pad_values = set()
         for item in items:
             metadata = getattr(item, "model_specific_data", None)
@@ -309,6 +315,7 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
             pad_value = getattr(item, "pad_value", None)
             if type(pad_value) is not int:
                 raise ValueError("Missing final media pad value")
+            pad_in_int64 = -(1 << 63) <= pad_value < (1 << 63)
             pad_values.add(pad_value)
             for start, inclusive_end in offsets:
                 if (
@@ -317,24 +324,50 @@ def freeze_cache_input_metadata(input_ids, mm_inputs) -> dict:
                     or not 0 <= start <= inclusive_end < len(ids)
                 ):
                     raise ValueError("Invalid final media offsets")
-                if any(
-                    ids[index] != pad_value for index in range(start, inclusive_end + 1)
-                ):
+                # Check the scalar range before NumPy comparison: an oversized
+                # Python int must not be coerced to a rounded float or wrap.
+                if not pad_in_int64:
                     raise ValueError("Final media offsets cover non-media tokens")
-                spans.append((start, inclusive_end + 1, digest))
-        spans.sort(key=lambda span: (span[0], span[1]))
+                span_records.append((start, inclusive_end + 1, digest, pad_value))
+        span_records.sort(key=lambda span: (span[0], span[1]))
         previous_end = 0
-        for start, end, _ in spans:
+        for start, end, _, _ in span_records:
             if start < previous_end:
                 raise ValueError("Overlapping media intervals")
             previous_end = end
-        span_index = 0
-        for index, token in enumerate(ids):
-            while span_index < len(spans) and index >= spans[span_index][1]:
-                span_index += 1
-            is_media = span_index < len(spans) and index >= spans[span_index][0]
-            if not is_media and (token in pad_values or not 0 <= token <= 0xFFFFFFFF):
-                raise ValueError("Media token is not covered by final offsets")
+
+        # Validate all spans together: per-span NumPy reductions and per-gap
+        # membership checks become expensive with thousands of short spans.
+        # Keep pad IDs attached while sorting so each span keeps its own pad.
+        starts = np.fromiter(
+            (span[0] for span in span_records), dtype=np.intp, count=len(span_records)
+        )
+        ends = np.fromiter(
+            (span[1] for span in span_records), dtype=np.intp, count=len(span_records)
+        )
+        span_pads = np.fromiter(
+            (span[3] for span in span_records), dtype="q", count=len(span_records)
+        )
+        coverage_delta = np.zeros(len(ids) + 1, dtype=np.int8)
+        # Starts and ends are each unique after rejecting overlaps. An end
+        # may equal the next start: accumulate both so coverage remains one.
+        coverage_delta[starts] += 1
+        coverage_delta[ends] -= 1
+        covered = np.cumsum(coverage_delta[:-1], dtype=np.int8).astype(bool)
+        if np.any(ids_view[covered] != np.repeat(span_pads, ends - starts)):
+            raise ValueError("Final media offsets cover non-media tokens")
+
+        # Media IDs may lie outside uint32. Only uncovered positions are text,
+        # and even a uint32 pad ID is forbidden there. Check membership once.
+        text = ids_view[~covered]
+        if text.size and (text.min() < 0 or text.max() > 0xFFFFFFFF):
+            raise ValueError("Media token is not covered by final offsets")
+        text_pad_values = np.asarray(
+            [pad for pad in pad_values if 0 <= pad <= 0xFFFFFFFF], dtype="q"
+        )
+        if text_pad_values.size and np.any(np.isin(text, text_pad_values)):
+            raise ValueError("Media token is not covered by final offsets")
+        spans = [(start, end, digest) for start, end, digest, _ in span_records]
         return {"input_ids": ids, "media_spans": spans}
     except Exception:
         return {"error": "invalid_multimodal_metadata"}

@@ -56,6 +56,8 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`KVLocPlan.write_ids`).
     kv_loc_plan: Optional[KVLocPlan] = None
     kv_loc_cols: Optional[Cols] = None
+    # An idle DP rank can replay the busy peers' verify graph with dummy rows.
+    is_padding_only: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -95,7 +97,7 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        if not batch.forward_mode.is_idle():
+        if not batch.forward_mode.is_idle() and not self.is_padding_only:
             # Rebuild mamba track indices (lazy: gather the positions planned
             # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
             # before init_new snapshots them into the verify ForwardBatch.

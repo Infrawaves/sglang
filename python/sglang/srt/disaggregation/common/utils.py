@@ -36,6 +36,28 @@ class TransferKVChunk:
     lease_held: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Mooncake DCP draft peer gather: this rank's enqueue seq for the chunk.
+    draft_peer_seq: Optional[int] = None
+
+
+def bind_thread_to_device(gpu_id: int) -> None:
+    """Make ``gpu_id`` the calling thread's current device.
+
+    New threads default to device 0; binding keeps a transfer worker's device
+    calls on this rank's GPU instead of opening a context on device 0.
+    """
+    from sglang.srt.platforms import current_platform
+
+    try:
+        current_platform.set_device(current_platform.get_device(gpu_id))
+    except NotImplementedError:
+        pass
+
+
+def run_on_device(gpu_id: int, fn, *args) -> None:
+    """Thread target: bind the thread to ``gpu_id``, then run ``fn(*args)``."""
+    bind_thread_to_device(gpu_id)
+    fn(*args)
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
@@ -231,3 +253,11 @@ def build_dcp_page_transfer_plan(
     return DCPPageTransferPlan(
         src_pages, dst_page_indices[dst_start : dst_start + src_pages.size]
     )
+
+
+def expand_dcp_page_rows(
+    page_indices: npt.NDArray[np.int32], page_size: int
+) -> npt.NDArray[np.int64]:
+    """Every token row of the given physical pages, in page order."""
+    pages = np.asarray(page_indices, dtype=np.int64)
+    return (pages[:, None] * page_size + np.arange(page_size)).reshape(-1)

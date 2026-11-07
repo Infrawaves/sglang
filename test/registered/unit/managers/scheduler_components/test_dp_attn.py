@@ -29,6 +29,53 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
 
+    def test_decode_replay_vetoes_are_in_the_dp_vote(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            replace_embeds=None,
+            encoder_lens_cpu=[8],
+        )
+        vote = dp_attn._local_decode_cuda_graph_vote
+        self.assertTrue(vote(local_batch=batch, disable_cuda_graph=False))
+        batch.encoder_lens_cpu = [8, 0]
+        self.assertFalse(vote(local_batch=batch, disable_cuda_graph=False))
+        batch.encoder_lens_cpu = None
+        batch.replace_embeds = object()
+        self.assertFalse(vote(local_batch=batch, disable_cuda_graph=False))
+        self.assertTrue(vote(local_batch=None, disable_cuda_graph=False))
+        self.assertFalse(vote(local_batch=None, disable_cuda_graph=True))
+
+    def test_dspark_votes_eager_without_a_supported_target_graph(self):
+        model = SimpleNamespace(decode_cuda_graph_runner=None)
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, batch_size=lambda: 4)
+        unavailable = dp_attn._dspark_verify_graph_unavailable
+        self.assertTrue(unavailable(model, batch))
+        runner = model.decode_cuda_graph_runner = SimpleNamespace(
+            ragged_verify_mode=True,
+            attn_backend=SimpleNamespace(supports_ragged_verify_graph=True),
+            capture_hidden_mode=dp_attn.CaptureHiddenMode.FULL,
+            max_bs=4,
+        )
+        self.assertFalse(unavailable(model, batch))
+        runner.max_bs = 3
+        self.assertTrue(unavailable(model, batch))
+        self.assertFalse(unavailable(model, None))
+        runner.attn_backend.supports_ragged_verify_graph = False
+        self.assertTrue(unavailable(model, None))
+
+    def test_decode_clears_prompt_embedding_overrides_before_spec_verify(self):
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            input_embeds=object(),
+            replace_embeds=object(),
+            replace_positions=object(),
+        )
+        with patch("sglang.srt.speculative.spec_utils.spec_prepare_for_decode"):
+            dp_attn.ScheduleBatch.prepare_for_decode(batch)
+        self.assertIsNone(batch.input_embeds)
+        self.assertIsNone(batch.replace_embeds)
+        self.assertIsNone(batch.replace_positions)
+
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -36,6 +83,8 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             spec_info=None,
             reqs=[],
             seq_lens_cpu=torch.ones(4, dtype=torch.int64),
+            replace_embeds=None,
+            encoder_lens_cpu=None,
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (

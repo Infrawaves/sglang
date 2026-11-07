@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     ParallelInfoState,
 )
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -33,11 +34,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _run_control_message(manager, start_listener, message):
-    """Feed one wire message through the real control loop, then stop at recv."""
+def _run_control_message(manager, start_listener, *messages):
+    """Feed wire messages through the same control loop, then stop at recv."""
 
     manager.server_socket = MagicMock(spec=["recv_multipart"])
-    manager.server_socket.recv_multipart.side_effect = [message, SystemExit]
+    manager.server_socket.recv_multipart.side_effect = [*messages, SystemExit]
     with patch(
         "sglang.srt.disaggregation.mooncake.conn.threading.Thread", autospec=True
     ) as thread:
@@ -425,14 +426,76 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
             b"page",
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "KV geometry differs"):
-            _run_control_message(manager, manager.start_prefill_thread, message)
+        manager.request_status = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.failure_records = {}
+        manager.failure_lock = threading.Lock()
+        manager._transfer_lifetime = TransferLifetimeTracker()
+        manager._abort_drain_lock = threading.RLock()
+        manager._drain_ack_targets = {}
+        manager._prefill_unique_rank = lambda: 0
+        manager._kv_replica_factor = 1
 
-        self.assertEqual(manager.decode_kv_args_table, {})
-        manager._send_multipart_locked.assert_not_called()
+        def room(num, session):
+            return [
+                str(num).encode(),
+                b"127.0.0.1",
+                b"30001",
+                session,
+                struct.pack("I", 1),
+                b"0",
+                b"",
+                b"1",
+            ]
 
+        healthy = message.copy()
+        healthy[3] = b"healthy"
+        healthy[9] = b"8"
+        retry = healthy.copy()
+        retry[3] = b"session"
+        with self.assertLogs("sglang.srt.disaggregation.mooncake.conn", "ERROR"):
+            _run_control_message(
+                manager,
+                manager.start_prefill_thread,
+                retry,
+                room(4, b"session"),
+                message,
+                room(1, b"session"),
+                [b"ABORT", b"1", b"127.0.0.1", b"30001", b"token"],
+                healthy,
+                room(2, b"healthy"),
+                retry,
+                room(3, b"session"),
+                retry.copy(),  # An equivalent healthy re-registration keeps room 3 valid.
+            )
+        self.assertEqual(
+            manager.request_status,
+            {
+                1: KVPoll.Failed,
+                2: KVPoll.WaitingForInput,
+                3: KVPoll.WaitingForInput,
+                4: KVPoll.WaitingForInput,
+            },
+        )
+        self.assertNotEqual(
+            manager.transfer_infos[4]["session"].registration_epoch,
+            manager.decode_kv_args_table["session"].registration_epoch,
+        )
+        self.assertEqual(
+            manager.transfer_infos[3]["session"].registration_epoch,
+            manager.decode_kv_args_table["session"].registration_epoch,
+        )
+        self.assertIn("KV geometry differs", manager.failure_records[1])
+        self.assertTrue(manager._transfer_lifetime.is_drained(1))
+        self.assertFalse(manager._transfer_lifetime.open(1))
+        self.assertEqual(
+            [call.args[1] for call in manager._send_multipart_locked.call_args_list],
+            [
+                [b"1", str(int(KVPoll.Failed)).encode(), b"0"],
+                [b"ABORT_ACK", b"1", b"0", b"token"],
+            ],
+        )
         message[9] = b"8"
-        _run_control_message(manager, manager.start_prefill_thread, message)
         self.assertEqual(
             manager.decode_kv_args_table["session"].dcp_kv_layout,
             "page",

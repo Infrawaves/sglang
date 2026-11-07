@@ -1092,6 +1092,7 @@ class Req(ReqDllmMixin):
         self.decision_layout = decision_layout
 
         # For req-level memory management
+        self.prefill_ready_seq: Optional[int] = None
         self.kv = ReqKvInfo()
 
         # Full-KV-derived boundary whose SWA window should be inserted after
@@ -2505,6 +2506,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None
     spec_verify_tier_num_tokens: int = -1
+    # DSpark compact verify: the budget computed before the MLP sync (so the sync
+    # can carry it), and whether that happened for the batch about to run.
+    spec_verify_token_budget_presync: Optional[int] = None
+    spec_verify_budget_presync: bool = False
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2557,6 +2562,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Per DP rank: its attention-TP rank 0's verify budget + 1 (0 = no budget).
+    global_spec_verify_token_budget_enc: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
@@ -3581,9 +3588,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
-        # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensor so it doesn't leak into ForwardBatch.
+        # Decode embeds the last output token. Prompt embeddings and positional
+        # replacements refer to the previous prefill input.
         self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

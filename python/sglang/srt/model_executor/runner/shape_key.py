@@ -28,3 +28,5 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    # Request slots for a compact verify graph with `size` packed tokens.
+    ragged_bs: Optional[int] = None

@@ -75,9 +75,21 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     return True
 
 
+class _PendingVerifyRowCount(msgspec.Struct, frozen=True):
+    host: torch.Tensor
+    ready: torch.Event
+
+
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    sampling_row_count: int | _PendingVerifyRowCount | None = None
+
+    def num_valid_sampling_rows(self) -> Optional[int]:
+        if isinstance(self.sampling_row_count, _PendingVerifyRowCount):
+            self.sampling_row_count.ready.synchronize()
+            return int(self.sampling_row_count.host)
+        return self.sampling_row_count
 
 
 def candidate_request_length_bound(
@@ -139,6 +151,7 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_len = simulated_correct_len
+        self._sampling_row_count_buf: Optional[_PendingVerifyRowCount] = None
 
     def accept_and_finalize(
         self,
@@ -154,6 +167,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        num_valid_rows: Optional[int] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -178,6 +192,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            num_valid_rows=num_valid_rows,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
         )
@@ -236,6 +251,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=idle_layout,
+            is_padding_only=idle_layout is not None,
         )
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
@@ -318,6 +334,7 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        sampling_row_count: int | _PendingVerifyRowCount | None = None,
     ) -> TargetVerifyResult:
         if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
@@ -338,6 +355,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            sampling_row_count=sampling_row_count,
         )
 
     def commit_hidden(
@@ -410,6 +428,7 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
+        num_valid_rows = layout.total_verify_tokens
         if seq_lens_cpu_backup is not None:
             verify_lens_cpu = (
                 layout.verify_lens_cpu
@@ -420,13 +439,46 @@ class TargetVerifyExecutor:
                 verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
             )
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            num_valid_rows = sum(verify_lens_cpu)
+
+        sampling_row_count = None
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and sampling_info.need_top_p_sampling
+        ):
+            sampling_row_count = (
+                num_valid_rows
+                if num_valid_rows is not None
+                else self._stage_sampling_row_count(layout.qo_indptr_device)
+            )
 
         return self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            sampling_row_count=sampling_row_count,
         )
+
+    def _stage_sampling_row_count(
+        self, indptr: torch.Tensor
+    ) -> int | _PendingVerifyRowCount:
+        if indptr.device.type == "cpu":
+            return int(indptr[-1])
+        # The renorm kernel takes its row count on the host. Copy that one
+        # scalar before target verify; acceptance can then wait on this copy
+        # without synchronizing the target graph or the adjusted logits. This
+        # executor consumes the count before it stages the next batch.
+        if self._sampling_row_count_buf is None:
+            self._sampling_row_count_buf = _PendingVerifyRowCount(
+                host=torch.empty((), dtype=indptr.dtype, device="cpu", pin_memory=True),
+                ready=torch.get_device_module(indptr.device).Event(),
+            )
+        count = self._sampling_row_count_buf
+        count.host.copy_(indptr[-1], non_blocking=True)
+        count.ready.record()
+        return count
 
     def run_compact(
         self,
@@ -902,9 +954,13 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    num_valid_rows: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
+    verify_row_indptr = (
+        cutoff_layout.qo_indptr_device if num_valid_rows is not None else None
+    )
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
     if all_greedy:
         return AcceptGreedy.execute(
@@ -942,6 +998,8 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            verify_row_indptr=verify_row_indptr,
+            num_valid_rows=num_valid_rows,
         )
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
@@ -960,6 +1018,8 @@ def accept_draft_tokens(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        verify_row_indptr=verify_row_indptr,
+        num_valid_rows=num_valid_rows,
     )
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,

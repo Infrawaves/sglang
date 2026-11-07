@@ -43,11 +43,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.storage_page_group import batch_spans
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.metrics_collector import (
     hicache_diagnostic_metrics_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        start_page: int = 0,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -254,6 +256,10 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Absolute page index of hash_value[0]; only grouped L3 objects use it.
+        self.start_page = start_page
+        # Pool name -> segment chain from the existence query (grouped L3 only).
+        self.storage_plans: Optional[dict] = None
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -344,6 +350,11 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        storage_page_size = get_memory().hicache_storage_page_size
+        # HiCache pages per L3 object for the KV and draft pools.
+        self.storage_page_group = (
+            1 if storage_page_size is None else storage_page_size // page_size
+        )
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
@@ -784,6 +795,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            storage_page_group=self.storage_page_group,
         )
 
     def reset(self):
@@ -1137,20 +1149,29 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+        for i, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
             if all_success:
-                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_hashes = operation.hash_value[i:batch_end]
                 batch_host_indices = operation.host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                    i * self.page_size : batch_end * self.page_size
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                extra_info = HiCacheStorageExtraInfo(
+                    prefix_keys=prefix_keys,
+                    start_page=operation.start_page + i,
+                    storage_plans=operation.storage_plans,
+                )
 
                 operation.kv_last_ts = time.monotonic()
 
@@ -1163,9 +1184,12 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
+                    # This rank can only vouch for earlier batches. Continue the
+                    # normal short-read path so every rank issues the same ACKs.
                     logger.exception(
-                        "HiCache prefetch transfer failed for request %s",
+                        "Prefetch KV read failed for request %s at page %d",
                         operation.request_id,
+                        operation.start_page + i,
                     )
                     hit_pages = 0
                 # Check termination
@@ -1405,14 +1429,21 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+        for i, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
+            batch_hashes = operation.hash_value[i:batch_end]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                i * self.page_size : batch_end * self.page_size
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, start_page=operation.start_page + i
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

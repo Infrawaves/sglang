@@ -52,6 +52,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
+    sched.enable_chunked_prefill_round_robin = False
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.waiting_queue = []

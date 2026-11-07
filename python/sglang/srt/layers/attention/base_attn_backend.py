@@ -61,6 +61,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # A full-coverage packed query must assign any unused graph tokens to
+    # dummy requests; extending a real request would expose unwritten KV.
+    ragged_verify_needs_padding_slot: bool = True
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

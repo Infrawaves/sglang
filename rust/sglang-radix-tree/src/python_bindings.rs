@@ -929,6 +929,8 @@ pub struct StorageBackupSpecBinding {
     hash_value: Option<Vec<String>>,
     prefix_keys: Option<Vec<String>>,
     comp_xfers: Py<PyDict>,
+    /// hash_value[0]'s absolute page index (grouped L3 objects).
+    start_page: usize,
 }
 
 #[pyclass(get_all)]
@@ -1803,6 +1805,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             hash_value: spec.hash_value,
             prefix_keys: spec.prefix_keys,
             comp_xfers: comp_xfers_to_py(py, spec.comp_xfers)?,
+            start_page: spec.start_page,
         }))
     }
 

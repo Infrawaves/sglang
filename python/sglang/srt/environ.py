@@ -591,6 +591,11 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Allow SGLANG_RAGGED_VERIFY_MODE=compact for a dense DSpark draft under DP
+    # attention (MoE a2a backends, CUDA graphs, PD decode) and under Kimi-K3 DCP.
+    # Every DP rank replays the same verify token tier, agreed through the MLP
+    # sync. cap-accept stays rejected. Off by default until validated.
+    SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -757,6 +762,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Debug: log PD DCP draft peer-wait stats every N seconds; 0 disables.
+    SGLANG_DISAGG_DRAFT_PEER_WAIT_STATS_INTERVAL = EnvFloat(0.0)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
@@ -1908,10 +1915,16 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Fuse the dense BF16 K3 o_proj with SP reduce-scatter and prefix addition,
+    # and the next layer's SP all-gather with its qkv_proj; keeps the residual
+    # stream token-sharded like SGLANG_K3_SP_ATTN_RES, whose fused collectives
+    # it replaces. Only enable with SGLANG_K3_SP_COLLECTIVE.
+    SGLANG_K3_SP_GEMM_FUSION = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE; ignored when
+    # SGLANG_K3_SP_GEMM_FUSION is set.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one

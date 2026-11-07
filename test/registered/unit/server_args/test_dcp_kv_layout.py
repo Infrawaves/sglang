@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 from transformers import LlamaConfig
 
+from sglang.srt.arg_groups.model_overrides.kimi_k3 import _kimi_k3_overrides
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.arg_groups.pd_disaggregation_hook import validate_dcp_kv_layout
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +34,19 @@ def _page_args(**overrides) -> ServerArgs:
 
 
 class TestDcpKvLayout(CustomTestCase):
+    def test_kimi_dcp_rejects_compact_aiter_before_kernel_setup(self):
+        args = _page_args(
+            dcp_kv_layout="token",
+            speculative_algorithm="DSPARK",
+            decode_attention_backend="aiter",
+        )
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+            envs.SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER.override(True),
+            self.assertRaisesRegex(ValueError, "AITER DCP verify requires fixed-width"),
+        ):
+            _kimi_k3_overrides(args, hf_config=None)
+
     def test_defaults_to_token_and_is_exposed_by_cli(self):
         self.assertEqual(ServerArgs(model_path="dummy").dcp_kv_layout, "token")
 
@@ -56,6 +71,8 @@ class TestDcpKvLayout(CustomTestCase):
 
     def test_page_accepts_final_supported_contract(self):
         validate_dcp_kv_layout(_page_args())
+        validate_dcp_kv_layout(_page_args(speculative_algorithm="DSPARK"))
+        validate_dcp_kv_layout(_page_args(disaggregation_transfer_backend="fake"))
 
     def test_page_reads_the_resolved_decode_backend(self):
         server_args = _page_args(decode_attention_backend="aiter")

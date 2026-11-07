@@ -177,7 +177,6 @@ class TestNodeLeaderStartup(CustomTestCase):
     def _startup(
         self,
         *,
-        mode="broadcast",
         enabled=True,
         group_ranks=(0,),
         rank=0,
@@ -197,7 +196,6 @@ class TestNodeLeaderStartup(CustomTestCase):
                 f"{module}.get_memory",
                 return_value=SimpleNamespace(
                     enable_mla_hicache_per_node=enabled,
-                    mla_hicache_per_node_mode=mode,
                 ),
             ),
             mock.patch(f"{module}.mla_host_dedup_eligible", return_value=eligible),
@@ -234,47 +232,29 @@ class TestNodeLeaderStartup(CustomTestCase):
 
     def test_ineligible_pool_rejects_before_world_group_creation(self):
         """A non-CUDA or FP4 MLA pool must raise on every rank before WORLD setup."""
-        for mode in ("broadcast", "shm"):
-            with (
-                self.subTest(mode=mode),
-                self._startup(mode=mode, group_ranks=range(4), eligible=False) as (
-                    create,
-                    _,
-                ),
-            ):
-                with self.assertRaisesRegex(ValueError, "non-FP4 MLA KV pool"):
-                    self._create()
-                create.assert_not_called()
+        with self._startup(group_ranks=range(4), eligible=False) as (create, _):
+            with self.assertRaisesRegex(ValueError, "non-FP4 MLA KV pool"):
+                self._create()
+            create.assert_not_called()
 
     def test_singleton_groups_join_world_setup(self):
         """One-rank-per-node groups must not strand active peers in WORLD NCCL setup."""
-        for mode, creates_nccl in (("broadcast", True), ("shm", False)):
-            with (
-                self.subTest(mode=mode),
-                self._startup(mode=mode, group_ranks=(0,)) as (create, _),
-            ):
-                self.assertIsNone(self._create())
-                if creates_nccl:
-                    create.assert_called_once_with(group_ranks=[0], backend="nccl")
-                    self.destroy.assert_called_once_with(create.return_value)
-                else:
-                    create.assert_not_called()
-                    self.destroy.assert_not_called()
+        with self._startup(group_ranks=(0,)) as (create, _):
+            self.assertIsNone(self._create())
+            create.assert_called_once_with(group_ranks=[0], backend="nccl")
+            self.destroy.assert_called_once_with(create.return_value)
 
-    def test_both_modes_use_common_capacity_and_own_node_ranks(self):
+    def test_common_capacity_and_own_node_ranks(self):
         """Each rank must share with its own node's ranks, with equal cache-group capacity."""
-        for mode, ranks, rank, local_rank, capacity, nccl in (
-            ("broadcast", range(8), 4, 0, 4, [4, 5, 6, 7]),
-            ("broadcast", range(8), 7, 3, 4, [4, 5, 6, 7]),
-            ("shm", range(6, 12), 8, 0, 2, None),
-            ("shm", range(6, 12), 11, 3, 2, None),
+        for ranks, rank, local_rank, capacity, nccl in (
+            (range(8), 4, 0, 4, [4, 5, 6, 7]),
+            (range(8), 7, 3, 4, [4, 5, 6, 7]),
+            (range(6, 12), 8, 0, 2, [8, 9, 10, 11]),
+            (range(6, 12), 11, 3, 2, [8, 9, 10, 11]),
         ):
             with (
-                self.subTest(mode=mode, rank=rank),
-                self._startup(mode=mode, group_ranks=ranks, rank=rank) as (
-                    create,
-                    _,
-                ),
+                self.subTest(rank=rank),
+                self._startup(group_ranks=ranks, rank=rank) as (create, _),
             ):
                 context = self._create({3: 0})
                 self.assertEqual(context.capacity_multiplier, capacity)
@@ -283,12 +263,9 @@ class TestNodeLeaderStartup(CustomTestCase):
                     context.shared_allocator.node_ranks,
                     list(range(rank - local_rank, rank - local_rank + 4)),
                 )
-                self.assertEqual(context.broadcast is not None, mode == "broadcast")
+                self.assertIsNotNone(context.broadcast)
                 # The broadcast NCCL group spans only this node's ranks.
-                if nccl is None:
-                    create.assert_not_called()
-                else:
-                    create.assert_called_once_with(group_ranks=nccl, backend="nccl")
+                create.assert_called_once_with(group_ranks=nccl, backend="nccl")
 
 
 class TestNodeSharedHostTensorCleanup(CustomTestCase):
@@ -404,7 +381,7 @@ _LEADER_SHARD_BYTES = 5 * mmap.PAGESIZE
 _SHARED_MARKER_SUM = _LEADER_SHARD_BYTES + 2 * (_SHARED_BYTES - _LEADER_SHARD_BYTES)
 
 
-def _build_test_shared_pool(allocator, mode):
+def _build_test_shared_pool(allocator):
     pin_count = 0
 
     def register(buffer, granularity=None):
@@ -442,7 +419,7 @@ def _build_test_shared_pool(allocator, mode):
             0,
             1,
             "layer_first",
-            is_dummy=mode == "broadcast" and follower,
+            is_dummy=follower,
             host_allocator=allocator,
             host_buffer_read_only=follower,
         )
@@ -494,7 +471,7 @@ def _shared_allocator_worker(rank, init_path, failure, events, out):
         def map_buffer(fd, dims, dtype, *, populate_shard):
             if rank == 3 and failure == "other_node":
                 raise OSError("injected other_node prefault failure")
-            if rank == 1 and failure in ("pool_broadcast", "pool_shm"):
+            if rank == 1 and failure == "pool":
                 blocked.set()
                 if not release.wait(30):
                     raise TimeoutError("test did not release prefault")
@@ -535,10 +512,8 @@ def _shared_allocator_worker(rank, init_path, failure, events, out):
                     )
                 )
             try:
-                if failure in ("pool_broadcast", "pool_shm"):
-                    pool, pin_count = _build_test_shared_pool(
-                        allocator, failure.removeprefix("pool_")
-                    )
+                if failure == "pool":
+                    pool, pin_count = _build_test_shared_pool(allocator)
                     returned[rank].set()
                     out.put(
                         (
@@ -583,7 +558,7 @@ class TestNodeSharedHostTensorAllocator(CustomTestCase):
             for process in processes:
                 process.start()
             try:
-                if failure in ("pool_broadcast", "pool_shm", "lifetime"):
+                if failure in ("pool", "lifetime"):
                     blocked, release, leader_fence, returned = events
                     self.assertTrue(
                         blocked.wait(45),
@@ -609,25 +584,10 @@ class TestNodeSharedHostTensorAllocator(CustomTestCase):
                 out.close()
                 out.join_thread()
 
-    def test_both_modes_initialize_before_registration_and_keep_only_runtime_views(
-        self,
-    ):
-        """No rank pins before every share is populated; broadcast followers keep no data view."""
-        for mode in ("broadcast", "shm"):
-            with self.subTest(mode=mode):
-                results = self._run(f"pool_{mode}")
-                expected = (
-                    [
-                        (0, "pool", 1, True),
-                        (1, "pool", 0, False),
-                    ]
-                    if mode == "broadcast"
-                    else [
-                        (0, "pool", 1, True),
-                        (1, "pool", 1, True),
-                    ]
-                )
-                self.assertEqual(results, expected)
+    def test_initialize_before_registration_and_keep_only_runtime_views(self):
+        """No rank pins before every share is populated; followers keep no data view."""
+        results = self._run("pool")
+        self.assertEqual(results, [(0, "pool", 1, True), (1, "pool", 0, False)])
 
     def test_late_follower_reopens_before_leader_closes_fd(self):
         """The original descriptor must survive until a delayed follower opens it."""
@@ -698,20 +658,14 @@ class TestReadOnlyAnchorTransfers(CustomTestCase):
         mamba = PoolTransfer(
             name=PoolName.MAMBA, host_indices=indices, device_indices=indices
         )
-        for mode, follower, write_mla, load_mla in (
-            ("shm", False, True, True),
-            ("shm", True, False, True),
-            ("broadcast", False, True, True),
-            ("broadcast", True, False, False),
+        for follower, write_mla, load_mla in (
+            (False, True, True),
+            (True, False, False),
         ):
-            with self.subTest(mode=mode, follower=follower):
+            with self.subTest(follower=follower):
                 controller = self._controller(
                     mla_host_read_only=follower,
-                    node_leader_broadcast=(
-                        _context([(3, 0)], is_src=not follower)
-                        if mode == "broadcast"
-                        else None
-                    ),
+                    node_leader_broadcast=_context([(3, 0)], is_src=not follower),
                 )
                 entries = controller.mem_pool_host.entry_map
                 kv_pool = entries[PoolName.KV].host_pool

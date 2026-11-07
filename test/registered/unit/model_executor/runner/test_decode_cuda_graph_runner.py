@@ -29,10 +29,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +44,91 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
+
+
+class TestRaggedGraphShape(unittest.TestCase):
+    def test_shared_request_max_selects_same_captured_pair(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 256
+        runner.captured_req_width = 6
+        runner._ragged_slots_by_tokens = {
+            g: mod.ragged_verify_slot_buckets(g, req_width=6, max_bs=256)
+            for g in (240, 384)
+        }
+        keys = {
+            runner._make_graph_key(runner._capture_graph_size(bs=b, num_tokens=g))
+            for b, g in runner._capture_sizes()
+        }
+        # Two busy ranks, plus the synthetic layout used by their idle peer.
+        for local_bs in (24, 57, 60):
+            layout = SimpleNamespace(bs=local_bs, graph_max_bs=60, graph_num_tokens=240)
+            pair = runner._ragged_replay_shape(layout)
+            self.assertEqual(pair, (64, 240))
+            self.assertIn(runner._make_graph_key(pair), keys)
+
+        for bs, expected in ((40, 40), (65, 128), (240, 240)):
+            layout = SimpleNamespace(bs=bs, graph_max_bs=None, graph_num_tokens=240)
+            pair = runner._ragged_replay_shape(layout)
+            self.assertEqual(pair, (expected, 240))
+            key = runner._make_graph_key(pair)
+            self.assertIn(key, keys)
+            self.assertNotEqual(key, runner._make_graph_key((64, 240)))
+
+        # A missing slot or token bucket must reject replay.
+        for bs, tokens in ((241, 240), (57, 241)):
+            layout = SimpleNamespace(bs=bs, graph_max_bs=bs, graph_num_tokens=tokens)
+            self.assertIsNone(runner._ragged_replay_shape(layout))
+        self.assertNotIn(runner._make_graph_key(240), keys)
+        runner.reserve_ragged_padding_slot = True
+        for local_bs in (57, 64):
+            layout = SimpleNamespace(bs=local_bs, graph_max_bs=64, graph_num_tokens=240)
+            self.assertEqual(runner._ragged_replay_shape(layout), (128, 240))
+        runner.ragged_verify_mode = False
+        self.assertEqual(runner._capture_graph_size(bs=64, num_tokens=384), 64)
+
+    def test_full_coverage_at_capacity_keeps_uniform_and_anchor_only_graphs(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.max_bs = 60
+        runner.captured_req_width = 6
+        runner.reserve_ragged_padding_slot = True
+        runner._ragged_slots_by_tokens = {
+            g: mod.ragged_verify_slot_buckets(g, req_width=6, max_bs=60)
+            for g in (60, 240, 360)
+        }
+        for bs in (57, 60):
+            layout = SimpleNamespace(
+                bs=bs, graph_max_bs=60, graph_num_tokens=360, total_verify_tokens=6 * bs
+            )
+            self.assertEqual(runner._ragged_replay_shape(layout), (60, 360))
+            layout.total_verify_tokens -= 1
+            self.assertIsNone(runner._ragged_replay_shape(layout))
+            layout.graph_num_tokens = 240
+            self.assertIsNone(runner._ragged_replay_shape(layout))
+            layout.graph_num_tokens = 60
+            layout.total_verify_tokens = bs
+            self.assertEqual(runner._ragged_replay_shape(layout), (60, 60))
+
+    def test_stage_updates_offsets_in_selected_graph_only(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.captured_req_width = 6
+        key40 = runner._make_graph_key((40, 240))
+        key64 = runner._make_graph_key((64, 240))
+
+        def layout(lens):
+            return RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=lens, device=torch.device("cpu"), grid=[240]
+            )
+
+        small = layout([6] * 40)
+        large = layout([4] * 48 + [3] * 16)
+        runner._captured_ragged_layouts = {key40: small, key64: large}
+        live = layout([1, 3] * 32)
+        runner._stage_ragged_verify_layout(live, key64)
+        self.assertTrue(torch.equal(large.verify_lens, live.verify_lens))
+        self.assertTrue(torch.equal(large.qo_indptr_device, live.qo_indptr_device))
+        self.assertTrue(torch.equal(large.extend_start_loc, live.extend_start_loc))
+        self.assertEqual(small.verify_lens.tolist(), [6] * 40)
 
 
 def _make_fake_self(capture_bs):
