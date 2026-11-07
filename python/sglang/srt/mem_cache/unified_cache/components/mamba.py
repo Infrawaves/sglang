@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import math
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -59,6 +61,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -708,7 +713,62 @@ class MambaComponent(TreeComponent):
                     lock.receipt.skipped_lock_components += (ct,)
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = storage.take_state_slots(sub_pool, 1)
+        if slot is None:
+            self._on_mamba_alloc_failed()
         return slot
+
+    _CENSUS_THROTTLE_S = 60.0
+    _last_census_t = 0.0
+
+    def _on_mamba_alloc_failed(self) -> None:
+        """Account for a caching-path mamba slot alloc failure: bump the
+        radix-cache metric and emit a throttled WARNING census of the tree's
+        mamba-bearing device nodes by pin class. Never raises."""
+        if self.cache.metrics_collector is not None:
+            self.cache.metrics_collector.increment_aux_alloc_failed()
+        now = time.monotonic()
+        if now - self._last_census_t < self._CENSUS_THROTTLE_S:
+            return
+        self._last_census_t = now
+        try:
+            ct = self.component_type
+            total = locked = host_locked = wt_pending = lb_pending = 0
+            stack = [self.tree_core.root_node]
+            while stack:
+                node = stack.pop()
+                stack.extend(node.children.values())
+                cd = node.component_data[ct]
+                if cd.value is None:
+                    continue
+                total += 1
+                if cd.lock_ref > 0:
+                    locked += 1
+                if cd.host_lock_ref > 0:
+                    host_locked += 1
+                if node.write_through_pending_id is not None:
+                    wt_pending += 1
+                if node.load_back_pending_id is not None:
+                    lb_pending += 1
+            logger.warning(
+                "mamba slot alloc failed after eviction; skipping radix caching "
+                "for this chunk. census: device_nodes=%d lock_ref>0=%d "
+                "host_lock_ref>0=%d write_through_pending=%d load_back_pending=%d "
+                "evictable_size=%d protected_size=%d",
+                total,
+                locked,
+                host_locked,
+                wt_pending,
+                lb_pending,
+                self.tree_core.component_evictable_size_[ct],
+                self.tree_core.component_protected_size_[ct],
+            )
+        except Exception:
+            logger.warning(
+                "mamba slot alloc failed after eviction; skipping radix caching "
+                "for this chunk (census unavailable)",
+                exc_info=True,
+            )
+
 
     def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
         """Allocate a slot required for request state or load-back."""

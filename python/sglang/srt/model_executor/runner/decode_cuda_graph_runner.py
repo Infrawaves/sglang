@@ -29,6 +29,7 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+from bisect import bisect_left
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
@@ -130,6 +131,10 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.speculative.ragged_verify import (
+    full_coverage_graph_slots,
+    needs_full_width_ragged_graph,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -184,6 +189,25 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+def ragged_verify_slot_buckets(
+    num_tokens: int, req_width: int, max_bs: int, *, uniform: bool = False
+) -> tuple[int, ...]:
+    """Bound capture count while covering every feasible batch at this token tier."""
+    min_slots = (num_tokens + req_width - 1) // req_width
+    max_slots = min(num_tokens, max_bs)
+    if uniform or min_slots == max_slots:
+        return (min_slots,)
+    # A captured layout needs slots <= tokens <= slots * req_width. Powers
+    # of two between the endpoints add only O(log(req_width)) graphs per tier.
+    buckets = [min_slots]
+    slots = 1 << min_slots.bit_length()
+    while slots < max_slots:
+        buckets.append(slots)
+        slots *= 2
+    buckets.append(max_slots)
+    return tuple(buckets)
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -211,6 +235,9 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    # An idle compact verify supplies dummy rows for its peers' graph tier.
+    # None of those rows owns a Mamba state slot.
+    live_bs = 0 if getattr(forward_batch.spec_info, "is_padding_only", False) else raw_bs
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -230,7 +257,7 @@ def build_replay_fb_view(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),
         max_seq_len_host=forward_batch.max_seq_len_host,
-        num_padding=bs - raw_bs,
+        num_padding=bs - live_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
@@ -307,6 +334,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
+
+    # Draft runner subclasses share the capture loop but use ordinary BS keys.
+    _ragged_slots_by_tokens: Optional[dict[int, tuple[int, ...]]] = None
+    reserve_ragged_padding_slot: bool = False
 
     def __init__(
         self,
@@ -473,10 +504,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.ragged_verify_mode
             else None
         )
-        self._ragged_graph_size = 0
-        # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
-        # baked into the captured graphs and refreshed in place each replay.
-        self._captured_ragged_layouts: dict[int, object] = {}
+        if self.capture_num_tokens is not None:
+            uniform = envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+            self.reserve_ragged_padding_slot = (
+                not uniform and self.attn_backend.ragged_verify_needs_padding_slot
+            )
+            self._ragged_slots_by_tokens = {
+                tokens: ragged_verify_slot_buckets(
+                    tokens, self.captured_req_width, self.max_bs, uniform=uniform
+                )
+                for tokens in self.capture_num_tokens
+            }
+        # Each captured graph retains the addresses of its own verify_lens / qo_indptr.
+        self._captured_ragged_layouts: dict[ShapeKey, object] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.lora_manager is not None
@@ -792,10 +832,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, size, variant_label=None, attention_variant=None):
+        ragged_bs = None
+        if isinstance(size, tuple):
+            ragged_bs, size = size
         return ShapeKey(
             size=size,
             variant_label=variant_label,
             attention_variant=attention_variant,
+            ragged_bs=ragged_bs,
         )
 
     def _with_logits_variant(self, key, logits_variant: Optional[str]):
@@ -821,8 +865,39 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # so padding differs per rank and only the sampling decides there.
         return not is_ragged and not self.require_mlp_tp_gather and bs != raw_bs
 
-    def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
-        return num_tokens if self.ragged_verify_mode else bs
+    def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int | tuple[int, int]:
+        return (bs, num_tokens) if self.ragged_verify_mode else bs
+
+    def _capture_sizes(self):
+        if self._ragged_slots_by_tokens is None:
+            return self.capture_bs
+        return [
+            (bs, tokens)
+            for tokens, buckets in self._ragged_slots_by_tokens.items()
+            for bs in buckets
+        ]
+
+    def _replay_key_for(
+        self,
+        forward_batch,
+        size,
+        *,
+        raw_bs: int,
+        bs: int,
+        is_ragged: bool,
+        attention_variant: Optional[str],
+    ):
+        return self._with_logits_variant(
+            self._make_graph_key(
+                size, self._resolve_lora_variant(forward_batch), attention_variant
+            ),
+            self._resolve_logits_variant(
+                forward_batch,
+                padded=self._replay_pads_rows(
+                    raw_bs=raw_bs, bs=bs, is_ragged=is_ragged
+                ),
+            ),
+        )
 
     def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
         if self.require_mlp_tp_gather:
@@ -883,19 +958,47 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return not draft_is_deepseek_v4()
 
-    def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
-        return min(num_tokens, self.max_bs)
+    def _ragged_graph_slots(self, num_tokens: int, max_bs: int) -> Optional[int]:
+        slots = self._ragged_slots_by_tokens.get(num_tokens, ())
+        required_slots = (
+            full_coverage_graph_slots(max_bs, num_tokens, self.captured_req_width)
+            if self.reserve_ragged_padding_slot
+            else max_bs
+        )
+        idx = bisect_left(slots, required_slots)
+        return slots[idx] if 0 < max_bs and idx < len(slots) else None
 
-    def _capture_ragged_verify_layout(self, num_tokens: int):
+    def _ragged_replay_shape(self, layout) -> Optional[tuple[int, int]]:
+        # On synchronized DP the planner carries the same maximum on busy
+        # and idle ranks; DP-local execution only needs the local request count.
+        max_bs = layout.graph_max_bs if layout.graph_max_bs is not None else layout.bs
+        if needs_full_width_ragged_graph(
+            self, max_bs, layout.graph_num_tokens, self.captured_req_width
+        ):
+            # Every rank switched to uniform lengths. The smallest captured
+            # slot bucket can hold the rounded full-width tier, including when
+            # the shared live count falls between two capture batch sizes.
+            buckets = self._ragged_slots_by_tokens.get(layout.graph_num_tokens, ())
+            if (
+                buckets
+                and 0 < layout.bs <= max_bs
+                and layout.graph_num_tokens >= max_bs * self.captured_req_width
+                and layout.total_verify_tokens == layout.bs * self.captured_req_width
+            ):
+                return buckets[0], layout.graph_num_tokens
+            return None
+        slots = self._ragged_graph_slots(layout.graph_num_tokens, max_bs)
+        if slots is None or max_bs < layout.bs:
+            return None
+        return slots, layout.graph_num_tokens
+
+    def _capture_ragged_verify_layout(self, bs: int, num_tokens: int):
         if not self.ragged_verify_mode:
             return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
-        layout = self._captured_ragged_layouts.get(num_tokens)
-        if layout is not None:
-            return layout
+        # Each (slots, tokens, variant) graph owns its layout, keyed by ShapeKey in
+        # _captured_ragged_layouts; replay stages the layout of the graph it runs.
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
@@ -903,21 +1006,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         verify_lens_cpu = build_capture_verify_lens(
             num_tokens=num_tokens,
-            num_slots=self._ragged_capture_slots(num_tokens),
+            num_slots=bs,
             num_draft_tokens=self.captured_req_width,
         )
-        layout = RaggedVerifyLayout.from_verify_lens(
+        return RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
             grid=self.capture_num_tokens,
         )
-        self._captured_ragged_layouts[num_tokens] = layout
-        return layout
 
-    def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
+    def _stage_ragged_verify_layout(self, ragged_layout, key: ShapeKey) -> None:
         # Without this refresh every replay reuses the capture-time synthetic
         # verify_lens / qo_indptr and mis-slices the packed q rows.
-        cap_layout = self._captured_ragged_layouts.get(graph_size_key)
+        cap_layout = self._captured_ragged_layouts[key]
         if cap_layout is None:
             return
         live = ragged_layout
@@ -927,6 +1028,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         cap_layout.verify_lens.copy_(live.verify_lens)
         cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+        cap_layout.extend_start_loc.copy_(live.extend_start_loc)
 
     @staticmethod
     def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
@@ -1042,10 +1144,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not self.attn_backend.supports_ragged_verify_graph:
             return False
 
-        admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        shape = self._ragged_replay_shape(ragged_layout)
+        is_tokens_supported = shape is not None and forward_batch.batch_size <= shape[0]
 
         is_dp_supported = (
             forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
@@ -1082,7 +1182,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _set_profile_trace_tag(
         self,
-        bs: int,
+        bs: int | tuple[int, int],
         variant_label: Optional[str],
         attention_variant: Optional[str],
         logits_variant: Optional[str] = None,
@@ -1094,7 +1194,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         if getattr(self, "_profiler", None) is None:
             return
-        parts = [f"bs_{bs}"]
+        # Compact ragged verify captures several slot buckets per token tier.
+        parts = [
+            f"bs_{bs[0]}_tokens_{bs[1]}" if isinstance(bs, tuple) else f"bs_{bs}"
+        ]
         if attention_variant is not None:
             parts.append(attention_variant)
         if logits_variant is not None:
@@ -1196,7 +1299,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        capture_ragged_verify_layout = self._capture_ragged_verify_layout(num_tokens)
+        capture_ragged_verify_layout = self._capture_ragged_verify_layout(
+            bs, num_tokens
+        )
         spec_info = self.get_spec_info(
             num_tokens, ragged_verify_layout=capture_ragged_verify_layout
         )
@@ -1353,13 +1458,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
-        capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
-        )
+        capture_range = reversed(self._capture_sizes())
+        if get_parallel().tp_rank == 0:
+            capture_range = tqdm.tqdm(list(capture_range))
         lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
-        for bs in capture_range:
+        for size in capture_range:
+            if isinstance(size, tuple):
+                bs, num_tokens = size
+            else:
+                bs, num_tokens = size, size * self.captured_req_width
             attention_variants = (
                 self.attention_graph_variants.capture_labels
                 if self._attention_varies_at(bs)
@@ -1372,7 +1479,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({size=} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label in lora_variants:
@@ -1381,7 +1488,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         _set_capture_attention_variant(attention_variant)
                         for logits_variant in self.logits_graph_variants:
                             self._set_profile_trace_tag(
-                                bs,
+                                size,
                                 variant_label,
                                 attention_variant,
                                 logits_variant,
@@ -1391,12 +1498,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                                 self.backend.prepare_capture_forward(
                                     self.model_runner.model,
                                     enable_compile=bs in self.compile_bs,
-                                    num_tokens=bs * self.captured_req_width,
+                                    num_tokens=num_tokens,
                                     tp_group=get_parallel().tp_group,
                                 ) as forward,
                             ):
                                 self.capture_one_shape(
-                                    bs,
+                                    size,
                                     forward,
                                     variant_label,
                                     attention_variant,
@@ -1405,13 +1512,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def capture_one_shape(
         self,
-        size: int,
+        size: int | tuple[int, int],
         forward: Callable,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
-        bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
+        bs, num_tokens = (
+            size if isinstance(size, tuple) else (size, size * self.captured_req_width)
+        )
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
@@ -1525,6 +1633,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                     get_capture_logits_variant(),
                 )
+                if self.ragged_verify_mode:
+                    self._captured_ragged_layouts[shape_key] = (
+                        forward_batch.ragged_verify_layout
+                    )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
                     attn_backend,
@@ -1589,19 +1701,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_ids[self.raw_num_token : padded_tokens].zero_()
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
-            graph_size_key = (
-                self._ragged_graph_size
-                if is_ragged
-                else self._capture_graph_size(
-                    bs=self.bs, num_tokens=self.bs * self.captured_req_width
-                )
+            graph_size_key = self._capture_graph_size(
+                bs=self.bs,
+                num_tokens=(
+                    self.raw_num_token
+                    if is_ragged
+                    else self.bs * self.captured_req_width
+                ),
+            )
+            replay_key = self._replay_key_for(
+                forward_batch,
+                graph_size_key,
+                raw_bs=self.raw_bs,
+                bs=self.bs,
+                is_ragged=is_ragged,
+                attention_variant=self._resolve_attention_variant(
+                    forward_batch, self.bs
+                ),
             )
             if is_ragged:
-                assert self.raw_num_token == ragged_layout.graph_num_tokens, (
-                    f"stale ragged raw_num_token {self.raw_num_token} != "
-                    f"{ragged_layout.graph_num_tokens}"
+                assert graph_size_key == self._ragged_replay_shape(ragged_layout), (
+                    "preplanned ragged verify graph shape changed"
                 )
-                self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+                self._stage_ragged_verify_layout(ragged_layout, replay_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
             self._copy_replay_inputs(forward_batch)
             if (
@@ -1631,17 +1753,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
-            attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
-            self._replay_graph_key = self._with_logits_variant(
-                self._make_graph_key(graph_size_key, variant_label, attention_variant),
-                self._resolve_logits_variant(
-                    forward_batch,
-                    padded=self._replay_pads_rows(
-                        raw_bs=self.raw_bs, bs=self.bs, is_ragged=is_ragged
-                    ),
-                ),
-            )
+            self._replay_graph_key = replay_key
             return
 
         buffers = self.buffers
@@ -1656,14 +1768,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # capture_num_tokens (same source), and verify_layout_grid's
             # [total] escape branches only fire with ragged_verify_mode off,
             # where this branch is unreachable.
-            raw_num_token = graph_size_key = ragged_layout.graph_num_tokens
-            bs = self._ragged_capture_slots(graph_size_key)
+            raw_num_token = ragged_layout.graph_num_tokens
+            graph_size_key = self._ragged_replay_shape(ragged_layout)
+            assert graph_size_key is not None, "unsupported ragged verify graph shape"
+            bs, padded_num_tokens = graph_size_key
             assert bs >= raw_bs, (
                 f"ragged capture slots {bs} (tier {graph_size_key}) < raw_bs "
                 f"{raw_bs}; the planner must reject this batch before replay"
             )
-            padded_num_tokens = graph_size_key
-            self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
@@ -1677,6 +1789,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         attention_variant = self._resolve_attention_variant(forward_batch, bs)
+        replay_key = self._replay_key_for(
+            forward_batch,
+            graph_size_key,
+            raw_bs=raw_bs,
+            bs=bs,
+            is_ragged=is_ragged,
+            attention_variant=attention_variant,
+        )
+        if is_ragged:
+            self._stage_ragged_verify_layout(ragged_layout, replay_key)
         glue_key = self._glue_key(
             bs, str(forward_batch.forward_mode), attention_variant
         )
@@ -1741,26 +1863,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
-        if is_ragged:
-            self._ragged_graph_size = graph_size_key
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
         if self._early_verify_metadata is not None:
             self._early_verify_metadata.count_variant(
                 attention_variant, taken=early_staged
             )
-        self._replay_graph_key = self._with_logits_variant(
-            self._make_graph_key(graph_size_key, variant_label, attention_variant),
-            self._resolve_logits_variant(
-                forward_batch,
-                padded=self._replay_pads_rows(
-                    raw_bs=raw_bs, bs=bs, is_ragged=is_ragged
-                ),
-            ),
-        )
+        self._replay_graph_key = replay_key
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
         input_ids, positions = forward_batch.input_ids, forward_batch.positions
@@ -1820,10 +1931,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
+        # An idle compact verify's rows are all padding (see build_replay_fb_view).
+        padding_only = getattr(forward_batch.spec_info, "is_padding_only", False)
         glue_route = (
             self._metadata_glue is not None
             and not self._metadata_glue.disabled
             and (raw_bs == bs or (self._padded_glue and 0 < raw_bs < bs))
+            and not padding_only
             and not self.enable_two_batch_overlap
             and self.model_runner.lora_manager is None
         )
@@ -2096,7 +2210,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.batch_size,
                     self._replay_graph_key.attention_variant,
                     (
-                        f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
+                        f" slots={self._replay_graph_key.ragged_bs}"
                         if self.ragged_verify_mode
                         else ""
                     ),

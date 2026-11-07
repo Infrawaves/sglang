@@ -107,6 +107,9 @@ class TestGenerateRouteGate(CustomTestCase):
         served = []
 
         class FakeTokenizerManager:
+            def validate_request_params(self, obj):
+                pass
+
             async def generate_request(self, obj, request):
                 served.append(obj)
                 yield {"text": "ok"}

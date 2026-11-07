@@ -737,6 +737,47 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             swa_avail,
         )
 
+    @requires_mamba
+    def test_checkpoint_degrades_when_mamba_pool_exhausted(self):
+        """A caching-path mamba slot alloc that still fails after the one-shot
+        eviction (every cached state pinned by running requests or in-flight
+        hicache DMAs) must skip caching the chunk, never kill the scheduler:
+        nothing is inserted, the request keeps its live state, no slot leaks,
+        and the failure is observable (metric + WARNING census)."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 3)
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        req.kv.mamba_last_track_seqlen = len(tokens)
+
+        pool = req_to_token_pool.mamba_allocator
+        live_slot = int(req.kv.mamba_pool_idx)
+        free_before = pool.available_size()
+        collector = mock.Mock()
+        cache.metrics_collector = collector
+        mamba_logger = "sglang.srt.mem_cache.unified_cache.components.mamba"
+
+        # The pool hands out nothing and eviction cannot free anything.
+        with (
+            mock.patch.object(pool, "alloc", return_value=None),
+            mock.patch.object(
+                cache, "evict_for_alloc", autospec=True
+            ) as evict_for_alloc,
+            self.assertLogs(mamba_logger, level="WARNING") as logs,
+        ):
+            cache.checkpoint(req, up_to=req.extend_end)
+
+        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        collector.increment_aux_alloc_failed.assert_called_once_with()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("census", logs.output[0])
+
+        # Nothing was cached and the request still owns its live mamba slot.
+        self.assertEqual(list(node_children(cache, cache.root_node_handle())), [])
+        self.assertEqual(int(req.kv.mamba_pool_idx), live_slot)
+        self.assertEqual(pool.available_size(), free_before)
+        cache.sanity_check()
+
     @requires_swa_only
     @requires_ps1_window4
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):

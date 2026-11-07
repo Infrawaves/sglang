@@ -33,6 +33,12 @@ def handle_hicache(server_args: Any):
         )
 
         UnifiedCacheLinkerConfig.from_dict(config)
+    if cfg.enable_mla_hicache_per_node:
+        validate_mla_hicache_per_node(server_args)
+    if cfg.hicache_draft_node_merge:
+        validate_hicache_draft_node_merge(server_args)
+    if cfg.hicache_storage_page_size is not None:
+        validate_hicache_storage_page_size(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -89,6 +95,8 @@ def handle_hicache(server_args: Any):
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
     resolve_unified_memory_layout_io(server_args)
+    if cfg.hicache_draft_node_merge:
+        validate_hicache_draft_node_merge_layout(server_args)
     if (
         cfg.disaggregation_decode_host_receive_threshold < 1
         and cfg.hicache_mem_layout != "layer_first"
@@ -100,6 +108,122 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def validate_mla_hicache_per_node(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-mla-hicache-per-node requires --pp-size 1; "
+            "pipeline parallelism is not supported."
+        )
+    if cfg.disaggregation_mode == "decode":
+        # Broadcast needs a forward to run the layer-wait hook.
+        raise ValueError(
+            "--enable-mla-hicache-per-node is not supported on PD decode instances."
+        )
+    if cfg.dcp_size > 1:
+        # DCP pages are rank-sharded in the current transfer contract.
+        raise ValueError(
+            "--enable-mla-hicache-per-node is not supported with --dcp-size > 1."
+        )
+    if cfg.hicache_storage_backend == "mooncake":
+        # Lazy: only per-node Mooncake launches pay for these imports.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStoreConfig,
+        )
+
+        extra_config = HybridCacheController.parse_storage_backend_extra_config(
+            cfg.hicache_storage_backend_extra_config
+        )[0]
+        if MooncakeStoreConfig.load(extra_config).standalone_storage:
+            raise ValueError(
+                "--enable-mla-hicache-per-node is incompatible with Mooncake "
+                "standalone_storage=True, which requires MooncakeHostTensorAllocator."
+            )
+
+
+def validate_hicache_draft_node_merge(server_args: Any):
+    # The draft pool class and node size are checked when the draft host pool
+    # is built; the layout once resolution settles it.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_mla_hicache_per_node:
+        raise ValueError(
+            "--hicache-draft-node-merge requires --enable-mla-hicache-per-node."
+        )
+    if cfg.hicache_storage_backend != "mooncake":
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-storage-backend mooncake."
+        )
+    # Unverified: CP ranks may not hold the same host index for a page.
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--hicache-draft-node-merge is not supported with --attn-cp-size > 1."
+        )
+    # Write-back eviction syncs locally, so the node's last rank could put a
+    # page before every rank's D2H into it has finished.
+    if cfg.hicache_write_policy not in ("write_through", "write_through_selective"):
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-write-policy "
+            "write_through or write_through_selective."
+        )
+
+
+def validate_hicache_draft_node_merge_layout(server_args: Any):
+    """Reject before model load what the draft host pool build would reject."""
+    # Lazy: the merge module pulls in torch.distributed.
+    from sglang.srt.mem_cache.hicache_draft_node_merge import (
+        DRAFT_NODE_MERGE_LAYOUTS,
+    )
+
+    layout = resolving_view(server_args).hicache_mem_layout
+    if layout not in DRAFT_NODE_MERGE_LAYOUTS:
+        raise ValueError(
+            "--hicache-draft-node-merge requires --hicache-mem-layout in "
+            f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
+        )
+
+
+def validate_hicache_storage_page_size(server_args: Any):
+    # Pool-level limits (standalone_storage, split heads) are checked by Mooncake.
+    cfg = resolving_view(server_args)
+    size, page_size = cfg.hicache_storage_page_size, cfg.page_size
+    if size <= 0 or size % page_size != 0:
+        raise ValueError(
+            f"--hicache-storage-page-size ({size}) must be a positive multiple "
+            f"of --page-size ({page_size})."
+        )
+    group = size // page_size
+    if group == 1:
+        return
+    # STORAGE_BATCH_SIZE pages per L3 batch; a group must not straddle two.
+    if 128 % group != 0:
+        raise ValueError(
+            "--hicache-storage-page-size / --page-size must divide 128, "
+            f"got {group}."
+        )
+    unsupported = {
+        "--enable-hierarchical-cache is off": not cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend is not mooncake": (
+            cfg.hicache_storage_backend != "mooncake"
+        ),
+        "--pp-size > 1": cfg.pp_size > 1,
+        "--dcp-size > 1": cfg.dcp_size > 1,
+        "PD decode": cfg.disaggregation_mode == "decode",
+        # Buffer mode writes staged spans without a radix node position.
+        "--hicache-host-memory-mode buffer_only": (
+            cfg.hicache_host_memory_mode == "buffer_only"
+        ),
+    }
+    reasons = [reason for reason, hit in unsupported.items() if hit]
+    if reasons:
+        raise ValueError(
+            "--hicache-storage-page-size larger than --page-size is not "
+            "supported when: " + ", ".join(reasons) + "."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

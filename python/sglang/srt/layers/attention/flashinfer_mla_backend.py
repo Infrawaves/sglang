@@ -564,11 +564,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     @staticmethod
     def _verify_graph_key(bs: int, ragged_layout: Optional[RaggedVerifyLayout]):
-        """bs for uniform graphs; token tier for ragged (tiers share slot
-        counts but each graph must replay its own recorded plan buffers)."""
+        """Each ragged capture needs its own wrapper and recorded plan buffers."""
         if ragged_layout is None:
             return bs
-        return ("ragged", ragged_layout.graph_num_tokens)
+        return (bs, ragged_layout.graph_num_tokens)
 
     def _apply_cuda_graph_metadata(
         self,

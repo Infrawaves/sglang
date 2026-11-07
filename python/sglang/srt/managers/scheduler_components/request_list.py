@@ -25,6 +25,11 @@ class ListKind(enum.Enum):
     # The running requests.
     DECODING = enum.auto()
     CHUNKED = enum.auto()
+    # PD prefill round robin: chunked requests waiting for their next chunk.
+    PREFILL_SUSPENDED = enum.auto()
+    # PD prefill round robin: terminal requests waiting for their overlap
+    # results before their deferred cleanup runs.
+    PREFILL_RR_PENDING = enum.auto()
     PD_BOOTSTRAP = enum.auto()
     PREFILL_LAUNCHED = enum.auto()
     PD_SENDING = enum.auto()
@@ -105,6 +110,37 @@ class KeyedReqList(ReqList):
 
     def __contains__(self, req: Req) -> bool:
         return req in self._reqs
+
+
+class ActionReqList(KeyedReqList):
+    """Requests in join order, each with the action its owner runs later."""
+
+    def __init__(self, kind: ListKind) -> None:
+        super().__init__(kind)
+        self._actions: Dict[Req, str] = {}
+
+    def defer(self, req: Req, action: str) -> None:
+        """Add `req` with `action`; one already in keeps its first action."""
+        if req not in self._reqs:
+            self.join([req])
+            self._actions[req] = action
+
+    def pop(self, req: Req) -> str:
+        """Drop `req` and return its action."""
+        self._reqs.pop(req)
+        return self._actions.pop(req)
+
+    def __getitem__(self, req: Req) -> str:
+        return self._actions[req]
+
+    def leave(self, reqs: Iterable[Req]) -> None:
+        for req in reqs:
+            self._reqs.pop(req, None)
+            self._actions.pop(req, None)
+
+    def clear(self) -> None:
+        self._reqs.clear()
+        self._actions.clear()
 
 
 class IndexedReqList(ReqList):

@@ -58,6 +58,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 from openai.types.responses.response_function_tool_call_param import (
     ResponseFunctionToolCallParam,
 )
+from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
@@ -715,6 +716,7 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    modalities: Optional[Literal["video"]] = "video"
 
 
 class ChatCompletionMessageContentInputAudio(BaseModel):
@@ -967,6 +969,16 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class AllowedTools(BaseModel):
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoice]
+
+
+class AllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: AllowedTools
+
+
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
 # none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
 # /v1/responses.
@@ -1099,9 +1111,9 @@ class ChatCompletionRequest(PDRoutingFields):
     # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
     # drives tool-call parsing.
     _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
-    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
-        default="auto", examples=["none"]
-    )  # noqa
+    tool_choice: Union[
+        ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
+    ] = Field(default="auto", examples=["none"])
     # Whether the client sent tool_choice, as opposed to the default filled in
     # by set_tool_choice_default.
     _tool_choice_explicit: bool = PrivateAttr(default=False)
@@ -1547,6 +1559,11 @@ class ChatCompletionRequest(PDRoutingFields):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if isinstance(self.tool_choice, AllowedToolChoice):
+                raise ValueError(
+                    "allowed_tools cannot be combined with an active response_format, "
+                    "regex, or ebnf constraint."
+                )
             if forces_tool_call:
                 if self.regex or self.ebnf:
                     raise ValueError(
@@ -2237,6 +2254,12 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
+class ResponseAllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoiceFunction]
+
+
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
@@ -2336,6 +2359,13 @@ class ResponsesRequest(PDRoutingFields):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @field_validator("tool_choice")
+    @classmethod
+    def validate_allowed_tool_choice(cls, value):
+        if isinstance(value, dict) and value.get("type") == "allowed_tools":
+            return ResponseAllowedToolChoice.model_validate(value).model_dump()
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -2440,12 +2470,12 @@ class ResponsesRequest(PDRoutingFields):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` / ``custom`` tool survives, the
-        rest (web_search, mcp, ...) can't be forced through the tool-call
-        parser."""
+        """Keep named tools and allowlists; unsupported built-in choices
+        cannot be forced through the tool-call parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice.get("type") == "allowed_tools":
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
@@ -2631,6 +2661,11 @@ class ResponsesResponse(BaseModel):
             if usage.prompt_tokens_details
             else 0
         )
+        reasoning_tokens = (
+            usage.completion_tokens_details.reasoning_tokens
+            if usage.completion_tokens_details
+            else usage.reasoning_tokens or 0
+        )
         return {
             "input_tokens": usage.prompt_tokens,
             "input_tokens_details": {
@@ -2639,7 +2674,7 @@ class ResponsesResponse(BaseModel):
                 "cache_write_tokens": cache_write_tokens,
             },
             "output_tokens": usage.completion_tokens or 0,
-            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
             "total_tokens": usage.total_tokens,
         }
 

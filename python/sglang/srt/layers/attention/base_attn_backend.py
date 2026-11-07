@@ -117,6 +117,9 @@ class AttentionBackend(ABC):
     # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
     # skips cached-row compression for replay rows folded into the extend.
     folds_encoder_swa_replay: bool = False
+    # A full-coverage packed query must assign any unused graph tokens to
+    # dummy requests; extending a real request would expose unwritten KV.
+    ragged_verify_needs_padding_slot: bool = True
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

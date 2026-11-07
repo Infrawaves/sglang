@@ -15,7 +15,6 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncGenerator,
     Callable,
     Dict,
     List,
@@ -49,7 +48,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -63,6 +62,7 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     CacheUsage,
+    AllowedToolChoice,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -93,7 +93,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    warn_if_slow_preprocessing,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -115,6 +118,7 @@ from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.utils import (
+    check_tool_parameters_schema,
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
@@ -122,6 +126,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -162,6 +167,40 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+_KIMI_K3_MAX_VIDEO_INPUTS = 2
+
+
+def _truncate_kimi_k3_videos(messages: List[Dict[str, Any]]) -> None:
+    """Keep only the latest two K3 video parts across the whole request.
+
+    K3 receives the complete conversation on every chat request, so the
+    ordering here naturally covers both same-turn and multi-turn inputs.
+    Removing old parts before encoding keeps the rendered placeholders and
+    the extracted ``video_data`` list aligned.
+    """
+    video_count = sum(
+        1
+        for message in messages
+        for part in (message.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "video_url"
+    )
+    to_drop = max(0, video_count - _KIMI_K3_MAX_VIDEO_INPUTS)
+    if not to_drop:
+        return
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for part in content:
+            is_video = isinstance(part, dict) and part.get("type") == "video_url"
+            if is_video and to_drop:
+                to_drop -= 1
+                continue
+            kept.append(part)
+        message["content"] = kept
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -459,6 +498,7 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    supports_process_preprocessing = True
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
@@ -749,7 +789,8 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[list[dict[str, Any]], int, str | None]:
-        image_count = 0
+        _truncate_kimi_k3_videos(messages)
+        media_count = 0
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -772,7 +813,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        media_count += 1
+                    elif part_type == "video_url":
+                        video = part.get("video_url") or {}
+                        if isinstance(video, str):
+                            video = {"url": video}
+                        # K3's chat encoder only recognizes image parts. Emit one
+                        # structural media placeholder here; the multimodal
+                        # processor expands it into timestamped video chunks.
+                        parts.append({"type": "image_url", "image_url": video})
+                        media_count += 1
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -816,7 +866,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, media_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -840,7 +890,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
@@ -854,8 +904,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         f"chat_template_kwargs cannot set {key!r}; "
                         "use the request fields instead."
                     )
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            if media_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * media_count
 
             tiers = self._kimi_k3_effort_tiers()
             effort = template_kwargs.get("thinking_effort")
@@ -885,6 +935,17 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if passes_tool_choice:
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -1387,7 +1448,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+        if isinstance(request.tool_choice, ToolChoice):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -1397,35 +1458,37 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            if self.tool_call_parser != "kimi_k3":
+                return "allowed_tools requires the Kimi K3 tool parser."
+            allowed_tools = request.tool_choice.allowed_tools
+            declared_names = {
+                tool.function.name
+                for tool in effective_tools
+                if tool.type == "function"
+            }
+            for tool in allowed_tools.tools:
+                if tool.function.name not in declared_names:
+                    return f"allowed_tools references undeclared function {tool.function.name!r}."
+
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
             if len(names) != len(set(names)):
                 return "Tool names must be unique across request and message tools."
 
-        # Validate tool definitions
-        for i, tool in enumerate(effective_tools):
-            if tool.function.parameters is None:
-                continue
-            try:
-                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
-                # to standard JSON Schema types before validation. RecursionError
-                # guards against hand-crafted cyclic schemas so the request gets
-                # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                # Identifier keywords are checked for URI form by the 2020-12
-                # metaschema but constrain no instance, so a draft-07-style
-                # `$id: "#name"` would 400 a schema this stack renders and
-                # constrains correctly. Validate without them.
-                Draft202012Validator.check_schema(
-                    without_schema_identifiers(tool.function.parameters)
-                )
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-            except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
-                )
+        # Validate tool definitions. This runs on the event loop of every entry
+        # point that validates chat requests (chat, Anthropic, tokenize).
+        started = monotonic_time()
+        error_msg, python_fallbacks = self._validate_tool_schemas(effective_tools)
+        warn_if_slow_preprocessing(
+            "tool schema validation on the event loop",
+            monotonic_time() - started,
+            request,
+            tools=len(effective_tools),
+            python_fallbacks=python_fallbacks,
+        )
+        if error_msg:
+            return error_msg
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1446,6 +1509,43 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    @staticmethod
+    def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
+        """The first parameters schema error, if any, and Python fallbacks."""
+        python_fallbacks = 0
+        for i, tool in enumerate(tools):
+            if tool.function.parameters is None:
+                continue
+            try:
+                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
+                # to standard JSON Schema types before validation. RecursionError
+                # guards against hand-crafted cyclic schemas so the request gets
+                # a 400 instead of crashing into a 500.
+                normalize_json_schema_types(tool.function.parameters)
+                # Identifier keywords are checked for URI form by the 2020-12
+                # metaschema but constrain no instance, so a draft-07-style
+                # `$id: "#name"` would 400 a schema this stack renders and
+                # constrains correctly. Validate without them.
+                # Count before checking so Python errors are included as well.
+                # A Rust success returns False and removes the provisional count.
+                python_fallbacks += 1
+                if not check_tool_parameters_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                ):
+                    python_fallbacks -= 1
+            except SchemaError as e:
+                return (
+                    f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
+                    python_fallbacks,
+                )
+            except RecursionError:
+                return (
+                    f"Tool {i} function 'parameters' schema is too deeply nested "
+                    "or contains a cycle.",
+                    python_fallbacks,
+                )
+        return None, python_fallbacks
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         if self.tokenizer_manager.model_config.is_multimodal:
@@ -2114,9 +2214,11 @@ class OpenAIServingChat(OpenAIServingBase):
         kimi_k3_tool_grammar = (
             self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
         )
-        if effective_tools and request.tool_choice != "none":
+        if (
+            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
+        ) and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
+            if isinstance(request.tool_choice, ToolChoice):
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
@@ -2314,6 +2416,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 normalize_assistant_tool_call_arguments(
                     message, strict=strict_tool_call_arguments
                 )
+        if self.chat_encoding_spec == "kimi_k3":
+            _truncate_kimi_k3_videos(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -2332,8 +2436,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else self.chat_encoding_spec == "kimi_k3"
             )
             if collects_openai_media:
-                for message in request.messages:
-                    msg_dict = message.model_dump()
+                for msg_dict in messages:
                     if msg_dict.get("content") is None:
                         msg_dict["content"] = ""
                     process_content_for_template_format(
@@ -3738,7 +3841,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: list[Any],
         finish_reason: dict[str, Any],
-        tool_choice: str | ToolChoice | None = None,
+        tool_choice: str | ToolChoice | AllowedToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,

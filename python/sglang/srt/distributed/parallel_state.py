@@ -2810,8 +2810,9 @@ def initialize_model_parallel(
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             # Attention TP can be a derived subgroup of the full TP group.
             # Inherit the global policy and let per-group capability detection
-            # select a custom communicator or fall back.
-            use_custom_allreduce=None,
+            # select a custom communicator or fall back. K3 SP collective needs
+            # the custom communicator on this group, so force it on there.
+            use_custom_allreduce=True if envs.SGLANG_K3_SP_COLLECTIVE.get() else None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
@@ -2841,6 +2842,7 @@ def initialize_model_parallel(
                 shared_group_ranks,
                 get_world_group().local_rank,
                 backend,
+                use_pynccl=True,
                 use_custom_allreduce=False,
                 use_torch_symm_mem_allreduce=False,
                 group_name="shared_experts_tp",

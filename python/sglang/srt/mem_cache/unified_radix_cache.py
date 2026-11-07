@@ -114,6 +114,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
+    hicache_diagnostic_metrics_enabled,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -204,6 +205,33 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+def _classify_hybrid_prefetch(operation, completed_tokens, expected_tokens, ok):
+    """Result kind of a hybrid prefetch: success, or why it was discarded."""
+    if ok:
+        return "success"
+    if getattr(operation, "skip_reason", None) == "terminated":
+        return "discard_terminated"
+    if completed_tokens != expected_tokens:
+        return "discard_kv_short"
+    return "discard_pool_short"
+
+
+def _prefetch_read_age(operation) -> Optional[float]:
+    """Seconds from the L3 existence query to the start of the last read
+    (non-KV pool if it ran, else the last KV batch); None if either is unknown."""
+    query_ts = getattr(operation, "query_done_ts", None)
+    last_ts = getattr(operation, "sidecar_ts", None)
+    if last_ts is None:
+        last_ts = getattr(operation, "kv_last_ts", None)
+    if query_ts is None or last_ts is None:
+        return None
+    return last_ts - query_ts
+
+
+def _format_age(age: Optional[float]) -> str:
+    return "n/a" if age is None else f"{age:.2f}"
+
+
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
@@ -225,6 +253,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -2422,6 +2451,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            start_page=spec.start_page,
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -2987,6 +3017,10 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer.keys is not None and count == len(transfer.keys)
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
+        if pool_transfers:
+            self._log_hybrid_prefetch_outcome(
+                operation, completed_tokens, expected_tokens, all_succeeded
+            )
         if pool_transfers and not all_succeeded:
             # Drop each pool's beliefs beyond what it served (KV and its
             # sidecars beyond the completed span); the next insert re-writes
@@ -3038,19 +3072,52 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             logger.warning(
                 "HiCache hybrid prefetch discarded req=%s reason=%s completed=%d "
-                "requested=%d kv_beliefs_kept_pages=%s aux_pool_hit_pages=%s",
+                "requested=%d kv_beliefs_kept_pages=%s kind=%s assume_stored=%d "
+                "aux_pool_hit_pages=%s pool_keys=%s read_age_s=%s sidecar_read=%d",
                 request.rid,
                 reason,
                 completed_tokens,
                 expected_tokens,
                 None if operation.deadline_expired else keep_pages,
+                _classify_hybrid_prefetch(
+                    operation, completed_tokens, expected_tokens, all_succeeded
+                ),
+                int(bool(getattr(operation, "assume_stored", False))),
                 {
                     getattr(transfer.name, "value", transfer.name): count
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
                 },
+                [len(t.keys) if t.keys is not None else None for t in pool_transfers],
+                _format_age(_prefetch_read_age(operation)),
+                int(getattr(operation, "sidecar_ts", None) is not None),
             )
             return False
         return True
+
+    def _log_hybrid_prefetch_outcome(
+        self,
+        operation: PrefetchOperation,
+        completed_tokens: int,
+        expected_tokens: int,
+        all_succeeded: bool,
+    ) -> None:
+        """Observability only: classify the all-or-nothing result and record how
+        old the L3 read lease was when the last read started."""
+        if (
+            not self.enable_storage_metrics
+            or not self.enable_diagnostic_metrics
+            or self.storage_metrics_collector is None
+        ):
+            return
+        collector = self.storage_metrics_collector
+        assume = "1" if getattr(operation, "assume_stored", False) else "0"
+        kind = _classify_hybrid_prefetch(
+            operation, completed_tokens, expected_tokens, all_succeeded
+        )
+        collector.log_hybrid_prefetch_result(kind, assume)
+        age = _prefetch_read_age(operation)
+        if age is not None:
+            collector.log_storage_read_age(kind, assume, age)
 
     def _record_storage_prefetch_hit(
         self, request: CacheRequestHandle, num_tokens: int
@@ -3579,6 +3646,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
+                query_spread = getattr(operation, "query_rank_spread", None)
+                # Drop non-signal samples: terminated ops (a rank that saw the
+                # terminate reported 0), skipped queries, and all-rank misses.
+                if (
+                    query_spread is not None
+                    and not operation.is_terminated()
+                    and not operation.assume_stored
+                    and hit_tokens + query_spread > 0
+                    and self.enable_storage_metrics
+                    and self.enable_diagnostic_metrics
+                    and self.storage_metrics_collector is not None
+                ):
+                    self.storage_metrics_collector.log_prefetch_query_rank_spread(
+                        query_spread
+                    )
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
                     if hit_tokens > 0:

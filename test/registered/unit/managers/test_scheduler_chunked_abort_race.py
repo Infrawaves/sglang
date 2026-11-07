@@ -15,6 +15,9 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
@@ -51,9 +54,16 @@ class _FakeReq:
         self.prefill_weight_versions = None
         self.time_stats = Mock()
         self.cache_request_handle = None
+        self.session = None
 
     def finished(self):
         return self._finished
+
+    def release_mm_inputs_on_abort(self):
+        pass
+
+    def get_mm_token_counts(self):
+        return None
 
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
@@ -61,6 +71,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     empty_request_lists(sched)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
+    sched.enable_chunked_prefill_round_robin = False
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.disaggregation_mode = None
@@ -140,6 +151,87 @@ class TestPendingChunkedAbortRace(CustomTestCase):
             sched.process_pending_chunked_abort()
 
         self.assertEqual(calls, [("hisparse", req), ("kv", req)])
+
+
+class TestPrefillAbortSourceOwnership(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+    def make_prefill_scheduler(self):
+        req = _FakeReq("prefill-source")
+        req.return_logprob = False
+        req.metadata_buffer_index = 7
+        req.pending_bootstrap = True
+        req.bootstrap_room = 123
+        req.finished_reason = None
+        req.time_stats = Mock()
+        req.disagg_kv_sender = Mock()
+        req.disagg_kv_sender.poll.return_value = KVPoll.Failed
+        req.disagg_kv_sender.is_source_release_safe.return_value = False
+
+        scheduler = _make_scheduler(None, chunked_req=None, running_reqs=[])
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_pending_chunk_rids = {req.rid}
+        scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+        scheduler.tree_cache = Mock()
+        scheduler.ipc_channels = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.enable_overlap = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+        scheduler.scheduler_stage_metrics = None
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.output_streamer = Mock()
+        scheduler.collect_inflight_reqs = Mock(return_value=[])
+        scheduler.request_retirer = release_only_retirer(
+            scheduler.tree_cache, beam_coordinator=scheduler.beam_coordinator
+        )
+        return scheduler, req
+
+    @patch.object(retirer_mod, "release_kv_cache")
+    def test_waiting_and_chunked_abort_keep_source_until_drained(
+        self, release_retirer
+    ):
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                scheduler, req = self.make_prefill_scheduler()
+                if queued:
+                    scheduler.waiting_queue.join([req])
+                    scheduler.abort_request(AbortReq(rid=req.rid))
+                else:
+                    scheduler.chunked_req = req
+                    scheduler._release_chunked_abort(req)
+                    self.assertNotIn(req, scheduler.chunked_reqs)
+
+                self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
+                self.assertNotIn(req, scheduler.waiting_queue)
+                self.assertEqual(req.metadata_buffer_index, 7)
+                self.assertTrue(req.kv.holds_kv)
+                self.assertFalse(req.pending_bootstrap)
+                release_retirer.assert_not_called()
+
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                        side_effect=lambda senders, *_: [s.poll() for s in senders],
+                    ),
+                    patch("sglang.srt.disaggregation.prefill.dist.all_reduce"),
+                ):
+                    self.assertEqual(
+                        scheduler.process_disagg_prefill_transfer_queue(), []
+                    )
+                    release_retirer.assert_not_called()
+                    req.disagg_kv_sender.is_source_release_safe.return_value = True
+                    self.assertEqual(
+                        scheduler.process_disagg_prefill_transfer_queue(), [req]
+                    )
+                self.assertEqual(req.metadata_buffer_index, -1)
+                self.assertEqual(len(scheduler.disagg_prefill_transfer_queue), 0)
+                release_retirer.assert_called_once_with(
+                    req, scheduler.tree_cache, checkpoint=False
+                )
+                release_retirer.reset_mock()
 
 
 if __name__ == "__main__":

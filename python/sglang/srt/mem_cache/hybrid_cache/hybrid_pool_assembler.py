@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
     MLABufferInfo,
+    MLASplitBuffers,
     PageRowBufferInfo,
+)
+from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DRAFT_NODE_MERGE_LAYOUTS,
+    DraftNodeShareAllocator,
+    log_draft_node_merge,
+    maybe_create_draft_node_merge,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -33,15 +43,19 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+from sglang.srt.mem_cache.mla_host_node_leader import (
+    maybe_create_node_leader_context,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -145,6 +159,10 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
+    capacity_multiplier: int = 1,
+    host_allocator: Optional[Any] = None,
+    host_buffer_read_only: bool = False,
 ):
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
@@ -176,6 +194,10 @@ def build_kv_host_pool(
         kwargs["page_unified_layout"] = geometry.page_unified_layout
         if not use_mla:
             kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
+    if host_allocator is not None:
+        kwargs["host_allocator"] = host_allocator
+    if host_buffer_read_only:
+        kwargs["host_buffer_read_only"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -193,6 +215,17 @@ def build_kv_host_pool(
         )
     else:
         kwargs.update(mha_kwargs)
+    if is_dummy:
+        # Broadcast follower: same token capacity, no retained host data mapping.
+        # MLATokenToKVPoolHost selects the allocator-only mode by its input type.
+        assert use_mla, "only the MLA host pool has an allocator-only mode"
+        host_input = _mla_host_allocation(
+            host_input,
+            kwargs.pop("draft_buffer_infos"),
+            kwargs["target_layer_num"],
+            override_kv_cache_dim,
+            get_memory().hicache_mem_layout,
+        )
     if parallel.dcp_enabled:
         assert use_mla, (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
@@ -200,10 +233,11 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    host_size = get_memory().hicache_size if host_size is None else host_size
     host_pool = kv_host_pool_cls(
         host_input,
-        get_memory().hicache_ratio,
-        get_memory().hicache_size if host_size is None else host_size,
+        get_memory().hicache_ratio * capacity_multiplier,
+        host_size * capacity_multiplier,
         page_size,
         get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
@@ -213,6 +247,38 @@ def build_kv_host_pool(
     if isinstance(kv_pool, PageInterleaveKVPoolMixin):
         return PageInterleaveHostPool(host_pool, kv_pool.placement)
     return host_pool
+
+
+def _mla_host_allocation(
+    buffer_info, draft_buffer_infos, target_layer_num, override_kv_cache_dim, layout
+) -> MLAHostAllocation:
+    """Allocator-only geometry sized like the real MLA host pool of this rank, so a
+    follower's share matches the leader's per-rank share."""
+    kv_cache_dim = override_kv_cache_dim or (
+        buffer_info.kv_lora_rank + buffer_info.qk_rope_head_dim
+    )
+    itemsize = buffer_info.dtype.itemsize
+    layer_num = target_layer_num + len(draft_buffer_infos)
+    size_per_token = kv_cache_dim * itemsize * layer_num
+    native = buffer_info.buffers
+    if (
+        isinstance(native, MLASplitBuffers)
+        and layout == "page_first_kv_split"
+        and native.index_k is not None
+    ):
+        index_layers = len(native.index_layer_indices)
+        size_per_token += native.index_width * itemsize * index_layers
+        if native.index_scales is not None:
+            size_per_token += 4 * index_layers
+    return MLAHostAllocation(
+        dtype=buffer_info.dtype,
+        kv_lora_rank=buffer_info.kv_lora_rank,
+        qk_rope_head_dim=buffer_info.qk_rope_head_dim,
+        kv_cache_dim=kv_cache_dim,
+        size_per_token=size_per_token,
+        draft_layer_num=len(draft_buffer_infos),
+        packed_fp8=buffer_info.packed_fp8,
+    )
 
 
 def _split_hicache_size(
@@ -274,6 +340,7 @@ def _build_cache_controller(
     model_name: Optional[str],
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
+    node_leader_broadcast: Optional[Any] = None,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -294,6 +361,7 @@ def _build_cache_controller(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
+        node_leader_broadcast=node_leader_broadcast,
     )
 
 
@@ -1136,12 +1204,37 @@ def build_hybrid_mamba_stack(
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
-    kv_host_pool = build_kv_host_pool(
+    # WORLD-collective on every rank, before host allocation: it decides whether
+    # this rank's MLA host pool is real, allocator-only or mapped from the leader.
+    node_leader = maybe_create_node_leader_context(
         kv_pool=kv_pool,
-        page_size=params.page_size,
-        host_size=kv_host_size,
-        mtp_draft_device_pools=config.packed_draft_device_pools,
+        full_layer_mapping=full_layer_mapping,
+        tp_cache_group=params.tp_cache_group,
+        draft_pools=config.packed_draft_device_pools,
     )
+    with (
+        node_leader.leader_budget_scope()
+        if node_leader is not None
+        else contextlib.nullcontext()
+    ):
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=params.page_size,
+            host_size=kv_host_size,
+            mtp_draft_device_pools=config.packed_draft_device_pools,
+            capacity_multiplier=(
+                1 if node_leader is None else node_leader.capacity_multiplier
+            ),
+            is_dummy=node_leader is not None and node_leader.is_follower,
+            host_allocator=None
+            if node_leader is None
+            else node_leader.shared_allocator,
+            host_buffer_read_only=node_leader is not None and node_leader.is_follower,
+        )
+    if node_leader is not None:
+        # Mamba's budget check must observe the leader's completed MLA pin.
+        # Use Gloo: pinning can outlast the NCCL watchdog.
+        dist.barrier(group=params.tp_cache_group)
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         _mamba_entry(
             params=params,
@@ -1165,6 +1258,7 @@ def build_hybrid_mamba_stack(
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
+        node_leader_broadcast=None if node_leader is None else node_leader.broadcast,
     )
     return host_pool_group, cache_controller, config
 
@@ -1611,6 +1705,7 @@ def _build_mha_mla_host_pool(
     host_token_capacity: int | None = None,
     dcp_size: int = 1,
     dcp_rank: int = 0,
+    host_allocator: Optional[Any] = None,
 ):
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
@@ -1630,7 +1725,25 @@ def _build_mha_mla_host_pool(
     )
     if is_mha:
         host_cls, host_kwargs = _mha_host_inputs(pool, buffer_info)
+        if host_allocator is not None:
+            if host_cls is not MHATokenToKVPoolHost:
+                raise NotImplementedError(
+                    "--hicache-draft-node-merge supports only the symmetric "
+                    "non-MXFP8 MHA draft host pool."
+                )
+            # Also checked at launch; kept for callers that bypass server args.
+            if layout not in DRAFT_NODE_MERGE_LAYOUTS:
+                raise ValueError(
+                    "--hicache-draft-node-merge requires --hicache-mem-layout in "
+                    f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
+                )
+            host_kwargs["host_allocator"] = host_allocator
         return host_cls(buffer_info, **host_kwargs, **kwargs)
+    if host_allocator is not None:
+        raise NotImplementedError(
+            "--hicache-draft-node-merge supports only the symmetric "
+            "non-MXFP8 MHA draft host pool."
+        )
     return MLATokenToKVPoolHost(
         buffer_info,
         device_capacity_tokens=_device_capacity_tokens(pool),
@@ -1680,35 +1793,59 @@ def build_full_draft_pools(
         )
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
+    # Every rank runs this in the same order; the node share allocates collectively.
+    # Read tp_group only when enabled: draft-builder callers without a node
+    # share (and their test controllers) need not carry one.
+    merge = (
+        maybe_create_draft_node_merge(enabled=True, tp_cache_group=controller.tp_group)
+        if get_memory().hicache_draft_node_merge
+        else None
+    )
+    host_allocator = (
+        None
+        if merge is None
+        else DraftNodeShareAllocator(merge=merge, tp_cache_group=controller.tp_group)
+    )
     parallel = get_parallel()
-    if not isinstance(pool, MHATokenToKVPool) and parallel.dcp_enabled:
-        # An MLA draft holds only its own rows, so its sidecar is physical too
-        # and translates with dcp_size like the target's. Built without it, the
-        # L2 transfer copied raw widened rows the draft never reads.
-        draft_host_pool = _build_mha_mla_host_pool(
-            pool=pool,
-            buffer_info=buffer_info,
-            host_to_device_ratio=host_pool_group.size / pool.size,
-            page_size=controller.page_size,
-            layout=get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
-            pool_label="draft",
-            dcp_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
-        )
-    else:
-        # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
-        # virtual loc space, so match the target host's logical_size.
-        draft_host_pool = _build_mha_mla_host_pool(
-            pool=pool,
-            buffer_info=buffer_info,
-            host_to_device_ratio=host_pool_group.logical_size / pool.size,
-            page_size=controller.page_size,
-            layout=get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
-            pool_label="draft",
-            host_token_capacity=host_pool_group.logical_size,
-        )
+    try:
+        if not isinstance(pool, MHATokenToKVPool) and parallel.dcp_enabled:
+            # An MLA draft holds only its own rows, so its sidecar is physical too
+            # and translates with dcp_size like the target's. Built without it, the
+            # L2 transfer copied raw widened rows the draft never reads.
+            draft_host_pool = _build_mha_mla_host_pool(
+                pool=pool,
+                buffer_info=buffer_info,
+                host_to_device_ratio=host_pool_group.size / pool.size,
+                page_size=controller.page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                pool_label="draft",
+                dcp_size=parallel.attn_dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+                host_allocator=host_allocator,
+            )
+        else:
+            # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
+            # virtual loc space, so match the target host's logical_size.
+            draft_host_pool = _build_mha_mla_host_pool(
+                pool=pool,
+                buffer_info=buffer_info,
+                host_to_device_ratio=host_pool_group.logical_size / pool.size,
+                page_size=controller.page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                pool_label="draft",
+                host_token_capacity=host_pool_group.logical_size,
+                host_allocator=host_allocator,
+            )
+    except Exception as exc:
+        # A per-rank failure before allocation (e.g. the host budget check)
+        # must still release peers blocked in the node-share collectives.
+        if host_allocator is not None:
+            host_allocator.abort(exc)
+        raise
+    if merge is not None:
+        log_draft_node_merge(draft_host_pool, merge)
 
     specs = [
         SidecarPoolSpec(
@@ -1750,6 +1887,10 @@ def build_swa_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
+    if get_memory().hicache_draft_node_merge:
+        raise NotImplementedError(
+            "--hicache-draft-node-merge does not support draft SWA pools."
+        )
     draft_swa_pool = draft_kv_pool.swa_kv_pool
     if draft_swa_pool is None:
         raise NotImplementedError(
@@ -2459,6 +2600,12 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         storage = params.token_to_kv_pool_allocator.storage
         if storage is not None:
+            # Rank-independent: every rank rejects before any stack collective.
+            if get_memory().enable_mla_hicache_per_node:
+                raise ValueError(
+                    "--enable-mla-hicache-per-node supports only hybrid MLA + "
+                    "Mamba/KDA HiCache stacks; got a unified storage host stack."
+                )
             # A unified pool: one host pool per sub-pool of its plan.
             result = build_unified_host_stack(
                 storage=storage,
@@ -2478,6 +2625,14 @@ def attach_hybrid_pool_to_unified_cache(
         else:
             components = set(cache.components.keys())
             strategy = _select_strategy(kvcache, components)
+            # Rank-independent: every rank rejects before any stack collective.
+            if get_memory().enable_mla_hicache_per_node and not isinstance(
+                strategy, _MambaStrategy
+            ):
+                raise ValueError(
+                    "--enable-mla-hicache-per-node supports only hybrid MLA + "
+                    f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
+                )
             result = strategy.build(
                 cache=cache,
                 kvcache=kvcache,

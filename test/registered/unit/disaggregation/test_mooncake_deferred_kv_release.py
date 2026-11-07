@@ -19,6 +19,7 @@ from test_deferred_decode_kv_release import (
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,6 +38,9 @@ def _manager(
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
     manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
+    manager._abort_drain_lock = threading.RLock()
+    # A prefill manager always has its lease tracker; no lease is held here.
+    manager._transfer_lifetime = TransferLifetimeTracker()
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()

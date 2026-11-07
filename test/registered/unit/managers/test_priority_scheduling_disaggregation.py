@@ -379,6 +379,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
         req.kv.retraction_backup = None
+        req.to_finish = None
+        req.finished = lambda: True
         cache.finish = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=cache,
@@ -389,9 +391,11 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             output_streamer=MagicMock(),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             enable_hicache_storage=False,
+            disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
         )
-        scheduler.release_prefill_sender = partial(
-            SchedulerDisaggregationPrefillMixin.release_prefill_sender, scheduler
+        scheduler.queue_aborted_prefill_transfer = partial(
+            SchedulerDisaggregationPrefillMixin.queue_aborted_prefill_transfer,
+            scheduler,
         )
 
         with (
@@ -412,6 +416,15 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         ):
             cache.advance_unpublished_req(req)
             SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
+            # Source buffers stay owned until the transfer queue agrees the
+            # sender drained; nothing is released at the failure itself.
+            self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
+            req.disagg_kv_sender.abort.assert_called_once()
+            release_kv_cache.assert_not_called()
+            # The drained request concludes as Failed and is released once.
+            SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure(
+                scheduler, req
+            )
 
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()

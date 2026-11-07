@@ -28,3 +28,5 @@ class ShapeKey:
     attention_variant: Optional[str] = None
     # Target-verify logits format (vocab shards or full logits); None is the only one.
     logits_variant: Optional[str] = None
+    # Request slots for a compact verify graph with `size` packed tokens.
+    ragged_bs: Optional[int] = None

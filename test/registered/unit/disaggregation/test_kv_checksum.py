@@ -282,7 +282,9 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
 class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self, computer=None):
         self.kv_checksum_computer = computer or object()
-        self.disagg_metadata_buffers = SimpleNamespace(set_kv_checksum=Mock())
+        self.disagg_metadata_buffers = SimpleNamespace(
+            set_kv_checksum=Mock(), _validate_request_metadata=Mock()
+        )
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             kv_checksum_signature=0x1234
         )

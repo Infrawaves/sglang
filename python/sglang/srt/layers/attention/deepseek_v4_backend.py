@@ -1562,7 +1562,7 @@ class DeepseekV4AttnBackend(
         self,
         bs: int,
         ragged_layout: Optional[RaggedVerifyLayout],
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int | tuple[int, int], int]:
         return compute_target_verify_graph_key(
             bs=bs,
             num_draft_tokens=self.speculative_num_draft_tokens,
@@ -3452,7 +3452,7 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                int | tuple[int, int],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -3486,7 +3486,7 @@ class DeepseekV4AttnBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs: int | tuple[int, int],
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,

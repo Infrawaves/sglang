@@ -46,6 +46,7 @@ class _RealVerifyPath(Exception):
 
 def _make_backend(backend_cls, bs: int, forward_mode: ForwardMode):
     backend = object.__new__(backend_cls)
+    backend.dcp_kv_layout = "token"
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.full((bs, 4), -1, dtype=torch.int32, device="cuda"),
@@ -324,6 +325,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                 )
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = self.PAGE_SIZE
+        backend.dcp_kv_layout = "token"
         backend.req_to_token = req_to_token
         backend.runner_ids = runner_ids
         return backend, req_to_token
@@ -465,6 +467,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         rather than silently storing into the sink."""
         backend = object.__new__(TRTLLMMLABackend)
         backend.runner_ids = SimpleNamespace(is_translating=True)
+        backend.dcp_kv_layout = "token"
         parallel = SimpleNamespace(
             dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
         )

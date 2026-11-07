@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "match": {
+    "device_name": "NVIDIA_GB300",
+    "world_size": 8,
+    "n": 7168,
+    "k": 1536,
+    "dtype": "bfloat16"
+  },
+  "selection": {
+    "rule": "floor_m",
+    "fallback": "baseline"
+  },
+  "source": {
+    "device": "NVIDIA GB300",
+    "gpus_per_node": 4,
+    "note": "Not measured on GB300; dispatch mirrors the B300 TP8 table (world=8,H=7168,device_name=NVIDIA_B300_SXM6_AC.json). B300 note: B300 TP8, K=1536, GEMM + RS + prefix, us (nccl / native baseline / fused pull): 2048 111.1/79.8/110.1; 4096 190.3/146.4/163.2; 8192 303.4/281.3/258.0; 12288 429.4/400.0/351.8; 16384 562.4/527.6/442.4. Native baseline below 8K, fused pull from 8K.",
+    "nodes": 2
+  },
+  "validation": {
+    "shared_workspace_gpu_validated": false,
+    "note": "Pull entries reuse the GB300 kernel configuration. Push was not measured on B300.",
+    "gb300_measured": false
+  },
+  "configs": {
+    "512": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "1024": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "2048": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "4096": {
+      "mode": "baseline",
+      "enabled": true,
+      "status": "native_baseline"
+    },
+    "8192": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    },
+    "12288": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    },
+    "16384": {
+      "mode": "pull",
+      "enabled": true,
+      "status": "measured",
+      "tile_shape": [
+        256,
+        128
+      ],
+      "cluster_hidden": 2,
+      "tile_order": "common"
+    }
+  }
+}

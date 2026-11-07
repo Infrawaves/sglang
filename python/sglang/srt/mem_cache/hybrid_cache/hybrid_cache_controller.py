@@ -31,6 +31,10 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DraftNodeMerge,
+    DraftNodeShareAllocator,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
@@ -46,6 +50,7 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.observability.trace import (
@@ -58,6 +63,7 @@ from sglang.srt.observability.trace import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -156,12 +162,23 @@ def _trailing_chain_groups(
     span_hashes: List[str],
     transfers: list[PoolTransfer],
     extra_info: Optional[dict] = None,
+    *,
+    start_page: int = 0,
+    storage_plans: Optional[dict] = None,
+    grouped: bool = False,
 ) -> list[tuple[HiCacheStorageExtraInfo, list[PoolTransfer]]]:
-    """One extra_info per tail length so prefix_keys + keys stays contiguous."""
-    if prefix_keys is None:
+    """One extra_info per tail length so prefix_keys + keys stays contiguous
+    and start_page names each transfer's first key."""
+    if prefix_keys is None and not grouped:
+        # start_page only addresses grouped objects; keep one call per span.
         return [
             (
-                HiCacheStorageExtraInfo(prefix_keys=None, extra_info=extra_info),
+                HiCacheStorageExtraInfo(
+                    prefix_keys=None,
+                    extra_info=extra_info,
+                    start_page=start_page,
+                    storage_plans=storage_plans,
+                ),
                 transfers,
             )
         ]
@@ -172,8 +189,14 @@ def _trailing_chain_groups(
     return [
         (
             HiCacheStorageExtraInfo(
-                prefix_keys=prefix_keys + span_hashes[:covered],
+                prefix_keys=(
+                    None
+                    if prefix_keys is None
+                    else prefix_keys + span_hashes[:covered]
+                ),
                 extra_info=extra_info,
+                start_page=start_page + covered,
+                storage_plans=storage_plans,
             ),
             group,
         )
@@ -190,8 +213,16 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        start_page: int = 0,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            start_page=start_page,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -205,6 +236,7 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        start_page: int = 0,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -225,6 +257,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            start_page=start_page,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
@@ -241,6 +274,14 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
+        # Observability only, all on the IO / prefetch threads' monotonic clock:
+        # when the existence query finished, when the last KV batch and the
+        # non-KV pool read started, and why the non-KV read was skipped
+        # ("terminated" or "kv_short"; None if it ran).
+        self.query_done_ts: Optional[float] = None
+        self.kv_last_ts: Optional[float] = None
+        self.sidecar_ts: Optional[float] = None
+        self.skip_reason: Optional[str] = None
 
     def mark_terminate(self):
         with self._lock:
@@ -352,12 +393,22 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
             mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPool
         )
+        # The MLA anchor host buffer is another rank's copy (shared or none):
+        # this rank never writes it (D2H backup, L3 prefetch).
+        anchor_host_pool = mem_pool_host.anchor_entry.host_pool
+        self.mla_host_read_only = (
+            isinstance(anchor_host_pool, MLATokenToKVPoolHost)
+            and anchor_host_pool.host_buffer_read_only
+        )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        # Set when the DRAFT sidecar registers a node-shared host pool.
+        self.draft_node_merge: Optional[DraftNodeMerge] = None
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
@@ -381,6 +432,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            node_leader_broadcast=node_leader_broadcast,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -389,7 +441,10 @@ class HybridCacheController(BaseHiCacheController):
             and transfer_layer_id_max != self.transfer_layer_id_max
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+            self.layer_done_counter = LayerDoneCounter(
+                self.transfer_layer_id_max,
+                on_layer_ready=self.layer_done_counter.on_layer_ready,
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -484,6 +539,8 @@ class HybridCacheController(BaseHiCacheController):
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
             )
+            if self.mla_host_read_only:
+                self.page_get_func = self._page_get_shared_by_leader
         except Exception:
             if self.pp_prefetch_command_group is not None:
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
@@ -512,6 +569,10 @@ class HybridCacheController(BaseHiCacheController):
             # attach-time DCP check.
             check_dcp_l3_extra_pool(entry, self.storage_host_pool)
         self.mem_pool_host.add_entry(entry)
+        if entry.name == PoolName.DRAFT and isinstance(
+            entry.host_pool.allocator, DraftNodeShareAllocator
+        ):
+            self.draft_node_merge = entry.host_pool.allocator.merge
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if storage_attached:
@@ -1017,15 +1078,28 @@ class HybridCacheController(BaseHiCacheController):
 
         return self.move_hybrid_indices(op, write_back_jit=True)
 
+    def _page_get_shared_by_leader(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
+        # The node leader reads these pages into the shared host buffer; the
+        # completed-token all_reduce(MIN) takes its count.
+        return len(hash_values)
+
     def _l2_transfers(
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        *,
+        include_anchor: Optional[bool] = None,
     ) -> list[L2Transfer]:
+        if include_anchor is None:
+            include_anchor = not self.mla_host_read_only
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
-        if host_indices.numel() > 0:
+        # Node-leader MLA followers skip the anchor on D2H (read-only host copy)
+        # and on H2D (KV comes from the leader's broadcast).
+        if host_indices.numel() > 0 and include_anchor:
             transfers.append(
                 L2Transfer(
                     host_pool=anchor.host_pool,
@@ -1066,7 +1140,15 @@ class HybridCacheController(BaseHiCacheController):
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(
+            host_indices,
+            device_indices,
+            pool_transfers,
+            include_anchor=(
+                self.node_leader_broadcast is None
+                or not self.node_leader_broadcast.is_follower
+            ),
+        )
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }
@@ -1234,6 +1316,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        start_page: int = 0,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1242,6 +1325,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            start_page=start_page,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1278,7 +1362,9 @@ class HybridCacheController(BaseHiCacheController):
                     last_hash,
                     prefix_keys,
                     extra_pools=pool_transfers,
-                    assume_stored=assume_stored,
+                    # A grouped read follows the chain only a query can find.
+                    assume_stored=assume_stored and self.storage_page_group == 1,
+                    start_page=len(matched_prefix_tokens or []) // self.page_size,
                 )
             )
 
@@ -1564,6 +1650,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        start_page: int = 0,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1571,6 +1658,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            start_page=start_page,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1588,6 +1676,7 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             operation.query_pool_hit_pages = {}
+            operation.query_done_ts = time.monotonic()
             return hash_value, kv_hit_pages * self.page_size
 
         # Carry caller_id/caller_role + the exported span ids (when present)
@@ -1595,11 +1684,14 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info=_storage_trace_extra(operation, include_request_id=True) or None,
+            start_page=operation.start_page,
         )
-        if operation.pool_transfers:
+        # Grouped L3 objects need the v2 query, which returns the segment chain.
+        if operation.pool_transfers or self.storage_page_group > 1:
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
+            operation.storage_plans = hit_result.storage_plans
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
@@ -1621,6 +1713,7 @@ class HybridCacheController(BaseHiCacheController):
         for transfer in operation.pool_transfers or ():
             if transfer.name in pool_hits:
                 operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+        operation.query_done_ts = time.monotonic()
 
         return (
             hash_value[:kv_hit_pages],
@@ -1657,8 +1750,13 @@ class HybridCacheController(BaseHiCacheController):
             hits = [storage_hit_count]
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
+        # The flag is read once at init, so every rank packs the same shape.
+        spread = [-storage_hit_count] if self.enable_diagnostic_metrics else []
         packed = torch.tensor(
-            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            hits
+            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+            + spread,
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1673,9 +1771,14 @@ class HybridCacheController(BaseHiCacheController):
             _finish_op_trace(operation)
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
+            for pool, pages in zip(
+                pools, reduced[len(hits) : len(hits) + len(pools)], strict=True
+            )
             if pages != _NO_POOL_VERDICT
         }
+        if spread:
+            # Cross-rank spread of the raw storage hit (observability only).
+            operation.query_rank_spread = -reduced[-1] - storage_hit_count
         if len(hits) == 1:
             return storage_hit_count
         restorable = reduced[: len(hits)]
@@ -1804,21 +1907,34 @@ class HybridCacheController(BaseHiCacheController):
         kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
-        self._page_transfer_sidecar(operation, kv_completed_pages)
+        if operation.pool_transfers is None:
+            return
+        try:
+            pool_hits = self._page_transfer_sidecar(operation, kv_completed_pages)
+        except Exception:
+            logger.exception(
+                "Prefetch sidecar read failed for request %s", operation.request_id
+            )
+            pool_hits = {}
+        # Every rank reduces the sidecar ACK, even if it read no usable pools.
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id, operation=operation, pool_hits=pool_hits
+            )
+        )
 
     def _page_transfer_sidecar(
         self, operation: PrefetchOperation, kv_completed_pages: int
-    ) -> None:
-        if operation.pool_transfers is None:
-            return
-
+    ) -> dict[str, int]:
         # Extra pools only after KV fully completes. If KV terminated early
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
-        ):
+        if operation.is_terminated():
+            operation.skip_reason = "terminated"
+        elif kv_completed_pages != len(operation.hash_value):
+            operation.skip_reason = "kv_short"
+        if operation.skip_reason is None:
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
             transfers_nonkv = [
@@ -1834,6 +1950,7 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            operation.sidecar_ts = time.monotonic()
             try:
                 results = {}
                 for extra_info, transfers in _trailing_chain_groups(
@@ -1842,6 +1959,12 @@ class HybridCacheController(BaseHiCacheController):
                     transfers_nonkv,
                     extra_info=_storage_trace_extra(operation, include_request_id=True)
                     or None,
+                    start_page=(
+                        operation.start_page
+                        - (len(sidecar_hashes) - len(operation.hash_value))
+                    ),
+                    storage_plans=operation.storage_plans,
+                    grouped=self.storage_page_group > 1,
                 ):
                     results.update(
                         self.storage_backend.batch_get_v2(
@@ -1854,17 +1977,7 @@ class HybridCacheController(BaseHiCacheController):
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
                 )
-        # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
-        # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
-        # to perform all_reduce.
-        self.prefetch_sync_queue.put(
-            PrefetchAck(
-                rid=operation.request_id,
-                operation=operation,
-                pool_hits=pool_hits,
-            )
-        )
-        return
+        return pool_hits
 
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;
@@ -1882,6 +1995,7 @@ class HybridCacheController(BaseHiCacheController):
         operation.prefetch_kv_page_offset += trim_pages
         operation.storage_hit_count -= trim_tokens
         operation.storage_start += trim_tokens
+        operation.start_page += trim_pages
 
     def _page_backup(self, operation):
         with self.mem_pool_host.layout_lease():
@@ -1941,6 +2055,8 @@ class HybridCacheController(BaseHiCacheController):
                 backup_transfers,
                 extra_info=_storage_trace_extra(operation, include_request_id=False)
                 or None,
+                start_page=operation.start_page,
+                grouped=self.storage_page_group > 1,
             ):
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
@@ -1975,6 +2091,14 @@ class HybridCacheController(BaseHiCacheController):
             _finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
+        # Checked before backup_skip: TP0 writes MLA but not a merged draft.
+        # Only Mooncake knows the node-object keys; other backends keep per-rank.
+        if (
+            transfer.name == PoolName.DRAFT
+            and self.draft_node_merge is not None
+            and self.storage_backend_type == "mooncake"
+        ):
+            return self.draft_node_merge.is_leader
         if not self.backup_skip:
             return True
 

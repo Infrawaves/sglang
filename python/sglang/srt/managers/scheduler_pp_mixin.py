@@ -645,12 +645,19 @@ class SchedulerPPMixin:
         releases the request through the same path and keeps its prefix cache in
         step with the others.
         """
-        succeeded, failed = self.get_rids(
-            self.disagg_prefill_transfer_queue,
-            True,
-            [KVPoll.Success],
-            [KVPoll.Failed],
-        )
+        # A peer's Failed poll does not prove this stage stopped reading source
+        # buffers. Publish a rid only once this stage's source/GPU drain is
+        # agreed across TP/CP (the same gate process_disagg_prefill_transfer_queue
+        # uses); otherwise one stage could retire it while another must retain
+        # it, and the PP intersection would never contain it again.
+        transfer_queue = list(self.disagg_prefill_transfer_queue)
+        polls = self.poll_prefill_transfer_releasable(transfer_queue)
+        succeeded = [
+            req.rid for req, poll in zip(transfer_queue, polls) if poll == KVPoll.Success
+        ]
+        failed = [
+            req.rid for req, poll in zip(transfer_queue, polls) if poll == KVPoll.Failed
+        ]
         curr_transferred = dict.fromkeys(succeeded, False)
         curr_transferred.update(dict.fromkeys(failed, True))
         if self.pp_group.is_first_rank:

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -18,6 +19,46 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
+    """Validate the resolved page DCP layout configuration."""
+
+    cfg = resolved_view(server_args)
+    if cfg.dcp_kv_layout != "page":
+        return
+
+    if cfg.dcp_size <= 1:
+        raise ValueError("--dcp-kv-layout page requires --dcp-size > 1.")
+
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError(
+            "--dcp-kv-layout page requires a PD decode server. "
+            "Prefill servers do not need this option; they send KV "
+            "according to the decode layout."
+        )
+    # Fake moves no KV, so page layout only affects the decode-side pool and
+    # attention kernels; Mooncake is the only real backend with page relayout.
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "fake"):
+        raise ValueError(
+            "--dcp-kv-layout page requires --disaggregation-transfer-backend "
+            "mooncake, or fake for synthetic benchmarking."
+        )
+    # DSPARK verifies on the target's decode kernel and transfers its
+    # replicated draft KV alongside the target pages.
+    if cfg.speculative_algorithm not in (None, "DSPARK"):
+        raise ValueError(
+            "--dcp-kv-layout page supports speculative decoding with DSPARK only "
+            f"(got --speculative-algorithm {cfg.speculative_algorithm!r})."
+        )
+
+    _, decode_backend = attention_backends_of(cfg)
+    if decode_backend != "cutedsl_mla":
+        raise ValueError(
+            "--dcp-kv-layout page requires the resolved decode attention "
+            "backend to be 'cutedsl_mla', got "
+            f"{decode_backend!r}."
+        )
 
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:

@@ -47,6 +47,7 @@ from sglang.srt.kernel_plugins.amd.binding import (
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    deregister_memory_region,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
@@ -329,6 +330,16 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _process_weights_after_loading(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -3140,6 +3151,49 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+def _should_release_reader_registration(protocol: Optional[str]) -> bool:
+    from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+        NVLINK_PROTOCOLS,
+    )
+
+    if envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.is_set():
+        return envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get()
+    return protocol not in NVLINK_PROTOCOLS
+
+
+def _seed_endpoint_for_local_engine(seed_info, protocol: Optional[str]):
+    # ``protocol`` is what the engine was actually initialized with, carried from
+    # the transporter that resolved it against the seed's offer.
+    from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+        NVLINK_PROTOCOLS,
+    )
+    from sglang.srt.utils.network import get_local_ip_auto
+    from sglang.srt.utils.nvlink_fabric_utils import get_nvlink_fabric_identity
+
+    if protocol is None:
+        protocol = (
+            envs.SGLANG_REMOTE_INSTANCE_PROTOCOL.get() or envs.MOONCAKE_PROTOCOL.get()
+        )
+    on_nvlink = protocol in NVLINK_PROTOCOLS
+    endpoint = seed_info.endpoint_for(
+        protocol=protocol,
+        fabric=(
+            get_nvlink_fabric_identity(torch.cuda.current_device())
+            if on_nvlink
+            else None
+        ),
+        local_host=get_local_ip_auto() if on_nvlink else None,
+    )
+    if endpoint is None:
+        logger.error(
+            "The seed serves weights over %s, none of which this rank can reach "
+            "over protocol=%s.",
+            seed_info.offered_protocols(),
+            protocol,
+        )
+    return endpoint
+
+
 class RemoteInstanceModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote sglang instance."""
 
@@ -3191,22 +3245,56 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
+        # The seed's bytes land straight in these parameters, so the layout has
+        # to match its post-load one: mxfp4 rewrites bias bf16 -> fp32, scales
+        # uint8 -> float8_e4m3fn, and shuffles experts. The transforms are
+        # structural, so zeroed weights still yield the right layout.
+        if (
+            load_config.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+        ):
+            post_tic = time.time()
+            _process_weights_after_loading(model, torch.device(device_config.device))
+            logger.info(
+                "Matched the seed's post-load weight layout in %.2fs.",
+                time.time() - post_tic,
+            )
+
         if (
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-            with create_remote_connector(model_weights, device_config.device) as client:
-                connector_type = get_connector_type(client)
-                if connector_type == ConnectorType.INSTANCE:
+            success = False
+            try:
+                with create_remote_connector(
+                    model_weights, device_config.device
+                ) as client:
+                    connector_type = get_connector_type(client)
+                    if connector_type != ConnectorType.INSTANCE:
+                        raise ValueError(
+                            f"Unsupported connector type {connector_type} for "
+                            f"remote tensor model loading."
+                        )
                     self.load_model_from_remote_instance_by_nccl(
                         model, client, model_config, device_config
                     )
-                else:
-                    raise ValueError(
-                        f"Unsupported connector type {connector_type} for "
-                        f"remote tensor model loading."
-                    )
+                success = True
+            except ValueError:
+                # A misconfigured connector is not a transient seed failure;
+                # disk would silently paper over the wrong URL. Safe to raise
+                # past the consensus below: the URL is the same on every rank.
+                raise
+            except Exception:
+                logger.exception("Broadcast from the seed instance raised.")
+            if not self._all_ranks_succeeded(success):
+                # The skeleton holds a full copy of the weights, which will
+                # not fit alongside the one the fallback builds.
+                del model
+                return self._fallback_to_disk(
+                    model_config=model_config,
+                    device_config=device_config,
+                )
         elif (
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
@@ -3220,23 +3308,66 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "TransferEngine registering memory regions (this may take a few seconds)..."
             )
             # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
+            register_tic = time.time()
+            (
+                self.remote_instance_transfer_engine_weight_info,
+                registered_blocks,
+            ) = register_memory_region(
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                protocol=load_config.remote_instance_weight_loader_transfer_engine_protocol,
             )
             logger.info(
-                "TransferEngine memory regions have been successfully registered."
+                "TransferEngine memory regions have been successfully registered "
+                "in %.2fs.",
+                time.time() - register_tic,
             )
 
             # transfer weights
-            success = self.load_model_from_remote_instance_by_transfer_engine(
-                model,
-                load_config.remote_instance_weight_loader_transfer_engine,
-                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
-                load_config.tp_rank,
+            success = False
+            try:
+                success = self.load_model_from_remote_instance_by_transfer_engine(
+                    model,
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                    load_config.tp_rank,
+                )
+            except Exception:
+                logger.exception("Transfer from the seed instance raised.")
+                success = False
+            # Runs before the release below: a rank that succeeded alone still
+            # needs its registration freed to have room for the checkpoint.
+            success = self._all_ranks_succeeded(success is True)
+            # Unconditional on failure, so the disk fallback has room to load
+            # into; otherwise it depends on what the registration cost.
+            engine_protocol = (
+                load_config.remote_instance_weight_loader_transfer_engine_protocol
             )
+            released = True
+            if not success or _should_release_reader_registration(engine_protocol):
+                deregister_tic = time.time()
+                released = deregister_memory_region(
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    registered_blocks,
+                    protocol=engine_protocol,
+                )
+                logger.info(
+                    "TransferEngine memory regions have been deregistered in %.2fs.",
+                    time.time() - deregister_tic,
+                )
             if not success:
-                raise RuntimeError(
-                    "Failed to load weights from remote instance via transfer engine."
+                if not released:
+                    raise RuntimeError(
+                        "Failed to load weights from the seed instance, and its "
+                        "RDMA registration could not be released. Disk loading "
+                        "would OOM against the pinned memory."
+                    )
+                # The skeleton holds a full copy of the weights, which will
+                # not fit alongside the one the fallback builds.
+                del model
+                return self._fallback_to_disk(
+                    model_config=model_config,
+                    device_config=device_config,
                 )
         elif (
             load_config.remote_instance_weight_loader_backend
@@ -3259,6 +3390,67 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             raise ValueError("Invalid remote instance weight loader backend.")
 
         return model.eval()
+
+    @staticmethod
+    def _all_ranks_succeeded(local_success: bool) -> bool:
+        """True only if every rank loaded from the seed.
+
+        SGLang is SPMD, so a rank falling back alone leaves the group serving a
+        mix of seed and checkpoint weights, which the barrier after loading does
+        not catch.
+        """
+        try:
+            group = get_parallel().world_group
+            if group.world_size <= 1:
+                return local_success
+            all_success = group.all_gather_object(local_success)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local_success
+
+        if not all(all_success):
+            failed = [rank for rank, ok in enumerate(all_success) if not ok]
+            logger.warning(
+                "Falling back to disk on every rank: %d of %d failed to load "
+                "from the seed (ranks %s).",
+                len(failed),
+                len(all_success),
+                failed[:8],
+            )
+            return False
+        return True
+
+    def _fallback_to_disk(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        configured = envs.SGLANG_REMOTE_INSTANCE_FALLBACK_LOAD_FORMAT.get()
+        try:
+            fallback_format = LoadFormat(configured) if configured else LoadFormat.AUTO
+        except ValueError:
+            logger.warning(
+                "Ignoring SGLANG_REMOTE_INSTANCE_FALLBACK_LOAD_FORMAT=%r: not a "
+                "known load format.",
+                configured,
+            )
+            fallback_format = LoadFormat.AUTO
+        logger.warning(
+            "Falling back to loading weights from disk with load_format=%s. This "
+            "costs the startup time the remote-instance path exists to save.",
+            fallback_format.value,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        fallback_config = LoadConfig(
+            load_format=fallback_format,
+            download_dir=self.load_config.download_dir,
+            tp_rank=self.load_config.tp_rank,
+        )
+        return get_model_loader(fallback_config, model_config).load_model(
+            model_config=model_config, device_config=device_config
+        )
 
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -3314,17 +3506,22 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, transfer_engine, seed_url, tp_rank
     ) -> bool:
         # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
-        )
-        if (
-            seed_transfer_engine_session_id is None
-            or seed_transfer_engine_weight_info is None
-        ):
+        seed_info = get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        if seed_info is None:
             logger.error("Cannot get transfer engine session or weight info.")
             return False
+        # Pointers and session id are per-endpoint, so read the one matching
+        # the engine this rank built.
+        endpoint = _seed_endpoint_for_local_engine(
+            seed_info,
+            self.load_config.remote_instance_weight_loader_transfer_engine_protocol,
+        )
+        if endpoint is None:
+            return False
+        seed_transfer_engine_session_id = endpoint.session_id
+        seed_transfer_engine_weight_info = endpoint.weights_info_dict
 
-        # prepare local/remote RDMA keys
+        # prepare the local/remote pointer pairs to read
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -3352,6 +3549,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client_len_list.append(client_len)
 
         # load weights from source instance through TransferEngine
+        total_bytes = sum(client_len_list)
+        transfer_tic = time.time()
         ret = transfer_engine.batch_transfer_sync_read(
             seed_transfer_engine_session_id,
             client_ptr_list,
@@ -3361,6 +3560,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if ret < 0:
             logger.error(f"batch transfer failed, error: {ret}")
             return False
+
+        transfer_elapsed = time.time() - transfer_tic
+        logger.info(
+            "Weight transfer over %s done: %.2f GiB in %.2fs (%.2f GiB/s) over "
+            "%d tensors.",
+            endpoint.protocol or "an unreported transport",
+            total_bytes / (1 << 30),
+            transfer_elapsed,
+            total_bytes / (1 << 30) / max(transfer_elapsed, 1e-9),
+            len(client_len_list),
+        )
 
         post_load_weights(model)
 

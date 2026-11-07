@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
@@ -160,6 +161,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         head_group_num: int = 1,
         page_unified_layout: PageUnifiedLayout | None = None,
         host_token_capacity: int | None = None,
+        host_allocator: Optional[HostTensorAllocator] = None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -231,6 +233,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type=allocator_type,
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
+            host_allocator=host_allocator,
         )
         self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
         self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)

@@ -523,6 +523,7 @@ class Req(ReqDllmMixin):
         self.decision_layout = decision_layout
 
         # For req-level memory management
+        self.prefill_ready_seq: Optional[int] = None
         self.kv = ReqKvInfo()
 
         # Full-KV-derived boundary whose SWA window should be inserted after
@@ -1246,15 +1247,19 @@ class Req(ReqDllmMixin):
         return due
 
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+        # Reasoning-aware user stops currently target non-speculative decoding only.
+        content_len = len(self.output_ids)
+        if self.require_reasoning:
+            if not self._is_reasoning_over:
+                return 0
+            content_len -= self.reasoning_tokens
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,
             self.sampling_params.stop_regex_max_len + 1,
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
-            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
-        )
+        return min(max_len_tail_str + max(new_accepted_len - 1, 0), content_len)
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
@@ -1265,7 +1270,7 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        return self.tokenizer.decode(self.output_ids[-tail_len:]) if tail_len else ""
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
@@ -1301,7 +1306,13 @@ class Req(ReqDllmMixin):
         matched_eos = False
 
         for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
+            if self.sampling_params.stop_token_ids and (
+                not self.require_reasoning
+                or (
+                    self._is_reasoning_over
+                    and len(self.output_ids) > self.reasoning_tokens
+                )
+            ):
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
@@ -1349,6 +1360,8 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
+        if self.require_reasoning and not self._is_reasoning_over:
+            return False
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
@@ -2053,6 +2066,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None
     spec_verify_tier_num_tokens: int = -1
+    # DSpark compact verify: the budget computed before the MLP sync (so the sync
+    # can carry it), and whether that happened for the batch about to run.
+    spec_verify_token_budget_presync: Optional[int] = None
+    spec_verify_budget_presync: bool = False
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2105,6 +2122,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Per DP rank: its attention-TP rank 0's verify budget + 1 (0 = no budget).
+    global_spec_verify_token_budget_enc: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
@@ -3203,8 +3222,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
-        # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensors so they don't leak into ForwardBatch.
+        # Decode embeds the last output token. Prompt embeddings and positional
+        # replacements refer to the previous prefill input.
         self.input_embeds = None
         self.replace_embeds = None
         self.replace_positions = None

@@ -29,9 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -74,7 +77,10 @@ from sglang.srt.cache_accounting.multimodal import prepare_media_digests
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    MAX_DISAGGREGATION_TOP_LOGPROBS,
+    DisaggregationMode,
+)
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -133,9 +139,16 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    drop_mm_features_for_decode,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
+from sglang.srt.managers.request_validation import (
+    validate_generation_request,
+    validate_input_ids,
+)
 from sglang.srt.managers.req_types import (
     get_request_return_hidden_states_mode,
 )
@@ -219,6 +232,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.event_loop_lag import EventLoopLagMonitor
 from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
@@ -610,6 +624,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Initialize blocking request preprocessor
+        self.init_request_preprocessor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -701,13 +718,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
+                self.tokenizer = _load_text_tokenizer()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -722,6 +733,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.async_dynamic_batch_tokenizer = None
 
+    @classmethod
+    def create_for_request_preprocessing(cls, server_args: ServerArgs):
+        """A tokenizer-only manager for a process-mode request preprocessor child.
+
+        Runs the same model-config and tokenizer setup as ``__init__`` but none
+        of the IPC, multimodal processor executors, metrics or request state;
+        the serving handlers built on it in the child only read ``server_args``,
+        ``model_config``, ``model_path``, ``served_model_name``, ``tokenizer``
+        and ``config_value``.
+        """
+        manager = cls.__new__(cls)
+        manager.server_args = server_args
+        manager.init_model_config()
+        manager.init_tokenizer_for_request_preprocessing()
+        return manager
+
+    def init_tokenizer_for_request_preprocessing(self):
+        """The tokenizer part of ``init_tokenizer_and_processor``, without the
+        multimodal processor and the dynamic batch tokenizer."""
+        self.mm_processor = None
+        self.async_dynamic_batch_tokenizer = None
+        if get_serving().skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        elif self.model_config.is_multimodal and not get_disagg().language_model_only:
+            import_processors("sglang.srt.multimodal.processors")
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
+            self.processor = get_processor_wrapper()
+            self.tokenizer = get_tokenizer_from_processor(self.processor)
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        else:
+            self.processor = None
+            self.tokenizer = _load_text_tokenizer()
+
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
             return
@@ -734,6 +779,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
             )
+
+    def init_request_preprocessor(self):
+        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+        # Set by maybe_start_process_request_preprocessor() in process mode.
+        self.process_request_preprocessor = None
+
+    def maybe_start_process_request_preprocessor(
+        self, template_manager, handler_classes=()
+    ) -> None:
+        """Start child processes for OpenAI request conversion when
+        SGLANG_REQUEST_PREPROCESSOR_MODE=process.
+
+        Call once the chat template and any template-derived config overrides
+        are in place: the children replay the config as it is now.
+        """
+        mode = envs.SGLANG_REQUEST_PREPROCESSOR_MODE.get()
+        if mode == "thread":
+            return
+        if mode != "process":
+            raise ValueError(
+                f"Invalid SGLANG_REQUEST_PREPROCESSOR_MODE={mode!r}; expected "
+                "'thread' or 'process'."
+            )
+        if getattr(self, "process_request_preprocessor", None) is not None:
+            return
+        if getattr(self, "tokenizer", None) is None:
+            logger.warning(
+                "SGLANG_REQUEST_PREPROCESSOR_MODE=process ignored: no tokenizer is "
+                "loaded (skip_tokenizer_init)."
+            )
+            return
+
+        from sglang.srt.managers.process_request_preprocessor import (
+            ProcessRequestPreprocessor,
+        )
+
+        try:
+            self.process_request_preprocessor = ProcessRequestPreprocessor(
+                tokenizer_manager=self,
+                template_manager=template_manager,
+                handler_classes=handler_classes,
+                num_processes=envs.SGLANG_REQUEST_PREPROCESSOR_PROCESSES.get(),
+            )
+        except Exception:
+            logger.exception(
+                "Could not start the process request preprocessor; request "
+                "preprocessing stays on the in-process thread."
+            )
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        func_call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._request_preprocessor_executor, func_call
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -865,6 +964,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self._drop_decode_mm_features = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_DISAGG_DECODE_DROP_MM_FEATURES.get()
+        )
+        if self._drop_decode_mm_features:
+            logger.info(
+                "PD decode: dropping multimodal feature tensors before dispatch "
+                "(SGLANG_DISAGG_DECODE_DROP_MM_FEATURES=1)."
+            )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
             start_disagg_service() if start_pd_bootstrap_service else None
@@ -1416,6 +1524,77 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             identity = None
         obj.cache_user_id = identity
 
+    def validate_request_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Preflight before streaming headers, expansion, or Scheduler dispatch."""
+        validate_input_ids(
+            obj.input_ids,
+            self.model_config.vocab_size,
+            allow_empty=(
+                isinstance(obj, GenerateReqInput)
+                and isinstance(obj.session_params, dict)
+                and bool(obj.session_params.get("id"))
+            ),
+        )
+        if not isinstance(obj, GenerateReqInput):
+            return
+        self.validate_logprob_params(obj)
+        validate_generation_request(
+            obj,
+            vocab_size=self.model_config.vocab_size,
+            max_parallel_samples=get_serving().max_parallel_samples,
+            max_batch_outputs=get_serving().max_batch_outputs,
+            preferred_sampling_params=self.preferred_sampling_params,
+            is_disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+            sampling_mask_enabled=envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get(),
+            sampling_mask_capacity=get_exec().features.sampling_mask_max_tokens,
+            speculative=get_spec().speculative_algorithm is not None,
+            sampling_backend=get_exec().kernel.sampling_backend,
+            sampling_params_class=self.sampling_params_class,
+        )
+
+    def validate_logprob_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate raw logprob sizes before inference or streaming headers."""
+        if not isinstance(obj, GenerateReqInput):
+            return
+        values = obj.top_logprobs_num
+        if values is None:
+            return
+        if not isinstance(values, list):
+            values = [values]
+        max_logprobs = self.model_config.vocab_size
+        if self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            max_logprobs = min(max_logprobs, MAX_DISAGGREGATION_TOP_LOGPROBS)
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"top_logprobs_num must be a non-negative integer, got {value!r}."
+                )
+            if value > max_logprobs:
+                raise ValueError(
+                    f"top_logprobs_num must be at most {max_logprobs} "
+                    f"for this server, got {value}."
+                )
+        if isinstance(obj.top_logprobs_num, list):
+            # Reuse input-shape detection without mutating or expanding the request.
+            shape = copy.copy(obj)
+            shape._validate_inputs()
+            shape._determine_batch_size()
+            if shape.is_single:
+                raise ValueError(
+                    "top_logprobs_num must be an integer for a single request."
+                )
+            if len(values) != shape.batch_size:
+                raise ValueError(
+                    "top_logprobs_num must contain one value per input in a batch."
+                )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1426,6 +1605,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._resolve_cache_identity(obj, request)
         if isinstance(obj, GenerateReqInput):
             self._validate_cache_request(obj)
+
+        # Reject the entire raw batch before expansion or dispatch of any member.
+        self.validate_request_params(obj)
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -1593,15 +1775,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize_sync():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
+
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.run_in_request_preprocessor(
+                tokenize_sync
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
@@ -1791,12 +1979,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if mm_inputs and mm_inputs.mm_items:
                 self.mm_processor.finalize_cache_identities(mm_inputs)
             if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                (envs.SGLANG_MM_PRECOMPUTE_HASH.get() or self._drop_decode_mm_features)
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
             await self._prepare_cache_media_digests(obj, mm_inputs)
+            if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
+                drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
@@ -2812,6 +3002,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state
                     if state.cache_physical_ttl_seconds is not None:
+                        # The initial rid has left rid_to_state; its state is kept here.
                         state.cache_metrics_parent = request_states[objs[i].rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -3152,6 +3343,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        loop_lag_ms = envs.SGLANG_LOG_EVENT_LOOP_LAG_MS.get()
+        if loop_lag_ms > 0:
+            EventLoopLagMonitor(loop, loop_lag_ms / 1000, "TokenizerManager").start()
 
     async def handle_loop(self):
         """The event loop that handles requests"""
@@ -4714,6 +4909,16 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+def _load_text_tokenizer():
+    return get_tokenizer(
+        get_serving().tokenizer_path,
+        tokenizer_mode=get_serving().tokenizer_mode,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_model().revision,
+        tokenizer_backend=get_serving().tokenizer_backend,
+    )
 
 
 def get_processor_wrapper():

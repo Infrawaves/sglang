@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import random
 from collections import deque
@@ -25,7 +26,11 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    FAKE_BOOTSTRAP_HOST,
+    MAX_DISAGGREGATION_TOP_LOGPROBS,
+    DisaggregationMode,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -47,10 +52,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
 #########################
+
+
+class InvalidDisaggregationMetadata(ValueError):
+    """Request metadata cannot be represented by the PD wire buffers."""
 
 
 def pp_sync_polls(
@@ -184,6 +196,9 @@ def disagg_transfers_in_flight(scheduler):
                     not decode_req.host_staged
                     for decode_req in scheduler.disagg_decode_transfer_queue.queue.items()
                 )
+                # Deferred releases keep destinations published to a peer that
+                # may still be writing them, until the transfer drains.
+                or scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -236,10 +251,11 @@ def pre_alloc_fill_len(req: Req) -> int:
 
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+    """Gate success on matching metadata before the TP status consensus.
 
-    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
-    ranks naturally prevents any rank from committing before all ranks are ready.
+    Missing metadata remains in flight; metadata from another room fails the
+    request on every TP rank. A local-only failure at commit time would let
+    peers admit a request whose destination is already being released.
     """
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
@@ -251,6 +267,18 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            else:
+                expected_room = decode_req.req.bootstrap_room or 0
+                if actual_room != expected_room:
+                    logger.error(
+                        "Metadata bootstrap room mismatch: request %s, "
+                        "expected=%s, actual=%s, metadata_buffer_index=%s",
+                        decode_req.req.rid,
+                        expected_room,
+                        actual_room,
+                        decode_req.metadata_buffer_index,
+                    )
+                    polls[i] = int(KVPoll.Failed)
 
 
 def kv_layout_signature(kv_args: KVArgs) -> int:
@@ -304,7 +332,7 @@ def poll_and_all_reduce(
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
 
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    # Missing metadata stays in flight; a mismatched room fails before TP consensus.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
@@ -331,7 +359,7 @@ def poll_and_all_reduce_with_staging(
     metadata_buffers: Optional[MetadataBuffers] = None,
     pollers=None,
 ):
-    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    """Include staging, local restore and metadata state before TP consensus."""
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -355,7 +383,7 @@ def poll_and_all_reduce_with_staging(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    # Missing metadata stays in flight; a mismatched room fails before TP consensus.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(raw_polls, gloo_group)
@@ -402,7 +430,7 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_sampling_mask_tokens: int,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = MAX_DISAGGREGATION_TOP_LOGPROBS,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
         *,
@@ -441,8 +469,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
@@ -664,7 +690,64 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
+    def _validate_request_metadata(self, req: Req) -> Optional[SamplingMaskChunk]:
+        """Validate variable-length rows before publishing any metadata."""
+        if req.return_logprob:
+            values = req.logprob.output_top_logprobs_val
+            indices = req.logprob.output_top_logprobs_idx
+            value_len = len(values[0]) if values else 0
+            index_len = len(indices[0]) if indices else 0
+            if value_len != index_len:
+                raise InvalidDisaggregationMetadata(
+                    "top_logprobs values and token IDs must have matching lengths."
+                )
+            capacity = min(
+                self.output_top_logprobs_val.shape[1],
+                self.output_top_logprobs_idx.shape[1],
+            )
+            if value_len > capacity:
+                raise InvalidDisaggregationMetadata(
+                    f"top_logprobs_num {value_len} exceeds "
+                    f"disaggregation metadata capacity {capacity}. "
+                    "Lower top_logprobs_num or increase the metadata buffer."
+                )
+
+        if not req.return_sampling_mask:
+            return None
+        if not self.enable_sampling_mask:
+            raise InvalidDisaggregationMetadata(
+                "return_sampling_mask requires enabled disaggregation sampling-mask buffers."
+            )
+        if req.sampling_mask_rows is None:
+            raise InvalidDisaggregationMetadata("The sampling-mask row is missing.")
+        chunk = req.sampling_mask_rows.view()
+        mask_len = len(chunk.token_ids)
+        if len(chunk.lengths) != 1 or int(chunk.lengths[0]) != mask_len:
+            raise InvalidDisaggregationMetadata(
+                "Disaggregation metadata requires exactly one complete sampling-mask row."
+            )
+        capacity = self.output_token_sampling_mask_idx.shape[1]
+        if mask_len > capacity:
+            raise InvalidDisaggregationMetadata(
+                f"Sampling-mask length {mask_len} exceeds "
+                f"disaggregation metadata capacity {capacity}."
+            )
+        if req.sampling_logprobs_mode not in ("selected", "support"):
+            raise InvalidDisaggregationMetadata("Invalid sampling_logprobs_mode.")
+        expected_logprobs = mask_len if req.sampling_logprobs_mode == "support" else 1
+        if len(chunk.logprobs) != expected_logprobs:
+            raise InvalidDisaggregationMetadata(
+                f"Sampling-mask logprobs length {len(chunk.logprobs)} must be "
+                f"{expected_logprobs} in {req.sampling_logprobs_mode} mode."
+            )
+        if expected_logprobs > self.output_token_sampling_logprobs.shape[1]:
+            raise InvalidDisaggregationMetadata(
+                "Sampling-mask logprobs exceed disaggregation metadata capacity."
+            )
+        return chunk
+
     def set_buf(self, req: Req):
+        chunk = self._validate_request_metadata(req)
         self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -693,14 +776,6 @@ class MetadataBuffers:
                 )
 
             if req.logprob.output_top_logprobs_val:  # not none or empty list
-                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
-                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
-                if top_logprobs_len > max_top_logprobs_len:
-                    raise RuntimeError(
-                        f"top_logprobs_num {top_logprobs_len} exceeds "
-                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
-                        "Lower top_logprobs_num or increase the metadata buffer."
-                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
@@ -719,7 +794,7 @@ class MetadataBuffers:
         if req.return_sampling_mask:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
-            chunk = req.sampling_mask_rows.view()
+            assert chunk is not None
             mask_len = len(chunk.token_ids)
             self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
             self.output_token_sampling_mask_idx[

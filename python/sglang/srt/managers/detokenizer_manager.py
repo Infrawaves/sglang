@@ -13,6 +13,7 @@
 # ==============================================================================
 """DetokenizerManager is a process that detokenizes the token ids."""
 
+import functools
 import logging
 import signal
 from collections import defaultdict
@@ -199,6 +200,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return output[:-1]
         return output
 
+    def _trim_content_matched_stop(
+        self,
+        reasoning_text_len: int,
+        output: Union[str, List[int]],
+        finished_reason: Dict,
+        no_stop_trim: bool,
+    ):
+        """trim_matched_stop on the text after the thinking prefix only."""
+        if not isinstance(output, str):
+            return self.trim_matched_stop(output, finished_reason, no_stop_trim)
+        return output[:reasoning_text_len] + self.trim_matched_stop(
+            output[reasoning_text_len:], finished_reason, no_stop_trim
+        )
+
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
@@ -299,6 +314,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             states.append(s)
         return states
 
+    def _reasoning_text_len(
+        self, s: DetokenizeState, finished_reason: Dict, reasoning_tokens: int
+    ) -> int:
+        """Length of the thinking text at the start of the decoded output, for a
+        request finished by a user stop string; 0 otherwise."""
+        if not reasoning_tokens or not isinstance(finished_reason.get("matched"), str):
+            return 0
+        # decode_ids = prompt tail + all output ids; the decoded text starts after
+        # the header's prompt_tail_ids, which may also hold output ids skipped
+        # before the first emission. reasoning_tokens counts from the first
+        # output id and includes the complete thinking terminator.
+        text_start = len(s.header.prompt_tail_ids)
+        output_start = len(s.decode_ids) - s.num_received_ids
+        reasoning_end = min(output_start + reasoning_tokens, len(s.decode_ids))
+        if output_start < 0 or reasoning_end <= text_start:
+            return 0
+        prefix_ids = [s.decode_ids[:text_start], s.decode_ids[:reasoning_end]]
+        skip = s.header.skip_special_tokens
+        space = s.header.spaces_between_special_tokens
+        if self.disable_tokenizer_batch_decode:
+            prefix_texts = [
+                self.tokenizer.decode(
+                    ids, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for ids in prefix_ids
+            ]
+        else:
+            prefix_texts = self._grouped_batch_decode(
+                prefix_ids, [skip] * 2, [space] * 2
+            )
+        return len(prefix_texts[1]) - len(prefix_texts[0])
+
     def _decode_batch_token_id_output(
         self, recv_obj: BatchTokenIDOutput, states: List[Optional[DetokenizeState]]
     ):
@@ -349,14 +396,31 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 output_strs.append("")
                 continue
             finished_reason = recv_obj.finished_reasons[i]
+            trim_matched_stop = self.trim_matched_stop
             if finished_reason is not None:
                 self.detokenize_state_table.release(recv_obj.rids[i])
+                beam_outputs = recv_obj.beam_search_output
+                is_beam = beam_outputs is not None and beam_outputs[i] is not None
+                reasoning_text_len = (
+                    0
+                    if is_beam
+                    else self._reasoning_text_len(
+                        s, finished_reason, recv_obj.reasoning_tokens[i]
+                    )
+                )
+                if reasoning_text_len:
+                    # User stop strings only apply to content: keep the
+                    # thinking prefix and trim the first match after it.
+                    trim_matched_stop = functools.partial(
+                        self._trim_content_matched_stop, reasoning_text_len
+                    )
+
             output_strs.append(
                 s.step(
                     read_text=read_texts[i],
                     surr_text=surr_texts[i],
                     finished_reason=finished_reason,
-                    trim_matched_stop=self.trim_matched_stop,
+                    trim_matched_stop=trim_matched_stop,
                 )
             )
 

@@ -9,6 +9,8 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -40,6 +42,8 @@ class _State:
     def __init__(self, group: GroupCoordinator, comm: CustomAllReduceV2):
         self.group = group
         self.comm = comm
+        self.gemm_fusion_manager = None
+        self.ag_gemm_fusion_manager = None
 
 
 _STATE: Optional[_State] = None
@@ -124,12 +128,36 @@ def _init_state() -> Optional[_State]:
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
         group.world_size,
     )
-    if envs.SGLANG_K3_SP_ATTN_RES.get():
+    attn_res_enabled = envs.SGLANG_K3_SP_ATTN_RES.get()
+    gemm_fusion_enabled = envs.SGLANG_K3_SP_GEMM_FUSION.get()
+    if gemm_fusion_enabled:
+        # kimi_k3.py on the layer_boundary design does not call the fused
+        # AG+qkv_proj / o_proj+RS+prefix_add kernels yet, so the flag must not
+        # turn the attention-residual fast path off.
+        logger.warning(
+            "SGLANG_K3_SP_GEMM_FUSION is set but K3's layer_boundary path does "
+            "not use the fused GEMM collectives yet; it has no effect."
+        )
+    if attn_res_enabled:
         logger.info(
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
         )
     _create_sp_symm_buffers(_STATE)
+    if gemm_fusion_enabled:
+        from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
+            create_ag_gemm_fusion_manager,
+            create_gemm_fusion_manager,
+        )
+
+        _STATE.gemm_fusion_manager = create_gemm_fusion_manager(group, _HIDDEN_SIZE)
+        if _STATE.gemm_fusion_manager is not None:
+            logger.info("K3 SP GEMM fusion enabled (o_proj + RS + prefix addition)")
+        _STATE.ag_gemm_fusion_manager = create_ag_gemm_fusion_manager(
+            group, _HIDDEN_SIZE
+        )
+        if _STATE.ag_gemm_fusion_manager is not None:
+            logger.info("K3 SP AG GEMM fusion enabled (AG + qkv_proj)")
     return _STATE
 
 
@@ -143,6 +171,99 @@ def _create_sp_symm_buffers(state: _State) -> None:
 
 def enabled() -> bool:
     return _init_state() is not None
+
+
+def install_o_proj_wrapper(o_proj) -> None:
+    state = _init_state()
+    manager = state.gemm_fusion_manager
+    if manager is not None and not manager.supports(o_proj):
+        manager = None
+    native_o_proj_forward = o_proj.forward
+
+    def forward(x, *args, **kwargs):
+        if manager is not None and not args:
+            fused_output = manager.try_fused_o_proj(o_proj, x, **kwargs)
+            if fused_output is not None:
+                return fused_output
+
+        # v0.5.22 dropped the padded-row override (attention runs on all rows).
+        output_rows = x.shape[0]
+        if requires_symmetric_rs(output_rows, x.device, x.element_size()):
+            output = get_o_proj_output_buffer(output_rows, x.dtype, o_proj.output_size)
+            result = native_o_proj_forward(
+                x, *args, output_tensor=output[: x.shape[0]], **kwargs
+            )
+            register_o_proj_output(result[0], output)
+            return result
+        return native_o_proj_forward(x, *args, **kwargs)
+
+    o_proj.forward = forward
+
+
+def o_proj_fusion_call(prefix_sum, num_global_tokens: int):
+    state = _STATE
+    if state is None or state.gemm_fusion_manager is None:
+        return nullcontext(None)
+    from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
+        use_o_proj_fusion_call,
+    )
+
+    return use_o_proj_fusion_call(prefix_sum, num_global_tokens)
+
+
+def install_qkv_proj_wrapper(qkv_proj) -> bool:
+    state = _init_state()
+    manager = None if state is None else state.ag_gemm_fusion_manager
+    if manager is None or not manager.register(qkv_proj):
+        return False
+    native_qkv_proj_forward = qkv_proj.forward
+
+    def forward(x, *args, **kwargs):
+        if not args and not kwargs:
+            fused_output = manager.try_fused_qkv_proj(x)
+            if fused_output is not None:
+                return fused_output
+        return native_qkv_proj_forward(x, *args, **kwargs)
+
+    qkv_proj.forward = forward
+    return True
+
+
+def qkv_proj_fusion_call(fused_output):
+    from sglang.srt.layers.communication.k3_sp_gemm_fusion import (
+        use_qkv_proj_fusion_output,
+    )
+
+    return use_qkv_proj_fusion_output(fused_output)
+
+
+def ag_qkv_proj_input(qkv_proj, num_shard_tokens: int) -> Optional[torch.Tensor]:
+    state = _STATE
+    if state is None or state.ag_gemm_fusion_manager is None:
+        return None
+    return state.ag_gemm_fusion_manager.local_input_shard(qkv_proj, num_shard_tokens)
+
+
+def ag_qkv_proj(qkv_proj, local_input: torch.Tensor):
+    return _STATE.ag_gemm_fusion_manager.fused_qkv_proj(qkv_proj, local_input)
+
+
+def prepare_gemm_fusion() -> None:
+    state = _STATE
+    if state is None:
+        return
+    # Both allocate symmetric memory collectively; keep the order on every rank.
+    managers = [
+        manager
+        for manager in (state.gemm_fusion_manager, state.ag_gemm_fusion_manager)
+        if manager is not None
+    ]
+    if not managers:
+        return
+    from sglang.srt.runtime_context import max_prefill_buffer_tokens
+
+    for manager in managers:
+        manager.prepare(max_prefill_buffer_tokens())
 
 
 def _symm_buffer(

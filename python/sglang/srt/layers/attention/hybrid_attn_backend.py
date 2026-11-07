@@ -65,6 +65,12 @@ class HybridAttnBackend(AttentionBackend):
         speculative_attention_mode is "decode", else the prefill backend."""
         return self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
 
+    @property
+    def ragged_verify_needs_padding_slot(self) -> bool:
+        return self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).ragged_verify_needs_padding_slot
+
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
         Select the appropriate attention backend based on the forward mode.

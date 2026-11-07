@@ -97,7 +97,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_npu,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -198,6 +198,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 spec_algorithm=target_worker.model_runner.spec_algorithm,
                 dspark_is_moe=self._draft_is_moe,
             )
+        )
+        # Whether the verify forward must keep one shape across DP ranks: the
+        # target's MLP / MoE is DP-synchronized (the CUDA graph bakes
+        # global_num_tokens = [T] * dp), or the drafter is a MoE (DSV4). The draft
+        # itself can be DP-local while the target verify still needs this.
+        self._dp_synced_verify = get_parallel().attn_dp_enabled and (
+            self._draft_is_moe or require_mlp_tp_gather()
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
@@ -334,12 +341,39 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
         ):
-            raise ValueError(
-                "DSpark dense-draft compact verify under attention DP does not "
-                "yet support cuda graph (idle DP groups cannot join the token-keyed "
-                "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
-                "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
-                "cuda graph under DP."
+            if not envs.SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER.get():
+                raise ValueError(
+                    "DSpark dense-draft compact verify under attention DP "
+                    "with cuda graph needs SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1 "
+                    "(every DP rank then replays one verify token tier). Otherwise "
+                    "use SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+            if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+                raise ValueError(
+                    "DSpark compact DP graphs require the scheduler all-gather "
+                    "to agree on request counts and graph eligibility."
+                )
+            if not self._dp_synced_verify:
+                # Idle DP ranks learn the shared tier from the dp-global request
+                # count, which the batch only carries when the target MLP is
+                # DP-synchronized.
+                raise ValueError(
+                    "SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER needs a DP-synchronized "
+                    "target MLP (require_mlp_tp_gather(); see --moe-dense-tp-size, "
+                    "--enable-dp-lm-head, --moe-a2a-backend). Without it idle DP "
+                    "ranks cannot join the token-keyed compact graph; use "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+        if (
+            self._dp_synced_verify
+            and self._verify_planner.is_compact_mode
+            and not self._decode_graph_allowed
+            and not self._is_pd_prefill
+            and self.model_runner.tp_rank == 0
+        ):
+            logger.warning(
+                "DSpark compact verify with DP-synchronized MLP and disabled "
+                "decode graphs uses the full verify width on every eager step."
             )
         self._kv_injector = TargetHiddenKvInjector(
             draft_model=self.draft_model,
@@ -893,8 +927,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
+    def _use_uniform_eager_verify(self, batch: ScheduleBatch) -> bool:
+        # Eager MLP sync expands per-rank request counts at the full verify
+        # width. A DP-local dense target can still execute its packed layout.
+        return (
+            self._dp_synced_verify
+            and self._verify_planner.is_compact_mode
+            and not batch.can_run_decode_cuda_graph
+        )
+
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+            return None
+        if self._use_uniform_eager_verify(batch):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
@@ -909,10 +954,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
         if not (
-            self._draft_is_moe
-            and get_parallel().attn_dp_enabled
+            self._dp_synced_verify
+            and self._verify_planner.dp_tier_gather_enabled
             and batch.global_num_tokens is not None
-            and self._verify_planner.is_compact_mode
+            and not batch.is_extend_in_batch
+            and batch.can_run_decode_cuda_graph
         ):
             return None
         return dp_global_verify_tier_num_tokens(
@@ -979,9 +1025,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         global_num_reqs = (
             max(batch.global_num_tokens)
-            if self._draft_is_moe
-            and get_parallel().attn_dp_enabled
-            and batch.global_num_tokens is not None
+            if self._dp_synced_verify and batch.global_num_tokens is not None
             else None
         )
         if coordination_plan is not None:
@@ -1099,15 +1143,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        if self._use_uniform_eager_verify(batch):
+            layout = None
+        else:
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids
@@ -1240,6 +1287,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 verify_ids_2d=verify_ids_2d,
                 target_logits=target_logits,
+                num_valid_rows=target_verify.num_valid_sampling_rows(),
                 draft_block=draft_block,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
@@ -1545,3 +1593,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return None
         return self._verify_planner.confidence_budget_prepare()
+
+    def get_confidence_budget_pre_sync(self):
+        if not self._hosts_draft:
+            return None
+        return self._verify_planner.confidence_budget_pre_sync()

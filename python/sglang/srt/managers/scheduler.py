@@ -113,6 +113,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
@@ -303,6 +304,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    ActionReqList,
     IndexedReqList,
     KeyedReqList,
     ListKind,
@@ -335,6 +337,9 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+    validate_runtime_storage_update,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -508,6 +513,9 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # Class-level default so a scheduler built without init_chunked_prefill
+    # registers no round-robin lists.
+    enable_chunked_prefill_round_robin: bool = False
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
 
     def __init__(
@@ -1449,6 +1457,19 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
+        self.enable_chunked_prefill_round_robin = (
+            get_schedule().enable_chunked_prefill_round_robin
+        )
+        self._validate_prefill_round_robin()
+        # Chunked requests waiting for their next round-robin chunk.
+        self.suspended_prefill_queue = IndexedReqList(
+            ListKind.PREFILL_SUSPENDED, abort=self._abort_round_robin
+        )
+        # Terminal cleanup actions waiting for outstanding GPU results.
+        self._pending_round_robin_actions = ActionReqList(
+            ListKind.PREFILL_RR_PENDING
+        )
+        self._prefill_ready_seq = 0
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1471,6 +1492,59 @@ class Scheduler(
         # Load rule: the size held through a dip, and the steps the dip has lasted.
         self._pp_held_chunk = 0
         self._pp_dip_steps = 0
+
+    def _validate_prefill_round_robin(self) -> None:
+        if not self.enable_chunked_prefill_round_robin:
+            return
+        if (
+            get_disagg().disaggregation_mode != "prefill"
+            or get_parallel().pp_size != 1
+            or self.is_hybrid_swa
+            or self.chunked_prefill_size is None
+        ):
+            raise ValueError(
+                "--enable-chunked-prefill-round-robin requires PD prefill, "
+                "PP=1 and chunked prefill enabled; colocated serving and "
+                "hybrid SWA are unsupported."
+            )
+
+    def enqueue_prefill_ready(self, reqs) -> None:
+        for req in reqs:
+            if self.enable_chunked_prefill_round_robin:
+                req.prefill_ready_seq = self._prefill_ready_seq
+                self._prefill_ready_seq += 1
+            self.waiting_queue.join([req])
+
+    def reset_prefill_ready_seq_if_idle(self) -> None:
+        if not self.enable_chunked_prefill_round_robin:
+            return
+        if (
+            not self.waiting_queue
+            and not self.suspended_prefill_queue
+            and self.chunked_req is None
+            and not self._pending_round_robin_actions
+        ):
+            self._prefill_ready_seq = 0
+
+    def iter_round_robin_requests(self):
+        seen = set()
+        for req in (
+            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.suspended_prefill_queue,
+            *self._pending_round_robin_actions,
+        ):
+            if id(req) not in seen:
+                seen.add(id(req))
+                yield req
+
+    def remove_prefill_ready_requests(self, reqs) -> None:
+        reqs = set(reqs)
+        if not reqs:
+            return
+        if self.chunked_req in reqs:
+            self.chunked_req = None
+        self.waiting_queue.leave(reqs)
+        self.suspended_prefill_queue.leave(reqs)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1672,6 +1746,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_hrrn_prefill_chunk_limit=get_schedule().enable_hrrn_prefill_chunk_limit,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -1920,6 +1995,7 @@ class Scheduler(
         )
 
         self._confidence_budget_prepare = None
+        self._confidence_budget_pre_sync = None
         if (
             needs_confidence_relay
             and self.enable_overlap
@@ -1927,6 +2003,9 @@ class Scheduler(
         ):
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
+            )
+            self._confidence_budget_pre_sync = (
+                self.draft_worker.get_confidence_budget_pre_sync()
             )
 
         # If enable async D2H copy when overlap is enabled
@@ -2911,6 +2990,7 @@ class Scheduler(
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_request_lists=self.request_lists,
+            get_round_robin_requests=self.iter_round_robin_requests,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
@@ -3990,31 +4070,34 @@ class Scheduler(
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
             inflight_batches = self._collect_inflight_batches()
+            running_reqs = [
+                req
+                for batch in inflight_batches
+                if batch is not None
+                for req in batch.reqs
+            ]
+            if self.enable_chunked_prefill_round_robin:
+                running_reqs.extend(self.suspended_prefill_queue)
             seen_rids = set()
-            for batch in inflight_batches:
-                if batch is None:
+            for req in running_reqs:
+                if req.rid in seen_rids or req.finished():
                     continue
-                for req in batch.reqs:
-                    # Polling must not re-emit an abort awaiting result processing.
-                    if (
-                        req.rid in seen_rids
-                        or req.finished()
-                        or req.to_finish is not None
-                    ):
-                        continue
-                    seen_rids.add(req.rid)
-                    if 0 < req.time_stats.forward_entry_time < deadline:
-                        aborts.append(
-                            AbortReq(
-                                rid=req.rid,
-                                abort_message="Request running timeout reached.",
-                                finished_reason={
-                                    "type": "abort",
-                                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                                    "message": "Request running timeout reached.",
-                                },
-                            )
+                # Polling must not re-emit an abort awaiting result processing.
+                if req.to_finish is not None:
+                    continue
+                seen_rids.add(req.rid)
+                if 0 < req.time_stats.forward_entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request running timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request running timeout reached.",
+                            },
                         )
+                    )
 
         return aborts
 
@@ -4169,6 +4252,10 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        if self.enable_chunked_prefill_round_robin:
+            if self.enable_overlap:
+                self.process_pending_round_robin_actions()
+            return
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -4184,16 +4271,27 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
+        self._release_chunked_abort(req)
+        # Clear in every mode: a PREFILL abort hands the request to the inflight
+        # queue, and a stale chunked_req would launch its next chunk.
+        self.chunked_req = None
+        self._pending_chunked_abort_req = None
+
+    def _release_chunked_abort(self, req: Req) -> None:
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.release_prefill_sender(req, abort_sender=True)
+            # Source buffers stay owned until every reader has drained; the
+            # transfer queue releases through the retirer and sends the final
+            # abort response. Leave CHUNKED first so the request sits in one
+            # list only (the caller also clears chunked_req).
+            self.chunked_reqs.leave([req])
+            self.queue_aborted_prefill_transfer(req)
+            return
         self.request_retirer.release(req, checkpoint=False)
 
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.send_abort_output(
@@ -4383,6 +4481,8 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
+        if need_mlp_sync:
+            self.prepare_verify_budget_pre_sync(ret)
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
@@ -4473,16 +4573,17 @@ class Scheduler(
             # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
+        has_resume = self.chunked_req is not None or bool(self.suspended_prefill_queue)
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not has_resume:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
-            and self.chunked_req is None
+            and not has_resume
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
@@ -4508,7 +4609,7 @@ class Scheduler(
         # microbatch, so holding it back here would leak its memory.
         if (
             num_allocatable_reqs <= 0
-            and self.chunked_req is None
+            and not has_resume
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -4571,15 +4672,28 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            round_robin_requests=tuple(self.iter_round_robin_requests())
+            if self.enable_chunked_prefill_round_robin
+            else None,
         )
 
-        if self.chunked_req is not None:
+        chunk_limit_budget = adder.rem_chunk_tokens or 0
+        if self.chunked_req is not None and not self.enable_chunked_prefill_round_robin:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
+                chunk_limit_budget,
                 self.page_size,
+                max_reqs=adder.reservable_new_reqs(
+                    # Match the admission gate, which gives back the row the
+                    # continuation already holds.
+                    self.get_num_allocatable_reqs(
+                        len(running_batch.reqs),
+                        running_batch=running_batch,
+                        num_held_rows=int(self.chunked_req.kv.holds_kv),
+                    )
+                ),
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4612,42 +4726,91 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        round_robin_enabled = self.enable_chunked_prefill_round_robin
+        round_robin_chunked_req = None
+        resume_ids = (
+            {id(r) for r in self.iter_round_robin_requests()}
+            if round_robin_enabled
+            else set()
+        )
+        fresh_blocked = False
+        candidates = self.waiting_queue
+        if round_robin_enabled:
+            candidates = sorted(
+                [*self.waiting_queue, *self.suspended_prefill_queue],
+                key=lambda r: r.prefill_ready_seq,
+            )
+            if self.chunked_req is not None:
+                candidates.insert(0, self.chunked_req)
+        # Ordinary candidates keep the existing matching and allocation path.
+        for req in candidates:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
                 break
-            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
-                continue
-
-            # A forward batch runs one pooling mode, so setwise readout requests
-            # (token_indices_to_pool) cannot share a batch with last-token ones.
-            # Admit only the first request's mode; the other stays queued.
+            # A forward batch runs one pooling mode, including resumed chunks.
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                continue
+            if round_robin_enabled:
+                if (
+                    adder.rem_input_tokens <= 0
+                    or adder.rem_chunk_tokens <= 0
+                    or len(adder.can_run_list)
+                    >= get_parallel().pp_max_micro_batch_size - running_bs
+                    or (
+                        get_schedule().prefill_max_requests is not None
+                        and len(adder.can_run_list)
+                        >= get_schedule().prefill_max_requests
+                    )
+                ):
+                    break
+                if id(req) in resume_ids:
+                    req.init_next_round_input(self.tree_cache)
+                    previous_size = len(adder.can_run_list)
+                    chunked_req = adder.add_chunked_req(req)
+                    if len(adder.can_run_list) == previous_size:
+                        break
+                    round_robin_chunked_req = chunked_req
+                    if (
+                        round_robin_chunked_req is not None
+                        or adder.budget_state() != AddReqResult.CONTINUE
+                    ):
+                        break
+                    continue
+                if fresh_blocked:
+                    continue
+
+            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
-                running_bs,
-                candidate_beam_width,
-                running_batch=running_batch,
-                num_held_rows=num_held_rows,
-            ):
-                running_batch.batch_is_full = True
-
-            if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+            if round_robin_enabled:
+                new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                if new_rows >= self.req_to_token_pool.available_size():
+                    fresh_blocked = True
+                    continue
+            else:
+                num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                    running_bs,
+                    candidate_beam_width,
+                    running_batch=running_batch,
+                    num_held_rows=num_held_rows,
                 ):
-                    break
+                    running_batch.batch_is_full = True
+
+                if running_batch.batch_is_full:
+                    if (
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req)
+                    ):
+                        break
 
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
@@ -4708,11 +4871,23 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._revert_unadmitted_mamba(req)
+                if round_robin_enabled and not added:
+                    fresh_blocked |= res == AddReqResult.NO_TOKEN
+                    continue
+                break
+
+            if round_robin_enabled and adder.new_chunked_req is not None:
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
         self.running_reqs.leave(adder.preempt_list)
+
+        self.policy.record_chunk_limit_outcome(
+            limit=adder.chunked_req_limit,
+            budget=chunk_limit_budget,
+            leftover_tokens=adder.rem_chunk_tokens or 0,
+        )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4733,7 +4908,11 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
+        if round_robin_enabled:
+            self.suspended_prefill_queue.leave(can_run_set)
+            assert round_robin_chunked_req is None or adder.new_chunked_req is None
+            self.chunked_req = round_robin_chunked_req or adder.new_chunked_req
+        elif adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
@@ -4870,6 +5049,9 @@ class Scheduler(
             ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
             ListKind.DECODING: self.running_reqs,
         }
+        if self.enable_chunked_prefill_round_robin:
+            lists[ListKind.PREFILL_SUSPENDED] = self.suspended_prefill_queue
+            lists[ListKind.PREFILL_RR_PENDING] = self._pending_round_robin_actions
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
@@ -5110,6 +5292,17 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def prepare_verify_budget_pre_sync(self, batch: Optional[ScheduleBatch]) -> None:
+        """DSpark compact verify under DP attention: compute the verify budget
+        before the MLP sync so the sync carries it to every DP rank. Call right
+        before the MLP sync, after the decode batch's request set is final."""
+        if (
+            self._confidence_budget_pre_sync is not None
+            and batch is not None
+            and batch.forward_mode.is_decode()
+        ):
+            self._confidence_budget_pre_sync(batch, self.future_map)
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
@@ -5870,7 +6063,12 @@ class Scheduler(
 
         lists = self.request_lists()
         if for_health_check:
-            busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
+            busy_lists = {
+                ListKind.CHUNKED,
+                ListKind.WAITING,
+                ListKind.PREFILL_SUSPENDED,
+                ListKind.PREFILL_RR_PENDING,
+            }
             if not self._engine_paused:
                 busy_lists.add(ListKind.PD_RETRACTED)
         else:
@@ -5894,6 +6092,19 @@ class Scheduler(
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
         idle &= not any(lists.get(name) for name in busy_lists)
+
+        # A terminal request can still own buffers used by a remote transfer.
+        # PD_RELEASING above covers held deferred releases; this also covers
+        # failed cleanups, which are in no request list but still pin pages, so
+        # administrative flush/offload never treats them as reclaimable.
+        if (
+            not for_health_check
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_transfer_queue is not None
+        ):
+            idle &= (
+                not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+            )
 
         if not for_health_check:
             idle &= not self.request_receiver.has_pending()
@@ -5940,6 +6151,11 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
@@ -5996,6 +6212,11 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if not self.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
@@ -6191,8 +6412,12 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
-        if self.enable_continuous_input_polling and self.result_queue:
-            # Polling can run intake before the newest queued batch becomes last_batch.
+        if self.result_queue and (
+            self.enable_continuous_input_polling
+            or (self.enable_chunked_prefill_round_robin and self.enable_overlap)
+        ):
+            # Queued batches are still in flight: polling can run intake before the
+            # newest one becomes last_batch, and round-robin overlap keeps several.
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
@@ -6201,9 +6426,22 @@ class Scheduler(
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
             if is_prefill:
-                # A PD prefill request may hold KV its sender still reads; abort
-                # the sender before that KV is freed.
-                self.release_prefill_sender(req, abort_sender=True)
+                # A yielded/chunked request may already have sent KV. Retain
+                # KV, recurrent state and metadata until every source read ends;
+                # the transfer queue releases it and sends the abort response.
+                prepare_abort(
+                    req,
+                    recv_req.abort_message or "Aborted by AbortReq.",
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if recv_req.abort_message
+                        else None
+                    ),
+                )
+                self.beam_coordinator.retire_group(req)
+                self.queue_aborted_prefill_transfer(req)
+                logger.debug(f"Abort queued request. {req.rid=}")
+                continue
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.abort(
@@ -6213,10 +6451,43 @@ class Scheduler(
 
     def _abort_chunked(self, recv_req: AbortReq) -> None:
         """Mark the chunked request; `process_pending_chunked_abort` aborts it at
-        the next schedule."""
+        the next schedule. Under round robin, `_abort_round_robin` aborts it."""
+        if self.enable_chunked_prefill_round_robin:
+            return
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+
+    def _abort_round_robin(self, recv_req: AbortReq) -> None:
+        """Abort the round-robin chunked and suspended requests `recv_req` names.
+
+        A request with an overlap result still queued is parked in
+        `_pending_round_robin_actions`; its cleanup runs once the result is
+        processed. Every other one goes to the transfer queue, which releases it
+        after the source drain (`poll_prefill_transfer_releasable`)."""
+        candidates = [
+            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.suspended_prefill_queue,
+        ]
+        cancelled = []
+        for req in candidates:
+            if not recv_req.matches(req.rid) or is_aborted(req):
+                continue
+            req.request_finish(
+                FINISH_ABORT(recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE)
+                if recv_req.abort_message
+                else FINISH_ABORT()
+            )
+            req.time_stats.trace_ctx.abort(abort_info=req.to_finish)
+            cancelled.append(req)
+        self.remove_prefill_ready_requests(cancelled)
+        for req in cancelled:
+            if self.has_pending_prefill_result(req):
+                # The pending result's abort branch would retire it; hold it in
+                # a request list until then.
+                self._pending_round_robin_actions.defer(req, "retire")
+            else:
+                self._retire_aborted_prefill_result(req, defer=False)
 
     def abort_request(self, recv_req: AbortReq):
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -6228,6 +6499,12 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
+            # A deferred round-robin cleanup keeps its first terminal reason.
+            if (
+                self.enable_chunked_prefill_round_robin
+                and req in self._pending_round_robin_actions
+            ):
+                continue
             if not req.finished() and recv_req.matches(req.rid):
                 # A running request is finished through `request_finish` and
                 # still runs one decode forward pass.

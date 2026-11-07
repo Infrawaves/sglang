@@ -40,7 +40,8 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
+        # Storage: {tp_rank: (session_id, weights_info_dict, protocol,
+        #                     fabric_identity, alternates)}
         self.transfer_engine_info: Dict[int, Tuple] = {}
         self.lock = threading.Lock()
 
@@ -57,11 +58,27 @@ class EngineInfoBootstrapServer:
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
+                # Appended; readers unpack positionally and older seeds send
+                # neither.
+                protocol = info.get("protocol")
+                fabric_identity = info.get("fabric_identity")
+                alternates = info.get("alternates") or []
 
                 with self.lock:
                     self.transfer_engine_info[tp_rank] = (
                         session_id,
                         weights_info_dict,
+                        protocol,
+                        fabric_identity,
+                        [
+                            (
+                                alt["session_id"],
+                                alt["weights_info_dict"],
+                                alt.get("protocol"),
+                                alt.get("fabric_identity"),
+                            )
+                            for alt in alternates
+                        ],
                     )
 
                 logger.info(

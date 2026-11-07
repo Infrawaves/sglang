@@ -9,6 +9,7 @@ but also on whether each one failed.
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,10 +19,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 def _stage(first_rank: bool, succeeded, failed, prev=None):
     """A PP stage whose own senders report `succeeded` / `failed` rids."""
+    # The stage's local outcome comes from the source-drain gate, which reports
+    # a concluded transfer as Success / Failed and anything else as in flight.
+    reqs = [SimpleNamespace(rid=rid) for rid in [*succeeded, *failed]]
     return SimpleNamespace(
         pp_group=SimpleNamespace(is_first_rank=first_rank),
-        disagg_prefill_transfer_queue=[],
-        get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
+        disagg_prefill_transfer_queue=reqs,
+        poll_prefill_transfer_releasable=lambda queue: [
+            KVPoll.Success if req.rid in succeeded else KVPoll.Failed
+            for req in queue
+        ],
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
     )
 

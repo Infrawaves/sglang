@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -47,6 +48,7 @@ from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
+    InvalidDisaggregationMetadata,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -180,6 +182,28 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+def all_reduce_prefill_release_safe(
+    senders, attn_cp_cpu_group, attn_tp_cpu_group, abort_succeeded
+):
+    """Require every source rank to stop reading before reclaiming a request.
+
+    Failed is the lowest KVPoll value, so the regular status MIN can report a
+    peer's failure while this rank still has a running transfer. This separate
+    reduction must not use the poller's fault-injection path.
+    """
+    safe = torch.tensor(
+        [
+            int(aborted and getattr(sender, "is_source_release_safe", lambda: True)())
+            for sender, aborted in zip(senders, abort_succeeded)
+        ],
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    dist.all_reduce(safe, op=dist.ReduceOp.MIN, group=attn_tp_cpu_group)
+    dist.all_reduce(safe, op=dist.ReduceOp.MIN, group=attn_cp_cpu_group)
+    return safe.tolist()
 
 
 class PrefillBootstrapQueue:
@@ -619,23 +643,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         checkpoint_kv_cache(req, cache)
 
-    def release_prefill_sender(
-        self: Scheduler, req: Req, *, abort_sender: bool
-    ) -> None:
-        """Release a retiring request's KV send: its pending chunk entry and
-        metadata buffer. ``abort_sender`` stops a live sender; a failed one
-        already concluded through ``failure_exception``."""
-        self.clear_pending_chunk_send(req)
-        if abort_sender and req.disagg_kv_sender is not None:
-            try:
-                req.disagg_kv_sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
@@ -645,7 +652,11 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        candidates = [
+            req
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
+            if not is_aborted(req)
+        ]
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -667,12 +678,15 @@ class SchedulerDisaggregationPrefillMixin:
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-        self.waiting_queue.leave(failed)
+        if self.enable_chunked_prefill_round_robin:
+            self.remove_prefill_ready_requests(failed)
+        else:
+            self.waiting_queue.leave(failed)
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
-            for req in self.waiting_queue
+            for req in (*self.waiting_queue, *self.suspended_prefill_queue)
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -724,7 +738,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.join(
+            self.reset_prefill_ready_seq_if_idle()
+            self.enqueue_prefill_ready(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -848,12 +863,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
+            self.reset_prefill_ready_seq_if_idle()
             bootstrapped_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
                 if should_ingest_requests
                 else []
             )
-            self.waiting_queue.join(bootstrapped_reqs)
+            self.enqueue_prefill_ready(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -923,6 +939,8 @@ class SchedulerDisaggregationPrefillMixin:
                 oldest_batch, oldest_batch_result = self.result_queue.popleft()
                 self.process_batch_result(oldest_batch, oldest_batch_result)
             elif batch is None:
+                if self.enable_chunked_prefill_round_robin:
+                    self.process_pending_round_robin_actions()
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
@@ -935,6 +953,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if self.enable_chunked_prefill_round_robin:
+                self.process_pending_round_robin_actions()
 
             # Update last_batch and scheduler status
             self._sched_idled = batch is None
@@ -992,6 +1012,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        # Queued chunks read KV from forwards up to this batch's: run_batch issues
+        # early sends before launching its forward. copy_done is None only without
+        # overlap, where early sends carry no wait event and are ready at enqueue.
+        self.disagg_prefill_bootstrap_queue.kv_manager.mark_prefill_forward_synced()
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -1043,6 +1067,14 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if (
+                self.enable_chunked_prefill_round_robin
+                and self.enable_overlap
+                and req in self._pending_round_robin_actions
+            ):
+                # Its deferred cleanup runs in process_pending_round_robin_actions.
+                advance_logprob_pt(i, req)
+                continue
             if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
 
@@ -1157,6 +1189,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # Still chunking while it holds the chunked slot or has another
                 # step in flight; otherwise it yielded, and this was its last step.
                 still_chunking = self.chunked_req is req or req.inflight_steps > 1
+                if self.enable_chunked_prefill_round_robin:
+                    # A suspended request resumes later; one with a queued
+                    # overlap result is retired by that result.
+                    still_chunking = (
+                        self.chunked_req is req
+                        or req in self.suspended_prefill_queue
+                        or self.has_pending_prefill_result(req)
+                    )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
                 if is_aborted(req):
@@ -1228,6 +1268,61 @@ class SchedulerDisaggregationPrefillMixin:
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
 
+    def poll_prefill_transfer_releasable(self: Scheduler, reqs: List[Req]):
+        """Poll terminal transfers only after source reads and GPU work drain.
+
+        PP release-ID consensus uses this same gate, so an early Failed on one
+        rank cannot remove a request that a later PP stage must still retain.
+        """
+        if not reqs:
+            return []
+
+        # An aborted prefill result can arrive here even when notifying the
+        # transport failed. Retry cancellation, retaining all source buffers if
+        # it still fails. Marking a Req finished is not a transfer drain fence.
+        abort_succeeded = [True] * len(reqs)
+        for i, req in enumerate(reqs):
+            if is_aborted(req):
+                try:
+                    req.disagg_kv_sender.abort()
+                except Exception:
+                    abort_succeeded[i] = False
+                    logger.exception("Failed to abort KV sender for %s", req.rid)
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        terminal_indices = [
+            i for i, poll in enumerate(polls) if poll in (KVPoll.Success, KVPoll.Failed)
+        ]
+        for i in terminal_indices:
+            if polls[i] == KVPoll.Failed and not is_aborted(reqs[i]):
+                # Failure can have originated on another TP/CP rank. Stop this
+                # rank's producer as well before asking whether its reads drained.
+                try:
+                    reqs[i].disagg_kv_sender.abort()
+                except Exception:
+                    abort_succeeded[i] = False
+                    logger.exception("Failed to abort KV sender after peer failure")
+        if terminal_indices:
+            safe = all_reduce_prefill_release_safe(
+                [reqs[i].disagg_kv_sender for i in terminal_indices],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                [
+                    abort_succeeded[i] and not self.has_pending_prefill_result(reqs[i])
+                    for i in terminal_indices
+                ],
+            )
+            for i, can_release in zip(terminal_indices, safe):
+                if not can_release:
+                    polls[i] = KVPoll.Transferring
+
+        return polls
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_transfer_queue(
         self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
@@ -1243,13 +1338,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        # The polls are reduced across ranks in this order.
+        # The polls are reduced across ranks in this order. Terminal polls are
+        # downgraded to Transferring until every rank agrees the source buffers
+        # drained (lease + abort + no pending GPU result).
         transfer_queue = list(self.disagg_prefill_transfer_queue)
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in transfer_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        polls = self.poll_prefill_transfer_releasable(transfer_queue)
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_transfer_queue. If Success, respond to the client and remove it from the queue
@@ -1283,6 +1376,10 @@ class SchedulerDisaggregationPrefillMixin:
                     poll == KVPoll.Failed,
                 )
 
+            if poll == KVPoll.Transferring:
+                undone_reqs.append(req)
+                continue
+
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1308,7 +1405,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self.optimistic_release_and_requeue(
                         req, self.disagg_prefill_transfer_queue
                     )
-                elif poll != KVPoll.Failed:
+                else:
+                    # A bootstrap failure now retains its buffers in this same
+                    # queue until cancellation and source drain are established.
                     undone_reqs.append(req)
                 continue
 
@@ -1385,12 +1484,18 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
+        # The caller has established TP/CP source-drain consensus. Diagnostic
+        # failure lookup itself must never clear state while readers are active.
+        req.disagg_kv_sender.clear()
         # Mute error message for propagated exceptions to avoid duplicate logging
         if getattr(exc, "is_from_another_rank", False):
             logger.debug(error_message)
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        # The caller reached this only after poll_prefill_transfer_releasable
+        # agreed on every TP/CP rank that the source reads drained, so the
+        # retirer may now free KV, recurrent state and (in the caller) metadata.
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1409,8 +1514,22 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
-    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
-        """Release an aborted request when its last prefill result is safe."""
+    def has_pending_prefill_result(self: Scheduler, req: Req) -> bool:
+        """Whether an overlap-scheduled GPU result for `req` is still queued."""
+        return self.enable_overlap and any(
+            any(r is req for r in batch.reqs) for batch, _ in self.result_queue
+        )
+
+    def _retire_aborted_prefill_result(
+        self: Scheduler, req: Req, *, defer: bool = True
+    ) -> bool:
+        """Stop an aborted producer and retain its buffers until transfer drain.
+
+        Always returns False: the transfer queue owns the final release and the
+        abort response once every source read has drained. Under round robin
+        with overlap, `defer` parks the cleanup until queued results land."""
+        if defer and self.defer_round_robin_action(req, "retire"):
+            return False
         self.prefill_launched_reqs.leave([req])
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1420,33 +1539,60 @@ class SchedulerDisaggregationPrefillMixin:
             self.clear_pending_chunk_send(req)
             return False
 
+        if req in self.disagg_prefill_transfer_queue:
+            return False
+
+        self.queue_aborted_prefill_transfer(req)
+        # The transfer queue now owns cleanup and the final abort response.
+        return False
+
+    def queue_aborted_prefill_transfer(self: Scheduler, req: Req) -> None:
+        """Hand an aborted request to the source-drain (PD_SENDING) queue.
+
+        This frees nothing: KV, recurrent
+        state and the metadata buffer stay owned until
+        ``poll_prefill_transfer_releasable`` reports the source drained on every
+        rank; the transfer queue then releases through the RequestRetirer.
+        The caller must already have removed ``req`` from its previous list.
+        """
+        if req not in self.disagg_prefill_transfer_queue:
+            self.disagg_prefill_transfer_queue.join([req])
+        self.clear_pending_chunk_send(req)
+
+        sender = req.disagg_kv_sender
+        if sender is not None:
+            try:
+                sender.abort()
+            except Exception:
+                # A transport error is not evidence that outstanding reads
+                # stopped. Keep the request queued and retry cancellation.
+                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
-        self.release_prefill_sender(req, abort_sender=True)
-        self.request_retirer.release(req, checkpoint=False)
-        return True
+        # Leave the pending-bootstrap branch of the transfer queue, so a Failed
+        # poll concludes via handle_inflight_transfer_failure instead of
+        # re-entering handle_bootstrap_failure.
+        req.pending_bootstrap = False
 
-    def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+    def handle_bootstrap_failure(
+        self: Scheduler, req: Req, *, defer: bool = True
+    ) -> None:
+        if defer and self.defer_round_robin_action(req, "bootstrap_failure"):
+            return
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
-        is_propagated = False
-        try:
-            req.disagg_kv_sender.failure_exception()
-        except Exception as e:
-            error_message += f" with exception {e}"
-            is_propagated = getattr(e, "is_from_another_rank", False)
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if is_propagated:
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
+        # Some backends clear transport state in failure_exception(). Defer
+        # failure cleanup until every source rank has drained.
+        logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-        self.release_prefill_sender(req, abort_sender=False)
-        self.request_retirer.release(req, checkpoint=False)
-        self.output_streamer.stream_output([req], req.return_logprob)
+        # Retained in the transfer queue until source drain is agreed; it then
+        # concludes as Failed through handle_inflight_transfer_failure, which
+        # releases through the retirer and streams the abort.
+        self.queue_aborted_prefill_transfer(req)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
 
@@ -1483,6 +1629,50 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
+    def defer_round_robin_action(self: Scheduler, req: Req, action: str) -> bool:
+        """Under round robin with overlap, park a terminal cleanup of a request
+        the scheduler still holds until its queued results are processed.
+
+        The request moves from its scheduler-side list (waiting, suspended,
+        chunked or prefill_launched) into `_pending_round_robin_actions`. One in
+        the bootstrap or transfer queue has no queued result and is not parked:
+        the transfer queue's release gate already waits for the source drain."""
+        if not (self.enable_chunked_prefill_round_robin and self.enable_overlap):
+            return False
+        # Preserve the first terminal cleanup action.
+        if req in self._pending_round_robin_actions:
+            return True
+        holders = (
+            self.waiting_queue,
+            self.suspended_prefill_queue,
+            self.chunked_reqs,
+            self.prefill_launched_reqs,
+        )
+        if not any(req in holder for holder in holders):
+            return False
+        for holder in holders:
+            holder.leave([req])
+        self._pending_round_robin_actions.defer(req, action)
+        return True
+
+    def process_pending_round_robin_actions(self: Scheduler) -> None:
+        # Insertion order follows broadcast aborts and TP-reduced bootstrap polls.
+        pending = list(self._pending_round_robin_actions)
+        if not pending:
+            return
+        self.remove_prefill_ready_requests(pending)
+        for req in pending:
+            # Result callbacks synchronize before this queue is processed again.
+            if self.has_pending_prefill_result(req):
+                continue
+            action = self._pending_round_robin_actions.pop(req)
+            # Both hand the request to the transfer queue, which releases it
+            # after the source drain.
+            if action == "bootstrap_failure":
+                self.handle_bootstrap_failure(req, defer=False)
+            elif action == "retire":
+                self._retire_aborted_prefill_result(req, defer=False)
+
     def process_prefill_chunk(
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
@@ -1494,8 +1684,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
-                if is_aborted(req):
-                    # bootstrap failed
+                if is_aborted(req) or self.chunked_req is not req:
+                    # bootstrap failed (a round-robin deferral already moved it
+                    # to _pending_round_robin_actions)
                     self.chunked_req = None
                 elif (
                     get_disagg().disaggregation_decode_allocation_policy
@@ -1533,6 +1724,18 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+        if (
+            self.enable_chunked_prefill_round_robin
+            and req is not None
+            and self.chunked_req is req
+            and not req.pending_bootstrap
+            and (self.waiting_queue or self.suspended_prefill_queue)
+        ):
+            req.prefill_ready_seq = self._prefill_ready_seq
+            self._prefill_ready_seq += 1
+            self.chunked_req = None
+            self.suspended_prefill_queue.join([req])
 
     def maybe_send_cached_prefix_chunk(
         self: Scheduler, req: Req, allow_send: bool = True
@@ -1581,26 +1784,34 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
-        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
-        if last_chunk and computer is not None:
-            if is_health_check_req(req):
-                digest = signature = 0
-            else:
-                if end_idx is None:
-                    end_idx = min(req.extend_end, len(req.origin_input_ids))
-                # Only the pages this prefill sends; decode digests the same
-                # range of its row, past the prefix it promised at bootstrap.
-                start_idx = req.disagg_decode_prefix_len
-                page_indices_gpu = page_indices_for_request(
-                    self, req, end_idx, start_idx=start_idx
-                )
-                state_indices = state_indices_for_request(
-                    self, req, end_idx, start_idx=start_idx
-                )
-                digest = computer.compute(page_indices_gpu, state_indices)
-                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
-            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        try:
+            computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+            if last_chunk and computer is not None:
+                self.disagg_metadata_buffers._validate_request_metadata(req)
+                if is_health_check_req(req):
+                    digest = signature = 0
+                else:
+                    if end_idx is None:
+                        end_idx = min(req.extend_end, len(req.origin_input_ids))
+                    # Only the pages this prefill sends; decode digests the same
+                    # range of its row, past the prefix it promised at bootstrap.
+                    start_idx = req.disagg_decode_prefix_len
+                    page_indices_gpu = page_indices_for_request(
+                        self, req, end_idx, start_idx=start_idx
+                    )
+                    state_indices = state_indices_for_request(
+                        self, req, end_idx, start_idx=start_idx
+                    )
+                    digest = computer.compute(page_indices_gpu, state_indices)
+                    signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+                self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
+            self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        except InvalidDisaggregationMetadata as exc:
+            # Keep the request in the inflight queue. Its normal Failed
+            # polling path releases KV and metadata, preserving this 400.
+            prepare_abort(req, str(exc), status_code=HTTPStatus.BAD_REQUEST)
+            req.disagg_kv_sender.abort()
+            self.clear_pending_chunk_send(req)
 
     def _send_kv_chunk(
         self: Scheduler,
@@ -1962,4 +2173,8 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             src.leave([req])
-            self.waiting_queue.prepend([req])
+            if self.enable_chunked_prefill_round_robin:
+                # Round robin orders by ready sequence: requeue at the back.
+                self.enqueue_prefill_ready([req])
+            else:
+                self.waiting_queue.prepend([req])

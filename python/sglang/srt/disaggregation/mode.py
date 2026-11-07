@@ -3,6 +3,8 @@
 from enum import Enum
 
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+# Width of the PD top-logprobs wire buffers; the tokenizer rejects larger requests.
+MAX_DISAGGREGATION_TOP_LOGPROBS = 128
 
 
 class DisaggregationMode(Enum):
