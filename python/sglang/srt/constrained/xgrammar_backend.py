@@ -109,7 +109,10 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def rollback(self, k: int):
         self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        # Speculative traversal rolls back each visited node. Remove only the
+        # tail instead of copying the entire accepted history on every rollback.
+        # Keep the existing slice semantics, including k == 0.
+        del self.accepted_tokens[-k:]
 
     def is_terminated(self):
         return self.matcher.is_terminated()
