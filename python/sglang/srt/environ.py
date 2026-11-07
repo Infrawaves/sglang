@@ -313,6 +313,25 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # Overrides whether the reader frees its registration. Unset, the transport
+    # decides (see deregister_memory_region).
+    SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE = EnvBool(True)
+    # HCAs for remote-instance weight transfers, same formats MOONCAKE_DEVICE
+    # takes and falling back to it when unset. Separate because mooncake store
+    # has to match the HCA the rest of the cluster handshakes on, while this
+    # one wants a per-rank split to avoid contending on transfer.
+    SGLANG_REMOTE_INSTANCE_IB_DEVICE = EnvStr(None)
+    # load_format the remote-instance loader falls back to when the seed is
+    # unreachable. "auto" unless set; --load-format is already spoken for by
+    # remote_instance, so there is nowhere else to say it.
+    SGLANG_REMOTE_INSTANCE_FALLBACK_LOAD_FORMAT = EnvStr(None)
+    # Pins the mooncake transport for remote-instance weight transfers, falling
+    # back to MOONCAKE_PROTOCOL. Unset, each client picks per seed.
+    SGLANG_REMOTE_INSTANCE_PROTOCOL = EnvStr(None)
+    # "NVLINK" allocates the weights from a fabric-capable pool so MNNVL can
+    # serve them, and raises at startup when that pool is unavailable. See
+    # weight_mem_pool.py.
+    SGLANG_REMOTE_INSTANCE_WEIGHT_MEM_POOL = EnvStr(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
@@ -344,6 +363,13 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    # Where the HTTP frontend runs OpenAI request preprocessing (chat template
+    # rendering + tokenization): "thread" keeps it on a helper thread of the
+    # tokenizer worker; "process" moves it into child processes so it stops
+    # contending for the GIL with the loop that streams every request's output.
+    SGLANG_REQUEST_PREPROCESSOR_MODE = EnvStr("thread")
+    # Child processes per tokenizer worker when the mode is "process".
+    SGLANG_REQUEST_PREPROCESSOR_PROCESSES = EnvInt(1)
 
     # ===================================================================
     # Logging
@@ -353,7 +379,23 @@ class Envs:
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    # WARNING when chat tool schema validation (on the tokenizer worker's event
+    # loop) or request conversion on the in-process preprocessing thread
+    # (queueing excluded) takes at least this many ms; either delays the next
+    # token of every stream on that worker. <= 0 disables.
+    SGLANG_LOG_SLOW_PREPROCESSING_MS = EnvInt(200)
+    # WARNING (with the blocking call's stack) when a tokenizer worker's event
+    # loop stops running callbacks for at least this many ms. <= 0 disables.
+    SGLANG_LOG_EVENT_LOOP_LAG_MS = EnvInt(0)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    # Request-log fields (any nesting depth) logged as their length plus a hash
+    # at --log-requests-level 1 and 2: grammar constraints such as a tool-call
+    # structural_tag can be hundreds of KB per request. Empty logs them verbatim.
+    SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS = EnvTuple(
+        ("structural_tag", "json_schema", "ebnf", "regex")
+    )
+    # Only string values longer than this many characters are abbreviated.
+    SGLANG_LOG_REQUEST_ABBREVIATE_MIN_CHARS = EnvInt(256)
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
@@ -591,6 +633,11 @@ class Envs:
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
     # in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)
+    # Allow SGLANG_RAGGED_VERIFY_MODE=compact for a dense DSpark draft under DP
+    # attention (MoE a2a backends, CUDA graphs, PD decode) and under Kimi-K3 DCP.
+    # Every DP rank replays the same verify token tier, agreed through the MLP
+    # sync. cap-accept stays rejected. Off by default until validated.
+    SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -757,10 +804,19 @@ class Envs:
     # Retained only to reject the removed setting during startup.
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Decode side, seconds from request arrival until the prefill handshake is done;
+    # unset follows SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT. The prefill_complete
+    # wait that follows the handshake is bounded by the waiting timeout instead.
+    SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT = EnvInt(None)
+    # Split connect/read budgets so half-dead prefill HTTP calls have a bound.
+    SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT = EnvFloat(5.0)
+    SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_READ_TIMEOUT = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Debug: log PD DCP draft peer-wait stats every N seconds; 0 disables.
+    SGLANG_DISAGG_DRAFT_PEER_WAIT_STATS_INTERVAL = EnvFloat(0.0)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
@@ -770,10 +826,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
-    # Deferred decode-side KV release: on abort, hold an in-flight request's KV
-    # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Only applies to backends that ack the drain
-    # (supports_deferred_decode_kv_release).
+    # ACK-capable backends retain aborted destinations until remote writes drain.
+    # Mooncake enforces this even when explicitly disabled; unsupported backends
+    # remain opted out. The timeout controls warnings/retries, not unsafe reuse.
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
@@ -886,6 +941,11 @@ class Envs:
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
     MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
+    # mooncake reads these at each initialize() to pick a TransferEngine's
+    # transport, ignoring the protocol argument. sglang sets them per call so one
+    # seed can serve NVLink and the NIC at once, then restores them.
+    MC_INTRANODE_NVLINK = EnvBool(False)
+    MC_FORCE_MNNVL = EnvBool(False)
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
@@ -1219,6 +1279,9 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Experimental CuTeDSL MLA override: 0 keeps FlashInfer's heuristic;
+    # 1..32 requests fixed KV splits. Read once before graph capture.
+    SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS = EnvInt(0)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
@@ -1608,6 +1671,10 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # PD decode only: drop multimodal feature tensors in the tokenizer before
+    # dispatch. Decode gets prompt KV from prefill and never runs the encoder,
+    # so it only needs item metadata (offsets, hash/pad_value, grid info).
+    SGLANG_DISAGG_DECODE_DROP_MM_FEATURES = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
@@ -2106,6 +2173,13 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Fuse the dense BF16 K3 o_proj with SP reduce-scatter and prefix addition,
+    # and the next layer's SP all-gather with its qkv_proj; keeps the residual
+    # stream token-sharded like SGLANG_K3_SP_ATTN_RES, whose fused collectives
+    # it replaces. Only enable with SGLANG_K3_SP_COLLECTIVE.
+    # NOTE: not wired into K3's layer_boundary path yet (v0.5.22+); has no
+    # effect on the model forward until re-integrated.
+    SGLANG_K3_SP_GEMM_FUSION = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
@@ -2120,6 +2194,137 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Hard cap on sampled frames for a Kimi-K3 request's video_url content, as
+    # a safety net independent of the checkpoint's own sample_fps /
+    # max_num_frames_each_video preprocessor config: summed across every
+    # video in the request (NOT checked per-video -- two videos each under
+    # the cap can still add up over it, which is exactly the shape of a real
+    # incident this was missed on the first pass), a request that would
+    # sample more than this many frames total is rejected with 503 (Service
+    # Unavailable) before any GPU preprocessing, instead of risking an OOM
+    # deep in the model forward pass on an oversized prefill batch. 503 (not
+    # 400) so a router/gateway sees this as "this backend can't take it
+    # right now" and can retry elsewhere, rather than a client-side error.
+    # Set to 0 (or any value <= 0) to disable the cap.
+    SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES = EnvInt(256)
+    # Global cap on total sampled frames across all Kimi-K3 video requests
+    # currently in GPU preprocessing (bicubic resize -> patchify -> concat)
+    # on this worker, at the same time. SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES
+    # bounds one request's own preprocessing cost, but nothing else bounds
+    # how many of those per-request peaks land on the GPU simultaneously --
+    # two or more requests that are each individually within budget can
+    # still add up past available memory (the same shape of gap that
+    # motivated checking SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES cumulatively
+    # across videos within one request, just one level up: across
+    # concurrent requests on the same worker). This is a byte-count-free
+    # proxy for GPU memory pressure -- weighted by sampled frame count
+    # rather than by request count, so a request queues for exactly as
+    # long as its own frame weight needs the other requests to finish, not
+    # a fixed number of concurrency "slots". Excess requests block until
+    # enough frame budget frees up; this never rejects a request that
+    # already passed SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES on its own. Set to
+    # 0 (or any value <= 0) to disable (unbounded concurrency).
+    SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES = EnvInt(256)
+    # Cap on how many Kimi-K3 video requests may be queued at once waiting
+    # for SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES's GPU-preprocess frame budget
+    # to free up, on this worker. The current queue depth (requests waiting
+    # at this gate, not counting the ones already admitted) is logged at
+    # INFO level on every video request that reaches the gate. Frame
+    # decoding itself (the CPU/IO-thread-pool step that runs before this
+    # gate) is not bounded by this cap -- a request that arrives once the
+    # queue is already at this depth has already paid its own decode cost
+    # by the time it gets here, but rejecting it with 400 (Bad Request)
+    # before it joins the wait queue stops that queue, and the decoded
+    # frame tensors already resident in host memory behind it, from growing
+    # without bound under a sustained burst of video requests. Set to 0 (or
+    # any value <= 0) to disable (unbounded queueing, the previous
+    # behavior).
+    SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH = EnvInt(8)
+    # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
+    # events (current in-flight count) at INFO level, on top of the
+    # always-on per-request duration/frame-count/token-count logs. Off by
+    # default because slot events fire far more often than one line per
+    # video; turn on to confirm the concurrency cap above is actually taking
+    # effect under real traffic.
+    SGLANG_K3_VIDEO_DEBUG_LOG = EnvBool(False)
+    # Override individual keys of the checkpoint-provided video media_proc_cfg
+    # (sample_fps / max_num_frames_each_video / in_patch_limit_video) without
+    # locating or editing the checkpoint's own trust_remote_code processor
+    # file -- media_proc_cfg ships entirely from that checkpoint-side code,
+    # not from sglang or any file sglang controls, so there is normally no
+    # way to tune it short of finding and editing that file. Unset (None)
+    # leaves the checkpoint's own value alone; each is applied independently.
+    SGLANG_K3_VIDEO_SAMPLE_FPS = EnvFloat(None)
+    SGLANG_K3_VIDEO_MAX_NUM_FRAMES = EnvInt(None)
+    SGLANG_K3_VIDEO_IN_PATCH_LIMIT = EnvInt(None)
+    # Threads VideoDecoderWrapper may use *within* one Kimi-K3 video's frame
+    # decode. Defaults to 1 because _split_k3_video already runs one video per
+    # thread on the shared multimodal IO pool (mm_io_worker_num, 16 by
+    # default), so the decoder's own inner pool multiplies against that:
+    # io_workers x inner_threads live VideoDecoder instances, each with its own
+    # ffmpeg threads, and each entering an OpenMP region per colour-conversion
+    # copy. libgomp aborts the *process* when pthread_create returns EAGAIN
+    # (gomp_fatal -> exit() off the main thread, while other threads still hold
+    # torch/CUDA state -> SIGSEGV), so the product has to stay bounded. Inner
+    # parallelism only helps when the outer pool is idle -- a single video in
+    # flight -- and that is exactly the case that was never the bottleneck.
+    # Raise it (or 0 for min(cpu_count, 16)) only alongside a lowered
+    # --mm-io-worker-num and a pinned OMP_NUM_THREADS.
+    SGLANG_K3_VIDEO_DECODE_THREADS = EnvInt(1)
+    # Where Kimi-K3 *image* preprocessing (bicubic resize -> transparent-bg
+    # composite -> normalize+patchify) runs. Video is unaffected: it has no
+    # CPU preprocessing path and always uses the GPU.
+    #   "auto" - pick per request. A request goes to the GPU path (eager in
+    #            the tokenizer process, or deferred to the vision-DP owner
+    #            rank when `_should_defer_gpu_preprocessing` says so) only if
+    #            its estimated GPU preprocessing peak fits in
+    #            SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB together with every
+    #            request already preprocessing on the GPU; otherwise it takes
+    #            the "cpu" path below. With the budget disabled this is the
+    #            previous unconditional GPU behavior.
+    #   "cpu"  - run the checkpoint's own HF processor on the CPU, and decode
+    #            JPEG with PIL instead of nvJPEG. No image preprocessing
+    #            allocates on any GPU, which removes the tokenizer-process
+    #            allocation behind request-level "CUDA out of memory" on
+    #            large multi-image requests. Costs host CPU and raises TTFT;
+    #            numerically this is the checkpoint's exact reference path,
+    #            not an approximation of it (the GPU bicubic resize tracks
+    #            PIL to ~5e-3, and nvJPEG needs fancy_upsampling to match
+    #            PIL's chroma upsampling at all).
+    #   "gpu"  - always preprocess eagerly on the GPU in the tokenizer
+    #            process, never defer. Only useful as an A/B baseline against
+    #            "cpu"; this is the configuration that OOMs.
+    # Changing this changes `gpu_image_decode`, which is part of the
+    # preprocess-artifact fingerprint, so cached artifacts from another mode
+    # are never reused across a restart.
+    SGLANG_K3_IMAGE_PREPROCESS_MODE = EnvStr("auto")
+    # GPU memory budget, in MiB, that "auto" mode lets image preprocessing use
+    # on the tokenizer's GPU at one time, summed over every request currently
+    # preprocessing there (concurrent processor workers each hold one). A
+    # request whose estimate does not fit next to the ones in flight is
+    # preprocessed on the CPU instead; nothing waits. The estimate comes from
+    # image headers, before decode, because nvJPEG decode itself lands on the
+    # GPU. Split evenly across --tokenizer-worker-num, which all share one GPU.
+    # The default leaves room under the ~10 GiB a B300 prefill rank has free
+    # beside the scheduler at --mem-fraction-static 0.85: 10x 8192x8192 (est.
+    # ~8 GiB) did not OOM there, 40x 8192x8192 did. Each decision is logged
+    # with its estimate when SGLANG_K3_IMAGE_PREPROCESS_LOG is on, which is
+    # the data to tune this from. Set to 0 (or any value <= 0) to disable,
+    # restoring the previous always-GPU "auto".
+    SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB = EnvInt(6144)
+    # Safety net under the budget above, for when the estimate is wrong: if
+    # Kimi-K3 *image* preprocessing on the tokenizer's GPU raises CUDA OOM,
+    # release the cached allocations and redo that request on the CPU instead
+    # of failing it with 500. Logged at WARNING every time it fires -- each one
+    # means the budget is set too high. Video still raises (no CPU path). Off
+    # only to reproduce the raw OOM, e.g. as the mode=gpu A/B baseline.
+    SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK = EnvBool(True)
+    # Log one line per processor call naming the backend that actually ran
+    # (plus image count and resolved visual-token total), to confirm the mode
+    # above is taking effect under real traffic. One line per call is roughly
+    # one line per request, matching the always-on video logs; turn it off to
+    # silence it entirely.
+    SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

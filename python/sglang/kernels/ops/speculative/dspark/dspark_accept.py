@@ -51,6 +51,8 @@ class AcceptSampling:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        verify_row_indptr: Optional[torch.Tensor] = None,
+        num_valid_rows: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
@@ -62,6 +64,8 @@ class AcceptSampling:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            verify_row_indptr=verify_row_indptr,
+            num_valid_rows=num_valid_rows,
         )
 
     @classmethod
@@ -77,6 +81,8 @@ class AcceptSampling:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        verify_row_indptr: Optional[torch.Tensor] = None,
+        num_valid_rows: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
@@ -88,6 +94,8 @@ class AcceptSampling:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            verify_row_indptr=verify_row_indptr,
+            num_valid_rows=num_valid_rows,
         )
 
 
@@ -102,10 +110,50 @@ def _accept_sampling_core(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
     block_verification: bool,
+    verify_row_indptr: Optional[torch.Tensor],
+    num_valid_rows: Optional[int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+    if verify_row_indptr is not None and num_valid_rows == bs * verify_num_draft_tokens:
+        verify_row_indptr = None
+    if verify_row_indptr is not None:
+        assert num_valid_rows is not None and verify_row_indptr.shape == (bs + 1,)
+        assert bs <= num_valid_rows <= bs * verify_num_draft_tokens
+        # Grammar, penalties and bias are applied in the original strided row
+        # order. Gather those adjusted logits, including each request's bonus
+        # row, before the vocabulary-wide probability operations.
+        rows = torch.arange(
+            num_valid_rows, device=device, dtype=verify_row_indptr.dtype
+        )
+        request_ids = torch.searchsorted(verify_row_indptr[1:], rows, right=True)
+        strided_rows = request_ids * verify_num_draft_tokens + (
+            rows - verify_row_indptr.index_select(0, request_ids)
+        )
+        target_probs = build_speculative_verify_target_probs(
+            next_token_logits=target_logits,
+            sampling_info=sampling_info,
+            draft_token_num=1,
+            bs=num_valid_rows,
+            max_top_k=draft_input.max_top_k,
+            uniform_top_k_value=draft_input.uniform_top_k_value,
+            row_to_request=request_ids,
+            logit_rows=strided_rows,
+        )
+        if _is_npu:
+            # The external NPU kernel takes a valid distribution on every
+            # strided row. Only valid rows go through top-p.
+            dense = target_probs.new_zeros(
+                (bs * verify_num_draft_tokens, target_probs.shape[-1])
+            )
+            dense[:, 0] = 1
+            target_probs = dense.index_copy_(0, strided_rows, target_probs[:, 0]).view(
+                bs, verify_num_draft_tokens, -1
+            )
+            verify_row_indptr = None
+    elif (
+        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
+    ):
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
@@ -158,8 +206,17 @@ def _accept_sampling_core(
         threshold_single=1.0,
         threshold_acc=1.0,
         deterministic=True,
+        **(
+            {"target_row_indptr": verify_row_indptr}
+            if verify_row_indptr is not None
+            else {}
+        ),
     )
     correct_len = accept_token_num
+    if _is_npu and num_valid_rows is not None:
+        # Preserve the last valid row's decision and ignore acceptances
+        # computed from the NPU kernel's dummy tail distributions.
+        correct_len = torch.minimum(correct_len, cutoff_verify_lens)
     if cutoff_verify_lens is not None:
         correct_len, cap_trim_lens = CapCorrectLen.execute(
             correct_len=correct_len, verify_lens=cutoff_verify_lens
@@ -180,6 +237,8 @@ def accept_sampling(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
+    verify_row_indptr: Optional[torch.Tensor] = None,
+    num_valid_rows: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -193,6 +252,8 @@ def accept_sampling(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        verify_row_indptr=verify_row_indptr,
+        num_valid_rows=num_valid_rows,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
@@ -250,6 +311,8 @@ def accept_sampling_triton(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
+    verify_row_indptr: Optional[torch.Tensor] = None,
+    num_valid_rows: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
         candidates=candidates,
@@ -261,6 +324,8 @@ def accept_sampling_triton(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        verify_row_indptr=verify_row_indptr,
+        num_valid_rows=num_valid_rows,
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len

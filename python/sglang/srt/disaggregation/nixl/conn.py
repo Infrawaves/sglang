@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -3531,7 +3532,20 @@ class NixlKVSender(CommonKVSender):
 
 
 class NixlKVReceiver(CommonKVReceiver):
-    pass
+    def failure_exception(self):
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        # No clear() here: a deferred release must still abort() this room, and
+        # clear() gives up the room ownership that abort() needs to arm ACKs.
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "NIXL KVReceiver Exception"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):

@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -42,8 +43,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.storage_page_group import batch_spans
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.observability.metrics_collector import (
+    hicache_diagnostic_metrics_enabled,
+)
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -81,13 +86,20 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+    ):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Called on the forward stream after each wait,
+        # with (consumer index, transfer layer id).
+        self.on_layer_ready = on_layer_ready
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -103,6 +115,8 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if self.on_layer_ready is not None:
+            self.on_layer_ready(self.consumer_index, threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -234,6 +248,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        start_page: int = 0,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -241,6 +256,10 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Absolute page index of hash_value[0]; only grouped L3 objects use it.
+        self.start_page = start_page
+        # Pool name -> segment chain from the existence query (grouped L3 only).
+        self.storage_plans: Optional[dict] = None
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -293,6 +312,9 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    # HiCache pages per L3 KV/draft object; __init__ sets it from the flags.
+    storage_page_group = 1
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -311,6 +333,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -330,11 +353,18 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        storage_page_size = get_memory().hicache_storage_page_size
+        # HiCache pages per L3 object for the KV and draft pools.
+        self.storage_page_group = (
+            1 if storage_page_size is None else storage_page_size // page_size
+        )
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Read once so every collective in this process uses the same shape.
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -356,7 +386,16 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        # MLA host dedup: the forward broadcasts each loaded layer as it waits for it.
+        self.node_leader_broadcast = node_leader_broadcast
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            on_layer_ready=(
+                None
+                if node_leader_broadcast is None
+                else node_leader_broadcast.broadcast_ready_layers
+            ),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -810,6 +849,7 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
+            storage_page_group=self.storage_page_group,
         )
 
     def reset(self):
@@ -1036,6 +1076,10 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        if self.node_leader_broadcast is not None:
+            # Before the fence below, so the new H2D also waits for it.
+            self.node_leader_broadcast.flush_stale(producer_id, self.load_fence_stream)
+
         if self.load_fence_stream is not None:
             # in overlap scheduling, reclaimed pages might still be written by the forward thread
             # therefore a fence is needed for loading thread to prevent memory corruption
@@ -1050,6 +1094,12 @@ class HiCacheController:
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.node_leader_broadcast is not None:
+            self.node_leader_broadcast.start_load(
+                index=producer_id,
+                device_indices=device_indices,
+                finish_event=completion.finish_event,
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
@@ -1162,20 +1212,31 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+        for i, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
             if all_success:
-                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_hashes = operation.hash_value[i:batch_end]
                 batch_host_indices = operation.host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                    i * self.page_size : batch_end * self.page_size
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                extra_info = HiCacheStorageExtraInfo(
+                    prefix_keys=prefix_keys,
+                    start_page=operation.start_page + i,
+                    storage_plans=operation.storage_plans,
+                )
+
+                operation.kv_last_ts = time.monotonic()
 
                 try:
                     hit_pages = self._page_transfer_kv_batch(
@@ -1186,9 +1247,12 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
+                    # This rank can only vouch for earlier batches. Continue the
+                    # normal short-read path so every rank issues the same ACKs.
                     logger.exception(
-                        "HiCache prefetch transfer failed for request %s",
+                        "Prefetch KV read failed for request %s at page %d",
                         operation.request_id,
+                        operation.start_page + i,
                     )
                     hit_pages = 0
                 # Check termination
@@ -1371,13 +1435,30 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
-        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        # [x, -x] under MIN yields [min x, -max x] in one collective, so
+        # the cross-rank spread costs no extra communication. PP-ticket
+        # mode reduces a scalar on these groups elsewhere, so keep the
+        # scalar shape there to avoid mismatched collectives.
+        pack_spread = (
+            self.enable_diagnostic_metrics
+            and getattr(self, "pp_prefetch_command_group", None) is None
+        )
+        hit_count = torch.tensor(
+            [storage_hit_count, -storage_hit_count]
+            if pack_spread
+            else storage_hit_count,
+            dtype=torch.int,
+        )
         self._all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
         )
-        return int(hit_count.item())
+        if not pack_spread:
+            return int(hit_count.item())
+        min_hits, neg_max_hits = hit_count.tolist()
+        operation.query_rank_spread = -neg_max_hits - min_hits
+        return int(min_hits)
 
     def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
         """Advance the backend's prefix context past omitted pages."""
@@ -1416,14 +1497,21 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+        for i, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
+            batch_hashes = operation.hash_value[i:batch_end]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                i * self.page_size : batch_end * self.page_size
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, start_page=operation.start_page + i
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

@@ -96,6 +96,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_model_capability_adjustments",
         "handle_amd_monokernel",
         "handle_nvidia_megakernel",
+        "validate_dcp_kv_layout",
         "validate_deepep_v2_speculative_draft",
         "validate_deepep_v2_dispatch_token_budget",
     }

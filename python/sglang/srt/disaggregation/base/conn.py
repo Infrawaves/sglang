@@ -133,6 +133,9 @@ class BaseKVManager(ABC):
 
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
+    # Fail-closed source/destination lifetime: never free on a timeout, only
+    # after every writer's drain ACK (Mooncake).
+    requires_transfer_drain: bool = False
 
     def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
         """Whether the checksum sent by the prefill at bootstrap_addr is comparable
@@ -167,6 +170,10 @@ class BaseKVManager(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support PD role switch teardown"
         )
+
+    def mark_prefill_forward_synced(self) -> None:
+        """Prefill scheduler hook: every forward whose KV a queued chunk reads
+        has completed on this rank's GPU."""
 
 
 class BaseKVSender(ABC):

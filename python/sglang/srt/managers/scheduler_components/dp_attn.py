@@ -30,10 +30,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
-    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -161,6 +160,13 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # DSpark compact verify, carried here so every DP rank agrees on one verify
+    # token tier per step without a collective of its own. 0 is neutral (no
+    # decode rows on this rank); -1 is a decode rank without a budget, which
+    # turns the tier off for the step. The budget is stored as budget + 1 so a
+    # missing budget is 0, keeping the neutral row all-zero.
+    spec_verify_tier_num_tokens: int = 0
+    spec_verify_token_budget_enc: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -172,6 +178,9 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    # Per attention-DP rank, read from each DP's attention-TP rank 0.
+    global_spec_verify_tier_num_tokens: list[int] = None
+    global_spec_verify_token_budget_enc: list[int] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -187,6 +196,8 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                self.spec_verify_tier_num_tokens,
+                self.spec_verify_token_budget_enc,
             ],
             device=device,
             dtype=dtype,
@@ -206,6 +217,8 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # spec_verify_tier_num_tokens
+                0,  # spec_verify_token_budget_enc
             ],
             device=device,
             dtype=dtype,
@@ -218,6 +231,8 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
+        self.global_spec_verify_tier_num_tokens = [self.spec_verify_tier_num_tokens]
+        self.global_spec_verify_token_budget_enc = [self.spec_verify_token_budget_enc]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -294,6 +309,8 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.global_spec_verify_tier_num_tokens = tp0_info_cpu[:, 11].tolist()
+        self.global_spec_verify_token_budget_enc = tp0_info_cpu[:, 12].tolist()
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -342,6 +359,12 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+        batch.global_spec_verify_tier_num_tokens = getattr(
+            mlp_sync_info, "global_spec_verify_tier_num_tokens", None
+        )
+        batch.global_spec_verify_token_budget_enc = getattr(
+            mlp_sync_info, "global_spec_verify_token_budget_enc", None
+        )
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -349,6 +372,24 @@ def _update_gather_batch(
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
+    )
+
+
+def local_spec_verify_tier(local_batch: Optional[ScheduleBatch]) -> tuple[int, int]:
+    """(verify token tier, budget + 1) this rank reports to the MLP sync.
+
+    Only a decode batch whose DSpark verify budget was computed before this sync
+    reports a tier; any other decode batch reports -1, which disables the
+    DP-shared tier for the step on every rank.
+    """
+    if local_batch is None or not local_batch.forward_mode.is_decode():
+        return 0, 0
+    if not getattr(local_batch, "spec_verify_budget_presync", False):
+        return -1, 0
+    budget = local_batch.spec_verify_token_budget_presync
+    return (
+        int(local_batch.spec_verify_tier_num_tokens),
+        0 if budget is None else int(budget) + 1,
     )
 
 
@@ -374,10 +415,33 @@ def _local_decode_cuda_graph_vote(
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
         return False
-    return (
-        local_batch is None
-        or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt()
+    if local_batch is None or local_batch.forward_mode.is_prebuilt():
+        return True
+    if not local_batch.forward_mode.is_decode_or_idle():
+        return False
+    # Mirror request-dependent replay vetoes before ranks select a verify tier.
+    if local_batch.replace_embeds is not None:
+        return False
+    encoder_lens = local_batch.encoder_lens_cpu
+    return encoder_lens is None or all(length > 0 for length in encoder_lens)
+
+
+def _dspark_verify_graph_unavailable(
+    model_runner: ModelRunner, local_batch: Optional[ScheduleBatch]
+) -> bool:
+    runner = model_runner.decode_cuda_graph_runner
+    if runner is None:
+        return True
+    # DSpark verifies with full hidden states. Eager ranks must signal the
+    # same vote even when only the prefill phase has a captured graph.
+    return getattr(runner, "ragged_verify_mode", False) and (
+        not runner.attn_backend.supports_ragged_verify_graph
+        or runner.capture_hidden_mode < CaptureHiddenMode.FULL
+        or (
+            local_batch is not None
+            and local_batch.forward_mode.is_decode()
+            and local_batch.batch_size() > runner.max_bs
+        )
     )
 
 
@@ -623,6 +687,9 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
+    spec_verify_tier_num_tokens, spec_verify_token_budget_enc = local_spec_verify_tier(
+        local_batch
+    )
 
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
@@ -641,6 +708,8 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        spec_verify_tier_num_tokens=spec_verify_tier_num_tokens,
+        spec_verify_token_budget_enc=spec_verify_token_budget_enc,
     )
 
     if num_dp_ranks == 1:
@@ -748,7 +817,13 @@ class SchedulerDPAttnAdapter:
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=cuda_graph_fully_disabled(),
+            disable_cuda_graph=(
+                check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                or (
+                    self.spec_algorithm.is_dspark()
+                    and _dspark_verify_graph_unavailable(self.model_runner, local_batch)
+                )
+            ),
             require_mlp_tp_gather=require_mlp_tp_gather(),
             draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,

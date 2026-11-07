@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import torch.distributed as dist
+
+from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DRAFT_NODE_MERGE_LAYOUTS,
+    DraftNodeShareAllocator,
+    log_draft_node_merge,
+    maybe_create_draft_node_merge,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -25,12 +34,16 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+from sglang.srt.mem_cache.mla_host_node_leader import (
+    maybe_create_node_leader_context,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -170,6 +183,10 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
+    capacity_multiplier: int = 1,
+    host_allocator: Optional[Any] = None,
+    host_buffer_read_only: bool = False,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -190,6 +207,13 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
+    if is_dummy:
+        # Broadcast follower: same token capacity, no retained host data mapping.
+        kwargs["is_dummy"] = True
+    if host_allocator is not None:
+        kwargs["host_allocator"] = host_allocator
+    if host_buffer_read_only:
+        kwargs["host_buffer_read_only"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -221,10 +245,11 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    host_size = get_memory().hicache_size if host_size is None else host_size
     host_pool = kv_host_pool_cls(
         host_input,
-        get_memory().hicache_ratio,
-        get_memory().hicache_size if host_size is None else host_size,
+        get_memory().hicache_ratio * capacity_multiplier,
+        host_size * capacity_multiplier,
         page_size,
         get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
@@ -1328,13 +1353,38 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
-    kv_host_pool = build_kv_host_pool(
+    # WORLD-collective on every rank, before host allocation: it decides whether
+    # this rank's MLA host pool is real, allocator-only or mapped from the leader.
+    node_leader = maybe_create_node_leader_context(
         kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        host_size=kv_host_size,
-        mtp_draft_device_pools=root.packed_draft_device_pools,
+        full_layer_mapping=full_layer_mapping,
+        tp_cache_group=params.tp_cache_group,
+        draft_pools=root.packed_draft_device_pools,
     )
+    with (
+        node_leader.leader_budget_scope()
+        if node_leader is not None
+        else contextlib.nullcontext()
+    ):
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=params.page_size,
+            use_mla=use_mla,
+            host_size=kv_host_size,
+            mtp_draft_device_pools=root.packed_draft_device_pools,
+            capacity_multiplier=(
+                1 if node_leader is None else node_leader.capacity_multiplier
+            ),
+            is_dummy=node_leader is not None and node_leader.is_follower,
+            host_allocator=None
+            if node_leader is None
+            else node_leader.shared_allocator,
+            host_buffer_read_only=node_leader is not None and node_leader.is_follower,
+        )
+    if node_leader is not None:
+        # Mamba's budget check must observe the leader's completed MLA pin.
+        # Use Gloo: pinning can outlast the NCCL watchdog.
+        dist.barrier(group=params.tp_cache_group)
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
     # pool has no separate K/V buffers, so kv_split does not apply; override
@@ -1408,6 +1458,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        node_leader_broadcast=None if node_leader is None else node_leader.broadcast,
     )
     return host_pool_group, cache_controller, config
 
@@ -1582,6 +1633,7 @@ def _build_mha_mla_host_pool(
     allocator_type: str,
     pool_label: str,
     host_token_capacity: int | None = None,
+    host_allocator: Optional[Any] = None,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -1600,6 +1652,27 @@ def _build_mha_mla_host_pool(
         pool_label=pool_label,
         host_token_capacity=host_token_capacity,
     )
+    if host_allocator is not None:
+        if not isinstance(pool, MHATokenToKVPool):
+            raise NotImplementedError(
+                "--hicache-draft-node-merge supports only the symmetric "
+                "non-MXFP8 MHA draft host pool."
+            )
+        host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
+        if host_cls is not MHATokenToKVPoolHost:
+            raise NotImplementedError(
+                "--hicache-draft-node-merge supports only the symmetric "
+                "non-MXFP8 MHA draft host pool."
+            )
+        # Also checked at launch; kept for callers that bypass server args.
+        if layout not in DRAFT_NODE_MERGE_LAYOUTS:
+            raise ValueError(
+                "--hicache-draft-node-merge requires --hicache-mem-layout in "
+                f"{DRAFT_NODE_MERGE_LAYOUTS}, got {layout!r}."
+            )
+        return MHATokenToKVPoolHost(
+            host_input, host_allocator=host_allocator, **host_kwargs, **kwargs
+        )
     if isinstance(pool, MHATokenToKVPool):
         host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
         return host_cls(host_input, **host_kwargs, **kwargs)
@@ -1637,17 +1710,40 @@ def build_full_draft_pools(
     if pool.layer_num > controller.transfer_layer_id_max:
         raise ValueError("Draft HiCache layers exceed the target transfer stages")
 
+    # Every rank runs this in the same order; the node share allocates collectively.
+    # Read tp_group only when enabled: draft-builder callers without a node
+    # share (and their test controllers) need not carry one.
+    merge = (
+        maybe_create_draft_node_merge(enabled=True, tp_cache_group=controller.tp_group)
+        if get_memory().hicache_draft_node_merge
+        else None
+    )
+    host_allocator = (
+        None
+        if merge is None
+        else DraftNodeShareAllocator(merge=merge, tp_cache_group=controller.tp_group)
+    )
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-        host_token_capacity=host_pool_group.logical_size,
-    )
+    try:
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_token_capacity=host_pool_group.logical_size,
+            host_allocator=host_allocator,
+        )
+    except Exception as exc:
+        # A per-rank failure before allocation (e.g. the host budget check)
+        # must still release peers blocked in the node-share collectives.
+        if host_allocator is not None:
+            host_allocator.abort(exc)
+        raise
+    if merge is not None:
+        log_draft_node_merge(draft_host_pool, merge)
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
     specs = [
@@ -1716,6 +1812,10 @@ def build_swa_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
+    if get_memory().hicache_draft_node_merge:
+        raise NotImplementedError(
+            "--hicache-draft-node-merge does not support draft SWA pools."
+        )
     draft_swa_pool = draft_kv_pool.swa_kv_pool
     if draft_swa_pool is None:
         raise NotImplementedError(
@@ -2537,6 +2637,14 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
         strategy = _select_strategy(kvcache, components)
+        # Rank-independent: every rank rejects before any stack collective.
+        if get_memory().enable_mla_hicache_per_node and not isinstance(
+            strategy, _MambaStrategy
+        ):
+            raise ValueError(
+                "--enable-mla-hicache-per-node supports only hybrid MLA + "
+                f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
+            )
         result = strategy.build(
             cache=cache,
             kvcache=kvcache,

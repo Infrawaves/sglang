@@ -1044,20 +1044,32 @@ def build_speculative_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    row_to_request: Optional[torch.Tensor] = None,
+    logit_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    def expand(values: torch.Tensor) -> torch.Tensor:
+        if row_to_request is not None:
+            return values.index_select(0, row_to_request)
+        return torch.repeat_interleave(values, draft_token_num, dim=0)
+
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
-    )
-    scaled_logits = next_token_logits / expanded_temperature
+    temperatures = expand(sampling_info.temperatures)
+    if logit_rows is None:
+        scaled_logits = next_token_logits / temperatures
+    else:
+        # The gather owns this storage. Reuse it when division preserves its
+        # dtype, and drop it before softmax when division needs promotion.
+        scaled_logits = next_token_logits.index_select(0, logit_rows)
+        if torch.result_type(scaled_logits, temperatures) == scaled_logits.dtype:
+            scaled_logits.div_(temperatures)
+        else:
+            scaled_logits = scaled_logits / temperatures
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
+        repeated_top_ks = expand(sampling_info.top_ks).to(dtype=torch.int64)
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
@@ -1081,9 +1093,7 @@ def build_speculative_verify_target_probs(
 
             topk_probs = F.softmax(topk_logits, dim=-1)
             if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
+                repeated_top_ps = expand(sampling_info.top_ps)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
@@ -1095,12 +1105,12 @@ def build_speculative_verify_target_probs(
         if need_top_k:
             target_probs = _dflash_top_k_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+                expand(sampling_info.top_ks),
             )
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+                expand(sampling_info.top_ps),
             )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 

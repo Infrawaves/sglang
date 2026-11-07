@@ -58,6 +58,7 @@ _TRITON_KERNELS = [
     ("shuffle_5d_cache", "launch_reshape_and_cache_shuffle_5d"),
     ("shuffle_5d_cache", "launch_gather_shuffle_5d_to_linear"),
     ("pd_dcp_gather", "copy_mla_rows_into_pack"),
+    ("pd_dcp_gather", "copy_rows_into_strided_pack"),
     ("kv_read_table", "build_kv_read_table"),
     ("kv_read_table", "build_kv_read_table_packed"),
     ("cache_move", "set_kv_buffer_prefix_valid_tiled"),

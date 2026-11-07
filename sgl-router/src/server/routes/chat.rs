@@ -26,8 +26,9 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
+    forwarded_prompt_ids, parse_embedding_request, parse_request_fields, PreparedRequest,
     CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    RESPONSES_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,15 +37,18 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+/// Maximum buffered request body, including base64 multimodal inputs.
+/// Enforced by the `DefaultBodyLimit` layers in app.rs, which return 413; chat
+/// and Responses use `--max-chat-body-bytes`, whose default this is.
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
 
 /// An inference route. HTTP and gRPC calls prepare and select for it alike.
 #[derive(Clone, Copy)]
 pub enum Endpoint {
     Chat,
     Completions,
+    /// OpenAI Responses; HTTP only, forwarded as sent.
+    Responses,
     Generate,
     Embeddings,
     Classify,
@@ -67,6 +71,18 @@ pub async fn completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     serve_http(ctx, Endpoint::Completions, headers, body).await
+}
+
+/// OpenAI Responses, forwarded to the engine's `/v1/responses` as sent.
+///
+/// The chat encoder cannot render Responses input, so these route on load and
+/// the body-size token estimate instead of tokenized prompts.
+pub async fn responses(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    serve_http(ctx, Endpoint::Responses, headers, body).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -180,6 +196,7 @@ impl Endpoint {
         match self {
             Endpoint::Chat => CHAT_PATH,
             Endpoint::Completions => COMPLETIONS_PATH,
+            Endpoint::Responses => RESPONSES_PATH,
             Endpoint::Generate => GENERATE_PATH,
             Endpoint::Embeddings => EMBEDDINGS_PATH,
             Endpoint::Classify => CLASSIFY_PATH,
@@ -198,18 +215,17 @@ async fn prepare<'a>(
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
     let served_model = || ModelId(ctx.config.model.id.clone());
     let (routing, request) = match endpoint {
-        Endpoint::Chat | Endpoint::Completions => {
-            let mut fields = parse_routing_fields(&body)?;
-            let model = fields.model.take();
-            let model =
-                ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
+        Endpoint::Chat | Endpoint::Completions | Endpoint::Responses => {
+            let path = endpoint.path();
+            let mut fields = parse_request_fields(&body, path)?;
+            let model = match fields.model.take() {
+                Some(model) => ModelId(model),
+                // `model` is optional in the Responses API; use the served model.
+                None if matches!(endpoint, Endpoint::Responses) => served_model(),
+                None => return Err(ApiError::BadRequest("missing `model` field".into())),
+            };
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
-            let path = if matches!(endpoint, Endpoint::Chat) {
-                CHAT_PATH
-            } else {
-                COMPLETIONS_PATH
-            };
             let request = if grpc && matches!(endpoint, Endpoint::Completions) {
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {

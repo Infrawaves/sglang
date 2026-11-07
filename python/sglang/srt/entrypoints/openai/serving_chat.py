@@ -8,18 +8,18 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
+from hashlib import sha256
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncGenerator,
     Callable,
     Dict,
     List,
     Optional,
 )
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_disagg, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -45,7 +45,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -57,6 +57,8 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
+    CacheUsage,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -84,7 +86,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    warn_if_slow_preprocessing,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -104,11 +109,13 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
+    check_tool_parameters_schema,
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -149,6 +156,65 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+# reasoning_effort values Kimi K3 ignores that were already warned about; the
+# value is client-controlled, so the set is capped.
+_K3_WARNED_REASONING_EFFORTS: set = set()
+_K3_WARNED_REASONING_EFFORTS_MAX = 64
+
+
+def _warn_k3_unsupported_reasoning_effort(value: Any) -> None:
+    key = repr(value)
+    if (
+        key in _K3_WARNED_REASONING_EFFORTS
+        or len(_K3_WARNED_REASONING_EFFORTS) >= _K3_WARNED_REASONING_EFFORTS_MAX
+    ):
+        logger.debug(
+            "Kimi K3 does not support reasoning_effort=%s; using the encoder default.",
+            key,
+        )
+        return
+    _K3_WARNED_REASONING_EFFORTS.add(key)
+    logger.warning(
+        "Kimi K3 does not support reasoning_effort=%s; using the encoder default. "
+        "Logged once per value.",
+        key,
+    )
+
+
+_KIMI_K3_MAX_VIDEO_INPUTS = 2
+
+
+def _truncate_kimi_k3_videos(messages: List[Dict[str, Any]]) -> None:
+    """Keep only the latest two K3 video parts across the whole request.
+
+    K3 receives the complete conversation on every chat request, so the
+    ordering here naturally covers both same-turn and multi-turn inputs.
+    Removing old parts before encoding keeps the rendered placeholders and
+    the extracted ``video_data`` list aligned.
+    """
+    video_count = sum(
+        1
+        for message in messages
+        for part in (message.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "video_url"
+    )
+    to_drop = max(0, video_count - _KIMI_K3_MAX_VIDEO_INPUTS)
+    if not to_drop:
+        return
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for part in content:
+            is_video = isinstance(part, dict) and part.get("type") == "video_url"
+            if is_video and to_drop:
+                to_drop -= 1
+                continue
+            kept.append(part)
+        message["content"] = kept
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -381,6 +447,7 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    supports_process_preprocessing = True
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
@@ -654,7 +721,8 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[list[dict[str, Any]], int, str | None]:
-        image_count = 0
+        _truncate_kimi_k3_videos(messages)
+        media_count = 0
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -677,7 +745,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        media_count += 1
+                    elif part_type == "video_url":
+                        video = part.get("video_url") or {}
+                        if isinstance(video, str):
+                            video = {"url": video}
+                        # K3's chat encoder only recognizes image parts. Emit one
+                        # structural media placeholder here; the multimodal
+                        # processor expands it into timestamped video chunks.
+                        parts.append({"type": "image_url", "image_url": video})
+                        media_count += 1
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -721,7 +798,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, media_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -745,15 +822,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            if media_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * media_count
 
             if (
                 request.reasoning_effort in ("low", "high", "max")
@@ -767,11 +844,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 "high",
                 "max",
             ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
-                )
+                _warn_k3_unsupported_reasoning_effort(request.reasoning_effort)
 
             effective_tools = self._effective_tools(request)
             if (
@@ -780,6 +853,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tool_choice in ("required", "none")
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -842,11 +926,59 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
         prompt_tokens = meta_info.get("prompt_tokens", 0)
-        if self.chat_encoding_spec == "kimi_k3":
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and meta_info.get("cache_usage") is None
+        ):
             # K3's three-token assistant generation stub is model input, but the
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
+
+    def _cache_request_params(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> dict[str, Any]:
+        # The gateway sends the same options to both PD workers. Only decode
+        # accounts the request; prefill accepts and ignores these options.
+        if get_disagg().disaggregation_mode == "prefill":
+            return {}
+        # Requests without a gateway identity keep the original API behavior,
+        # including usage fields and response headers, without a cache snapshot.
+        if request.cache_user_id is None:
+            return {}
+        if not getattr(get_serving(), "enable_cache_accounting", False):
+            if (
+                request.prompt_cache_options is None
+                or request.prompt_cache_options.mode == "explicit"
+            ):
+                return {}
+            raise ValueError("Cache accounting is not enabled on this server.")
+        # The gateway supplies its authenticated user's identity independently
+        # of optional engine API authentication. Hash it before dispatch; never
+        # use one shared gateway credential as all users' cache identity.
+        cache_user_id = (
+            "cache-user-id:" + sha256(request.cache_user_id.encode("utf-8")).hexdigest()
+        )
+        # TokenizerManager decides which shapes can use Redis accounting for
+        # identified users.
+        return {
+            "cache_user_id": cache_user_id,
+            "cache_required": (
+                request.prompt_cache_options is not None
+                and request.prompt_cache_options.mode == "implicit"
+            ),
+            "cache_mode": (
+                request.prompt_cache_options.mode
+                if request.prompt_cache_options is not None
+                else "implicit"
+            ),
+            "cache_ttl_seconds": (
+                3600
+                if request.prompt_cache_options is not None
+                and request.prompt_cache_options.ttl == "1h"
+                else 300
+            ),
+        }
 
     @staticmethod
     def _sort_tool_message_run(
@@ -988,6 +1120,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         cached_tokens=self._continuous_usage_cached_details(content),
+                        cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -1038,6 +1171,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         cached_tokens=self._continuous_usage_cached_details(content),
+                        cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -1066,6 +1200,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=reasoning_tokens.get(index, 0),
                     completion_tokens=completion_tokens.get(index, 0),
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 ).model_dump()
 
             yield build_sse_content(
@@ -1143,7 +1278,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+        if isinstance(request.tool_choice, ToolChoice):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -1153,29 +1288,37 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            if self.tool_call_parser != "kimi_k3":
+                return "allowed_tools requires the Kimi K3 tool parser."
+            allowed_tools = request.tool_choice.allowed_tools
+            declared_names = {
+                tool.function.name
+                for tool in effective_tools
+                if tool.type == "function"
+            }
+            for tool in allowed_tools.tools:
+                if tool.function.name not in declared_names:
+                    return f"allowed_tools references undeclared function {tool.function.name!r}."
+
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
             if len(names) != len(set(names)):
                 return "Tool names must be unique across request and message tools."
 
-        # Validate tool definitions
-        for i, tool in enumerate(effective_tools):
-            if tool.function.parameters is None:
-                continue
-            try:
-                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
-                # to standard JSON Schema types before validation. RecursionError
-                # guards against hand-crafted cyclic schemas so the request gets
-                # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-            except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
-                )
+        # Validate tool definitions. This runs on the event loop of every entry
+        # point that validates chat requests (chat, Anthropic, tokenize).
+        started = monotonic_time()
+        error_msg, python_fallbacks = self._validate_tool_schemas(effective_tools)
+        warn_if_slow_preprocessing(
+            "tool schema validation on the event loop",
+            monotonic_time() - started,
+            request,
+            tools=len(effective_tools),
+            python_fallbacks=python_fallbacks,
+        )
+        if error_msg:
+            return error_msg
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1195,6 +1338,37 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    @staticmethod
+    def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
+        """The first parameters schema error, if any, and Python fallbacks."""
+        python_fallbacks = 0
+        for i, tool in enumerate(tools):
+            if tool.function.parameters is None:
+                continue
+            try:
+                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
+                # to standard JSON Schema types before validation. RecursionError
+                # guards against hand-crafted cyclic schemas so the request gets
+                # a 400 instead of crashing into a 500.
+                normalize_json_schema_types(tool.function.parameters)
+                # Count before checking so Python errors are included as well.
+                # A Rust success returns False and removes the provisional count.
+                python_fallbacks += 1
+                if not check_tool_parameters_schema(tool.function.parameters):
+                    python_fallbacks -= 1
+            except SchemaError as e:
+                return (
+                    f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
+                    python_fallbacks,
+                )
+            except RecursionError:
+                return (
+                    f"Tool {i} function 'parameters' schema is too deeply nested "
+                    "or contains a cycle.",
+                    python_fallbacks,
+                )
+        return None, python_fallbacks
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         if self.tokenizer_manager.model_config.is_multimodal:
@@ -1278,7 +1452,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-
+        cache_params = self._cache_request_params(request)
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":
@@ -1365,6 +1539,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            **cache_params,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
@@ -1858,9 +2033,11 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
-        if effective_tools and request.tool_choice != "none":
+        if (
+            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
+        ) and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
+            if isinstance(request.tool_choice, ToolChoice):
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
@@ -2042,6 +2219,8 @@ class OpenAIServingChat(OpenAIServingBase):
             normalize_assistant_tool_call_arguments(
                 message, strict=strict_tool_call_arguments
             )
+        if self.chat_encoding_spec == "kimi_k3":
+            _truncate_kimi_k3_videos(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -2060,8 +2239,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else self.chat_encoding_spec == "kimi_k3"
             )
             if collects_openai_media:
-                for message in request.messages:
-                    msg_dict = message.model_dump()
+                for msg_dict in messages:
                     if msg_dict.get("content") is None:
                         msg_dict["content"] = ""
                     process_content_for_template_format(
@@ -2417,7 +2595,10 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse | ErrorResponse:
         """Handle streaming chat completion request"""
-        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+        cache_context: dict[str, CacheUsage] = {}
+        generator = self._generate_chat_stream(
+            adapted_request, request, raw_request, cache_context=cache_context
+        )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
@@ -2435,6 +2616,11 @@ class OpenAIServingChat(OpenAIServingBase):
         return StreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
+            headers=(
+                cache_context["usage"].response_headers()
+                if "usage" in cache_context
+                else None
+            ),
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
@@ -2443,6 +2629,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        cache_context: dict[str, CacheUsage] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = int(time.time())
@@ -2464,6 +2651,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        cache_usage = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -2505,6 +2693,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                if content["meta_info"].get("cache_usage") is not None:
+                    cache_usage[index] = content["meta_info"]["cache_usage"]
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -2582,6 +2772,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
+                    if (
+                        cache_context is not None
+                        and "usage" not in cache_context
+                        and index in cache_usage
+                    ):
+                        # Publish only for a successful first role event,
+                        # independently of the caller's usage options.
+                        cache_context["usage"] = CacheUsage.model_validate(
+                            cache_usage[index]
+                        )
                     # K2 templates require preserved thinking, including empty reasoning.
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
@@ -2786,6 +2986,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
+                    cache_usage=cache_usage,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -2983,7 +3184,13 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             choice_meta_info = (
-                ret_item["meta_info"] if request.return_meta_info else None
+                {
+                    key: value
+                    for key, value in ret_item["meta_info"].items()
+                    if key != "cache_usage"
+                }
+                if request.return_meta_info
+                else None
             )
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
@@ -3152,7 +3359,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: list[Any],
         finish_reason: dict[str, Any],
-        tool_choice: str | ToolChoice | None = None,
+        tool_choice: str | ToolChoice | AllowedToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,
@@ -3698,6 +3905,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -3751,6 +3959,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
                     cached_tokens=self._continuous_usage_cached_details(content),
+                    cache_usage=content["meta_info"].get("cache_usage"),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

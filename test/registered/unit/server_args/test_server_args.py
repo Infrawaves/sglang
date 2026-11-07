@@ -1328,7 +1328,7 @@ class TestLoraForwardDomains(unittest.TestCase):
                         check_lora_server_args(args)
 
 
-class TestLoadBalanceMethod(unittest.TestCase):
+class TestLoadBalanceMethod(CustomTestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
         handle_pd_disaggregation(server_args)
@@ -1350,6 +1350,65 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = self._load_balance_args(disaggregation_mode="decode")
+        self.assertEqual(
+            resolution_result(server_args, "load_balance_method"), "round_robin"
+        )
+
+    def test_context_bucket_accepts_fixed_dp_topology(self):
+        for max_ep_size in (None, 8):
+            with self.subTest(max_ep_size=max_ep_size):
+                server_args = self._load_balance_args(
+                    disaggregation_mode="decode",
+                    load_balance_method="context_bucket",
+                    dp_size=8,
+                    max_ep_size=max_ep_size,
+                )
+                self.assertEqual(
+                    resolution_result(server_args, "load_balance_method"),
+                    "context_bucket",
+                )
+
+    def test_context_bucket_rejects_elastic_topology(self):
+        for topology in (
+            {"elastic_ep_backend": "mooncake"},
+            {"max_ep_size": 16},
+        ):
+            with self.subTest(topology=topology):
+                with self.assertRaisesRegex(ValueError, "fixed DP topology"):
+                    self._load_balance_args(
+                        disaggregation_mode="decode",
+                        load_balance_method="context_bucket",
+                        dp_size=8,
+                        **topology,
+                    )
+
+    def test_context_bucket_rejects_non_decode_modes(self):
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "disaggregation-mode decode"):
+                    self._load_balance_args(
+                        disaggregation_mode=mode,
+                        load_balance_method="context_bucket",
+                        dp_size=8,
+                    )
+
+    def test_context_bucket_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pp-size 1"):
+            self._load_balance_args(
+                disaggregation_mode="decode",
+                load_balance_method="context_bucket",
+                dp_size=8,
+                pp_size=2,
+            )
+
+    def test_round_robin_is_not_rejected_by_context_bucket_topology_guard(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            load_balance_method="round_robin",
+            dp_size=8,
+            max_ep_size=16,
+            elastic_ep_backend="mooncake",
+        )
         self.assertEqual(
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )
@@ -2302,6 +2361,115 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_hicache_draft_node_merge_admission(self):
+        """Draft node merge needs per-node MLA, Mooncake, a write-through policy
+        and a (K, V)-per-page layout, all rejected before model load."""
+        mooncake = {
+            "hicache_storage_backend": "mooncake",
+            "hicache_storage_backend_extra_config": json.dumps(
+                {"client_server_address": "localhost:50052"}
+            ),
+        }
+        cases = (
+            (True, mooncake, "write_through", "page_first", None),
+            (True, mooncake, "write_through_selective", "page_first_direct", None),
+            (True, mooncake, "write_through", "page_head", "--hicache-mem-layout"),
+            (True, mooncake, "write_back", "page_first", "write_through"),
+            (
+                False,
+                mooncake,
+                "write_through",
+                "page_first",
+                "--enable-mla-hicache-per-node",
+            ),
+            (
+                True,
+                {"hicache_storage_backend": "file"},
+                "write_through",
+                "page_first",
+                "mooncake",
+            ),
+        )
+        for per_node, storage, policy, layout, error in cases:
+            with self.subTest(
+                per_node=per_node, storage=storage, policy=policy, layout=layout
+            ):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_per_node=per_node,
+                    hicache_draft_node_merge=True,
+                    hicache_write_policy=policy,
+                    hicache_mem_layout=layout,
+                    **storage,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
+    def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
+        """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""
+        standalone = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": True}
+        )
+        shared = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": False}
+        )
+        for overrides, error in (
+            ({"disaggregation_mode": "decode"}, "PD decode"),
+            ({"dcp_size": 2, "tp_size": 2}, "--dcp-size"),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": standalone,
+                },
+                "standalone_storage=True",
+            ),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": shared,
+                },
+                None,
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_per_node=True,
+                    **overrides,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
+    def test_mla_hicache_per_node_requires_pp_size_one(self):
+        """Per-node MLA HiCache must reject PP even on inactive or linker paths."""
+        for enabled, cache_path, pp_size, rejects in (
+            (True, {"enable_hierarchical_cache": True}, 2, True),
+            (True, {}, 2, True),
+            (True, {"enable_unified_cache_external_linker": True}, 2, True),
+            (True, {"enable_hierarchical_cache": True}, 1, False),
+            (False, {"enable_hierarchical_cache": True}, 2, False),
+        ):
+            with self.subTest(enabled=enabled, cache_path=cache_path, pp_size=pp_size):
+                args = self._make_args(
+                    enable_mla_hicache_per_node=enabled,
+                    pp_size=pp_size,
+                    **cache_path,
+                )
+                if rejects:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "--enable-mla-hicache-per-node requires --pp-size 1",
+                    ):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (

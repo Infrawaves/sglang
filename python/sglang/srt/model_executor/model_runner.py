@@ -616,6 +616,7 @@ class ModelRunner:
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
             gpu_id=self.gpu_id,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def init_ngram_embedding_manager(self):
@@ -747,7 +748,11 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
+        # The draft has its own checkpoint and its own --speculative-draft-load-format;
+        # it neither serves weights nor loads them off a seed.
+        if self.is_draft_worker:
+            return
+        if remote_instance_transfer_engine_enabled():
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):
@@ -1289,6 +1294,7 @@ class ModelRunner:
             tp_rank=get_parallel().tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
+            remote_instance_weight_transporter_protocol=self.remote_instance_weight_transporter.protocol,
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
@@ -1546,6 +1552,16 @@ class ModelRunner:
         load_format = get_spec().speculative_draft_load_format
         if load_format is not None:
             logger.info(f"Using draft model load_format: '{load_format}'")
+            return load_format
+        if get_model().load_format == "remote_instance":
+            # Inheriting it would send the draft to the seed for weights that
+            # are not there: the seed publishes the target's, keyed by a tp_rank
+            # the draft shares. Its own checkpoint is on disk.
+            logger.info(
+                "Draft model falls back to load_format 'auto': the target's "
+                "'remote_instance' does not carry the draft's weights."
+            )
+            return "auto"
         return load_format
 
     def configure_kv_cache_dtype(self):

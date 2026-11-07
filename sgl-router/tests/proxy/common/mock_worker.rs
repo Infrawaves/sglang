@@ -62,6 +62,15 @@ impl MockWorker {
     /// chat-completion request arrives.
     #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
+        Self::start_with_response_headers(stream_chunks, HeaderMap::new()).await
+    }
+
+    /// Like `start`, with additional chat response headers for transport tests.
+    #[allow(dead_code)]
+    pub async fn start_with_response_headers(
+        stream_chunks: Vec<&'static str>,
+        response_headers: HeaderMap,
+    ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let state = MockWorkerState {
@@ -72,14 +81,28 @@ impl MockWorker {
         // worker-manager introspect step resolves model_ids for the
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
-            .route("/v1/chat/completions", post(chat))
+            .route(
+                "/v1/chat/completions",
+                post(chat).layer(axum::middleware::map_response(
+                    move |mut response: Response<Body>| {
+                        let response_headers = response_headers.clone();
+                        async move {
+                            response.headers_mut().extend(response_headers);
+                            response
+                        }
+                    },
+                )),
+            )
             .route("/v1/completions", post(chat))
+            .route("/v1/responses", post(responses))
             .route("/generate", post(generate))
             .route("/v1/embeddings", post(embeddings))
             .route("/v1/classify", post(classify))
             .route("/v1/rerank", post(rerank))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
+            // Let router body-limit tests reach the worker with large payloads.
+            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -361,6 +384,23 @@ impl MockWorker {
     /// Used to test router behaviour when the upstream returns an error.
     #[allow(dead_code)]
     pub async fn start_returning_error(status: StatusCode, body: Value) -> Self {
+        Self::start_error_response(status, body, HeaderMap::new()).await
+    }
+
+    /// Return a fixed successful JSON body plus additional response headers.
+    #[allow(dead_code)]
+    pub async fn start_json_with_response_headers(
+        body: Value,
+        response_headers: HeaderMap,
+    ) -> Self {
+        Self::start_error_response(StatusCode::OK, body, response_headers).await
+    }
+
+    async fn start_error_response(
+        status: StatusCode,
+        body: Value,
+        response_headers: HeaderMap,
+    ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let body_arc = Arc::new(body.to_string());
@@ -370,6 +410,7 @@ impl MockWorker {
             captured: Arc<Mutex<CapturedHeaders>>,
             body_str: Arc<String>,
             status: StatusCode,
+            response_headers: HeaderMap,
         }
 
         async fn error_handler(
@@ -393,6 +434,7 @@ impl MockWorker {
                 HeaderName::from_static("content-type"),
                 HeaderValue::from_static("application/json"),
             );
+            r.headers_mut().extend(s.response_headers);
             r
         }
 
@@ -400,6 +442,7 @@ impl MockWorker {
             captured: captured.clone(),
             body_str: body_arc,
             status,
+            response_headers,
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))
@@ -473,6 +516,19 @@ fn stream_response(s: &MockWorkerState, request: &Value) -> Option<Response<Body
         "text/event-stream".parse().unwrap(),
     );
     Some(r)
+}
+
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+/// Same as `chat`, but marks the upstream path so tests can tell the endpoints apart.
+async fn responses(state: State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let captured = state.captured.clone();
+    let response = chat(state, headers, body).await;
+    captured
+        .lock()
+        .unwrap()
+        .headers
+        .insert("x-mock-path".into(), "/v1/responses".into());
+    response
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.

@@ -19,11 +19,12 @@ from xgrammar.structural_tag import (
     TriggeredTagsFormat,
 )
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import AllowedToolChoice, Tool, ToolChoice
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -586,8 +587,14 @@ def get_kimik3_auto_tool_call_structural_tag(
 
 def _select_tools(
     tools: List[Tool],
-    tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+    tool_choice: Union[ToolChoice, AllowedToolChoice, Literal["auto", "required"]],
 ) -> Tuple[List[Tool], bool]:
+    if isinstance(tool_choice, AllowedToolChoice):
+        names = {tool.function.name for tool in tool_choice.allowed_tools.tools}
+        return (
+            [tool for tool in tools if tool.function.name in names],
+            tool_choice.allowed_tools.mode == "required",
+        )
     if not isinstance(tool_choice, ToolChoice):
         return tools, tool_choice == "required"
     name = tool_choice.function.name
@@ -599,22 +606,43 @@ def _select_tools(
 
 def get_kimik3_structural_tag(
     tools: List[Tool],
-    tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+    tool_choice: Union[
+        ToolChoice, AllowedToolChoice, Literal["auto", "required"]
+    ] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
 ) -> StructuralTag:
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
+        if isinstance(tool_choice, AllowedToolChoice):
+            # Empty allowlists disable calls, including in required mode.
+            return StructuralTag(
+                format=_with_reasoning(
+                    AnyTextFormat(
+                        excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    ),
+                    thinking_mode,
+                )
+            )
         raise ValueError("Kimi K3 structural tags require at least one tool")
 
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
+        # EOS is masked until a call exists, so a free <|close|> lets the model
+        # repeat it forever. Only allow it as the response close before tools.
         suffix: Format = SequenceFormat(
             elements=[
                 AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    excludes=[
+                        TOOLS_OPEN,
+                        THINK_OPEN,
+                        THINK_CLOSE,
+                        CALL_OPEN,
+                        _CLOSE_TOKEN,
+                    ]
                 ),
+                OptionalFormat(content=ConstStringFormat(value=RESPONSE_CLOSE)),
                 tools_tag,
             ]
         )

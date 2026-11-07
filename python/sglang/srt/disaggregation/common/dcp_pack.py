@@ -92,7 +92,7 @@ def try_pack_dcp_src(
 
 
 def init_dcp_pack_buffers(
-    register_fn,
+    register_buffers,
     kv_args,
     count: int,
     dcp_size: int,
@@ -103,7 +103,6 @@ def init_dcp_pack_buffers(
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _bare_device_type,
-        _get_custom_mem_pool,
     )
 
     device_type = _bare_device_type(device_type)
@@ -122,15 +121,8 @@ def init_dcp_pack_buffers(
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
-    gpu_id = kv_args.gpu_id
-    device = f"{device_type}:{gpu_id}"
-    custom_mem_pool, _ = _get_custom_mem_pool(device)
-
-    buffers = []
-    for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        register_fn(buf.get_ptr(), buf.get_size())
-        buffers.append(buf)
+    buffers = allocate_pack_buffers(kv_args.gpu_id, count, size_bytes)
+    register_buffers(buffers)
     logger.info(
         "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
         count,
@@ -138,3 +130,18 @@ def init_dcp_pack_buffers(
         max_tokens,
     )
     return buffers
+
+
+def allocate_pack_buffers(
+    gpu_id: int, count: int, size_bytes: int
+) -> List[StagingBuffer]:
+    from sglang.srt.disaggregation.common.staging_handler import (
+        _get_custom_mem_pool,
+    )
+
+    device = f"cuda:{gpu_id}"
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
+    return [
+        StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
+        for _ in range(count)
+    ]

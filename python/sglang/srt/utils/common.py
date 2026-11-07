@@ -39,6 +39,7 @@ import resource
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,7 @@ import traceback
 import types
 import uuid
 import warnings
+import zlib
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -249,6 +251,19 @@ def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     return is_cuda() and dtype == target_dtype
+
+
+# --kv-cache-dtype spellings for the packed FP4 dtype (mem_cache/kv_cache_dtype.py);
+# kept as strings for pre-resolution checks.
+FP4_KV_CACHE_DTYPES = ("nvfp4", "fp4_mx_block16")
+
+
+def is_fp4_dtype(dtype) -> bool:
+    """Whether `dtype` is an FP4 variant. Accepts either a KV-cache dtype
+    string (e.g. the --kv-cache-dtype value) or a torch dtype."""
+    if isinstance(dtype, str):
+        return dtype in FP4_KV_CACHE_DTYPES
+    return is_float4_e2m1fn_x2(dtype)
 
 
 def get_cuda_version():
@@ -2126,17 +2141,49 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except (OSError, SyntaxError) as e:
-        raise ValueError(f"Could not decode image: {e}") from e
+    except Image.DecompressionBombError as e:
+        raise ValueError("image too large, exceeds upper limit.") from e
+    except CORRUPT_IMAGE_EXCEPTIONS as e:
+        raise ValueError(corrupt_image_message(e)) from e
     return _fully_load_pil_image(image)
+
+
+# What PIL raises for malformed image bytes. OSError alone is not enough: the
+# PNG chunk reader raises SyntaxError ("broken PNG file"), and other plugins
+# leak EOFError, struct.error or zlib.error on truncated or damaged data. All of
+# these are client errors (400). TypeError and friends stay server errors.
+CORRUPT_IMAGE_EXCEPTIONS = (OSError, SyntaxError, EOFError, struct.error, zlib.error)
+
+
+def corrupt_image_message(error: BaseException) -> str:
+    # Keep the client message short; the original error stays chained (`from e`).
+    if isinstance(error, UnidentifiedImageError):
+        return "Could not decode image: cannot identify image file"
+    return "Could not decode image: image is corrupted or truncated"
+
+
+# FFmpeg's AVERROR_INVALIDDATA text, which torchcodec wraps in a bare
+# RuntimeError when a frame's packet is damaged. The container can still open
+# fine (frame count and fps read from its header), so this only surfaces when
+# frames are decoded. Matched narrowly on purpose: a RuntimeError from the same
+# call can also be a missing driver, a CUDA fault or a decoder bug, which must
+# stay server errors.
+_CORRUPT_VIDEO_MARKERS = ("Invalid data found when processing input",)
+CORRUPT_VIDEO_MESSAGE = "Could not decode video: video is corrupted or truncated"
+
+
+def is_corrupt_video_error(error: BaseException) -> bool:
+    return isinstance(error, RuntimeError) and any(
+        marker in str(error) for marker in _CORRUPT_VIDEO_MARKERS
+    )
 
 
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except (OSError, SyntaxError) as e:
-        raise ValueError(f"Could not decode image: {e}") from e
+    except CORRUPT_IMAGE_EXCEPTIONS as e:
+        raise ValueError(corrupt_image_message(e)) from e
     return image
 
 

@@ -29,10 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -60,10 +62,24 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
+from sglang.srt.cache_accounting import (
+    CACHE_BLOCK_SIZE,
+    CacheAccountingError,
+    CacheMediaSpan,
+    CacheUsage,
+    PageCachePlan,
+    RedisPageCacheStore,
+    build_page_cache_plan,
+)
+from sglang.srt.cache_accounting.metrics import CacheAccountingMetrics
+from sglang.srt.cache_accounting.multimodal import prepare_media_digests
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    MAX_DISAGGREGATION_TOP_LOGPROBS,
+    DisaggregationMode,
+)
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -114,9 +130,16 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    drop_mm_features_for_decode,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
+from sglang.srt.managers.request_validation import (
+    validate_generation_request,
+    validate_input_ids,
+)
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -191,6 +214,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.event_loop_lag import EventLoopLagMonitor
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -275,6 +299,15 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    cache_plan: Optional[PageCachePlan] = None
+    # MM plans need the Scheduler's final expansion, not tokenizer placeholders.
+    cache_plan_context: Optional[tuple[str, str, int]] = None
+    cache_physical_ttl_seconds: Optional[int] = None
+    cache_metrics_parent: Optional[ReqState] = None
+    cache_task: Optional[asyncio.Task] = None
+    cache_usage: Optional[CacheUsage] = None
+    cache_finished_event: Optional[asyncio.Event] = None
+    cache_renewal_task: Optional[asyncio.Task] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -555,11 +588,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Initialize blocking request preprocessor
+        self.init_request_preprocessor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
         # Init running status
         self.init_running_status()
+        self._init_cache_accounting()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -639,13 +676,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
+                self.tokenizer = _load_text_tokenizer()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -660,6 +691,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.async_dynamic_batch_tokenizer = None
 
+    @classmethod
+    def create_for_request_preprocessing(cls, server_args: ServerArgs):
+        """A tokenizer-only manager for a process-mode request preprocessor child.
+
+        Runs the same model-config and tokenizer setup as ``__init__`` but none
+        of the IPC, multimodal processor executors, metrics or request state;
+        the serving handlers built on it in the child only read ``server_args``,
+        ``model_config``, ``model_path``, ``served_model_name``, ``tokenizer``
+        and ``config_value``.
+        """
+        manager = cls.__new__(cls)
+        manager.server_args = server_args
+        manager.init_model_config()
+        manager.init_tokenizer_for_request_preprocessing()
+        return manager
+
+    def init_tokenizer_for_request_preprocessing(self):
+        """The tokenizer part of ``init_tokenizer_and_processor``, without the
+        multimodal processor and the dynamic batch tokenizer."""
+        self.mm_processor = None
+        self.async_dynamic_batch_tokenizer = None
+        if get_serving().skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        elif self.model_config.is_multimodal and not get_disagg().language_model_only:
+            import_processors("sglang.srt.multimodal.processors")
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
+            self.processor = get_processor_wrapper()
+            self.tokenizer = get_tokenizer_from_processor(self.processor)
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        else:
+            self.processor = None
+            self.tokenizer = _load_text_tokenizer()
+
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
             return
@@ -672,6 +737,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
             )
+
+    def init_request_preprocessor(self):
+        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+        # Set by maybe_start_process_request_preprocessor() in process mode.
+        self.process_request_preprocessor = None
+
+    def maybe_start_process_request_preprocessor(
+        self, template_manager, handler_classes=()
+    ) -> None:
+        """Start child processes for OpenAI request conversion when
+        SGLANG_REQUEST_PREPROCESSOR_MODE=process.
+
+        Call once the chat template and any template-derived config overrides
+        are in place: the children replay the config as it is now.
+        """
+        mode = envs.SGLANG_REQUEST_PREPROCESSOR_MODE.get()
+        if mode == "thread":
+            return
+        if mode != "process":
+            raise ValueError(
+                f"Invalid SGLANG_REQUEST_PREPROCESSOR_MODE={mode!r}; expected "
+                "'thread' or 'process'."
+            )
+        if getattr(self, "process_request_preprocessor", None) is not None:
+            return
+        if getattr(self, "tokenizer", None) is None:
+            logger.warning(
+                "SGLANG_REQUEST_PREPROCESSOR_MODE=process ignored: no tokenizer is "
+                "loaded (skip_tokenizer_init)."
+            )
+            return
+
+        from sglang.srt.managers.process_request_preprocessor import (
+            ProcessRequestPreprocessor,
+        )
+
+        try:
+            self.process_request_preprocessor = ProcessRequestPreprocessor(
+                tokenizer_manager=self,
+                template_manager=template_manager,
+                handler_classes=handler_classes,
+                num_processes=envs.SGLANG_REQUEST_PREPROCESSOR_PROCESSES.get(),
+            )
+        except Exception:
+            logger.exception(
+                "Could not start the process request preprocessor; request "
+                "preprocessing stays on the in-process thread."
+            )
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        func_call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._request_preprocessor_executor, func_call
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -801,6 +920,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self._drop_decode_mm_features = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_DISAGG_DECODE_DROP_MM_FEATURES.get()
+        )
+        if self._drop_decode_mm_features:
+            logger.info(
+                "PD decode: dropping multimodal feature tensors before dispatch "
+                "(SGLANG_DISAGG_DECODE_DROP_MM_FEATURES=1)."
+            )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
             start_disagg_service() if start_pd_bootstrap_service else None
@@ -892,12 +1020,534 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    def validate_request_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Preflight before streaming headers, expansion, or Scheduler dispatch."""
+        validate_input_ids(
+            obj.input_ids,
+            self.model_config.vocab_size,
+            allow_empty=(
+                isinstance(obj, GenerateReqInput)
+                and isinstance(obj.session_params, dict)
+                and bool(obj.session_params.get("id"))
+            ),
+        )
+        if not isinstance(obj, GenerateReqInput):
+            return
+        self._validate_cache_request(obj)
+        self.validate_logprob_params(obj)
+        validate_generation_request(
+            obj,
+            vocab_size=self.model_config.vocab_size,
+            max_parallel_samples=get_serving().max_parallel_samples,
+            max_batch_outputs=get_serving().max_batch_outputs,
+            preferred_sampling_params=self.preferred_sampling_params,
+            is_disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+            sampling_mask_enabled=envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get(),
+            sampling_mask_capacity=get_exec().features.sampling_mask_max_tokens,
+            speculative=get_spec().speculative_algorithm is not None,
+            sampling_backend=get_exec().kernel.sampling_backend,
+            sampling_params_class=self.sampling_params_class,
+        )
+
+    def _init_cache_accounting(self) -> None:
+        cfg = get_serving()
+        role = get_disagg().disaggregation_mode
+        self._cache_store = None
+        self._cache_metrics = None
+        self._cache_tasks: set[asyncio.Task] = set()
+        self._cache_renewal_tasks: dict[asyncio.Task, asyncio.Event] = {}
+        self._cache_accounting_closing = False
+        if not cfg.enable_cache_accounting:
+            return
+        if role == "prefill":
+            action = "skip_prefill"
+        else:
+            if self.enable_metrics:
+                self._cache_metrics = CacheAccountingMetrics(
+                    role="standalone" if role == "null" else role
+                )
+            self._cache_store = RedisPageCacheStore(
+                cfg.cache_redis_url,
+                timeout_seconds=cfg.cache_timeout,
+                username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
+                password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
+                metrics=self._cache_metrics,
+                cluster=getattr(cfg, "cache_redis_cluster", False),
+            )
+            action = "account"
+        logger.info(
+            "Cache accounting startup enabled=%s role=%s action=%s block_size=%d "
+            "metrics_enabled=%s redis_mode=%s",
+            cfg.enable_cache_accounting,
+            "standalone" if role == "null" else role,
+            action,
+            CACHE_BLOCK_SIZE,
+            self._cache_metrics is not None,
+            "cluster" if getattr(cfg, "cache_redis_cluster", False) else "standalone",
+        )
+
+    def _validate_cache_request(self, obj: GenerateReqInput) -> None:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.cache_user_id = None
+            return
+        if obj.cache_ttl_seconds is None:
+            return
+        if not get_serving().enable_cache_accounting:
+            raise ValueError("Cache accounting is not enabled on this server")
+        if obj.cache_ttl_seconds not in (300, 3600):
+            raise ValueError("cache_ttl_seconds must be 300 or 3600")
+        if obj.cache_mode not in ("implicit", "explicit"):
+            raise ValueError("cache_mode must be implicit or explicit")
+        if not isinstance(obj.cache_user_id, str) or not obj.cache_user_id.strip():
+            # Requests without an identity use physical cache usage and never
+            # access Redis, including shapes unsupported by the Redis plan.
+            obj.cache_user_id = None
+            return
+        params = obj.sampling_params or {}
+        if isinstance(params, dict):
+            params = {
+                **(getattr(self, "preferred_sampling_params", None) or {}),
+                **params,
+            }
+        if (
+            not isinstance(params, dict)
+            or params.get("n", 1) != 1
+            or (params.get("beam_width") or 1) != 1
+            or params.get("use_beam_search", False)
+            or params.get("max_new_tokens") == 0
+            or isinstance(obj.text, list)
+            or (obj.input_ids and isinstance(obj.input_ids[0], list))
+            or obj.input_embeds is not None
+            or obj.session_params is not None
+            or obj.positional_embed_overrides is not None
+            or obj.lora_path is not None
+            or obj.lora_id is not None
+            or not self.is_generation
+        ):
+            if not obj.cache_required:
+                # Optional accounting: serve the request without cache usage
+                # instead of rejecting shapes the accountant cannot price.
+                logger.debug(
+                    "Cache accounting skipped rid=%s role=%s reason=unsupported_request",
+                    obj.rid,
+                    self.disaggregation_mode.value,
+                )
+                obj.cache_ttl_seconds = None
+                obj.cache_user_id = None
+                return
+            raise ValueError(
+                "Cache accounting currently supports a single "
+                "generation without sessions, adapters, embeddings, or beam search"
+            )
+
+    def _prepare_cache_plan(
+        self, obj: GenerateReqInput, input_ids: Optional[List[int]]
+    ) -> None:
+        if obj.cache_ttl_seconds is None:
+            return
+        self._validate_cache_request(obj)
+        if obj.cache_ttl_seconds is None:
+            return
+        if obj.cache_user_id is None:
+            self.rid_to_state[
+                obj.rid
+            ].cache_physical_ttl_seconds = obj.cache_ttl_seconds
+            return
+        cfg = get_serving()
+        # Accounting uses 256-token blocks independently of GPU KV page size.
+        # Keep all namespace inputs fixed before Scheduler dispatch.
+        namespace = json.dumps(
+            {
+                "deployment": cfg.cache_namespace,
+                "model": self.model_path,
+                "weights": self.config_value("weight_version"),
+                "tokenizer": cfg.tokenizer_path,
+                "tokenizer_template": getattr(self.tokenizer, "chat_template", None),
+                "chat_template": cfg.chat_template,
+                "hf_chat_template_name": cfg.hf_chat_template_name,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if obj.contains_mm_input():
+            self.rid_to_state[obj.rid].cache_plan_context = (
+                obj.cache_user_id,
+                namespace,
+                obj.cache_ttl_seconds,
+            )
+            return
+        if input_ids is None:
+            raise ValueError("Cache accounting requires final input token IDs")
+        plan = build_page_cache_plan(
+            input_ids=input_ids,
+            cache_user_id=obj.cache_user_id,
+            namespace=namespace,
+            page_size=CACHE_BLOCK_SIZE,
+            ttl_seconds=obj.cache_ttl_seconds,
+            mode=obj.cache_mode,
+        )
+        self.rid_to_state[obj.rid].cache_plan = plan
+
+    def _start_cache_accounting(
+        self,
+        state: ReqState,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: Any,
+        cached_tokens: int = 0,
+        cache_input_metadata: Optional[dict] = None,
+    ) -> None:
+        if getattr(self, "_cache_accounting_closing", False):
+            return
+        plan = state.cache_plan
+        context = getattr(state, "cache_plan_context", None)
+        physical_ttl = getattr(state, "cache_physical_ttl_seconds", None)
+        physical_finished_without_output = (
+            plan is None
+            and physical_ttl is not None
+            and completion_tokens == 0
+            and isinstance(finish_reason, dict)
+            and finish_reason.get("type") in ("stop", "length")
+        )
+        if (
+            (plan is None and context is None and physical_ttl is None)
+            or state.cache_task is not None
+            or (completion_tokens <= 0 and not physical_finished_without_output)
+            or (
+                isinstance(finish_reason, dict)
+                and finish_reason.get("type") in ("abort", "error")
+            )
+        ):
+            return
+
+        rid = state.obj.rid
+        role = (
+            "standalone"
+            if self.disaggregation_mode == DisaggregationMode.NULL
+            else self.disaggregation_mode.value
+        )
+        ttl_seconds = (
+            plan.ttl_seconds
+            if plan is not None
+            else context[2]
+            if context is not None
+            else physical_ttl
+        )
+        block_size = plan.page_size if plan is not None else CACHE_BLOCK_SIZE
+        metrics_parent = getattr(state, "cache_metrics_parent", None)
+        finished_event = asyncio.Event()
+        state.cache_finished_event = finished_event
+
+        async def account_once():
+            nonlocal cache_input_metadata
+            started = time.perf_counter()
+            active_plan = plan
+            media_unavailable = False
+            if context is not None:
+                try:
+                    if not isinstance(cache_input_metadata, dict):
+                        raise ValueError("Missing final multimodal input metadata")
+                    spans = [
+                        CacheMediaSpan(*span)
+                        for span in cache_input_metadata["media_spans"]
+                    ]
+                    if not spans:
+                        raise ValueError("Missing multimodal content identities")
+                    active_plan = await asyncio.to_thread(
+                        build_page_cache_plan,
+                        input_ids=cache_input_metadata["input_ids"],
+                        cache_user_id=context[0],
+                        namespace=context[1],
+                        page_size=CACHE_BLOCK_SIZE,
+                        ttl_seconds=ttl_seconds,
+                        media_spans=spans,
+                        mode=getattr(state.obj, "cache_mode", "implicit"),
+                    )
+                    if active_plan.prompt_tokens != prompt_tokens:
+                        raise ValueError("Final multimodal input length differs")
+                    state.cache_plan = active_plan
+                except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                    active_plan = None
+                    media_unavailable = True
+                    logger.warning(
+                        "Cache accounting multimodal fallback rid=%s role=%s ttl=%d "
+                        "reason=invalid_input_metadata error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(exc).__name__,
+                    )
+                finally:
+                    # The expanded input crosses IPC only once; retain just keys.
+                    cache_input_metadata = None
+                    state.cache_plan_context = None
+            if active_plan is None:
+                usage = CacheUsage(
+                    ttl_seconds=ttl_seconds,
+                    read_tokens=max(0, min(prompt_tokens, cached_tokens)),
+                )
+                source = (
+                    "multimodal_unavailable"
+                    if media_unavailable
+                    else "missing_identity"
+                )
+            else:
+                if prompt_tokens != active_plan.prompt_tokens:
+                    raise CacheAccountingError(
+                        "Cache prompt-token count differs from final input IDs"
+                    )
+                source = "redis" if active_plan.page_keys else "no_complete_block"
+                # A terminal-only output can finish before this task runs. In
+                # that case the initial EVAL already sets the TTL after finish.
+                finished_before_account = finished_event.is_set()
+                try:
+                    usage = await self._cache_store.account(active_plan, rid=rid)
+                except CacheAccountingError as exc:
+                    # Freeze the engine's actual prefix hit from this output. A
+                    # failed Redis operation cannot confirm any cache creation.
+                    usage = CacheUsage(
+                        ttl_seconds=ttl_seconds,
+                        read_tokens=max(0, min(prompt_tokens, cached_tokens)),
+                    )
+                    source = "physical"
+                    logger.warning(
+                        "Cache accounting Redis fallback rid=%s role=%s ttl=%d "
+                        "error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(
+                            exc.__cause__ if exc.__cause__ is not None else exc
+                        ).__name__,
+                    )
+                if source == "redis" and not finished_before_account:
+                    # A hit inherits the first writer's TTL. Renew that confirmed
+                    # generation rather than the requesting caller's preference.
+                    renewal_plan = dataclasses.replace(
+                        active_plan, ttl_seconds=usage.ttl_seconds
+                    )
+                    if active_plan.mode == "explicit":
+                        renewal_plan = dataclasses.replace(
+                            renewal_plan,
+                            page_keys=active_plan.page_keys[
+                                : usage.read_tokens // active_plan.page_size
+                            ],
+                            prompt_tokens=usage.read_tokens,
+                        )
+                    self._start_cache_renewal(
+                        state, renewal_plan, generation=usage.generation
+                    )
+            observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
+            if metrics_parent is not None and metrics_parent.cache_usage is None:
+                # Parallel samples share one input; the first successful sample
+                # owns its metric observation while each sample keeps its usage.
+                metrics_parent.cache_usage = usage
+            if self._cache_metrics is not None and observe_usage:
+                self._cache_metrics.observe_usage(usage.ttl_seconds, usage, source)
+            logger.info(
+                "Cache accounting complete rid=%s role=%s ttl=%d block_size=%d "
+                "prompt=%d read=%d write=%d source=%s "
+                "elapsed_ms=%.3f",
+                rid,
+                role,
+                usage.ttl_seconds,
+                block_size,
+                prompt_tokens,
+                usage.read_tokens,
+                usage.write_tokens,
+                source,
+                (time.perf_counter() - started) * 1000,
+            )
+            return usage
+
+        task = asyncio.create_task(account_once())
+        state.cache_task = task
+        # Do not await Redis in the shared batch-output receiver. Each response
+        # waits for its own decision before exposing any usage to its client.
+        tasks = getattr(self, "_cache_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    def _start_cache_renewal(
+        self, state: ReqState, plan: PageCachePlan, *, generation: str | None
+    ) -> None:
+        finished_event = getattr(state, "cache_finished_event", None)
+        if (
+            not plan.page_keys
+            or generation is None
+            or finished_event is None
+            or getattr(state, "cache_renewal_task", None) is not None
+        ):
+            return
+
+        async def renew_on_finish() -> None:
+            await finished_event.wait()
+            try:
+                await self._cache_store.renew(
+                    plan, generation=generation, rid=state.obj.rid
+                )
+            except Exception as exc:
+                # Maintenance cannot revise the read/write decision already
+                # returned in HTTP headers or usage.
+                logger.warning(
+                    "Cache accounting renewal failed rid=%s ttl=%d phase=finish "
+                    "error_type=%s",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                    type(exc).__name__,
+                )
+            else:
+                logger.info(
+                    "Cache accounting TTL renewal complete rid=%s ttl=%d phase=finish",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                )
+
+        task = asyncio.create_task(renew_on_finish())
+        state.cache_renewal_task = task
+        tasks = getattr(self, "_cache_renewal_tasks", None)
+        if tasks is None:
+            tasks = self._cache_renewal_tasks = {}
+        tasks[task] = finished_event
+        task.add_done_callback(lambda done: tasks.pop(done, None))
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    def _finish_cache_accounting(self, state: ReqState) -> None:
+        # The output owner signals completion even if the HTTP consumer left.
+        finished_event = getattr(state, "cache_finished_event", None)
+        if finished_event is not None:
+            finished_event.set()
+
+    async def _attach_cache_usage(self, state: ReqState, out: dict) -> None:
+        if state.cache_task is None:
+            return
+        if state.cache_usage is None:
+            state.cache_usage = await asyncio.shield(state.cache_task)
+        finished_event = getattr(state, "cache_finished_event", None)
+        renewal_task = getattr(state, "cache_renewal_task", None)
+        if finished_event is not None and finished_event.is_set() and renewal_task:
+            await asyncio.shield(renewal_task)
+        out["meta_info"]["cache_usage"] = state.cache_usage.to_dict()
+
+    async def close_cache_accounting(self) -> None:
+        if self._cache_store is not None:
+            self._cache_accounting_closing = True
+            if self._cache_tasks:
+                # In-flight confirmations may still register a final renewal.
+                await asyncio.gather(*tuple(self._cache_tasks), return_exceptions=True)
+            renewals = getattr(self, "_cache_renewal_tasks", {})
+            renewal_tasks = tuple(renewals)
+            # Let a terminal response finish its bounded Redis renewal. Cancelling
+            # it would also interrupt a response awaiting that task via shield.
+            # Signal active maintainers too, so forced shutdown never waits for
+            # another engine output.
+            for finished_event in tuple(renewals.values()):
+                finished_event.set()
+            if renewal_tasks:
+                await asyncio.gather(*renewal_tasks, return_exceptions=True)
+            await self._cache_store.aclose()
+
+    async def _prepare_cache_media_digests(self, obj, mm_inputs) -> None:
+        if (
+            not isinstance(obj, GenerateReqInput)
+            or obj.cache_ttl_seconds is None
+            or obj.cache_user_id is None
+            or mm_inputs is None
+        ):
+            return
+        try:
+            # Hash real processor payloads before transport/release, off the
+            # event loop. The Scheduler only attaches final token positions.
+            await asyncio.to_thread(prepare_media_digests, mm_inputs)
+        except Exception as exc:
+            logger.warning(
+                "Cache accounting multimodal identity unavailable rid=%s error_type=%s",
+                obj.rid,
+                type(exc).__name__,
+            )
+
+    def validate_logprob_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate raw logprob sizes before inference or streaming headers."""
+        if not isinstance(obj, GenerateReqInput):
+            return
+        values = obj.top_logprobs_num
+        if values is None:
+            return
+        if not isinstance(values, list):
+            values = [values]
+        max_logprobs = self.model_config.vocab_size
+        if self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            max_logprobs = min(max_logprobs, MAX_DISAGGREGATION_TOP_LOGPROBS)
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"top_logprobs_num must be a non-negative integer, got {value!r}."
+                )
+            if value > max_logprobs:
+                raise ValueError(
+                    f"top_logprobs_num must be at most {max_logprobs} "
+                    f"for this server, got {value}."
+                )
+        if isinstance(obj.top_logprobs_num, list):
+            # Reuse input-shape detection without mutating or expanding the request.
+            shape = copy.copy(obj)
+            shape._validate_inputs()
+            shape._determine_batch_size()
+            if shape.is_single:
+                raise ValueError(
+                    "top_logprobs_num must be an integer for a single request."
+                )
+            if len(values) != shape.batch_size:
+                raise ValueError(
+                    "top_logprobs_num must contain one value per input in a batch."
+                )
+
+    def _resolve_cache_identity(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+    ) -> None:
+        if not isinstance(obj, GenerateReqInput) or obj.cache_ttl_seconds is None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.cache_user_id = None
+            return
+        if request is None:
+            return
+        # API adapters set cache_identity only after validating their public
+        # identity fields. Native /generate bodies cannot populate request.state.
+        state = request.state
+        identity = getattr(state, "cache_identity", None)
+        if not isinstance(identity, str) or not identity.strip():
+            identity = None
+        obj.cache_user_id = identity
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+
+        self._resolve_cache_identity(obj, request)
+
+        # Reject the entire raw batch before expansion or dispatch of any member.
+        self.validate_request_params(obj)
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -1061,15 +1711,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize_sync():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
+
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.run_in_request_preprocessor(
+                tokenize_sync
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
@@ -1260,11 +1916,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 hex_hash,
                             )
             if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                (envs.SGLANG_MM_PRECOMPUTE_HASH.get() or self._drop_decode_mm_features)
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            await self._prepare_cache_media_digests(obj, mm_inputs)
+            if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
+                drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
@@ -1540,6 +2199,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        if isinstance(obj, GenerateReqInput):
+            self._prepare_cache_plan(obj, input_ids)
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -1583,6 +2244,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
+                return_cache_input=(
+                    self.rid_to_state[obj.rid].cache_plan_context is not None
+                ),
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
                 sampling_params=sampling_params,
@@ -2002,6 +2666,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             if key in state.customized_info_reported_keys:
                                 meta_info.setdefault(key, list(values))
 
+            try:
+                await self._attach_cache_usage(state, out)
+            except CacheAccountingError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Cache accounting is temporarily unavailable",
+                ) from exc
+
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
             # to avoid O(n) string rebuild per step (O(n^2) total).
@@ -2145,6 +2817,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
+                # This is an internal warmup, not one of the user's samples.
+                tmp_obj.cache_ttl_seconds = None
+                tmp_obj.cache_user_id = None
+                tmp_obj.cache_required = False
                 self._init_req_state(tmp_obj)
                 request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
                 await self._send_one_request(tokenized_obj)
@@ -2175,6 +2851,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state
+                    if state.cache_physical_ttl_seconds is not None:
+                        # The initial rid has left rid_to_state; its state is kept here.
+                        state.cache_metrics_parent = request_states[objs[i].rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -2462,6 +3141,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+        loop_lag_ms = envs.SGLANG_LOG_EVENT_LOOP_LAG_MS.get()
+        if loop_lag_ms > 0:
+            EventLoopLagMonitor(loop, loop_lag_ms / 1000, "TokenizerManager").start()
+
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -2550,6 +3233,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                self._start_cache_accounting(
+                    state,
+                    recv_obj.prompt_tokens[i],
+                    recv_obj.completion_tokens[i],
+                    recv_obj.finished_reasons[i],
+                    cached_tokens=recv_obj.cached_tokens[i],
+                    cache_input_metadata=(
+                        recv_obj.cache_input_metadata[i]
+                        if recv_obj.cache_input_metadata is not None
+                        else None
+                    ),
+                )
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
@@ -2740,6 +3435,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_last_time(ts=first_output_time)
 
             if state.finished:
+                self._finish_cache_accounting(state)
                 span_attrs = (
                     self.convert_to_span_attrs(state, recv_obj, i)
                     if state.time_stats.trace_ctx.tracing_enable
@@ -3539,6 +4235,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        await self.close_cache_accounting()
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
@@ -3591,6 +4288,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
+        self._finish_cache_accounting(state)
         state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
@@ -3840,6 +4538,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if isinstance(obj, GenerateReqInput) and obj.cache_ttl_seconds is not None:
+                # __getitem__ does not carry cache options. Preserve them on
+                # cached subobjects so parallel-sample clones keep the mode.
+                sub_obj.cache_ttl_seconds = obj.cache_ttl_seconds
+                sub_obj.cache_mode = obj.cache_mode
+                sub_obj.cache_user_id = obj.cache_user_id
+                sub_obj.cache_required = obj.cache_required
+                if (
+                    not isinstance(sub_obj.cache_user_id, str)
+                    or not sub_obj.cache_user_id.strip()
+                ):
+                    state.cache_physical_ttl_seconds = obj.cache_ttl_seconds
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
@@ -4045,6 +4755,16 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+def _load_text_tokenizer():
+    return get_tokenizer(
+        get_serving().tokenizer_path,
+        tokenizer_mode=get_serving().tokenizer_mode,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_model().revision,
+        tokenizer_backend=get_serving().tokenizer_backend,
+    )
 
 
 def get_processor_wrapper():

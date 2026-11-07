@@ -86,6 +86,7 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -107,6 +108,8 @@ class StorageBackupSpec(NamedTuple):
     hash_value: list[str]
     prefix_keys: Optional[list[str]]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    # Absolute page index of hash_value[0]; set only for grouped L3 objects.
+    start_page: int = 0
 
 
 class UnifiedTreeNode:
@@ -429,6 +432,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
+        storage_page_size = get_memory().hicache_storage_page_size
+        # Grouped L3 writes need each node's absolute page position.
+        self.storage_page_grouped = (
+            storage_page_size is not None and storage_page_size > self.page_size
+        )
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
@@ -2550,7 +2558,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             hash_value=node.hash_value,
             prefix_keys=prefix_keys,
             comp_xfers=comp_xfers,
+            start_page=self._node_start_page(node) if self.storage_page_grouped else 0,
         )
+
+    def _node_start_page(self, node: UnifiedTreeNode) -> int:
+        """Pages between the root and ``node``, i.e. its first page's index."""
+        pages = 0
+        ancestor = node.parent
+        while ancestor is not None and ancestor is not self.root_node:
+            pages += (
+                len(ancestor.hash_value)
+                if ancestor.hash_value is not None
+                else len(ancestor.key) // self.page_size
+            )
+            ancestor = ancestor.parent
+        return pages
 
     def build_hicache_transfers(
         self,

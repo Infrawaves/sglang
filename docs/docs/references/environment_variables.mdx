@@ -49,6 +49,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated request fields (matched at any nesting depth, e.g. inside <code>sampling_params</code>) that <code>--log-requests-level</code> 1 and 2 log as their length plus a hash instead of verbatim; a tool-call <code>structural_tag</code> can be hundreds of KB per request. Set to an empty string to log them verbatim.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>structural_tag,json_schema,ebnf,regex</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_REQUEST_ABBREVIATE_MIN_CHARS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Only string values longer than this many characters are abbreviated by <code>SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HEALTH_CHECK_TIMEOUT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout for health check in seconds</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>20</code></td>
@@ -1342,6 +1352,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>-1</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_SLOW_PREPROCESSING_MS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log a warning when chat tool schema validation (on the tokenizer worker's event loop) or request conversion on the in-process preprocessing thread (queueing excluded) takes at least this many milliseconds; either delays the next token of every stream served by that worker. <code>0</code> or less disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>200</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_SCHEDULER_STATUS_TARGET</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target (e.g. a file path) for periodic scheduler-status logging.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
@@ -1504,6 +1519,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: seconds from a request's arrival until its prefill handshake (topology, DP rank and bootstrap lookups) must finish; the request fails after that. Unset follows <code>SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: connect timeout (seconds) of each HTTP call to a prefill bootstrap server.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_READ_TIMEOUT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: read timeout (seconds) of each HTTP call to a prefill bootstrap server; bounds a prefill that accepts connections but never answers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5.0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_WAITING_TIMEOUT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for a request waiting on KV transfer.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300</code></td>
@@ -1520,7 +1550,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send timeout (seconds) for decode's ZMQ sockets to prefill peers. Raise if healthy sends exceed the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send timeout (seconds) for decode's synchronous ZMQ control sockets to prefill peers. Mooncake ABORT notifications use nonblocking sends and do not wait for this timeout on the scheduler.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
     <tr>
@@ -2234,6 +2264,16 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HTTP_SERVER_APP_PATH</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ASGI import string (<code>module:attr</code>) that Uvicorn and Granian worker processes load when <code>--tokenizer-worker-num</code> is greater than 1. Point it at an app that extends the SGLang app with extra routes.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sglang.srt.entrypoints.http_server:app</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_REQUEST_PREPROCESSOR_MODE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where each tokenizer worker runs OpenAI chat request preprocessing (chat template rendering and prompt tokenization). <code>thread</code>: a helper thread of the worker, which still contends for the GIL with the event loop that streams every request's output, so long prompts delay other requests' tokens. <code>process</code>: dedicated child processes per worker, started at server startup; falls back to the thread path if they fail to start or break.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>thread</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_REQUEST_PREPROCESSOR_PROCESSES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Child processes per tokenizer worker when <code>SGLANG_REQUEST_PREPROCESSOR_MODE=process</code>. Each loads its own tokenizer and chat template.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION</code></td>

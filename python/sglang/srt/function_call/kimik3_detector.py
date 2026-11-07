@@ -5,7 +5,7 @@ from typing import List, Literal, Optional, Union
 
 from xgrammar import StructuralTag
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import AllowedToolChoice, Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -13,6 +13,8 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -38,6 +40,12 @@ _ARG_RE = re.compile(
     r"<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
     r"(?P<val>.*?)<\|close\|>argument<\|sep\|>",
     re.DOTALL,
+)
+_CALL_HEADER_RE = re.compile(
+    r"<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>", re.DOTALL
+)
+_ARG_HEADER_RE = re.compile(
+    r"<\|open\|>argument\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>", re.DOTALL
 )
 _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
 
@@ -74,7 +82,9 @@ class KimiK3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = TOOLS_OPEN
         self.eot_token = TOOLS_CLOSE
-        self._sent_normal_idx = 0
+        self._cursor = 0
+        self._call_start: int | None = None
+        self._argument_is_string: bool | None = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -105,7 +115,9 @@ class KimiK3Detector(BaseFormatDetector):
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        tool_choice: Union[
+            ToolChoice, AllowedToolChoice, Literal["auto", "required"]
+        ] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> StructuralTag:
@@ -185,38 +197,131 @@ class KimiK3Detector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=self._emit_normal_text())
 
             normal_text = self._emit_normal_text(limit=open_idx)
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            calls = []
-            parsed = self._parse_calls(section)
-            for call in parsed[self.current_tool_id + 1 :]:
-                self.current_tool_id += 1
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": call["name"],
-                    "arguments": json.loads(call["arguments"]),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = call["arguments"]
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=call["name"],
-                        parameters=call["arguments"],
-                    )
-                )
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
+            self._cursor = max(self._cursor, open_idx + len(self.bot_token))
+            return StreamingParseResult(
+                normal_text=normal_text, calls=self._stream_calls()
+            )
         except Exception as e:
             logger.error(
                 "Error in Kimi K3 parse_streaming_increment: %s", e, exc_info=True
             )
-            # _sent_normal_idx indexes into _buffer, so it must be reset with it;
-            # otherwise every later _emit_normal_text sees limit <= _sent_normal_idx
+            # _cursor indexes into _buffer, so it must be reset with it;
+            # otherwise every later _emit_normal_text sees limit <= _cursor
             # and silently drops the rest of the response.
             self._buffer = ""
-            self._sent_normal_idx = 0
+            self._cursor = 0
+            self._call_start = None
+            self._argument_is_string = None
             return StreamingParseResult()
+
+    def _append_stream_call(
+        self, calls: List[ToolCallItem], parameters: str, *, name: str | None = None
+    ) -> None:
+        self.streamed_args_for_tool[self.current_tool_id] += parameters
+        if calls and calls[-1].tool_index == self.current_tool_id:
+            calls[-1].parameters += parameters
+        else:
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id, name=name, parameters=parameters
+                )
+            )
+
+    def _stream_calls(self) -> List[ToolCallItem]:
+        calls = []
+        while True:
+            if self._call_start is None:
+                header = _CALL_HEADER_RE.search(self._buffer, self._cursor)
+                if header is None:
+                    break
+                name = _parse_attrs(header["attrs"]).get("tool", "")
+                if not name:
+                    end = self._buffer.find(CALL_CLOSE, header.end())
+                    if end == -1:
+                        break
+                    self._cursor = end + len(CALL_CLOSE)
+                    continue
+                self._call_start = header.start()
+                self._cursor = header.end()
+                self.current_tool_id += 1
+                self.streamed_args_for_tool.append("")
+                self._append_stream_call(calls, "{", name=name)
+
+            call_end = self._buffer.find(CALL_CLOSE, self._cursor)
+            if self._argument_is_string is not None:
+                if self._stream_argument(calls, call_end=call_end):
+                    continue
+                if call_end == -1:
+                    break
+
+            if self._argument_is_string is None:
+                header = _ARG_HEADER_RE.search(
+                    self._buffer,
+                    self._cursor,
+                    call_end if call_end != -1 else len(self._buffer),
+                )
+                if header is not None:
+                    attrs = _parse_attrs(header["attrs"])
+                    self._argument_is_string = attrs.get("type", "string") == "string"
+                    prefix = (
+                        ""
+                        if self.streamed_args_for_tool[self.current_tool_id] == "{"
+                        else ", "
+                    )
+                    prefix += (
+                        json.dumps(attrs.get("key", ""), ensure_ascii=False) + ": "
+                    )
+                    if self._argument_is_string:
+                        prefix += '"'
+                    self._append_stream_call(calls, prefix)
+                    self._cursor = header.end()
+                    continue
+                if call_end == -1:
+                    break
+                self._append_stream_call(calls, "}")
+
+            # Keep call-close markers visible even inside malformed loose arguments.
+            match = _CALL_RE.match(self._buffer, self._call_start)
+            call = self._decode_call(match["attrs"], match["body"])
+            self.prev_tool_call_arr.append(
+                {"name": call["name"], "arguments": json.loads(call["arguments"])}
+            )
+            self._cursor = call_end + len(CALL_CLOSE)
+            self._call_start = None
+            self._argument_is_string = None
+        return calls
+
+    def _stream_argument(self, calls: List[ToolCallItem], *, call_end: int) -> bool:
+        end = self._buffer.find(ARGUMENT_CLOSE, self._cursor)
+        complete = end != -1 and (call_end == -1 or end < call_end)
+        if not complete:
+            if not self._argument_is_string:
+                return False
+            end = call_end
+            if end == -1:
+                end = len(self._buffer) - partial_suffix_len(
+                    self._buffer[self._cursor :], [ARGUMENT_CLOSE, CALL_CLOSE]
+                )
+
+        value = self._buffer[self._cursor : end]
+        if self._argument_is_string:
+            # Escape only new raw text; a JSON string's escaped prefix is stable.
+            delta = json.dumps(value, ensure_ascii=False)[1:-1]
+            if complete:
+                delta += '"'
+        else:
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+            delta = json.dumps(value, ensure_ascii=False)
+        if delta:
+            self._append_stream_call(calls, delta)
+        self._cursor = end
+        if complete:
+            self._cursor += len(ARGUMENT_CLOSE)
+            self._argument_is_string = None
+        return complete
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         open_idx = self._buffer.find(self.bot_token)
@@ -224,8 +329,8 @@ class KimiK3Detector(BaseFormatDetector):
             section = self._buffer[open_idx + len(self.bot_token) :]
             if not self._parse_calls(section):
                 logger.warning(
-                    "Kimi K3 tools section ended with no complete tool call; "
-                    "dropping %d buffered chars",
+                    "Kimi K3 tools section ended with no complete tool call "
+                    "(%d buffered chars)",
                     len(section),
                 )
             return StreamingParseResult()
@@ -239,11 +344,11 @@ class KimiK3Detector(BaseFormatDetector):
                 [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
             )
             limit = len(self._buffer) - holdback
-        if limit <= self._sent_normal_idx:
+        if limit <= self._cursor:
             return ""
-        pending = self._buffer[self._sent_normal_idx : limit]
+        pending = self._buffer[self._cursor : limit]
         for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
             if marker in pending:
                 pending = pending.replace(marker, "")
-        self._sent_normal_idx = limit
+        self._cursor = limit
         return pending

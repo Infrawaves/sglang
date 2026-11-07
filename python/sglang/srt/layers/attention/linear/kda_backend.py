@@ -475,6 +475,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # The verify kernel is varlen and the conv path scatters ragged tokens
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
+    ragged_verify_needs_padding_slot: bool = False
 
     # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
     # force-flush path.

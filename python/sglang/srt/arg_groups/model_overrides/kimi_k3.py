@@ -53,6 +53,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
         overrides = {}
+        prefill_backend, decode_backend = attention_backends_of(cfg)
         if cfg.enable_symm_mem:
             logger.warning(
                 "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
@@ -61,17 +62,29 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["enable_symm_mem"] = False
 
         if cfg.speculative_algorithm == "DSPARK":
+            from sglang.srt.environ import envs
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
             )
 
             ragged_mode = read_ragged_verify_mode()
-            if ragged_mode is not RaggedVerifyMode.STATIC:
+            compact_allowed = (
+                ragged_mode is RaggedVerifyMode.COMPACT
+                and envs.SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER.get()
+            )
+            if ragged_mode is not RaggedVerifyMode.STATIC and not compact_allowed:
                 raise ValueError(
                     "Kimi-K3 DCP + DSPARK currently requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
-                    f"not validated under DCP (got {ragged_mode.value!r})."
+                    "SGLANG_RAGGED_VERIFY_MODE=static; cap-accept is not "
+                    "supported under DCP, and compact needs "
+                    "SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1 "
+                    f"(got {ragged_mode.value!r})."
+                )
+            if compact_allowed and decode_backend == "aiter":
+                raise ValueError(
+                    "Kimi-K3 AITER DCP verify requires fixed-width queries. "
+                    "Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
 
             # DSPARK target-verify + draft-extend must run on the decode
@@ -81,7 +94,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
-        prefill_backend, decode_backend = attention_backends_of(cfg)
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(

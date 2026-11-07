@@ -917,6 +917,75 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
+    @requires_full_mamba_ps1
+    @requires_hicache
+    def test_hicache_concurrent_full_and_mamba_load_back_on_shared_node(self):
+        """End-to-end regression for the cross-component load-back overlap
+        (production shape reported in #34975; fixed by #36317).
+
+        A load-back anchored at a descendant pins an evicted ancestor through
+        its Full-KV chain. Before that DMA acks, a second request anchors AT
+        the ancestor to restore its independently-evicted mamba state. The
+        mamba transfer must ride its own host lock rather than the Full
+        pending owner, so the second load-back commits, both acks drain, and
+        the tree stays consistent.
+        """
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        core = cache.tree_core
+        MAMBA = ComponentType.MAMBA
+
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 4)
+        self.assertGreaterEqual(len(chain), 2, "need a >=2 node chain")
+        self._backup_tree(cache)
+        total = sum(node_key_length(cache, n) for n in chain)
+        cache.evict(EvictParams(num_tokens=total + 16, mamba_num=64))
+
+        leaf = chain[-1]
+        self.assertTrue(core.is_full_device_evicted(leaf))
+        ancestor = next(
+            (
+                n
+                for n in chain[:-1]
+                if core.is_full_device_evicted(n)
+                and core.component_has_host_value_only(n, MAMBA)
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            ancestor, "fixture produced no Full-evicted + mamba-host-only ancestor"
+        )
+
+        # Load-back 1: anchored at the leaf; its Full-KV chain pins the ancestor.
+        self.assertTrue(cache.load_back(leaf))
+        self.assertEqual(core.node_by_id(ancestor).load_back_pending_id, leaf)
+        self.assertFalse(core.is_full_device_evicted(ancestor))
+        self.assertTrue(core.component_has_host_value_only(ancestor, MAMBA))
+
+        # Load-back 2: anchored AT the still-pinned ancestor for its mamba state.
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+        self.assertTrue(cache.load_back(ancestor, req=req))
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
+        self.assertEqual(core.node_by_id(ancestor).load_back_pending_id, leaf)
+        self.assertGreater(
+            core.node_by_id(ancestor).component_data[MAMBA].host_lock_ref, 0
+        )
+
+        self._finish_pending_loads(cache)
+        for n in chain:
+            self.assertIsNone(
+                core.node_by_id(n).load_back_pending_id,
+                f"node {n} kept a stale load-back pin",
+            )
+        self.assertIsNotNone(node_device_value(cache, ancestor, MAMBA))
+        self._release_ongoing_load_back_locks(cache)
+        self.assertEqual(
+            core.node_by_id(ancestor).component_data[MAMBA].host_lock_ref, 0
+        )
+        cache.sanity_check()
+
     @requires_swa
     @requires(
         lambda cfg: not cfg.has_mamba,

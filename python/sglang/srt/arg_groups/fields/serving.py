@@ -197,6 +197,26 @@ class Serving(msgspec.Struct):
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
+    enable_cache_accounting: A[
+        bool,
+        "Enable Redis input-cache accounting in 256-token blocks on decode/standalone "
+        "workers (default implicit 5m). The first write locks the prefix TTL; "
+        "matching prefixes and appended blocks retain it until expiration. "
+        "Explicit mode only reads and renews existing prefix blocks. "
+        "Use gateway cache_user_id for user "
+        "isolation. Without cache_user_id, serve "
+        "normally without Redis reads, writes, or renewals; report physical cache "
+        "reads and zero writes, even with explicit cache options. Prefill ignores accounting.",
+    ] = False
+    cache_redis_url: A[
+        Optional[str],
+        "Redis URL without credentials or query parameters (redis:// or rediss://). Set SGLANG_CACHE_REDIS_USERNAME/PASSWORD in the environment for authentication.",
+    ] = None
+    cache_namespace: A[
+        Optional[str],
+        "Redis namespace used to isolate cache accounting entries.",
+    ] = None
+    cache_timeout: A[float, "Timeout in seconds for each cache Redis operation."] = 0.2
     return_input_ids: A[
         bool,
         "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids_in_sglext were set on the request.",
@@ -236,6 +256,14 @@ class Serving(msgspec.Struct):
             choices=["openai", "model"],
         ),
     ] = "model"
+    max_parallel_samples: A[
+        int,
+        "Maximum n (candidate responses) per input. Must be positive. Checked before request expansion.",
+    ] = 128
+    max_batch_outputs: A[
+        int,
+        "Maximum batch_size * n per generation request. Must be positive. Checked before request expansion, including n=1.",
+    ] = 1024
     asr_max_buffer_seconds: A[
         int,
         "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
@@ -316,4 +344,10 @@ class Serving(msgspec.Struct):
     ] = False
     disable_tokenizer_batch_decode: A[
         bool, "Disable batch decoding when decoding multiple completions."
+    ] = False
+    # Append new input fields to preserve ServerArgs positional compatibility.
+    cache_redis_cluster: A[
+        bool,
+        "Use Redis Cluster for cache accounting. The Redis URL is a discovery seed; "
+        "workers must reach all advertised Redis nodes. Only database 0 is supported.",
     ] = False

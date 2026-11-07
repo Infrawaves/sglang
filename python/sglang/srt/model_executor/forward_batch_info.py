@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -1757,19 +1758,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         self._original_batch_size = self.batch_size
-        global_num_tokens = list(self.global_num_tokens_cpu)
+        global_num_tokens = self.global_num_tokens_cpu
         # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
         # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
         mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)
         if mega_moe_idle_materialize:
             global_num_tokens = [1] * len(global_num_tokens)
         sync_group_size = len(global_num_tokens)
-        attn_tp_size = get_parallel().attn_tp_size
-
-        for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+        alignment = get_parallel().attn_tp_size
+        if (
+            not self.is_extend_in_batch
+            and not model_runner.is_draft_worker
+            and self.spec_info is not None
+            and self.spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and self.spec_info.ragged_verify_layout is None
+        ):
+            # DSpark / DFlash fixed-width verify reshapes Q to [bs, width].
+            # Pad whole requests while keeping the TP reduce-scatter aligned.
+            alignment = math.lcm(alignment, self.spec_info.num_tokens_per_req)
+        global_num_tokens = [ceil_align(n, alignment) for n in global_num_tokens]
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1864,7 +1871,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
             ):
-                if self.forward_mode.is_idle():
+                # SUM_LEN can leave an idle rank with zero rows. Its idle
+                # forward still joins the MLP collectives and skips attention.
+                if self.forward_mode.is_idle() and num_tokens:
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.

@@ -57,6 +57,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 from openai.types.responses.response_function_tool_call_param import (
     ResponseFunctionToolCallParam,
 )
+from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
@@ -196,6 +197,7 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    cache_write_tokens: Optional[int] = Field(default=None, ge=0)
     # Multimodal prompt token counts (only populated when present in the prompt)
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
@@ -204,9 +206,13 @@ class PromptTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Drop multimodal fields when absent so text-only/cache-only responses
-        # keep the original {"cached_tokens": N} shape.
-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+        # Keep existing response shapes when optional details are absent.
+        for key in (
+            "cache_write_tokens",
+            "image_tokens",
+            "audio_tokens",
+            "video_tokens",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -218,6 +224,43 @@ class CompletionTokensDetails(BaseModel):
     reasoning_tokens: int = 0
 
 
+class PromptCacheOptions(BaseModel):
+    """Configure the cache policy for complete pages of the input prefix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["implicit", "explicit"] = "implicit"
+    ttl: Literal["5m", "1h"] = "5m"
+
+
+class CacheUsage(BaseModel):
+    """A per-request prefix cache accounting snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_seconds: Literal[300, 3600]
+    read_tokens: int = Field(default=0, ge=0, strict=True)
+    write_tokens: int = Field(default=0, ge=0, strict=True)
+
+    @field_validator("ttl_seconds", mode="before")
+    @classmethod
+    def validate_ttl_integer(cls, value):
+        if type(value) is not int:
+            raise ValueError("ttl_seconds must be an integer")
+        return value
+
+    def response_headers(self) -> Dict[str, str]:
+        """Expose both creation tiers, including zero, from this decision."""
+        return {
+            "Msh-Usage-Cache-Write-Tokens-5m": str(
+                self.write_tokens if self.ttl_seconds == 300 else 0
+            ),
+            "Msh-Usage-Cache-Write-Tokens-1h": str(
+                self.write_tokens if self.ttl_seconds == 3600 else 0
+            ),
+        }
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -227,6 +270,16 @@ class UsageInfo(BaseModel):
     reasoning_tokens: Optional[int] = 0
     # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
+    # Kept on the object for internal protocol adapters, never on the OpenAI wire.
+    cache_usage: Optional[CacheUsage] = Field(default=None, exclude=True)
+
+    @model_serializer(mode="wrap")
+    def _serialize_usage(self, handler):
+        data = handler(self)
+        if self.cache_usage is not None:
+            # Kimi exposes the same cache read count at both usage locations.
+            data["cached_tokens"] = self.cache_usage.read_tokens
+        return data
 
 
 class StreamOptions(BaseModel):
@@ -646,6 +699,7 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    modalities: Optional[Literal["video"]] = "video"
 
 
 class ChatCompletionMessageContentInputAudio(BaseModel):
@@ -873,6 +927,16 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class AllowedTools(BaseModel):
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoice]
+
+
+class AllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: AllowedTools
+
+
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
 # none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
 # /v1/responses.
@@ -950,9 +1014,21 @@ class ChatCompletionRequest(PDRoutingFields):
     # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
     # drives tool-call parsing.
     _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
-    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
-        default="auto", examples=["none"]
-    )  # noqa
+    prompt_cache_options: Optional[PromptCacheOptions] = Field(
+        default=None,
+        description="When server cache accounting is enabled, omission uses implicit mode with a 5m TTL.",
+    )
+    cache_user_id: Optional[str] = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        pattern=r"\S",
+        repr=False,
+        description="User identity supplied by the authenticating gateway for cache isolation.",
+    )
+    tool_choice: Union[
+        ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
+    ] = Field(default="auto", examples=["none"])
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1261,6 +1337,11 @@ class ChatCompletionRequest(PDRoutingFields):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if isinstance(self.tool_choice, AllowedToolChoice):
+                raise ValueError(
+                    "allowed_tools cannot be combined with an active response_format, "
+                    "regex, or ebnf constraint."
+                )
             if tool_call_constraint[0] != "full_assistant_ebnf" and (
                 self.tool_choice == "required"
                 or isinstance(self.tool_choice, ToolChoice)
@@ -1921,6 +2002,12 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
+class ResponseAllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoiceFunction]
+
+
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
@@ -1969,6 +2056,18 @@ class ResponsesRequest(PDRoutingFields):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    prompt_cache_options: Optional[PromptCacheOptions] = Field(
+        default=None,
+        description="When server cache accounting is enabled, omission uses implicit mode with a 5m TTL.",
+    )
+    cache_user_id: Optional[str] = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        pattern=r"\S",
+        repr=False,
+        description="User identity supplied by the authenticating gateway for cache isolation.",
+    )
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
@@ -2008,6 +2107,13 @@ class ResponsesRequest(PDRoutingFields):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @field_validator("tool_choice")
+    @classmethod
+    def validate_allowed_tool_choice(cls, value):
+        if isinstance(value, dict) and value.get("type") == "allowed_tools":
+            return ResponseAllowedToolChoice.model_validate(value).model_dump()
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -2112,12 +2218,12 @@ class ResponsesRequest(PDRoutingFields):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` / ``custom`` tool survives, the
-        rest (web_search, mcp, ...) can't be forced through the tool-call
-        parser."""
+        """Keep named tools and allowlists; unsupported built-in choices
+        cannot be forced through the tool-call parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice.get("type") == "allowed_tools":
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
@@ -2256,6 +2362,7 @@ class ResponsesResponse(BaseModel):
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]
     usage: Optional[UsageInfo] = None
+    prompt_cache_options: Optional[PromptCacheOptions] = None
     parallel_tool_calls: bool = True
     tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
@@ -2280,6 +2387,13 @@ class ResponsesResponse(BaseModel):
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize_response(self, handler):
+        data = handler(self)
+        if self.prompt_cache_options is None:
+            data.pop("prompt_cache_options", None)
+        return data
+
     @field_serializer("usage")
     def _serialize_usage(self, usage: Optional[UsageInfo], _info):
         """Emit the Responses usage shape, not the chat one UsageInfo carries."""
@@ -2290,15 +2404,25 @@ class ResponsesResponse(BaseModel):
             if usage.prompt_tokens_details
             else 0
         )
+        cache_write_tokens = (
+            usage.prompt_tokens_details.cache_write_tokens or 0
+            if usage.prompt_tokens_details
+            else 0
+        )
+        reasoning_tokens = (
+            usage.completion_tokens_details.reasoning_tokens
+            if usage.completion_tokens_details
+            else 0
+        )
         return {
             "input_tokens": usage.prompt_tokens,
             "input_tokens_details": {
                 "cached_tokens": cached,
                 # required (no default) in the SDK's InputTokensDetails model
-                "cache_write_tokens": 0,
+                "cache_write_tokens": cache_write_tokens,
             },
             "output_tokens": usage.completion_tokens or 0,
-            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
             "total_tokens": usage.total_tokens,
         }
 
@@ -2319,8 +2443,24 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
+        *,
+        cache_usage: Optional[CacheUsage] = None,
     ) -> ResponsesResponse:
         """Create a response from a request."""
+
+        if cache_usage is None and usage is not None:
+            cache_usage = usage.cache_usage
+        prompt_cache_options = None
+        if cache_usage is not None:
+            cache_usage = CacheUsage.model_validate(cache_usage)
+            prompt_cache_options = PromptCacheOptions(
+                mode=(
+                    request.prompt_cache_options.mode
+                    if request.prompt_cache_options is not None
+                    else "implicit"
+                ),
+                ttl="1h" if cache_usage.ttl_seconds == 3600 else "5m",
+            )
 
         # Determine if the output is plain text only to set text.format
         def _is_text_only(
@@ -2370,6 +2510,7 @@ class ResponsesResponse(BaseModel):
             output=output,
             status=status,
             usage=usage,
+            prompt_cache_options=prompt_cache_options,
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None

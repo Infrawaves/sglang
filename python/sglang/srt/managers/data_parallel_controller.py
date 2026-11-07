@@ -36,6 +36,10 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.context_bucket import (
+    ContextBucketBudget,
+    estimate_decode_context_length,
+)
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -109,6 +113,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    CONTEXT_BUCKET = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -191,11 +196,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.CONTEXT_BUCKET: self.context_bucket_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.CONTEXT_BUCKET,
         )
 
         parallel = get_parallel()
@@ -222,6 +229,11 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
+        self.context_bucket_budget = (
+            ContextBucketBudget(self.max_dp_size)
+            if self.load_balance_method == LoadBalanceMethod.CONTEXT_BUCKET
+            else None
+        )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -358,7 +370,11 @@ class DataParallelController:
         if now - self._last_refresh_time < 0.02:
             return
         self._last_refresh_time = now
-        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+        loads = self.load_snapshot_reader.read_all()
+        if self.context_bucket_budget is not None:
+            self.context_bucket_budget.update_budget(loads)
+        else:
+            self.dp_budget.update_budget(loads)
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
         is_health_check = is_health_check_generate_req(req)
@@ -921,6 +937,29 @@ class DataParallelController:
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
+        sock_send(self.workers[target_worker], req)
+
+    def context_bucket_scheduler(self, req: Req):
+        estimated_tokens = estimate_decode_context_length(req)
+        if self.maybe_external_dp_rank_routing(req):
+            # Preserve explicit routing, but account for it when placing the
+            # next automatically routed request before the next snapshot.
+            self.context_bucket_budget.reserve(req.routed_dp_rank, estimated_tokens)
+            return
+        active_ranks = [
+            rank
+            for rank in self._active_workers
+            if self.status[rank] and self.workers[rank] is not None
+        ]
+        target_worker = self.context_bucket_budget.dispatch(
+            estimated_tokens, active_ranks
+        )
+        logger.debug(
+            "Context-bucket routing: tokens=%d dp_rank=%d outstanding=%s",
+            estimated_tokens,
+            target_worker,
+            self.context_bucket_budget.total_requests,
         )
         sock_send(self.workers[target_worker], req)
 

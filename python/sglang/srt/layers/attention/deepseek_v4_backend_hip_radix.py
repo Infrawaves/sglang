@@ -2016,7 +2016,7 @@ class DeepseekV4HipRadixBackend(
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
-                graph_key = num_tokens_v
+                graph_key = (bs, num_tokens_v)
             else:
                 num_tokens_v = self.target_verify_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
@@ -2479,7 +2479,7 @@ class DeepseekV4HipRadixBackend(
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                int | tuple[int, int],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -2493,7 +2493,7 @@ class DeepseekV4HipRadixBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs: int | tuple[int, int],
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,
