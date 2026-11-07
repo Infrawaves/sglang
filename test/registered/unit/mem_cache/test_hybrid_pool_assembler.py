@@ -180,15 +180,14 @@ class TestNodeLeaderPoolAssembly(CustomTestCase):
                 side_effect=lambda *args, **kw: SimpleNamespace(**kw),
             ),
         ):
-            group, controller = hybrid_pool_assembler.build_hybrid_mamba_stack(
+            group, controller, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
                 params=params,
                 kv_pool=kv_pool,
                 mamba_pool=mamba_pool,
                 full_layer_mapping={3: 0},
-                mamba_layer_mapping={0: 0},
+                start_layer=0,
                 load_cache_event=None,
                 storage_backend=None,
-                use_mla=True,
             )
         self.assertIs(controller.node_leader_broadcast, broadcast)
         return group, events, shared_allocator
