@@ -878,10 +878,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
+            # Preserve an omitted choice: an explicit "none" adds a K3 control
+            # message even without tools, changing the prompt and cache keys.
             tool_choice=(
                 self._chat_tool_choice(tool_choice)
-                if chat_tools or is_allowed_tools
-                else "none"
+                if chat_tools
+                or is_allowed_tools
+                or "tool_choice" in request.model_fields_set
+                else None
             ),
             parallel_tool_calls=(
                 request.parallel_tool_calls
