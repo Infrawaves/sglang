@@ -2531,6 +2531,8 @@ class Envs:
     # peers' shards are copied (copy engine, CUDA IPC, no NCCL) into a
     # full-width staging buffer and the shared MLP runs on local rows as in
     # TP1. Needs --shared-experts-tp-size > 1 with the subgroup on one node.
+    # Unset: on for PD prefill when eligible, off elsewhere. Decode always
+    # keeps the activation AG/RS and ignores it (weight_stream_policy).
     SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM = EnvBool(False)
     # Fewer local rows than this keep the activation AG/RS path. Arbitrary;
     # the weight bytes are fixed per layer while the activation bytes scale

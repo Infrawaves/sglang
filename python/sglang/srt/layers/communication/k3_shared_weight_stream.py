@@ -34,6 +34,33 @@ _CUDA_MEMCPY_DEFAULT = 4
 _CUDA_STREAM_CAPTURE_STATUS_NONE = 0
 
 
+WEIGHT_STREAM_OFF = "off"
+# Stream when the layers and the subgroup allow it, else keep activations.
+WEIGHT_STREAM_AUTO = "auto"
+# Stream or fail at load.
+WEIGHT_STREAM_ON = "on"
+
+
+def weight_stream_policy(*, disaggregation_mode: str, env_value: Optional[bool]) -> str:
+    """Shared-expert TP mode per PD role.
+
+    Prefill pulls the weights: its row count makes the per-layer activation
+    AG/RS cost more than the fixed weight copy. Decode pulls the activations:
+    a few rows per step move far fewer bytes than a full layer of weights, and
+    the staging copy would not hide behind the short decode attention. The
+    env var (None when unset) forces the choice on prefill and on non-PD
+    servers; decode ignores it."""
+    if disaggregation_mode == "decode":
+        return WEIGHT_STREAM_OFF
+    if env_value is None:
+        return (
+            WEIGHT_STREAM_AUTO
+            if disaggregation_mode == "prefill"
+            else WEIGHT_STREAM_OFF
+        )
+    return WEIGHT_STREAM_ON if env_value else WEIGHT_STREAM_OFF
+
+
 class CopyOp(msgspec.Struct, frozen=True):
     """One pitched pull copy; all offsets / pitches / widths are elements."""
 

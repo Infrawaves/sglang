@@ -42,7 +42,10 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.communication.k3_shared_weight_stream import (
+    WEIGHT_STREAM_OFF,
+    WEIGHT_STREAM_ON,
     SharedWeightStream,
+    weight_stream_policy,
 )
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
@@ -147,6 +150,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -791,9 +795,8 @@ class KimiK3MoE(nn.Module):
                 (parallel.attn_tp_group, parallel.tp_group),
             )
         )
-        # Set after weight loading by KimiK3LinearForCausalLM when
-        # SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM is on; None keeps the
-        # activation AG/RS path.
+        # Set after weight loading by KimiK3LinearForCausalLM on prefill (see
+        # weight_stream_policy); None keeps the activation AG/RS path.
         self._shared_weight_stream: Optional[SharedWeightStream] = None
         self._shared_weight_slot: Optional[int] = None
         self._shared_weight_stream_min_rows = (
@@ -4158,8 +4161,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
 
-        if envs.SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM.get():
-            self._setup_shared_weight_stream()
+        self._setup_shared_weight_stream()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
@@ -4186,8 +4188,22 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     def _setup_shared_weight_stream(self) -> None:
         """Move the local MoE layers' shared-expert shards into one IPC pool and
-        chain their staging copies in forward order. Must run before KV-cache
-        sizing and CUDA graph capture; idempotent across post-load calls."""
+        chain their staging copies in forward order, on the PD roles that pull
+        weights (weight_stream_policy). Must run before KV-cache sizing and
+        CUDA graph capture; idempotent across post-load calls."""
+        env = envs.SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM
+        disaggregation_mode = get_disagg().disaggregation_mode
+        policy = weight_stream_policy(
+            disaggregation_mode=disaggregation_mode,
+            env_value=env.get() if env.is_set() else None,
+        )
+        if policy == WEIGHT_STREAM_OFF:
+            if disaggregation_mode == "decode" and env.is_set() and env.get():
+                rank0_log(
+                    "SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM is ignored on decode: "
+                    "decode shared-expert TP all-gathers the activations."
+                )
+            return
         moes = [
             layer.mlp
             for layer in self.model.layers
@@ -4197,13 +4213,28 @@ class KimiK3LinearForCausalLM(nn.Module):
         ]
         if not moes or moes[0]._shared_weight_stream is not None:
             return
+        # Every rank of the subgroup sees the same layers and server args, so
+        # all of them reach the same decision below (the activation fallback's
+        # collectives still pair up).
         if not all(moe._can_stream_shared_weights() for moe in moes):
-            raise ValueError(
-                "SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM needs CUDA, an EP a2a "
-                "backend, --shared-experts-tp-size > 1 and dense bf16 shared "
-                "experts."
-            )
+            if policy == WEIGHT_STREAM_ON:
+                raise ValueError(
+                    "SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM needs CUDA, an EP a2a "
+                    "backend, --shared-experts-tp-size > 1 and dense bf16 shared "
+                    "experts."
+                )
+            return
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
         group = moes[0]._shared_experts_tp_group
+        if policy != WEIGHT_STREAM_ON and not all(
+            in_the_same_node_as(group.cpu_group, source_rank=0)
+        ):
+            rank0_log(
+                "K3 shared-expert weight streaming is off: the shared-expert TP "
+                "subgroup spans nodes; prefill keeps the activation AG/RS."
+            )
+            return
         stream = SharedWeightStream(
             mlps=[moe.shared_experts for moe in moes],
             cpu_group=group.cpu_group,

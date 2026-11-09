@@ -4,7 +4,13 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.communication.k3_shared_weight_stream import slot_copy_plan
+from sglang.srt.layers.communication.k3_shared_weight_stream import (
+    WEIGHT_STREAM_AUTO,
+    WEIGHT_STREAM_OFF,
+    WEIGHT_STREAM_ON,
+    slot_copy_plan,
+    weight_stream_policy,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -72,6 +78,27 @@ class TestSharedWeightStreamPlan(CustomTestCase):
                     sources = [op.src_rank for op in plan]
                     self.assertEqual(sources[-2:], [rank, rank])
                     self.assertNotIn(rank, sources[:-2])
+
+
+class TestWeightStreamPolicy(CustomTestCase):
+    def test_prefill_pulls_weights_decode_pulls_activations(self):
+        cases = {
+            # (disaggregation_mode, env): policy
+            ("prefill", None): WEIGHT_STREAM_AUTO,
+            ("prefill", True): WEIGHT_STREAM_ON,
+            ("prefill", False): WEIGHT_STREAM_OFF,
+            ("decode", None): WEIGHT_STREAM_OFF,
+            ("decode", True): WEIGHT_STREAM_OFF,
+            ("decode", False): WEIGHT_STREAM_OFF,
+            ("null", None): WEIGHT_STREAM_OFF,
+            ("null", True): WEIGHT_STREAM_ON,
+        }
+        for (mode, env), want in cases.items():
+            with self.subTest(mode=mode, env=env):
+                self.assertEqual(
+                    weight_stream_policy(disaggregation_mode=mode, env_value=env),
+                    want,
+                )
 
 
 if __name__ == "__main__":
