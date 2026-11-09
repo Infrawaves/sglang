@@ -1028,7 +1028,10 @@ class Req(ReqDllmMixin):
         cannot carry its entire digest. Scope both the radix tree and storage
         to the ordered media identities. This deliberately gives up text-prefix
         sharing across different media while preserving same-media reuse.
+        SGLANG_MM_DISABLE_REQUEST_CACHE_NAMESPACE keeps the caller's salt.
         """
+        if envs.SGLANG_MM_DISABLE_REQUEST_CACHE_NAMESPACE.get():
+            return
         if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
             identities = tuple(
                 item.cache_key for item in self.multimodal_inputs.mm_items
