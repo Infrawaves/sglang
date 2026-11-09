@@ -1916,6 +1916,12 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Opt out of scoping a media request's KV namespace (radix tree and HiCache
+    # storage) to its ordered media identities, so text before an image and
+    # turns that append images share the prefix again. Media spans are then
+    # told apart only by their 62-bit pad sentinels: a match ending within the
+    # first 3 tokens of a span is not collision-proof. Trusted traffic only.
+    SGLANG_MM_DISABLE_REQUEST_CACHE_NAMESPACE = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # PD decode only: drop multimodal feature tensors in the tokenizer before
