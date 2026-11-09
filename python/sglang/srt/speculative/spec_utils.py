@@ -5,8 +5,9 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple, Union
 
+import msgspec
 import torch
 from huggingface_hub import snapshot_download
 
@@ -842,35 +843,101 @@ class GrammarTree:
     ) -> GrammarTree:
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
-    @classmethod
-    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
-        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
-
-        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
-        token, so mask rows line up with the target's logits rows one-for-one.
-        Only the ids need a copy; the links are fixed by the shape.
-        """
-        bs, chain_len = verify_ids_2d.shape
-        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
-        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        return cls.from_device(next_token, next_sibling, verify_ids_2d)
-
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
             self._done.synchronize()
         return self._host
 
 
+class GrammarChain(msgspec.Struct, frozen=True):
+    """The (bs, chain_len) verify ids of a chain-verify algorithm, on the host.
+
+    Column 0 is the already-committed token, so mask rows line up with the target's
+    logits rows one-for-one. ``from_device`` starts an async copy, so build it
+    before the target verify launch.
+    """
+
+    host_verify_ids: torch.Tensor
+    # Device event recorded after the copy; None when the ids are already on host.
+    done: Optional[Any]
+
+    @classmethod
+    def from_device(cls, verify_ids: torch.Tensor) -> GrammarChain:
+        host_verify_ids = _async_d2h(verify_ids)
+        if verify_ids.device.type == "cpu":
+            return cls(host_verify_ids=host_verify_ids, done=None)
+        done = torch.get_device_module(verify_ids.device).Event()
+        done.record()
+        return cls(host_verify_ids=host_verify_ids, done=done)
+
+    def resolve(self) -> torch.Tensor:
+        if self.done is not None:
+            self.done.synchronize()
+        return self.host_verify_ids
+
+
+def generate_chain_token_bitmask(
+    reqs: List[Req],
+    verify_ids_cpu: torch.Tensor,
+    vocab_size: int,
+) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
+    """Mask row i * chain_len + pos corresponds to request i, position pos."""
+    bs, chain_len = verify_ids_cpu.shape
+    assert len(reqs) == bs
+    chains = verify_ids_cpu.tolist()
+    vocab_mask = None
+    grammar = None
+    for i, req in enumerate(reqs):
+        if req.grammar is None:
+            continue
+        if vocab_mask is None:
+            vocab_mask = req.grammar.allocate_vocab_mask(
+                vocab_size=vocab_size,
+                batch_size=bs * chain_len,
+                device="cpu",
+            )
+            vocab_mask_words = vocab_mask.numpy()
+        grammar = req.grammar
+        s = time.perf_counter()
+        if not grammar.is_terminated():
+            base_row = i * chain_len
+            grammar.fill_vocab_mask(vocab_mask, base_row)
+            num_grammar_steps = 0
+            for pos in range(1, chain_len):
+                token = chains[i][pos]
+                if vocab_size and token >= vocab_size:
+                    break
+                # The parent row decides, not accept_token: a reasoner grammar does not
+                # consult its inner grammar while thinking.
+                parent_word = vocab_mask_words.item(base_row + pos - 1, token >> 5)
+                if not (parent_word >> (token & 31)) & 1:
+                    break
+                grammar.accept_token(token)
+                num_grammar_steps += 1
+                if grammar.is_terminated():
+                    break
+                grammar.fill_vocab_mask(vocab_mask, base_row + pos)
+            if num_grammar_steps:
+                grammar.rollback(num_grammar_steps)
+        chain_traverse_time = time.perf_counter() - s
+        if chain_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
+            logger.warning(
+                f"Bit mask generation took {chain_traverse_time} seconds with "
+                f"grammar: {req.grammar}"
+            )
+
+    return vocab_mask, grammar
+
+
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
-    tree: GrammarTree,
+    tree: Union[GrammarTree, GrammarChain],
     sampling_info: SamplingBatchInfo,
     device,
     barrier: Optional[Callable[[], None]],
 ) -> Optional[GrammarMask]:
-    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
+    """Build the constrained-decoding bitmask and stage it on device.
 
     Call it after the target verify launch -- every step here is host work, so it all
     overlaps that forward. ``barrier`` advances the previous batch's FSM over its
@@ -878,11 +945,18 @@ def build_grammar_vocab_mask(
     """
     if barrier is not None:
         barrier()
-    vocab_mask, grammar = generate_token_bitmask(
-        reqs,
-        *tree.resolve(),
-        sampling_info.vocab_size,
-    )
+    if isinstance(tree, GrammarChain):
+        vocab_mask, grammar = generate_chain_token_bitmask(
+            reqs=reqs,
+            verify_ids_cpu=tree.resolve(),
+            vocab_size=sampling_info.vocab_size,
+        )
+    else:
+        vocab_mask, grammar = generate_token_bitmask(
+            reqs,
+            *tree.resolve(),
+            sampling_info.vocab_size,
+        )
     if vocab_mask is None:
         return None
 

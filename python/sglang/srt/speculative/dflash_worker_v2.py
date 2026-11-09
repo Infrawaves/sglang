@@ -137,7 +137,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
-    GrammarTree,
+    GrammarChain,
     build_grammar_vocab_mask,
     check_simulate_acc_token_mode,
     draft_pp_context,
@@ -4008,8 +4008,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+        grammar_chain = (
+            GrammarChain.from_device(draft_tokens) if batch.has_grammar else None
         )
 
         # --- 2) Target verify.
@@ -4141,7 +4141,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.has_grammar:
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                tree=grammar_tree,
+                tree=grammar_chain,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,

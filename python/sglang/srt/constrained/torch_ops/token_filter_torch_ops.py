@@ -11,11 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Torch fallback for token filter operations (non-CUDA devices and HIP).
+"""Token filters for CPU masks and accelerator torch fallbacks.
 
-Sets or clears specific bits in an int32 bitmask by token ID.  The token list
-is typically tiny (< 10 entries); aggregation is done in Python with the actual
-bitmask operations using torch tensor indexing.
+CPU masks use a shared NumPy view to avoid per-token tensor operations.
 """
 
 import ctypes
@@ -31,6 +29,17 @@ def set_token_filter_torch(
     is_allowed: bool = True,
     reset_vocab_mask: bool = True,
 ):
+    if vocab_mask.device.type == "cpu":
+        row = vocab_mask.numpy()[batch_idx]
+        if reset_vocab_mask:
+            row.fill(-1 if not is_allowed else 0)
+        for token_id in token_ids:
+            element_idx, bit_idx = divmod(token_id, 32)
+            bitmask = ctypes.c_int32(1 << bit_idx).value
+            value = int(row[element_idx])
+            row[element_idx] = value | bitmask if is_allowed else value & ~bitmask
+        return
+
     if reset_vocab_mask:
         vocab_mask[batch_idx].fill_(-1 if (not is_allowed) else 0)
 

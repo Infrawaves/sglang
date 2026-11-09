@@ -87,7 +87,7 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
+    GrammarChain,
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
@@ -1168,8 +1168,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.info("Verify ids read from the draft graph output (first step).")
 
         # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        grammar_chain = (
+            GrammarChain.from_device(verify_ids_2d) if batch.has_grammar else None
         )
 
         # A live grammar forces the eager path: the folded epilogue accepts inside
@@ -1235,7 +1235,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             # lines up with the logits on both verify paths.
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                tree=grammar_tree,
+                tree=grammar_chain,
                 sampling_info=sampling_info,
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,
