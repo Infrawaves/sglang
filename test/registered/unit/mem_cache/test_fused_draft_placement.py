@@ -308,7 +308,7 @@ def _config(**overrides):
     fields = dict(
         attention_arch=AttentionArch.MHA,
         is_hybrid_swa=True,
-        is_deepseek_v4_arch=False,
+        is_compressed_kv_arch=False,
         swa_attention_layer_ids=[0],
         num_nextn_predict_layers=None,
         hf_text_config=SimpleNamespace(),
@@ -741,7 +741,7 @@ class TestFusedDraftDecision(CustomTestCase):
             swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
-        cfg.dflash_draft_rows_dcp_collapsed = False
+        cfg.dflash_draft_loc_space_scale = 1
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,
@@ -750,7 +750,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 model_path="draft-model",
                 revision="test-revision",
                 is_hybrid_swa=False,
-                is_deepseek_v4_arch=False,
+                is_compressed_kv_arch=False,
                 num_nextn_predict_layers=None,
                 get_num_kv_heads=lambda tp: max(1, 4 // tp),
                 head_dim=64,

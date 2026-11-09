@@ -34,6 +34,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
@@ -58,11 +59,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.common import (
-    ceil_align,
-    get_eager_max_batch_size,
-    require_mlp_sync,
-)
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
@@ -314,8 +311,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
             shared_read_ends = (
                 model_runner.attn_backend.resolve_prefill_shared_read_ends(
-                    forward_batch,
-                    num_qo_tokens=len(forward_batch.input_ids),
+                    forward_batch
                 )
             )
             maybe_publish_prefill_shared_read_done(

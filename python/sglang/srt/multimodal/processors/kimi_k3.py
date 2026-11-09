@@ -82,8 +82,12 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.runtime_context import get_serving
-from sglang.srt.utils import is_cuda, load_image
-from sglang.srt.utils.common import CORRUPT_VIDEO_MESSAGE, is_corrupt_video_error
+from sglang.srt.utils import is_cuda
+from sglang.srt.multimodal.media_io import (
+    CORRUPT_VIDEO_MESSAGE,
+    is_corrupt_video_error,
+    load_image,
+)
 
 logger = logging.getLogger(__name__)
 

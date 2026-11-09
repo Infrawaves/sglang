@@ -25,11 +25,11 @@ from sglang.srt.managers.mm_utils import (  # noqa: E402
     MultiModalityDataPaddingPatternMultimodalTokens,
     drop_mm_features_for_decode,
 )
+from sglang.srt.managers.req_types import MultimodalProcessorOutput  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    MultimodalProcessorOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402

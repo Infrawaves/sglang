@@ -208,27 +208,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         tokens -- those collapse into the consumer's ghost slot. Real tokens
         map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-            PaddedToBucket,
+            PadVerifyLayout,
         )
 
-        # At an exact request bucket there is no dummy request to own token
-        # padding. Dense consumers must leave it uncovered, even when the last
-        # real request has room below the fixed verify width.
-        if cap is not None and padded_bs == self.bs:
-            padded = self.verify_lens
-        else:
-            padded = PaddedToBucket.execute(
-                verify_lens=self.verify_lens,
-                graph_num_tokens=self.graph_num_tokens,
-                bs=self.bs,
-                padded_bs=padded_bs,
-            )
-        if cap is not None:
-            padded = torch.clamp(padded, max=cap)
-
-        return RaggedVerifyLayout._assemble_device(
-            verify_lens=padded,
+        padded = PadVerifyLayout.execute(
+            verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
+            padded_bs=padded_bs,
+            cap=cap,
+        )
+        return RaggedVerifyLayout(
+            verify_lens=padded.verify_lens,
+            graph_num_tokens=self.graph_num_tokens,
+            extend_start_loc=padded.extend_start_loc,
+            qo_indptr_device=padded.qo_indptr,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
             graph_max_bs=self.graph_max_bs,

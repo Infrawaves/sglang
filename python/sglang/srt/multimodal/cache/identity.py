@@ -75,7 +75,10 @@ class MediaSnapshot:
 
 
 def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
-    from sglang.srt.utils.common import CORRUPT_IMAGE_EXCEPTIONS, corrupt_image_message
+    from sglang.srt.multimodal.media_io import (
+        CORRUPT_IMAGE_EXCEPTIONS,
+        corrupt_image_message,
+    )
 
     try:
         snapshot = image.copy()
@@ -136,7 +139,7 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
         return bytes(media)
 
-    from sglang.srt.utils import (
+    from sglang.srt.multimodal.media_io import (
         get_image_bytes,
         image_extension_names,
         read_local_media_file,
@@ -159,7 +162,7 @@ def snapshot_media(media: Any) -> MediaSnapshot:
     Paths and URLs are deliberately not identities. They are resolved to bytes
     on every untrusted lookup, so changing their contents produces a cache miss.
     """
-    from sglang.srt.utils import ImageData
+    from sglang.srt.multimodal.media_io import ImageData
 
     if isinstance(media, ImageData):
         media = media.url
@@ -170,7 +173,7 @@ def snapshot_media(media: Any) -> MediaSnapshot:
             media = media["image"]
 
     if isinstance(media, (str, bytes)):
-        from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS
+        from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS
 
         try:
             payload = _read_media_bytes(media)

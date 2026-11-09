@@ -83,6 +83,11 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.beam_coordinator = Mock()
     sched.output_streamer = Mock()
     sched.enable_hisparse = False
+    sched.tree_cache = Mock()
+    sched.hisparse_coordinator = None
+    sched.uocr_runtime = None
+    sched.ipc_channels = Mock()
+    sched.init_request_retirer()
     return sched
 
 
@@ -103,10 +108,12 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.request_retirer = Mock()
-        sched.ipc_channels = Mock()
 
-        sched.process_pending_chunked_abort()
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
+            sched.process_pending_chunked_abort()
 
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
@@ -115,10 +122,6 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.request_retirer = release_only_retirer(
-            Mock(), beam_coordinator=sched.beam_coordinator
-        )
-        sched.ipc_channels = Mock()
 
         with (
             patch.object(sched.request_retirer, "_detach"),
@@ -132,13 +135,12 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         # Each chunk's extend allocates HiSparse spec scratch for the row.
         req = _FakeReq("hisparse_chunked")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.ipc_channels = Mock()
         calls = []
         hisparse_coordinator = Mock()
         hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
-        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
+        sched.request_retirer.hisparse_coordinator = hisparse_coordinator
 
         with (
             patch.object(sched.request_retirer, "_detach"),

@@ -60,6 +60,8 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -135,12 +137,7 @@ from sglang.srt.speculative.ragged_verify import (
     full_coverage_graph_slots,
     needs_full_width_ragged_graph,
 )
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    require_attn_tp_gather,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 try:
@@ -953,10 +950,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
+            draft_uses_compressed_kv_attention,
         )
 
-        return not draft_is_deepseek_v4()
+        return not draft_uses_compressed_kv_attention()
 
     def _ragged_graph_slots(self, num_tokens: int, max_bs: int) -> Optional[int]:
         slots = self._ragged_slots_by_tokens.get(num_tokens, ())
@@ -1021,14 +1018,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         cap_layout = self._captured_ragged_layouts[key]
         if cap_layout is None:
             return
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            PaddedLayout,
+            PadVerifyLayout,
+        )
+
         live = ragged_layout
-        if live.bs != cap_layout.bs or live.cap is None:
-            live = live.padded_to_bucket(
-                padded_bs=cap_layout.bs, cap=self.captured_req_width
-            )
-        cap_layout.verify_lens.copy_(live.verify_lens)
-        cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
-        cap_layout.extend_start_loc.copy_(live.extend_start_loc)
+        if live.bs == cap_layout.bs and live.cap is not None:
+            cap_layout.verify_lens.copy_(live.verify_lens)
+            cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+            cap_layout.extend_start_loc.copy_(live.extend_start_loc)
+            return
+        PadVerifyLayout.execute(
+            verify_lens=live.verify_lens,
+            graph_num_tokens=live.graph_num_tokens,
+            padded_bs=cap_layout.bs,
+            cap=self.captured_req_width,
+            out=PaddedLayout(
+                verify_lens=cap_layout.verify_lens,
+                qo_indptr=cap_layout.qo_indptr_device,
+                extend_start_loc=cap_layout.extend_start_loc,
+            ),
+        )
 
     @staticmethod
     def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
@@ -1388,6 +1399,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with self.model_context():
             self._capture()
 
+    def _capture_profile_options(self) -> CaptureProfileOptions:
+        per_shape = self._graph_batch_capture_active()
+        if per_shape:
+            self._profile_trace_tag = None
+        return CaptureProfileOptions(
+            runner_name=self._profile_runner_name(),
+            per_shape=per_shape,
+            get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
+        )
+
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
@@ -1408,16 +1429,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the original unscheduled pass leaves this None.
         self._profiler = None
         if self.enable_profile_cuda_graph:
-            per_shape = self._graph_batch_capture_active()
-            if per_shape:
-                self._profile_trace_tag = None
-            profile_options = CaptureProfileOptions(
-                runner_name=self._profile_runner_name(),
-                per_shape=per_shape,
-                get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
-            )
+            profile_options = self._capture_profile_options()
             profile_context = self.backend.capture_profile_context(profile_options)
-            if per_shape:
+            if profile_options.per_shape:
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
@@ -1903,13 +1917,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _glues_draft_metadata(self) -> bool:
         """Whether this draft runner's metadata prep runs through the glue graph: a
-        static-verify draft runner whose backend accepts it."""
+        draft runner whose backend accepts it."""
         if not self.model_runner.is_draft_worker:
             return False
-        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
-            why = "ragged verify"
-        else:
-            why = self.attn_backend.glue_draft_metadata()
+        why = self.attn_backend.glue_draft_metadata()
         if why:
             logger.info("Draft metadata glue graph off: %s.", why)
             return False

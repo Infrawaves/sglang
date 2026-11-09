@@ -21,6 +21,7 @@ from sglang.srt.configs.hybrid_arch import (
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
@@ -36,6 +37,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     mla_attention_dcp_size,
+    uses_compressed_kv_attention,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -66,10 +68,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
 )
-from sglang.srt.mem_cache.draft_kv_budget import (
-    resolve_dflash_draft_cell_size,
-    resolve_dflash_draft_rows_dcp_collapsed,
-)
+from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -121,7 +120,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -363,8 +362,7 @@ def mla_draft_rows_are_dcp_collapsed(
     kv_cache_dtype: torch.dtype,
 ) -> bool:
     """Whether a draft with this geometry keeps DCP-collapsed (physical) MLA rows;
-    see KVCacheConfigurator.draft_mla_rows_are_physical. Shared with the target's
-    pool budget, which must not charge such a draft per widened location."""
+    see KVCacheConfigurator.draft_mla_rows_are_physical."""
     return (
         get_parallel().attn_dcp_size > 1
         and use_mla_backend
@@ -400,6 +398,15 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
+    execution_width = (
+        mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
+        if use_mla_backend
+        else 1
+    )
+    return dcp_size // execution_width
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -429,9 +436,7 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
-    # The DFLASH draft pool keeps DCP-collapsed MLA rows (one per target row),
-    # so the target's budget charges it per row, not per widened location.
-    dflash_draft_rows_dcp_collapsed: bool = field(init=False, default=False)
+    dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
@@ -467,10 +472,12 @@ class KVCacheConfigurator:
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
             )
-            self.dflash_draft_rows_dcp_collapsed = (
-                resolve_dflash_draft_rows_dcp_collapsed(
-                    draft_model_config=aux.draft_model_config
-                )
+            self.dflash_draft_loc_space_scale = draft_loc_space_scale(
+                hf_config=aux.draft_model_config.hf_config,
+                use_mla_backend=(
+                    aux.draft_model_config.attention_arch == AttentionArch.MLA
+                ),
+                dcp_size=get_parallel().attn_dcp_size,
             )
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
@@ -667,19 +674,13 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        if self.draft_mla_rows_are_physical:
-            return 1
-        dcp_size = get_parallel().attn_dcp_size
         if not self.is_draft_worker:
             return 1
-        execution_width = (
-            mla_attention_dcp_size(
-                self.model_config.hf_config, dcp_size=dcp_size, is_nextn=True
-            )
-            if self.use_mla_backend
-            else 1
+        return draft_loc_space_scale(
+            hf_config=self.model_config.hf_config,
+            use_mla_backend=self.use_mla_backend,
+            dcp_size=get_parallel().attn_dcp_size,
         )
-        return dcp_size // execution_width
 
     @property
     def pool_page_size(self) -> int:
@@ -723,7 +724,7 @@ class KVCacheConfigurator:
         # dtype attributes initialized so _init_pools can share one code path.
         c4_state_dtype: Optional[torch.dtype] = None
         c128_state_dtype: Optional[torch.dtype] = None
-        if is_deepseek_v4(self.model_config.hf_config):
+        if uses_compressed_kv_attention(self.model_config.hf_config):
             c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
 
         return _PoolSizes(
@@ -933,16 +934,18 @@ class KVCacheConfigurator:
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
-        is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        is_compressed_kv_model = uses_compressed_kv_attention(
+            self.model_config.hf_config
+        )
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
-            is_dsa_model, is_dsv4_model, current_platform
+            is_dsa_model, is_compressed_kv_model, current_platform
         )
 
         token_to_kv_pool = self._build_token_to_kv_pool(
             sizes=sizes,
             is_dsa_model=is_dsa_model,
-            is_dsv4_model=is_dsv4_model,
+            is_compressed_kv_model=is_compressed_kv_model,
             req_to_token_pool=req_to_token_pool,
             state=state,
         )
@@ -973,7 +976,7 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
             sizes=sizes,
             token_to_kv_pool=token_to_kv_pool,
-            is_dsv4_model=is_dsv4_model,
+            is_compressed_kv_model=is_compressed_kv_model,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
@@ -1032,10 +1035,10 @@ class KVCacheConfigurator:
         return placement
 
     def _unified_window_and_state(self) -> tuple:
-        """Whether this model's unified plan holds a window sub-pool and a state
-        sub-pool. DeepSeek-V4 is not served by the unified pool."""
+        """Whether the unified plan holds a window sub-pool and a state sub-pool;
+        compressed-KV models are not served by it."""
         has_state = self.mambaish_config is not None
-        has_window = self.is_hybrid_swa and not is_deepseek_v4(
+        has_window = self.is_hybrid_swa and not uses_compressed_kv_attention(
             self.model_config.hf_config
         )
         return has_window, has_state
@@ -1489,14 +1492,14 @@ class KVCacheConfigurator:
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self,
         is_dsa_model: bool,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         current_platform,
     ):
         if not get_schedule().prefill_only_disable_kv_cache or self.is_draft_worker:
             return
 
         unsupported_pool_family = None
-        if is_dsv4_model:
+        if is_compressed_kv_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
@@ -1740,7 +1743,7 @@ class KVCacheConfigurator:
         *,
         sizes: _PoolSizes,
         is_dsa_model: bool,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         req_to_token_pool: ReqToTokenPool,
         state: Optional[StateStorage] = None,
     ) -> KVCache:
@@ -1748,7 +1751,9 @@ class KVCacheConfigurator:
         # layout with separate KV storage. Handle them before the normal pool
         # dispatch; targets and drafts without that allocator fall through.
         mtp_pool = self._build_mtp_kv_shard_pool(
-            sizes=sizes, is_dsa_model=is_dsa_model, is_dsv4_model=is_dsv4_model
+            sizes=sizes,
+            is_dsa_model=is_dsa_model,
+            is_compressed_kv_model=is_compressed_kv_model,
         )
         if mtp_pool is not None:
             return mtp_pool
@@ -1778,7 +1783,7 @@ class KVCacheConfigurator:
                 current_platform, subsystem="the block-scaled (fp4 / mxfp8) KV pool"
             )
 
-        if is_dsv4_model:
+        if is_compressed_kv_model:
             reject_out_of_tree_path(
                 current_platform, subsystem="the DeepSeek-V4 KV pool"
             )
@@ -1885,7 +1890,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mtp_kv_shard_pool(
-        self, *, sizes: _PoolSizes, is_dsa_model: bool, is_dsv4_model: bool
+        self, *, sizes: _PoolSizes, is_dsa_model: bool, is_compressed_kv_model: bool
     ) -> Optional[KVCache]:
         """Build a draft pool in its target's logical space, with its own KV.
 
@@ -1910,7 +1915,7 @@ class KVCacheConfigurator:
         if get_parallel().attn_dcp_size > 1:
             raise ValueError("MTP KV sharding is incompatible with DCP.")
         if (
-            is_dsv4_model
+            is_compressed_kv_model
             or self.is_hybrid_swa
             or self.mambaish_config is not None
             or self.sliding_window_size is not None
@@ -2001,6 +2006,7 @@ class KVCacheConfigurator:
                 kv_cache_dim=target_pool.kv_cache_dim,
                 index_head_dim=index_head_dim,
                 index_kpool=1,
+                use_fp4_indexer=target_pool.use_fp4_indexer,
             )
         if self.use_mla_backend:
             return PageInterleaveMLATokenToKVPool(
@@ -2063,6 +2069,19 @@ class KVCacheConfigurator:
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
+            if self.model_config.mla_layer_ids:
+                from sglang.srt.mem_cache.ernie55_memory_pool import (
+                    Ernie5_5TokenToKVPool,
+                )
+
+                pool_cls = Ernie5_5TokenToKVPool
+                kv_layout_kwargs.update(
+                    pool_cls.stage_kwargs(
+                        self.model_config.hf_config,
+                        self.layer_info.start_layer,
+                        self.layer_info.end_layer,
+                    )
+                )
 
         unified_fp8 = unified_fp8_for_dsv4_pool(
             is_draft_worker=self.is_draft_worker,
@@ -2364,6 +2383,7 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -2401,6 +2421,7 @@ class KVCacheConfigurator:
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
                 ),
+                use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             )
 
         return SWAKVPool(
@@ -2625,6 +2646,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
@@ -2819,7 +2841,7 @@ class KVCacheConfigurator:
         *,
         sizes: _PoolSizes,
         token_to_kv_pool: KVCache,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
@@ -2828,13 +2850,13 @@ class KVCacheConfigurator:
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
-                or is_dsv4_model
+                or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if is_dsv4_model:
+                    if is_compressed_kv_model:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,
                         )
@@ -2958,7 +2980,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if get_memory().enable_hisparse and is_compressed_kv_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator

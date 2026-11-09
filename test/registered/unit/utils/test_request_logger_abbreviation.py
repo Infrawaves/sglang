@@ -12,8 +12,8 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.entrypoints.openai import serving_chat  # noqa: E402
 from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
-from sglang.srt.utils import request_logger  # noqa: E402
-from sglang.srt.utils.request_logger import RequestLogger  # noqa: E402
+from sglang.srt.observability import request_logger  # noqa: E402
+from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")

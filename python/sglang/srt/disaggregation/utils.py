@@ -192,10 +192,7 @@ def disagg_transfers_in_flight(scheduler):
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                any(
-                    not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue.items()
-                )
+                scheduler.disagg_decode_prealloc_queue.has_device_destinations
                 # Deferred releases keep destinations published to a peer that
                 # may still be writing them, until the transfer drains.
                 or scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases()

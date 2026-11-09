@@ -29,9 +29,9 @@ import requests
 import torch
 from PIL import Image
 
+from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import common
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
 from sglang.test.test_utils import CustomTestCase
 
@@ -157,14 +157,14 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         with self.assertRaisesRegex(
             ValueError, r"^Could not decode image: image is corrupted or truncated$"
         ) as ctx:
-            common.load_image(data, gpu_image_decode=False)
+            media_io.load_image(data, gpu_image_decode=False)
         self.assertIsInstance(ctx.exception.__cause__, SyntaxError)
         with self.assertRaisesRegex(ValueError, r"corrupted or truncated"):
             _StubProcessor._load_single_item(data, Modality.IMAGE)
 
     def test_oversized_image_is_a_client_error(self):
         with patch.object(
-            common.Image,
+            media_io.Image,
             "open",
             side_effect=Image.DecompressionBombError(
                 "Image size exceeds the decompression bomb limit"
@@ -173,7 +173,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
             with self.assertRaisesRegex(
                 ValueError, r"^image too large, exceeds upper limit\.$"
             ):
-                common.load_image(b"oversized image", gpu_image_decode=False)
+                media_io.load_image(b"oversized image", gpu_image_decode=False)
 
     def test_unexpected_loader_bug_remains_a_server_error(self):
         with patch(
@@ -187,28 +187,28 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         data = _jpeg_bytes()
         expected = torch.zeros((3, 8, 8), dtype=torch.uint8)
         with (
-            patch.object(common, "is_cuda", return_value=True),
+            patch.object(media_io, "is_cuda", return_value=True),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 return_value=expected,
             ) as decode,
         ):
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
 
         self.assertIs(image, expected)
         decode.assert_called_once_with(data)
 
     def test_high_fidelity_gpu_jpeg_decoder_falls_back_to_pil(self):
         data = _jpeg_bytes()
-        common._warn_fancy_jpeg_fallback.cache_clear()
+        media_io._warn_fancy_jpeg_fallback.cache_clear()
         with (
-            patch.object(common, "is_cuda", return_value=True),
+            patch.object(media_io, "is_cuda", return_value=True),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 side_effect=ImportError("nvImageCodec is unavailable"),
             ),
         ):
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
 
         self.assertIsInstance(image, Image.Image)
         reference = Image.open(io.BytesIO(data))

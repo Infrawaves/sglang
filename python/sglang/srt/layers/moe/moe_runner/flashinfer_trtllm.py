@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import contextvars
+import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generator, Optional, cast
 
 import torch
+from packaging.version import Version
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.moe import k31_decode_moe as k31
+from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -34,11 +39,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils.common import (
-    is_flashinfer_available,
-    next_power_of_2,
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_forward,
+    get_parallel,
 )
+from sglang.srt.utils.device import is_flashinfer_available
+from sglang.srt.utils.log_utils import print_info_once
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -132,6 +141,24 @@ def _make_deferred_finalize_output(
     )
 
 
+def _finalize_in_order(result, *, top_k: int, out: torch.Tensor) -> torch.Tensor:
+    """Sum FlashInfer's ``do_finalize=False`` outputs into ``out``, adding the
+    top-k terms in the same order whatever the batch size."""
+    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
+
+    deferred = _make_deferred_finalize_output(result, top_k=top_k)
+    num_tokens = out.shape[0]
+    return moe_finalize_fuse_shared(
+        deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1]),
+        deferred.expanded_idx_to_permuted_idx.view(-1)[: num_tokens * top_k],
+        deferred.expert_weights.view(-1, top_k)[:num_tokens],
+        None,
+        top_k,
+        enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+        out=out,
+    )
+
+
 def round_up_to_multiple(x: int, m: int) -> int:
     """Round up *x* to the nearest multiple of *m*."""
     return (x + m - 1) // m * m
@@ -208,14 +235,25 @@ _FP4_MXFP8_TILE_NS = (8, 16, 32, 64, 128, 192, 256)
 
 
 def _trtllm_moe_default_tile_n(
-    num_tokens: int, top_k: int, num_local_experts: int, device: torch.device
+    num_tokens: int, top_k: int, num_local_experts: int
 ) -> int:
+    # Must match FlashInfer's selectDefaultTileN: FlashInfer 0.7.2 runs a
+    # [tile, -1] tactic at its own default tile, not at the tile it is given.
     tiles = _FP4_MXFP8_TILE_NS
-    if torch.cuda.get_device_capability(device) == (10, 7):
-        tiles = tuple(t for t in tiles if t != 192)
     average = num_tokens * top_k / num_local_experts
     i = next((i for i, t in enumerate(tiles) if t >= average), len(tiles) - 1)
     return tiles[max(i - 1, 0)]
+
+
+@functools.cache
+def _flashinfer_lacks_sm107_moe_fixes(device: torch.device) -> bool:
+    # FlashInfer < 0.7.3 has no FP4 tile-192 kernels and no MoE PDL on SM107
+    # (flashinfer-ai/flashinfer#6271, #6788); drop once the pin is >= 0.7.3.
+    if torch.cuda.get_device_capability(device) != (10, 7):
+        return False
+    import flashinfer
+
+    return Version(flashinfer.__version__) < Version("0.7.3")
 
 
 def _trtllm_mxfp4_moe_runner(
@@ -224,7 +262,6 @@ def _trtllm_mxfp4_moe_runner(
     num_tokens: int,
     hidden_size: int,
     top_k: int,
-    device: torch.device,
     num_experts: int,
     local_expert_offset: int,
     num_local_experts: int,
@@ -271,9 +308,6 @@ def _trtllm_mxfp4_moe_runner(
         num_fused_shared_experts=0,
     )
     enable_pdl = trtllm_moe_enable_pdl(num_tokens)
-    device_support_moe_pdl = getattr(fi_moe_core, "_device_support_moe_pdl", None)
-    if device_support_moe_pdl is not None and not device_support_moe_pdl(device):
-        enable_pdl = False
     runner_kwargs = {
         "routing_input_mode": routing_input_mode,
         "num_experts": num_experts,
@@ -321,7 +355,10 @@ def select_trtllm_routed_body(
         and method.flashinfer_mxfp4_moe_precision == "default"
         and method.moe_runner_config.activation == "situ"
         and method.hidden_size == x.shape[-1]
-    ):
+    ) or _flashinfer_lacks_sm107_moe_fixes(x.device):
+        return None
+    # The Kimi-K3.1 decode MoE kernels route from the packed top-k themselves.
+    if getattr(layer, "k31_decode_moe", False) and x.shape[0] <= k31.MAX_TOKENS:
         return None
     try:
         from flashinfer.autotuner import AutoTuner
@@ -341,7 +378,6 @@ def select_trtllm_routed_body(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         top_k=top_k,
-        device=device,
         num_experts=layer.num_experts,
         local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
         num_local_experts=layer.num_local_experts,
@@ -394,7 +430,7 @@ def select_trtllm_routed_body(
         return DABody(
             tactic=-1,
             tile_n=_trtllm_moe_default_tile_n(
-                num_tokens, top_k, layer.num_local_experts, device
+                num_tokens, top_k, layer.num_local_experts
             ),
         )
     return DABody(tactic=tactic[1], tile_n=tactic[0])
@@ -417,7 +453,6 @@ def _run_trtllm_prepared_routing_moe(
         num_tokens=x_quant.shape[0],
         hidden_size=x_quant.shape[1],
         top_k=topk_ids.shape[1],
-        device=x_quant.device,
         num_experts=quant_info.global_num_experts,
         local_expert_offset=quant_info.local_expert_offset,
         num_local_experts=quant_info.local_num_experts,
@@ -1375,6 +1410,94 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+    # Kimi-K3.1 decode MoE kernels usable for this layer (k31_decode_moe_supported)
+    k31_decode_moe: bool = False
+
+
+def _k31_decode_moe_mismatch(
+    layer: torch.nn.Module,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> Optional[str]:
+    """The first requirement of the Kimi-K3.1 decode MoE kernels that the layer
+    misses, or None; the shapes and SiTU constants are compiled into them."""
+    cfg = layer.moe_runner_config
+    if cfg.activation != "situ":
+        return f"activation {cfg.activation}, not situ"
+    situ = (cfg.gemm1_alpha, cfg.gemm1_clamp_limit)
+    if situ != (k31.SITU_BETA, k31.SITU_LINEAR_BETA):
+        return f"SiTU constants {situ}, not (4.0, 25.0)"
+    if with_bias:
+        return "expert bias"
+    if precision != "default":
+        return f"{precision} activations, not MXFP8"
+    if not layer.num_experts == layer.num_local_experts == k31.NUM_EXPERTS:
+        return f"{layer.num_local_experts} of {layer.num_experts} local experts"
+    if (intermediate_size, hidden_size) != (k31.INTER, k31.HIDDEN):
+        return f"intermediate {intermediate_size}, hidden {hidden_size}"
+    arch = current_arch()
+    if not (arch.is_sm(10, 0) or arch.is_sm(10, 3)):
+        return "not SM100 / SM103"
+    return None
+
+
+def k31_decode_moe_supported(
+    layer: torch.nn.Module,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> bool:
+    """Whether this layer runs the Kimi-K3.1 decode MoE kernels
+    (SGLANG_K31_DECODE_MOE); decided once, after the flashinfer_mxfp4 weights
+    are prepared."""
+    if not envs.SGLANG_K31_DECODE_MOE.get():
+        return False
+    mismatch = _k31_decode_moe_mismatch(
+        layer, intermediate_size, hidden_size, with_bias, precision
+    )
+    if mismatch is not None:
+        print_info_once(f"SGLANG_K31_DECODE_MOE: not used ({mismatch})")
+    return mismatch is None
+
+
+def _k31_decode_moe(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    packed_topk: Optional[torch.Tensor],
+    topk_output,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    out: Optional[torch.Tensor],
+) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
+    """With `out`, finalizes into it (as flashinfer's do_finalize with
+    routed_scaling_factor None) and returns None; else returns the deferred output."""
+    packed = packed_topk is not None
+    gemm2_out, expanded_idx, packed_weights = k31.k31_moe_mxfp4(
+        x_quant,
+        # the handoff's [T, 28] int32 and per_token_group_quant's packed UE8M0 are both
+        # the linear [T, 112] E8M0 bytes the kernel reads
+        x_scale.view(torch.uint8).view(x_quant.shape[0], -1),
+        packed_topk if packed else topk_output.topk_ids,
+        quant_info.w13_weight,
+        quant_info.w13_weight_scale,
+        quant_info.w2_weight,
+        quant_info.w2_weight_scale,
+        packed=packed,
+    )
+    weights = packed_weights if packed else topk_output.topk_weights
+    if out is not None:
+        moe_finalize_fuse_shared(
+            gemm2_out, expanded_idx, weights, None, k31.TOP_K, enable_pdl=True, out=out
+        )
+        return None
+    return FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=weights,
+        expanded_idx_to_permuted_idx=expanded_idx,
+        top_k=k31.TOP_K,
+    )
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1433,6 +1556,21 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         top_k = topk_output.topk_config.top_k
         router_logits = topk_output.router_logits
 
+    use_k31 = (
+        quant_info.k31_decode_moe and is_standard and x_quant.shape[0] <= k31.MAX_TOKENS
+    )
+    if quant_info.k31_decode_moe and not use_k31:
+        print_info_once(
+            "SGLANG_K31_DECODE_MOE: calls with a non-standard top-k or more than "
+            "256 tokens fall back to flashinfer"
+        )
+    if use_k31 and _deferred_finalize_enabled.get():
+        return StandardCombineInput(
+            hidden_states=_k31_decode_moe(
+                x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, None
+            )
+        )
+
     num_tokens = x_quant.shape[0]
     from sglang.srt.layers import zero_copy_context
 
@@ -1451,6 +1589,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if use_k31:
+        _k31_decode_moe(
+            x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, symm_output
+        )
+        return StandardCombineInput(hidden_states=symm_output)
 
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
@@ -1842,6 +1986,22 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             symmetric=hidden_pad == 0,
         )
 
+    # FlashInfer's small-batch finalize sums the top-k outputs in a different order
+    # from its large-batch finalize (flashinfer-ai/flashinfer#8831), so a token's
+    # output would depend on its batch size. In deterministic mode, take the
+    # unsummed outputs and sum them in one fixed order at every batch size. Only
+    # the pre-routed call: its routing weights already carry any routed scaling.
+    finalize_in_order = (
+        use_routed_topk
+        and not defer_finalize
+        and hidden_pad == 0
+        and symm_output.dtype == torch.bfloat16
+        # Kernel tests call this runner without a published server config.
+        and get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+    flashinfer_finalize = not (defer_finalize or finalize_in_order)
+
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
         moe_kwargs = dict(
@@ -1871,7 +2031,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             local_num_experts=quant_info.local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=not defer_finalize,
+            do_finalize=flashinfer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
@@ -1883,6 +2043,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             result = _make_deferred_finalize_output(
                 result,
                 top_k=_routing_top_k(routing),
+            )
+        elif finalize_in_order:
+            result = _finalize_in_order(
+                result, top_k=_routing_top_k(routing), out=symm_output
             )
         else:
             result = result[0]
