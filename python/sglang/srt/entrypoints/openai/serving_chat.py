@@ -1391,6 +1391,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # History contains complete calls, unlike streaming response deltas
+        # whose shared FunctionResponse model allows the name to be absent.
+        for message_index, message in enumerate(request.messages):
+            if (
+                not isinstance(message, ChatCompletionMessageGenericParam)
+                or message.role != "assistant"
+            ):
+                continue
+            for tool_index, tool_call in enumerate(message.tool_calls or []):
+                name = tool_call.function.name
+                if name is None or not name.strip():
+                    return (
+                        f"messages[{message_index}].tool_calls[{tool_index}]"
+                        ".function.name must be a non-empty string."
+                    )
+
         if (
             request.chat_template_kwargs
             and "chat_template" in request.chat_template_kwargs
