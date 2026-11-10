@@ -2418,16 +2418,6 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
-            spec_graph_candidate_count=(
-                self.draft_worker.get_shared_graph_candidate_count()
-                if self.spec_algorithm.is_dspark() and self.draft_worker is not None
-                else 0
-            ),
-            finalize_spec_graph_budget=(
-                self.draft_worker.finalize_shared_graph_budget
-                if self.spec_algorithm.is_dspark() and self.draft_worker is not None
-                else None
-            ),
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -5533,7 +5523,6 @@ class Scheduler(
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
-                "dspark_force_graph_tokens",
                 "dspark_clear_info_records",
             ]
         )
@@ -5567,19 +5556,6 @@ class Scheduler(
                     )
                     if_success = False
                     break
-            elif k == "dspark_force_graph_tokens":
-                if not self.spec_algorithm.is_dspark() or not hasattr(
-                    self.draft_worker, "validate_dspark_forced_graph_tokens"
-                ):
-                    logging.warning("dspark_force_graph_tokens requires DSpark.")
-                    if_success = False
-                    break
-                try:
-                    self.draft_worker.validate_dspark_forced_graph_tokens(v)
-                except (TypeError, ValueError) as exc:
-                    logging.warning("Rejected dspark_force_graph_tokens: %s", exc)
-                    if_success = False
-                    break
             elif k == "dspark_clear_info_records":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "clear_info_records"
@@ -5611,9 +5587,6 @@ class Scheduler(
                 self.draft_worker.set_dspark_forced_budget_frac(
                     None if frac is None else float(frac)
                 )
-            graph_tokens = remaining.pop("dspark_force_graph_tokens", None)
-            if "dspark_force_graph_tokens" in server_args_dict:
-                self.draft_worker.set_dspark_forced_graph_tokens(graph_tokens)
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:

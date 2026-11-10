@@ -148,12 +148,6 @@ class MLPSyncBatchInfo:
     # missing budget is 0, keeping the neutral row all-zero.
     spec_verify_tier_num_tokens: int = 0
     spec_verify_token_budget_enc: int = 0
-    # Startup-fixed utility width, including on idle ranks: one fixed-point
-    # expected token yield per graph plus a full-width fallback yield.
-    # An all-negative row disables shared graph search for the step; zero is
-    # the neutral idle contribution.
-    spec_graph_candidate_count: int = 0
-    spec_graph_utilities: Optional[list[int]] = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -165,16 +159,6 @@ class MLPSyncBatchInfo:
     # Per attention-DP rank, read from each DP's attention-TP rank 0.
     global_spec_verify_tier_num_tokens: list[int] = None
     global_spec_verify_token_budget_enc: list[int] = None
-    global_spec_graph_utilities: Optional[list[list[int]]] = None
-
-    def _graph_utility_row(self) -> list[int]:
-        count = self.spec_graph_candidate_count
-        if count == 0:
-            return []
-        utilities = self.spec_graph_utilities
-        if utilities is None or len(utilities) != count:
-            return [-1] * count
-        return utilities
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -190,8 +174,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 self.spec_verify_tier_num_tokens,
                 self.spec_verify_token_budget_enc,
-            ]
-            + self._graph_utility_row(),
+            ],
             device=device,
             dtype=dtype,
         )
@@ -210,8 +193,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # spec_verify_tier_num_tokens
                 0,  # spec_verify_token_budget_enc
-            ]
-            + [0] * self.spec_graph_candidate_count,
+            ],
             device=device,
             dtype=dtype,
         )
@@ -223,9 +205,6 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_spec_verify_tier_num_tokens = [self.spec_verify_tier_num_tokens]
         self.global_spec_verify_token_budget_enc = [self.spec_verify_token_budget_enc]
-        self.global_spec_graph_utilities = (
-            [self._graph_utility_row()] if self.spec_graph_candidate_count else None
-        )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -301,9 +280,6 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.global_spec_verify_tier_num_tokens = tp0_info_cpu[:, 9].tolist()
         self.global_spec_verify_token_budget_enc = tp0_info_cpu[:, 10].tolist()
-        self.global_spec_graph_utilities = (
-            tp0_info_cpu[:, 11:].tolist() if self.spec_graph_candidate_count else None
-        )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -357,16 +333,6 @@ def _update_gather_batch(
         batch.global_spec_verify_token_budget_enc = getattr(
             mlp_sync_info, "global_spec_verify_token_budget_enc", None
         )
-        batch.global_spec_graph_utilities = getattr(
-            mlp_sync_info, "global_spec_graph_utilities", None
-        )
-    else:
-        batch.global_spec_graph_utilities = None
-    # Batches can survive multiple decode rounds. A decision is valid only for
-    # the fresh metadata exchange that immediately precedes its forward.
-    batch.spec_shared_graph_tokens = None
-    batch.spec_shared_graph_step_seconds = None
-    batch.spec_shared_graph_theta = None
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -393,27 +359,6 @@ def local_spec_verify_tier(local_batch: Optional[ScheduleBatch]) -> tuple[int, i
         int(local_batch.spec_verify_tier_num_tokens),
         0 if budget is None else int(budget) + 1,
     )
-
-
-def local_spec_graph_utilities(
-    local_batch: Optional[ScheduleBatch], candidate_count: int
-) -> list[int]:
-    """Encode the local utility curve on the startup-shared capture grid."""
-    if candidate_count == 0:
-        return []
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    ):
-        return [0] * candidate_count
-    if local_batch.forward_mode.is_decode() and getattr(
-        local_batch, "spec_verify_budget_presync", False
-    ):
-        utilities = getattr(local_batch, "spec_graph_utilities", None)
-        if utilities is not None and len(utilities) == candidate_count:
-            return utilities
-    return [-1] * candidate_count
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -562,7 +507,6 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
-    spec_graph_candidate_count: int = 0,
 ):
     parallel = get_parallel()
     dp_size = parallel.dp_size
@@ -668,10 +612,6 @@ def prepare_mlp_sync_batch_raw(
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
         spec_verify_tier_num_tokens=spec_verify_tier_num_tokens,
         spec_verify_token_budget_enc=spec_verify_token_budget_enc,
-        spec_graph_candidate_count=spec_graph_candidate_count,
-        spec_graph_utilities=local_spec_graph_utilities(
-            local_batch, spec_graph_candidate_count
-        ),
     )
 
     if dp_size == 1:
@@ -740,10 +680,6 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
-    spec_graph_candidate_count: int = 0
-    finalize_spec_graph_budget: Optional[Callable[[Optional[ScheduleBatch]], None]] = (
-        None
-    )
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         draft_require_mlp_tp_gather = None
@@ -755,7 +691,7 @@ class SchedulerDPAttnAdapter:
                 moe_a2a_backend=draft_moe_a2a_backend,
             )
 
-        batch = prepare_mlp_sync_batch_raw(
+        return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
@@ -771,11 +707,7 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
-            spec_graph_candidate_count=self.spec_graph_candidate_count,
         )
-        if self.finalize_spec_graph_budget is not None:
-            self.finalize_spec_graph_budget(batch)
-        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self,

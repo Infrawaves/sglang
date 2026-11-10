@@ -5,10 +5,7 @@ from pathlib import Path
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
-    SpsGraphCostSample,
-    SpsGraphCostTable,
     build_uninitialized_sps_table,
-    graph_step_time,
     is_uninitialized_sps_table,
     load_sps_table_from_path,
     profile_sps_table,
@@ -201,98 +198,6 @@ class TestIsUninitializedSpsTable(CustomTestCase):
 
     def test_real_diagonal_table_is_initialized(self):
         self.assertFalse(is_uninitialized_sps_table(_make_table()))
-
-
-def _make_graph_table(**kwargs) -> SpsGraphCostTable:
-    fields = dict(
-        verify_width=6,
-        capture_num_tokens=[24, 48],
-        samples=[
-            SpsGraphCostSample(4, 8, 24, 0.02),
-            SpsGraphCostSample(8, 8, 24, 0.03),
-            SpsGraphCostSample(4, 16, 48, 0.05),
-        ],
-    )
-    fields.update(kwargs)
-    return SpsGraphCostTable(**fields)
-
-
-class TestGraphSpsCostTable(CustomTestCase):
-    def test_round_trip_and_capture_contract(self):
-        table = _make_graph_table()
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "graph.json"
-            path.write_text(table.to_json(), encoding="utf-8")
-            loaded = load_sps_table_from_path(str(path))
-        self.assertEqual(loaded, table)
-        self.assertFalse(is_uninitialized_sps_table(loaded))
-        loaded.validate_capture(verify_width=6, capture_num_tokens=[24, 48])
-        for width, grid in [(5, [24, 48]), (6, [24, 36, 48])]:
-            with self.assertRaises(ValueError):
-                loaded.validate_capture(verify_width=width, capture_num_tokens=grid)
-
-    def test_interpolates_only_request_count_within_measured_shape(self):
-        table = _make_graph_table()
-        self.assertAlmostEqual(
-            graph_step_time(table, num_reqs=6, graph_slots=8, graph_num_tokens=24),
-            0.025,
-        )
-        self.assertEqual(
-            graph_step_time(table, num_reqs=4, graph_slots=16, graph_num_tokens=48),
-            0.05,
-        )
-        for bs, slots, tokens in [(3, 8, 24), (9, 8, 24), (4, 8, 48), (4, 8, 36)]:
-            self.assertIsNone(
-                graph_step_time(
-                    table, num_reqs=bs, graph_slots=slots, graph_num_tokens=tokens
-                )
-            )
-
-    def test_rejects_invalid_shape_grid_timing_and_schema(self):
-        for kwargs in [
-            dict(verify_width=0),
-            dict(align=False),
-            dict(schema="dspark_graph_v2"),
-            dict(capture_num_tokens=[]),
-            dict(capture_num_tokens=[48, 24]),
-            dict(capture_num_tokens=[24, 24, 48]),
-            dict(samples=[]),
-            dict(samples=[SpsGraphCostSample(4, 8, 25, 0.02)]),
-            dict(samples=[SpsGraphCostSample(9, 8, 24, 0.02)]),
-            dict(samples=[SpsGraphCostSample(1, 2, 24, 0.02)]),
-            dict(samples=[SpsGraphCostSample(4, 8, 24, 0.0)]),
-            dict(samples=[SpsGraphCostSample(4, 8, 24, float("nan"))]),
-            dict(samples=[SpsGraphCostSample(4, 8, 24, float("inf"))]),
-            dict(samples=[SpsGraphCostSample(4, 8, 24, 0.02)] * 2),
-        ]:
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                _make_graph_table(**kwargs)
-
-    def test_legacy_cost_uses_shared_replay_tokens(self):
-        table = SpsAdditiveCostTable(
-            bias_seconds=0.01,
-            bs_probes=[4, 8],
-            alpha_seconds=[0.001, 0.003],
-            m_probes=[8, 24, 48],
-            theta_seconds=[0.0, 0.02, 0.05],
-        )
-        self.assertAlmostEqual(
-            graph_step_time(table, num_reqs=6, graph_slots=8, graph_num_tokens=24),
-            0.032,
-        )
-        self.assertAlmostEqual(
-            graph_step_time(
-                _make_table(), num_reqs=6, graph_slots=8, graph_num_tokens=32
-            ),
-            1.0 / 500,
-        )
-
-    def test_legacy_invalid_cost_is_unavailable(self):
-        for value in [0.0, -1.0, float("nan"), float("inf")]:
-            table = SpsCostTable([24], [value], 24)
-            self.assertIsNone(
-                graph_step_time(table, num_reqs=4, graph_slots=8, graph_num_tokens=24)
-            )
 
 
 if __name__ == "__main__":

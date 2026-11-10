@@ -6,14 +6,11 @@
 
 The server is launched for profiling, which differs from serving:
 
-  SGLANG_RAGGED_VERIFY_MODE=compact       graph table or 2D (--fracs); static for 1D
+  SGLANG_RAGGED_VERIFY_MODE=compact       2D table (--fracs); static for 1D
   SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER=1  compact under dp-attention, a2a MoE or DCP
   SGLANG_DSPARK_ENABLE_SPS_RECORD=1       step records, read via /server_info
   SGLANG_SIMULATE_ACC_LEN=1.0             every step commits exactly one token
-  --speculative-dspark-align-verify-tokens-to-graph-tier
-      required for --graph-table; exact graph pinning also works without a table
   --speculative-dspark-sps-table-path <any valid table>
-      required only for the legacy --fracs sweep:
       without one the planner is verify-all and the uniform layout
       ignores the pinned budget, so every cell measures full-width verify
   --cuda-graph-max-bs-decode >= the largest per-rank batch swept
@@ -21,15 +18,10 @@ The server is launched for profiling, which differs from serving:
       each /generate carries one DP rank's share, so the default 1024 suffices
   KV capacity per rank >= batch * (--input-len + max_new_tokens)
 
-  For the legacy --fracs sweep, leave align off: it refills
+  Leave --speculative-dspark-align-verify-tokens-to-graph-tier off: it refills
   the pinned budget up to the graph tier, so the cell would verify more real
   tokens than the M it is recorded under. A table fitted with it off still
-  serves with it on using an approximate token-axis lookup.
-
-The graph-table mode measures actual replay (Bmax,S,G), with align enabled.
-It uses a common contiguous steady window on all DP ranks and takes the
-slowest rank's whole-window scheduler cadence. No additional GPU/DP barrier
-is inserted. The full capture grid is retained in the output table.
+  serves with it on, since step time follows the replayed tier.
 
   PD decode only:
   --disaggregation-transfer-backend fake  load goes straight to decode, no prefill
@@ -47,7 +39,6 @@ import logging
 import math
 import random
 import statistics
-import sys
 import threading
 import time
 from pathlib import Path
@@ -63,7 +54,6 @@ logger = logging.getLogger(__name__)
 def _load_module_by_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -75,13 +65,8 @@ try:
         should_skip_due_to_token_capacity,
     )
     from sglang.benchmark.utils import get_tokenizer
-    from sglang.srt.speculative.dspark_components.dspark_graph_budget import (
-        GraphBudgetShapes,
-    )
     from sglang.srt.speculative.dspark_components.dspark_sps import (
         SpsAdditiveCostTable,
-        SpsGraphCostSample,
-        SpsGraphCostTable,
         load_sps_table_from_path,
         profile_sps_table,
     )
@@ -97,13 +82,6 @@ except ImportError as exc:
         _benchmark_dir.parent / "srt/speculative/dspark_components/dspark_sps.py",
     )
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
-    SpsGraphCostSample = _table_module.SpsGraphCostSample
-    SpsGraphCostTable = _table_module.SpsGraphCostTable
-    GraphBudgetShapes = _load_module_by_path(
-        "dspark_graph_budget",
-        _benchmark_dir.parent
-        / "srt/speculative/dspark_components/dspark_graph_budget.py",
-    ).GraphBudgetShapes
     load_sps_table_from_path = _table_module.load_sps_table_from_path
     profile_sps_table = _table_module.profile_sps_table
     DEFAULT_TIMEOUT = 60
@@ -150,11 +128,6 @@ class SpsRow(msgspec.Struct, frozen=True):
     num_running_reqs: int
     num_verify_tokens: int
     step_time: float
-    graph_max_bs: Optional[int] = None
-    graph_slots: Optional[int] = None
-    graph_num_tokens: Optional[int] = None
-    can_run_cuda_graph: Optional[bool] = None
-    step_boundary_seconds: Optional[float] = None
 
 
 # Server-side per-step record feed: the DsparkInfoDumper 'core' +
@@ -176,9 +149,6 @@ class ServerContext(msgspec.Struct, frozen=True):
     cuda_graph_max_bs: Optional[int]
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
-    graph_profile: Optional[dict] = None
-    forced_graph_tokens: Optional[int] = None
-    forced_budget_frac: Optional[float] = None
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -208,10 +178,6 @@ class RoundOutcome(msgspec.Struct, frozen=True):
     rank_rows: list[list[SpsRow]]
     load_info: LoadInfo
     frac: Optional[float] = None
-    graph_slots: Optional[int] = None
-    graph_num_tokens: Optional[int] = None
-    per_rank_window_step_seconds: Optional[list[float]] = None
-    steady_forward_ct: Optional[list[int]] = None
 
 
 def out_paths(*, out: str) -> dict[str, Path]:
@@ -234,23 +200,7 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
-    graph_table: bool = False,
-    graph_tokens: Optional[list[int]] = None,
 ) -> None:
-    if graph_table:
-        if fracs is not None:
-            raise ValueError("--graph-table sweeps captured graphs; omit --fracs.")
-        return run_graph_profile(
-            base_url=base_url,
-            batch_sizes=batch_sizes,
-            settings=settings,
-            out=out,
-            repeats=repeats,
-            local_tokenizer_path=local_tokenizer_path,
-            graph_tokens=graph_tokens,
-        )
-    if graph_tokens is not None:
-        raise ValueError("--graph-tokens requires --graph-table.")
     if get_tokenizer is None:
         raise RuntimeError(
             "'run' needs the full sglang runtime (torch, tokenizers, ...), but this "
@@ -385,73 +335,6 @@ def fit_profile(
     if not summaries:
         raise RuntimeError(f"{paths['rounds']} has no rounds to fit.")
     offdiag = any(summary.get("frac") is not None for summary in summaries)
-    manifest = (
-        json.loads(paths["manifest"].read_text(encoding="utf-8"))
-        if paths["manifest"].exists()
-        else {}
-    )
-    graph_table = manifest.get("schema") == "dspark_graph_profile_v1" or any(
-        summary.get("graph_num_tokens") is not None for summary in summaries
-    )
-
-    if graph_table:
-        if "graph_profile" not in manifest:
-            raise ValueError("Graph fit requires the run's graph_profile manifest.")
-        table = build_graph_table_from_summaries(
-            summaries=summaries, graph_profile=manifest["graph_profile"]
-        )
-        validate_graph_table_coverage(
-            table=table,
-            graph_profile=manifest["graph_profile"],
-            max_batch_size=manifest["graph_max_batch_size"],
-            min_batch_size=manifest["graph_min_batch_size"],
-            graph_tokens=manifest.get("graph_tokens"),
-        )
-        expected_cells = {tuple(cell) for cell in manifest["graph_cells"]}
-        measured_cells = {
-            (sample.num_reqs, sample.graph_slots, sample.graph_num_tokens)
-            for sample in table.samples
-        }
-        if expected_cells != measured_cells:
-            raise ValueError(
-                f"Graph run is incomplete or differs from its planned cells: missing={sorted(expected_cells - measured_cells)[:10]}, unexpected={sorted(measured_cells - expected_cells)[:10]}."
-            )
-        repeats_by_cell = {}
-        for summary in summaries:
-            key = (
-                summary["batch_size_per_rank"],
-                summary["graph_slots"],
-                summary["graph_num_tokens"],
-            )
-            repeats_by_cell.setdefault(key, []).append(summary.get("repeat", 0))
-        expected_repeats = list(range(manifest.get("repeats", 1)))
-        if any(
-            sorted(values) != expected_repeats for values in repeats_by_cell.values()
-        ):
-            raise ValueError(
-                "Graph run is incomplete: each planned cell must contain exactly the requested repeats."
-            )
-        paths["table"].write_text(table.to_json(), encoding="utf-8")
-        if self_check:
-            reloaded = load_sps_table_from_path(str(paths["table"]))
-            validate_graph_table_coverage(
-                table=reloaded,
-                graph_profile=manifest["graph_profile"],
-                max_batch_size=manifest["graph_max_batch_size"],
-                min_batch_size=manifest["graph_min_batch_size"],
-                graph_tokens=manifest.get("graph_tokens"),
-            )
-        logger.info(
-            "Wrote SpsGraphCostTable: %d actual (B,S,G) probes -> %s",
-            len(table.samples),
-            paths["table"],
-        )
-        if plot:
-            logger.info(
-                "Graph samples and timings are in %s; graph mode skips the additive-fit plot.",
-                paths["rounds"],
-            )
-        return
 
     table = build_table_from_summaries(
         summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
@@ -494,8 +377,6 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
-    graph_table: bool = False,
-    graph_tokens: Optional[list[int]] = None,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -505,8 +386,6 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
-        graph_table=graph_table,
-        graph_tokens=graph_tokens,
     )
     fit_profile(
         out=out,
@@ -561,7 +440,6 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
-    graph_table: bool = False,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
@@ -633,33 +511,6 @@ def fetch_server_context(
 
     internal_state = internal_states[0]
     dp_size = int(internal_state.get("dp_size") or 1)
-    graph_profile = None
-    if graph_table:
-        if len(sps_payloads) != dp_size:
-            raise ValueError(
-                f"Expected {dp_size} DP graph profiles, got {len(sps_payloads)}."
-            )
-        profiles = [payload.get("graph_profile") for payload in sps_payloads]
-        if any(not isinstance(profile, dict) for profile in profiles):
-            raise ValueError(
-                "Server lacks actual graph profiling metadata; launch this branch's server with compact, align and SPS_RECORD=1."
-            )
-        graph_profile = profiles[0]
-        if any(profile != graph_profile for profile in profiles[1:]):
-            raise ValueError(
-                "DP ranks disagree on graph_profile capture geometry/configuration."
-            )
-        overrides = {
-            (payload.get("forced_graph_tokens"), payload.get("forced_budget_frac"))
-            for payload in sps_payloads
-        }
-        if len(overrides) != 1:
-            raise ValueError("DP ranks disagree on graph profiling overrides.")
-        graph_shapes(graph_profile)
-        if graph_profile["verify_width"] != next(iter(verify_num_draft_tokens)):
-            raise ValueError(
-                "Graph profile verify_width disagrees with the draft width."
-            )
     cuda_graph_max_bs = resolve_cuda_graph_max_bs(internal_state=internal_state)
     max_running_per_dp = internal_state.get("effective_max_running_requests_per_dp", -1)
     if max_running_per_dp and max_running_per_dp > 0:
@@ -688,9 +539,6 @@ def fetch_server_context(
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
-        graph_profile=graph_profile,
-        forced_graph_tokens=sps_payloads[0].get("forced_graph_tokens"),
-        forced_budget_frac=sps_payloads[0].get("forced_budget_frac"),
     )
 
 
@@ -900,10 +748,7 @@ def start_load(
     temperature: float,
     vocab_size: int,
     rng: random.Random,
-    request_timeout_seconds: float = DEFAULT_TIMEOUT,
 ) -> threading.Thread:
-    if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
-        raise ValueError("request_timeout_seconds must be finite and positive.")
     token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
     if token_high <= RANDOM_TOKEN_LOW:
         raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
@@ -936,7 +781,7 @@ def start_load(
     def _post(payload: dict) -> None:
         try:
             response = requests.post(
-                base_url + "/generate", json=payload, timeout=request_timeout_seconds
+                base_url + "/generate", json=payload, timeout=DEFAULT_TIMEOUT
             )
         except Exception:
             logger.warning(
@@ -1068,9 +913,7 @@ def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
         )
 
 
-def fetch_rank_rows(
-    *, base_url: str, include_graph_boundaries: bool = False
-) -> list[list[SpsRow]]:
+def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     internal_states = response.json().get("internal_states") or []
@@ -1080,22 +923,14 @@ def fetch_rank_rows(
         rows: list[SpsRow] = []
         for record in payload.get("records", []):
             step_cpu_ms = record.get("step_cpu_ms")
-            if step_cpu_ms is None and not (
-                include_graph_boundaries
-                and record.get("step_boundary_seconds") is not None
-            ):
+            if step_cpu_ms is None:
                 continue
             rows.append(
                 SpsRow(
                     forward_ct=int(record["forward_ct"]),
                     num_running_reqs=int(record["num_running_reqs"]),
                     num_verify_tokens=int(record["num_verify_tokens"]),
-                    step_time=float(step_cpu_ms or 0.0) / 1000.0,
-                    graph_max_bs=record.get("graph_max_bs"),
-                    graph_slots=record.get("graph_slots"),
-                    graph_num_tokens=record.get("graph_num_tokens"),
-                    can_run_cuda_graph=record.get("can_run_cuda_graph"),
-                    step_boundary_seconds=record.get("step_boundary_seconds"),
+                    step_time=float(step_cpu_ms) / 1000.0,
                 )
             )
         rank_rows.append(rows)
@@ -1235,516 +1070,6 @@ def postprocess_round(
         load_info=load_info,
         frac=frac,
     )
-
-
-def graph_shapes(profile: dict) -> GraphBudgetShapes:
-    if profile.get("align") is not True:
-        raise ValueError("Graph profiling requires align=true on every DP rank.")
-    if profile.get("timing") != "scheduler_boundary_v1":
-        raise ValueError(
-            "Graph profiling requires scheduler_boundary_v1 timing records."
-        )
-    if profile.get("profile_allocation") != "uniform_confidence_topk":
-        raise ValueError(
-            "Graph profiling requires uniform_confidence_topk allocation to fill the aligned budget reproducibly."
-        )
-    if profile.get("dp_tier_gather_enabled") is not True:
-        raise ValueError("Graph profiling requires the shared DP graph tier path.")
-    return GraphBudgetShapes(
-        capture_num_tokens=profile["capture_num_tokens"],
-        slots_by_tokens={
-            int(g): slots for g, slots in profile["slots_by_tokens"].items()
-        },
-        verify_width=profile["verify_width"],
-        max_bs=profile["max_bs"],
-        reserve_padding_slot=profile["reserve_padding_slot"],
-    )
-
-
-def build_graph_sweep(
-    *,
-    graph_profile: dict,
-    batch_sizes: list[int],
-    graph_tokens: Optional[list[int]] = None,
-) -> list[tuple[int, int, int]]:
-    """Sample supplied B probes and every shape's feasible B interval endpoints.
-
-    The resulting discrete (S,G) table can interpolate B without extrapolating
-    across a slot-bucket transition, including narrow one-request intervals.
-    """
-    shapes = graph_shapes(graph_profile)
-    if not batch_sizes or min(batch_sizes) < 1 or max(batch_sizes) > shapes.max_bs:
-        raise ValueError("Graph B sweep must be within [1, captured max_bs].")
-    tokens_filter = set(
-        shapes.capture_num_tokens if graph_tokens is None else graph_tokens
-    )
-    if not tokens_filter or not tokens_filter.issubset(shapes.capture_num_tokens):
-        raise ValueError(
-            "--graph-tokens must be a nonempty subset of captured token tiers."
-        )
-    by_shape: dict[tuple[int, int, bool], list[int]] = {}
-    for bs in range(min(batch_sizes), max(batch_sizes) + 1):
-        for shape in shapes.for_batch(bs):
-            if shape is not None and shape.graph_num_tokens in tokens_filter:
-                by_shape.setdefault(
-                    (shape.slots, shape.graph_num_tokens, shape.uniform), []
-                ).append(bs)
-    requested = set(batch_sizes)
-    cells = set()
-    for (slots, tokens, _uniform), counts in by_shape.items():
-        # A shape can occur in separate compact/uniform feasibility intervals.
-        ends = {counts[0], counts[-1]}
-        for left, right in zip(counts, counts[1:]):
-            if right != left + 1:
-                ends.update((left, right))
-        for bs in requested.intersection(counts) | ends:
-            cells.add((bs, slots, tokens))
-    if not cells:
-        raise ValueError("No replayable graph cells in the requested sweep.")
-    return sorted(cells)
-
-
-def set_forced_graph_tokens(
-    *, base_url: str, graph_num_tokens: Optional[int], clear_records: bool = False
-) -> None:
-    update = {"dspark_force_graph_tokens": graph_num_tokens}
-    if clear_records:
-        update["dspark_clear_info_records"] = True
-    response = requests.post(
-        base_url + "/set_internal_state",
-        json={"server_args": update},
-        timeout=DEFAULT_TIMEOUT,
-    )
-    response.raise_for_status()
-    outputs = response.json()
-    outputs = outputs if isinstance(outputs, list) else [outputs]
-    if not outputs or not all(
-        isinstance(out, dict) and out.get("updated") for out in outputs
-    ):
-        raise RuntimeError(
-            f"Setting dspark_force_graph_tokens={graph_num_tokens} failed: {outputs}"
-        )
-
-
-def graph_aligned_window(
-    *, rank_rows: list[list[SpsRow]], cell: tuple[int, int, int]
-) -> list[int]:
-    bs, slots, tokens = cell
-    if not rank_rows or any(not rows for rows in rank_rows):
-        return []
-    by_rank = [{row.forward_ct: row for row in rows} for rows in rank_rows]
-    if any(len(rows) != len(by_ct) for rows, by_ct in zip(rank_rows, by_rank)):
-        raise RuntimeError("Duplicate forward_ct in graph profiling records.")
-    common = set.intersection(*(set(rows) for rows in by_rank))
-    aligned = []
-    for ct in sorted(common):
-        rows = [rank[ct] for rank in by_rank]
-        if not all(row.num_running_reqs == bs for row in rows):
-            continue
-        for row in rows:
-            if (
-                row.graph_max_bs,
-                row.graph_slots,
-                row.graph_num_tokens,
-            ) != cell or row.can_run_cuda_graph is not True:
-                raise RuntimeError(
-                    f"Graph probe {cell} at forward_ct={ct} ran a different shape or eager verification: {msgspec.to_builtins(row)}"
-                )
-            if row.step_boundary_seconds is None or not math.isfinite(
-                row.step_boundary_seconds
-            ):
-                raise RuntimeError(
-                    "Graph probe is missing a finite scheduler boundary timestamp."
-                )
-        aligned.append(ct)
-    if aligned and aligned != list(range(aligned[0], aligned[-1] + 1)):
-        raise RuntimeError(
-            "Graph steady window contains a missing step, retraction or DP imbalance."
-        )
-    return aligned
-
-
-def postprocess_graph_round(
-    *,
-    rank_rows: list[list[SpsRow]],
-    cell: tuple[int, int, int],
-    dp_size: int,
-    min_steady_steps: int,
-    load_info: LoadInfo,
-) -> RoundOutcome:
-    if len(rank_rows) != dp_size:
-        raise RuntimeError(f"Expected {dp_size} DP ranks, got {len(rank_rows)}.")
-    aligned = graph_aligned_window(rank_rows=rank_rows, cell=cell)
-    steady = aligned[ROUND_WARMUP_STEPS:]
-    intervals = len(steady) - 1
-    if intervals < min_steady_steps:
-        raise RuntimeError(
-            f"Graph probe {cell} has {max(intervals, 0)} steady intervals; need {min_steady_steps}."
-        )
-    per_rank = []
-    medians = []
-    for rows in rank_rows:
-        by_ct = {row.forward_ct: row for row in rows}
-        boundaries = [by_ct[ct].step_boundary_seconds for ct in steady]
-        if any(right <= left for left, right in zip(boundaries, boundaries[1:])):
-            raise RuntimeError("Graph boundary timestamps must be strictly increasing.")
-        per_rank.append((boundaries[-1] - boundaries[0]) / intervals)
-        medians.append(
-            statistics.median(
-                right - left for left, right in zip(boundaries, boundaries[1:])
-            )
-        )
-    # All ranks use exactly this same contiguous window. Taking the maximum
-    # whole-window cadence avoids charging shifted per-step stalls repeatedly.
-    step_seconds = max(per_rank)
-    if not math.isfinite(step_seconds) or step_seconds <= 0:
-        raise RuntimeError("Graph probe has invalid whole-window step time.")
-    bs, slots, tokens = cell
-    return RoundOutcome(
-        batch_size=bs * dp_size,
-        batch_size_per_rank=bs,
-        batch_tokens=tokens,
-        steps_per_sec=1.0 / step_seconds,
-        num_steady_steps=intervals,
-        match_fraction=1.0,
-        per_rank_median_step_time=medians,
-        rank_rows=rank_rows,
-        load_info=load_info,
-        graph_slots=slots,
-        graph_num_tokens=tokens,
-        per_rank_window_step_seconds=per_rank,
-        steady_forward_ct=[steady[0], steady[-1]],
-    )
-
-
-def run_graph_round(
-    *,
-    context: ServerContext,
-    cell: tuple[int, int, int],
-    settings: RoundSettings,
-    vocab_size: int,
-    rng: random.Random,
-) -> RoundOutcome:
-    bs, _slots, tokens = cell
-    batch_size = bs * context.dp_size
-    max_new_tokens = round_max_new_tokens(settings=settings)
-    if should_skip_due_to_max_running_requests(
-        batch_size, context.skip_max_running_requests_threshold
-    ) or should_skip_due_to_token_capacity(
-        batch_size,
-        settings.input_len,
-        max_new_tokens,
-        context.skip_token_capacity_threshold,
-    ):
-        raise RuntimeError(
-            f"Graph cell {cell} exceeds server request/KV capacity; reduce --max-batch-size or input length."
-        )
-    flush_cache(base_url=context.base_url)
-    set_forced_graph_tokens(
-        base_url=context.base_url, graph_num_tokens=tokens, clear_records=True
-    )
-    watermarks = [
-        max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(
-            base_url=context.base_url, include_graph_boundaries=True
-        )
-    ]
-    if len(watermarks) != context.dp_size:
-        raise RuntimeError("DP rank count changed before graph profiling round.")
-    started = time.monotonic()
-    thread = start_load(
-        base_url=context.base_url,
-        num_requests=batch_size,
-        dp_size=context.dp_size,
-        input_len=settings.input_len,
-        max_new_tokens=max_new_tokens,
-        temperature=settings.temperature,
-        vocab_size=vocab_size,
-        rng=rng,
-        request_timeout_seconds=(
-            settings.round_timeout_seconds + LOAD_JOIN_TIMEOUT_SECONDS
-        ),
-    )
-    reached = False
-    try:
-        while time.monotonic() - started < settings.round_timeout_seconds:
-            time.sleep(POLL_INTERVAL_SECONDS)
-            rows = fetch_rank_rows(
-                base_url=context.base_url, include_graph_boundaries=True
-            )
-            if len(rows) != context.dp_size:
-                raise RuntimeError(
-                    "DP rank count changed during graph profiling round."
-                )
-            rows = [
-                [row for row in rank if row.forward_ct > watermark]
-                for rank, watermark in zip(rows, watermarks)
-            ]
-            steady = graph_aligned_window(rank_rows=rows, cell=cell)[
-                ROUND_WARMUP_STEPS:
-            ]
-            if len(steady) - 1 < settings.min_steady_steps:
-                continue
-            by_rank = [{row.forward_ct: row for row in rank} for rank in rows]
-            elapsed = min(
-                rank[steady[-1]].step_boundary_seconds
-                - rank[steady[0]].step_boundary_seconds
-                for rank in by_rank
-            )
-            if elapsed >= settings.min_steady_seconds:
-                reached = True
-                break
-    finally:
-        try:
-            abort_all_requests(base_url=context.base_url)
-        finally:
-            thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
-    if thread.is_alive():
-        raise RuntimeError("Graph profiling load did not finish after abort.")
-    if not reached:
-        raise RuntimeError(
-            f"Graph probe {cell} timed out before the steady-step/time requirements were met."
-        )
-    rows = fetch_rank_rows(base_url=context.base_url, include_graph_boundaries=True)
-    if len(rows) != context.dp_size:
-        raise RuntimeError("DP rank count changed after graph profiling round.")
-    rows = [
-        [row for row in rank if row.forward_ct > watermark]
-        for rank, watermark in zip(rows, watermarks)
-    ]
-    return postprocess_graph_round(
-        rank_rows=rows,
-        cell=cell,
-        dp_size=context.dp_size,
-        min_steady_steps=settings.min_steady_steps,
-        load_info=LoadInfo(
-            batch_size, max_new_tokens, time.monotonic() - started, True
-        ),
-    )
-
-
-def build_graph_table_from_summaries(
-    *, summaries: list[dict], graph_profile: dict
-) -> SpsGraphCostTable:
-    shapes = graph_shapes(graph_profile)
-    groups: dict[tuple[int, int, int], list[float]] = {}
-    for summary in summaries:
-        if (
-            summary.get("timing") != "scheduler_boundary_v1"
-            or summary.get("graph_num_tokens") is None
-        ):
-            raise ValueError(
-                "Graph fit requires actual graph shape and scheduler-boundary records for every round."
-            )
-        key = (
-            summary["batch_size_per_rank"],
-            summary["graph_slots"],
-            summary["graph_num_tokens"],
-        )
-        valid = {
-            (shape.slots, shape.graph_num_tokens)
-            for shape in shapes.for_batch(key[0])
-            if shape is not None
-        }
-        if key[1:] not in valid:
-            raise ValueError(
-                f"Graph sample {key} is outside the reported captured geometry."
-            )
-        sps = summary["steps_per_sec"]
-        if not math.isfinite(sps) or sps <= 0:
-            raise ValueError(f"Invalid graph steps_per_sec for {key}: {sps}.")
-        seconds = 1.0 / sps
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ValueError(f"Invalid graph cost for {key}: {seconds}.")
-        groups.setdefault(key, []).append(seconds)
-    return SpsGraphCostTable(
-        verify_width=shapes.verify_width,
-        capture_num_tokens=list(shapes.capture_num_tokens),
-        samples=[
-            SpsGraphCostSample(*key, statistics.median(times))
-            for key, times in sorted(groups.items())
-        ],
-    )
-
-
-def validate_graph_table_coverage(
-    *,
-    table: SpsGraphCostTable,
-    graph_profile: dict,
-    max_batch_size: int,
-    min_batch_size: int = 1,
-    graph_tokens: Optional[list[int]] = None,
-) -> None:
-    shapes = graph_shapes(graph_profile)
-    table.validate_capture(
-        verify_width=shapes.verify_width,
-        capture_num_tokens=list(shapes.capture_num_tokens),
-    )
-    tokens_filter = set(
-        shapes.capture_num_tokens if graph_tokens is None else graph_tokens
-    )
-    for bs in range(min_batch_size, max_batch_size + 1):
-        for shape in shapes.for_batch(bs):
-            if (
-                shape is not None
-                and shape.graph_num_tokens in tokens_filter
-                and table.step_time(
-                    num_reqs=bs,
-                    graph_slots=shape.slots,
-                    graph_num_tokens=shape.graph_num_tokens,
-                )
-                is None
-            ):
-                raise ValueError(
-                    f"Graph table coverage is incomplete at B={bs}, S={shape.slots}, G={shape.graph_num_tokens}."
-                )
-    logger.info(
-        "Graph table self-check passed: selected shapes at B=%d..%d have costs (G coverage %d/%d).",
-        min_batch_size,
-        max_batch_size,
-        len(tokens_filter),
-        len(shapes.capture_num_tokens),
-    )
-
-
-def run_graph_profile(
-    *,
-    base_url: str,
-    batch_sizes: list[int],
-    settings: RoundSettings,
-    out: str,
-    repeats: int,
-    local_tokenizer_path: Optional[str],
-    graph_tokens: Optional[list[int]] = None,
-) -> None:
-    if get_tokenizer is None:
-        raise RuntimeError(
-            "Graph profiling 'run' requires the full sglang runtime; offline 'fit' supports fallback imports."
-        )
-    if (
-        not base_url
-        or repeats < 1
-        or settings.min_steady_steps < 1
-        or settings.min_steady_seconds < 0
-    ):
-        raise ValueError(
-            "Graph profiling requires a base URL, repeats>=1, steady steps>=1 and seconds>=0."
-        )
-    context = fetch_server_context(
-        base_url=base_url,
-        local_tokenizer_path=local_tokenizer_path,
-        allowed_modes=("compact",),
-        graph_table=True,
-    )
-    validate_sweep_against_server(context=context, batch_sizes=batch_sizes)
-    if (
-        context.forced_graph_tokens is not None
-        or context.forced_budget_frac is not None
-    ):
-        raise ValueError(
-            "Graph profiling requires initially cleared graph and fraction overrides."
-        )
-    cells = build_graph_sweep(
-        graph_profile=context.graph_profile,
-        batch_sizes=batch_sizes,
-        graph_tokens=graph_tokens,
-    )
-    paths = out_paths(out=out)
-    paths["table"].parent.mkdir(parents=True, exist_ok=True)
-    for key in ("records", "rounds"):
-        paths[key].write_text("", encoding="utf-8")
-    manifest = {
-        "schema": "dspark_graph_profile_v1",
-        "graph_profile": context.graph_profile,
-        "graph_min_batch_size": min(batch_sizes),
-        "graph_max_batch_size": max(batch_sizes),
-        "requested_batch_sizes": batch_sizes,
-        "graph_tokens": graph_tokens,
-        "complete_capture_grid": graph_tokens is None,
-        "graph_cells": cells,
-        "settings": msgspec.to_builtins(settings),
-        "base_url": base_url,
-        "tp_size": context.tp_size,
-        "dp_size": context.dp_size,
-        "verify_num_draft_tokens": context.verify_num_draft_tokens,
-        "repeats": repeats,
-        "seed": PROFILE_SEED,
-        "timestamp": time.time(),
-        "command": sys.argv,
-        "records_jsonl": paths["records"].name,
-        "rounds_jsonl": paths["rounds"].name,
-        "conversion_formula": "T = max_rank((boundary_last - boundary_first) / (forward_ct_last - forward_ct_first)); median T across repeated (B,S,G) probes",
-        "timing_scope": "overlapped pipeline scheduler cadence over a contiguous steady window",
-        "workload_scope": "uniform DP request counts and prefix-balanced verify lengths; aligned local M=min(G,B*W), allocation=uniform_confidence_topk, simulate_acc_len=1",
-    }
-    paths["manifest"].write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
-    logger.info(
-        "Graph sweep: %d distinct (B,S,G) cells x %d repeats; at least %.1f minutes of steady sampling, plus warmup/ramp. B endpoints added for selected shape coverage.",
-        len(cells),
-        repeats,
-        len(cells) * repeats * settings.min_steady_seconds / 60,
-    )
-    rng = random.Random(PROFILE_SEED)
-    vocab_size = len(get_tokenizer(context.tokenizer_path))
-    try:
-        abort_all_requests(base_url=base_url)
-        set_forced_budget_frac(base_url=base_url, frac=None)
-        for repeat in range(repeats):
-            for index, cell in enumerate(cells):
-                outcome = run_graph_round(
-                    context=context,
-                    cell=cell,
-                    settings=settings,
-                    vocab_size=vocab_size,
-                    rng=rng,
-                )
-                append_round_files(
-                    records_path=paths["records"],
-                    rounds_path=paths["rounds"],
-                    outcome=outcome,
-                    repeat=repeat,
-                )
-                logger.info(
-                    "Graph (%d/%d) repeat %d/%d B=%d S=%d G=%d: %.3f ms/round over %d intervals",
-                    index + 1,
-                    len(cells),
-                    repeat + 1,
-                    repeats,
-                    *cell,
-                    1000.0 / outcome.steps_per_sec,
-                    outcome.num_steady_steps,
-                )
-        latest = fetch_server_context(
-            base_url=base_url,
-            local_tokenizer_path=local_tokenizer_path,
-            allowed_modes=("compact",),
-            graph_table=True,
-        )
-        if (
-            latest.graph_profile != context.graph_profile
-            or latest.dp_size != context.dp_size
-            or latest.tp_size != context.tp_size
-        ):
-            raise RuntimeError(
-                "Server graph geometry or parallel configuration changed during profiling."
-            )
-    finally:
-        failure_in_flight = sys.exc_info()[0] is not None
-        cleanup_error = None
-        for cleanup in (
-            lambda: abort_all_requests(base_url=base_url),
-            lambda: set_forced_graph_tokens(base_url=base_url, graph_num_tokens=None),
-            lambda: set_forced_budget_frac(base_url=base_url, frac=None),
-        ):
-            try:
-                cleanup()
-            except Exception as exc:
-                cleanup_error = exc
-                logger.exception("Graph profiling cleanup failed.")
-        if cleanup_error is not None and not failure_in_flight:
-            raise cleanup_error
 
 
 def fitted_step_time(*, table, bs: int, m: int) -> float:
@@ -1962,17 +1287,6 @@ def round_summary_dict(*, outcome: RoundOutcome, repeat: int) -> dict:
         "match_fraction": outcome.match_fraction,
         "per_rank_median_step_time": outcome.per_rank_median_step_time,
         "load_info": msgspec.to_builtins(outcome.load_info),
-        **(
-            {
-                "graph_slots": outcome.graph_slots,
-                "graph_num_tokens": outcome.graph_num_tokens,
-                "per_rank_window_step_seconds": outcome.per_rank_window_step_seconds,
-                "steady_forward_ct": outcome.steady_forward_ct,
-                "timing": "scheduler_boundary_v1",
-            }
-            if outcome.graph_num_tokens is not None
-            else {}
-        ),
     }
 
 
@@ -1997,17 +1311,6 @@ def append_round_files(
                             "num_running_reqs": row.num_running_reqs,
                             "num_verify_tokens": row.num_verify_tokens,
                             "step_time": row.step_time,
-                            **(
-                                {
-                                    "graph_max_bs": row.graph_max_bs,
-                                    "graph_slots": row.graph_slots,
-                                    "graph_num_tokens": row.graph_num_tokens,
-                                    "can_run_cuda_graph": row.can_run_cuda_graph,
-                                    "step_boundary_seconds": row.step_boundary_seconds,
-                                }
-                                if outcome.graph_num_tokens is not None
-                                else {}
-                            ),
                         }
                     )
                     + "\n"
@@ -2130,21 +1433,6 @@ def add_out_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--graph-tokens",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Optional captured G subset for --graph-table smoke runs. The default "
-        "profiles every feasible G; a subset produces a partial cost table.",
-    )
-    parser.add_argument(
-        "--graph-table",
-        action="store_true",
-        help="Sweep actual captured (B,S,G) shapes with align enabled; build a "
-        "SpsGraphCostTable. Adds B endpoints for each shape's feasibility interval "
-        "so request-count interpolation covers every B up to the sweep maximum.",
-    )
     parser.add_argument(
         "--base-url",
         type=str,
@@ -2325,8 +1613,6 @@ def cli_main() -> None:
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
-            graph_table=args.graph_table,
-            graph_tokens=args.graph_tokens,
         )
     elif args.command == "fit":
         fit_profile(
@@ -2347,8 +1633,6 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
-            graph_table=args.graph_table,
-            graph_tokens=args.graph_tokens,
         )
 
 

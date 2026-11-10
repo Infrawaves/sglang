@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import (
+    Literal,
+    Optional,
+)
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import (
+    A,
+    Arg,
+)
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
@@ -76,10 +82,7 @@ class Spec(msgspec.Struct):
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
         "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
-        "scheduler (cap-accept / compact). Graph tables require compact mode, "
-        "graph-tier alignment, shared DP tier gathering and captured ragged "
-        "decode CUDA graphs; unsupported configurations fail at startup. "
-        "Omit for an uninitialized flat "
+        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
         "constant-SPS table: the budget degenerates to verify-all (zero throughput "
         "gain by itself).",
     ] = None

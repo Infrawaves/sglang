@@ -22,16 +22,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_graph_budget import (
-    GraphBudgetShapes,
-)
-from sglang.srt.speculative.dspark_components.dspark_graph_search import (
-    SharedGraphBudgetSearch,
-)
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
-    SpsGraphCostTable,
     _interp_clamped,
     build_uninitialized_sps_table,
     is_uninitialized_sps_table,
@@ -144,10 +137,6 @@ class DSparkVerifyPlanner:
         self._budget_tp_group = None
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
-        self._shared_graph_search: Optional[SharedGraphBudgetSearch] = None
-        self._forced_graph_tokens: Optional[int] = None
-        self._profile_graph_shapes: Optional[GraphBudgetShapes] = None
-        self._profile_confidence: Optional[torch.Tensor] = None
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -232,22 +221,11 @@ class DSparkVerifyPlanner:
                 if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
                     sps_table
                 ):
-                    if (
-                        self._dp_tier_gather_enabled
-                        and self._align_verify_tokens_to_graph_tier
-                        and envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-                        and envs.SGLANG_SIMULATE_ACC_LEN.get() == 1.0
-                    ):
-                        logger.info(
-                            "DSpark graph profiling can pin captured G without "
-                            "an input SPS table."
-                        )
-                    else:
-                        logger.warning(
-                            "DSpark SPS table is uninitialized (flat): the verify "
-                            "budget degenerates to verify-all (zero scheduling gain). "
-                            "Pass a profiled --speculative-dspark-sps-table-path."
-                        )
+                    logger.warning(
+                        "DSpark SPS table is uninitialized (flat): the verify "
+                        "budget degenerates to verify-all (zero scheduling gain). "
+                        "Pass a profiled --speculative-dspark-sps-table-path."
+                    )
 
     @property
     def carries_confidence(self) -> bool:
@@ -326,107 +304,6 @@ class DSparkVerifyPlanner:
             gamma=self.gamma,
         )
 
-    def initialize_shared_graph_search(self) -> int:
-        """Called after target graph capture, before fixing the MLP row width."""
-        runner = self.model_runner.decode_cuda_graph_runner
-        table = (
-            self._budget_planner.sps_table if self._budget_planner is not None else None
-        )
-        requirements = (
-            (
-                self._dp_tier_gather_enabled,
-                "compact DP tier gathering (compact mode, DP attention, MLP sync, "
-                "overlap scheduling, pp_size=1, attn_cp_size=1, and scheduler "
-                "all-gather enabled)",
-            ),
-            (
-                self._align_verify_tokens_to_graph_tier,
-                "--speculative-dspark-align-verify-tokens-to-graph-tier",
-            ),
-            (not self._is_verify_all, "budget scheduling instead of verify-all"),
-            (
-                self._schedule_cfg.min_verify_len == 1
-                and self._schedule_cfg.resolved_max_verify_len()
-                == self.verify_num_draft_tokens,
-                "min_verify_len=1 and max_verify_len=verify_num_draft_tokens",
-            ),
-            (
-                runner is not None
-                and runner.ragged_verify_mode
-                and getattr(runner, "_ragged_slots_by_tokens", None),
-                "captured ragged decode CUDA graphs",
-            ),
-        )
-        missing = [description for ready, description in requirements if not ready]
-        if missing:
-            if isinstance(table, SpsGraphCostTable):
-                # Unlike legacy tables, graph tables have no local-budget
-                # lookup. A permanently disabled search would silently verify
-                # every draft, so reject the configuration at startup. Per-step
-                # fallback remains available after successful initialization.
-                raise ValueError(
-                    "DSpark graph SPS table requires " + "; ".join(missing) + "."
-                )
-            return 0
-        shapes = GraphBudgetShapes.from_runner(runner)
-        if isinstance(table, SpsGraphCostTable):
-            table.validate_capture(
-                verify_width=self.verify_num_draft_tokens,
-                capture_num_tokens=list(shapes.capture_num_tokens),
-            )
-        self._shared_graph_search = SharedGraphBudgetSearch(
-            shapes=shapes, cost_table=table
-        )
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "DSpark shared graph budget enabled: %d graph tiers, cost=%s, "
-                "utility payload=%d int64 values on existing MLP sync.",
-                len(shapes.capture_num_tokens),
-                "measured graph shapes"
-                if isinstance(table, SpsGraphCostTable)
-                else "legacy SPS estimate evaluated at shared graph tokens",
-                self._shared_graph_search.payload_size,
-            )
-        return self._shared_graph_search.payload_size
-
-    def finalize_shared_graph_budget(self, batch: Optional[ScheduleBatch]) -> None:
-        search = self._shared_graph_search
-        if batch is not None and batch.forward_mode.is_prebuilt():
-            batch = batch.inner_idle_batch
-        forced_graph = getattr(self, "_forced_graph_tokens", None)
-        if batch is None or (search is None and forced_graph is None):
-            return
-        batch.spec_shared_graph_tokens = None
-        batch.spec_shared_graph_step_seconds = None
-        batch.spec_shared_graph_theta = None
-        if (
-            batch.is_extend_in_batch
-            or not batch.can_run_decode_cuda_graph
-            or not (batch.forward_mode.is_decode() or batch.forward_mode.is_idle())
-            or batch.global_num_tokens is None
-        ):
-            return
-        if forced_graph is not None:
-            shapes = self._profile_graph_shapes
-            shape = shapes.for_batch(max(batch.global_num_tokens))[
-                shapes.capture_num_tokens.index(forced_graph)
-            ]
-            # During ramp-in/drain the live B may not support the pinned G.
-            # The profiler accepts only the stable target (B,S,G) window.
-            if shape is not None:
-                batch.spec_shared_graph_tokens = forced_graph
-            return
-        decision = search.select(
-            batch_sizes=batch.global_num_tokens,
-            utilities=batch.global_spec_graph_utilities,
-        )
-        if decision is not None:
-            batch.spec_shared_graph_tokens = decision.shape.graph_num_tokens
-            batch.spec_shared_graph_step_seconds = decision.step_seconds
-            batch.spec_shared_graph_theta = (
-                decision.expected_tokens / decision.step_seconds
-            )
-
     def prepare_verify_budget_pre_sync(
         self, batch: ScheduleBatch, future_map: FutureMap
     ) -> None:
@@ -438,20 +315,7 @@ class DSparkVerifyPlanner:
         draft_input = batch.spec_info
         if draft_input is None or not batch.forward_mode.is_decode():
             return
-        if getattr(self, "_forced_graph_tokens", None) is not None:
-            draft_input.verify_token_budget = graph_tier_fill_budget(
-                graph_num_tokens=self._forced_graph_tokens,
-                bs=batch.batch_size(),
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                min_verify_len=self._schedule_cfg.min_verify_len,
-            )
-            batch.spec_graph_utilities = None
-            batch.spec_verify_tier_num_tokens = (
-                batch.batch_size() + draft_input.verify_token_budget
-            )
-            self._budget_planner.note_non_decode_step()
-        else:
-            self._compute_local_verify_budget(batch, future_map)
+        self._compute_local_verify_budget(batch, future_map)
         batch.spec_verify_token_budget_presync = draft_input.verify_token_budget
         batch.spec_verify_budget_presync = True
 
@@ -471,23 +335,6 @@ class DSparkVerifyPlanner:
         if not self._dp_tier_gather_enabled:
             self._compute_local_verify_budget(batch, future_map)
             return
-        shared_graph = getattr(batch, "spec_shared_graph_tokens", None)
-        if shared_graph is not None:
-            budget = graph_tier_fill_budget(
-                graph_num_tokens=shared_graph,
-                bs=batch.batch_size(),
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                min_verify_len=self._schedule_cfg.min_verify_len,
-            )
-            draft_input.verify_token_budget = budget
-            batch.spec_verify_tier_num_tokens = batch.batch_size() + budget
-            self._budget_planner.last_decision = VerifyBudgetDecision(
-                budget=budget,
-                predicted_step_seconds=batch.spec_shared_graph_step_seconds,
-                predicted_theta=batch.spec_shared_graph_theta,
-                graph_num_tokens=shared_graph,
-            )
-            return
         if presync:
             self._adopt_dp_rank0_budget(batch)
             return
@@ -503,20 +350,10 @@ class DSparkVerifyPlanner:
         self, batch: ScheduleBatch, future_map: FutureMap
     ) -> None:
         draft_input = batch.spec_info
-        batch.spec_graph_utilities = None
-        search = getattr(self, "_shared_graph_search", None)
-        # Relay resolution only reads the host ring. The MLP gather uses the
-        # attention-TP leader's curve, so peers can skip this host gather too.
-        resolved = (
-            None
-            if search is not None and get_parallel().attn_tp_rank != 0
-            else future_map.resolve_confidence_cpu(batch)
-        )
+        resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
-        if search is not None:
-            batch.spec_graph_utilities = self._budget_planner.last_graph_utilities
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
@@ -566,65 +403,6 @@ class DSparkVerifyPlanner:
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
-
-    def graph_profile_metadata(self) -> Optional[dict]:
-        runner = self.model_runner.decode_cuda_graph_runner
-        if not (
-            self.is_compact_mode
-            and runner is not None
-            and getattr(runner, "_ragged_slots_by_tokens", None)
-        ):
-            return None
-        if self._profile_graph_shapes is None:
-            self._profile_graph_shapes = GraphBudgetShapes.from_runner(runner)
-        shapes = self._profile_graph_shapes
-        return {
-            "capture_num_tokens": list(shapes.capture_num_tokens),
-            "slots_by_tokens": dict(shapes.slots_by_tokens),
-            "max_bs": shapes.max_bs,
-            "verify_width": shapes.verify_width,
-            "reserve_padding_slot": shapes.reserve_padding_slot,
-            "align": self._align_verify_tokens_to_graph_tier,
-            "dp_tier_gather_enabled": self._dp_tier_gather_enabled,
-            "timing": "scheduler_boundary_v1",
-            "profile_allocation": "uniform_confidence_topk",
-        }
-
-    def validate_forced_graph_tokens(self, tokens: Optional[int]) -> None:
-        if tokens is None:
-            return
-        metadata = self.graph_profile_metadata()
-        if not (
-            envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-            and envs.SGLANG_SIMULATE_ACC_LEN.get() == 1.0
-            and self._dp_tier_gather_enabled
-            and self._align_verify_tokens_to_graph_tier
-            and self._schedule_cfg.min_verify_len == 1
-            and metadata is not None
-        ):
-            raise ValueError(
-                "dspark_force_graph_tokens requires SPS_RECORD=1, "
-                "SIMULATE_ACC_LEN=1, compact DP gather and graph-tier align."
-            )
-        if (
-            isinstance(tokens, bool)
-            or not isinstance(tokens, int)
-            or tokens not in metadata["capture_num_tokens"]
-        ):
-            raise ValueError("dspark_force_graph_tokens must be a captured G or null.")
-
-    def set_forced_graph_tokens(self, tokens: Optional[int]) -> None:
-        self.validate_forced_graph_tokens(tokens)
-        if tokens is not None and getattr(self, "_profile_confidence", None) is None:
-            # Allocated once on the scheduler stream; the existing forward
-            # stream wait orders this initialization before probe execution.
-            self._profile_confidence = torch.ones(
-                (self._profile_graph_shapes.max_bs, self._schedule_cfg.gamma),
-                device=self.device,
-                dtype=torch.float32,
-            )
-        self._forced_graph_tokens = tokens
-        self.note_non_decode_step()
 
     def compute_budget_sync(
         self,
@@ -690,24 +468,19 @@ class DSparkVerifyPlanner:
         if group is not None and group.rank_in_group != 0:
             return group.broadcast_object(None)
         budget = None
-        search = getattr(self, "_shared_graph_search", None)
-        self._budget_planner.last_graph_utilities = None
-        # The existing metadata gather adopts the attention-TP leader's curve.
-        if search is not None and get_parallel().attn_tp_rank != 0:
-            self._budget_planner.note_non_decode_step()
-            return None
         if resolved is None:
             self._budget_planner.note_non_decode_step()
         else:
             current_generation = self.model_runner.req_to_token_pool.req_generation[
                 req_pool_indices_cpu.to(torch.int64)
             ]
-            budget = self._budget_planner.compute_budget(
-                confidence=resolved.confidence,
-                generation=resolved.generation,
-                current_generation=current_generation,
-                req_pool_indices_cpu=req_pool_indices_cpu,
-                graph_search=search,
+            budget = int(
+                self._budget_planner.compute_budget(
+                    confidence=resolved.confidence,
+                    generation=resolved.generation,
+                    current_generation=current_generation,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                )
             )
         return group.broadcast_object(budget) if group is not None else budget
 
@@ -724,11 +497,7 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if (
-            self._is_verify_all
-            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and getattr(self, "_forced_graph_tokens", None) is None
-        ):
+        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
@@ -850,14 +619,7 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or budget is None:
-            return None
-        if getattr(self, "_forced_graph_tokens", None) is not None:
-            # Retain proposal/confidence-head computation, then use a cached
-            # ranking input for the normal Topk kernel. This fills the aligned
-            # useful-token budget even when fake KV produces zeros or NaNs.
-            confidence = self._profile_confidence[: req_pool_indices.shape[0]]
-        if confidence is None:
+        if self._budget_planner is None or confidence is None or budget is None:
             return None
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
@@ -1226,22 +988,17 @@ class DSparkScheduleConfig(msgspec.Struct):
 
 
 class VerifyBudgetDecision(msgspec.Struct):
-    budget: Optional[int]
+    budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
-    graph_num_tokens: Optional[int] = None
 
 
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
-    sps_table: Union[SpsCostTable, SpsAdditiveCostTable, SpsGraphCostTable],
+    sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
 ) -> VerifyBudgetDecision:
-    if isinstance(sps_table, SpsGraphCostTable):
-        # Graph tables require a shared replay shape. Unavailable/unsupported
-        # steps retain the uniform verification path.
-        return VerifyBudgetDecision(budget=None)
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
 
@@ -1309,7 +1066,7 @@ class HostConfidenceBudgetPlanner:
     def __init__(
         self,
         *,
-        sps_table: SpsCostTable | SpsAdditiveCostTable | SpsGraphCostTable,
+        sps_table: SpsCostTable,
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
@@ -1320,7 +1077,6 @@ class HostConfidenceBudgetPlanner:
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
-        self.last_graph_utilities: Optional[list[int]] = None
         self.lag_steps = max(
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
         )
@@ -1336,9 +1092,7 @@ class HostConfidenceBudgetPlanner:
         generation: torch.Tensor,
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
-        graph_search: Optional[SharedGraphBudgetSearch] = None,
-    ) -> Optional[int]:
-        self.last_graph_utilities = None
+    ) -> int:
         lagged_confidence, lagged_generation = self._shift_to_lag(
             confidence=confidence,
             generation=generation,
@@ -1355,15 +1109,6 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
-        if graph_search is not None:
-            self.last_graph_utilities = graph_search.utilities(
-                survival[:, : self.cfg.resolved_max_verify_len()],
-                survival_eps=self.cfg.survival_eps,
-            )
-            self.last_decision = None
-            # The chosen budget is installed after the existing MLP sync.
-            # An invalid peer curve causes a group-wide uniform fallback.
-            return None
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
@@ -1379,7 +1124,6 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
-        self.last_graph_utilities = None
 
     def _shift_to_lag(
         self,
@@ -1430,7 +1174,7 @@ class HostConfidenceBudgetPlanner:
 def build_sps_cost_table(
     *,
     verify_num_draft_tokens: int,
-) -> Union[SpsCostTable, SpsAdditiveCostTable, SpsGraphCostTable]:
+) -> Union[SpsCostTable, SpsAdditiveCostTable]:
     sps_table_path = get_spec().speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)

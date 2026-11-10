@@ -9,9 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.speculative.dspark_components import (  # noqa: E402
-    dspark_planner as planner_module,
-)
+from sglang.srt.speculative.dspark_components import dspark_planner as planner_module  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -100,9 +98,7 @@ class TestDSparkVerifyBudget(CustomTestCase):
                 dp_tier_num_tokens=7,
             )
             self.assertEqual(topk.call_args.kwargs["budget"], 5)
-            pack.assert_called_once_with(
-                verify_lens=lens, graph_num_tokens=8, graph_max_bs=4
-            )
+            pack.assert_called_once_with(verify_lens=lens, graph_num_tokens=8)
 
     def test_overflow_uses_eager_before_aligning_or_scheduling_topk(self):
         planner = self._make_tp_planner(Mock(world_size=1, rank_in_group=0))

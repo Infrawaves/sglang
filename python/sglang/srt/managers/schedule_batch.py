@@ -2503,12 +2503,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # can carry it), and whether that happened for the batch about to run.
     spec_verify_token_budget_presync: Optional[int] = None
     spec_verify_budget_presync: bool = False
-    # Fixed-point token yield per DSpark graph, followed by the full-width yield.
-    spec_graph_utilities: Optional[List[int]] = None
-    # Shared graph selected from this round's gathered utility curves.
-    spec_shared_graph_tokens: Optional[int] = None
-    spec_shared_graph_step_seconds: Optional[float] = None
-    spec_shared_graph_theta: Optional[float] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2563,7 +2557,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
     # Per DP rank: its attention-TP rank 0's verify budget + 1 (0 = no budget).
     global_spec_verify_token_budget_enc: Optional[List[int]] = None
-    global_spec_graph_utilities: Optional[List[List[int]]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
