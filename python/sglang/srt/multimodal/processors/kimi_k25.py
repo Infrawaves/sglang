@@ -178,6 +178,25 @@ def _resize_bicubic_if_needed(
     )
 
 
+_RESIZE_CHUNK_BYTES_CAP = 1 << 30
+_RESIZE_FREE_MEMORY_FRACTION = 0.25
+
+
+def _resize_chunk_size(source_batch: torch.Tensor, scratch_bytes_per_image: int) -> int:
+    """Frames per bicubic launch, bounded by free VRAM.
+
+    Preprocessing runs after the weights and the KV pool are allocated, so a
+    long video's frames cannot all be cast to float at once: the uint8 -> float
+    copy alone is 4x the source batch. Budget against measured free memory
+    rather than total capacity.
+    """
+    free_bytes, _ = torch.cuda.mem_get_info(source_batch.device)
+    budget = min(
+        _RESIZE_CHUNK_BYTES_CAP, int(free_bytes * _RESIZE_FREE_MEMORY_FRACTION)
+    )
+    return max(1, budget // max(1, scratch_bytes_per_image))
+
+
 def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, int, int]:
     height = config["new_height"] + config["pad_height"]
     width = config["new_width"] + config["pad_width"]
