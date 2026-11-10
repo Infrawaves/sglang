@@ -231,6 +231,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # cumulative counters
     total_prefill_uncached_tokens: int = 0
     total_prefill_busy_us: int = 0
+    # Full prompt length of prefilled requests, cache hits included; with
+    # total_prefill_uncached_tokens it gives the router the engine's cold ratio.
+    total_prefill_input_tokens: int = 0
     # Decode step-time moment sums
     decode_moments: Optional[list[float]] = None
 

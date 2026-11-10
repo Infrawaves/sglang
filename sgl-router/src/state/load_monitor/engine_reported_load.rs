@@ -33,6 +33,9 @@ pub struct NativeCacheRankLoad {
     pub max_running_requests: u64,
     pub total_prefill_uncached_tokens: u64,
     pub total_prefill_busy_us: u64,
+    /// Cumulative prompt tokens prefilled, cache hits included. `None` from
+    /// engines that predate the field.
+    pub total_prefill_input_tokens: Option<u64>,
 }
 
 /// Per-scheduler runtime load snapshot. Mirrors the Python `LoadStat` in
@@ -88,6 +91,12 @@ pub struct EngineReportedSchedulingLoad {
     pub max_running_requests: u64,
     pub prefill_throughput_tokens_per_s: Option<f64>,
     pub estimated_prefill_queue_ms: Option<f64>,
+    /// Cumulative tokens the engine prefilled (cache hits excluded), summed
+    /// over DP ranks; monotonic until the engine restarts.
+    pub total_prefill_uncached_tokens: u64,
+    /// Cumulative prompt tokens prefilled, cache hits included, summed over DP
+    /// ranks; `None` if any rank's engine predates the field.
+    pub total_prefill_input_tokens: Option<u64>,
     pub captured_at: Instant,
 }
 
@@ -262,12 +271,14 @@ impl<'de> Deserialize<'de> for LoadStat {
                         let total_prefill_busy_us = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("total_prefill_busy_us"))?;
+                        let total_prefill_input_tokens = seq.next_element::<u64>()?;
                         Some(NativeCacheRankLoad {
                             num_waiting_uncached_tokens,
                             num_total_tokens,
                             max_running_requests,
                             total_prefill_uncached_tokens,
                             total_prefill_busy_us,
+                            total_prefill_input_tokens,
                         })
                     }
                 };
@@ -497,6 +508,8 @@ impl EngineReportedLoadTable {
                 let mut num_total_tokens = 0u64;
                 let mut max_total_num_tokens = 0u64;
                 let mut max_running_requests = 0u64;
+                let mut total_prefill_uncached_tokens = 0u64;
+                let mut total_prefill_input_tokens = Some(0u64);
                 let mut oldest_at = None;
                 let mut prefill_throughput_tokens_per_s = 0.0f64;
                 let mut complete_prefill_sample = !required.is_empty();
@@ -518,6 +531,11 @@ impl EngineReportedLoadTable {
                         max_total_num_tokens.saturating_add(load.max_total_num_tokens);
                     max_running_requests =
                         max_running_requests.saturating_add(native.max_running_requests);
+                    total_prefill_uncached_tokens = total_prefill_uncached_tokens
+                        .saturating_add(native.total_prefill_uncached_tokens);
+                    total_prefill_input_tokens = total_prefill_input_tokens
+                        .zip(native.total_prefill_input_tokens)
+                        .map(|(sum, rank)| sum.saturating_add(rank));
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
 
                     match previous {
@@ -558,6 +576,8 @@ impl EngineReportedLoadTable {
                             max_running_requests,
                             prefill_throughput_tokens_per_s,
                             estimated_prefill_queue_ms,
+                            total_prefill_uncached_tokens,
+                            total_prefill_input_tokens,
                             captured_at,
                         },
                     )
@@ -779,6 +799,7 @@ mod tests {
             max_running_requests: 64,
             total_prefill_uncached_tokens: 10_000,
             total_prefill_busy_us: 2_000_000,
+            total_prefill_input_tokens: None,
         });
         let mut new = old.clone();
         new.num_tokens = 20_000;

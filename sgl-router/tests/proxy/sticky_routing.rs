@@ -49,6 +49,8 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

@@ -16,10 +16,12 @@ use crate::config::{
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
     CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
     DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig,
+    LoadBasedMetric, LoadBasedTokenGate, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig,
+    StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    DEFAULT_LOAD_BASED_TOKEN_SLACK, DEFAULT_LOAD_BASED_TOKEN_TIE_BAND,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -273,6 +275,23 @@ pub struct RoutingArgs {
     /// which in PD mode is every decode rank. Defaults to least_in_flight.
     #[arg(long, value_enum, requires = "dp_aware")]
     pub dp_rank_policy: Option<DpRankPolicy>,
+
+    /// Load unit for load_based (--policy, sticky fallback, and --fuse term).
+    /// `tokens` ranks prefill workers by prompt tokens still to prefill.
+    #[arg(long, value_enum, default_value = "requests")]
+    pub load_based_metric: LoadBasedMetric,
+
+    /// With --load-based-metric tokens: skip prefill workers whose request count
+    /// (waiting + bootstrap + running) exceeds the fleet minimum by more than this.
+    /// 0 keeps only the fewest-request workers (tokens still rank among them);
+    /// a large value disables the gate.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_SLACK)]
+    pub load_based_token_slack: u64,
+
+    /// With --load-based-metric tokens: token loads within this many tokens of the
+    /// minimum tie and rank by request count. Defaults to one 16K prefill chunk.
+    #[arg(long, default_value_t = DEFAULT_LOAD_BASED_TOKEN_TIE_BAND)]
+    pub load_based_token_tie_band: u64,
 
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
@@ -677,6 +696,11 @@ impl Cli {
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
                 dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
+                load_based_metric: self.routing.load_based_metric,
+                load_based_token_gate: LoadBasedTokenGate {
+                    slack: self.routing.load_based_token_slack,
+                    tie_band: self.routing.load_based_token_tie_band,
+                },
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -3178,6 +3202,72 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn load_based_metric_defaults_to_requests_and_accepts_tokens() {
+        let default_config = cfg_of("--policy load_based").unwrap();
+        assert_eq!(
+            default_config.model.load_based_metric,
+            LoadBasedMetric::Requests
+        );
+
+        let tokens_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            tokens_config.model.load_based_metric,
+            LoadBasedMetric::Tokens
+        );
+
+        assert!(cfg_of("--load-based-metric blocks").is_err());
+    }
+
+    #[test]
+    fn load_based_token_gate_defaults_and_overrides() {
+        let default_config = cfg_of("--policy load_based --load-based-metric tokens").unwrap();
+        assert_eq!(
+            default_config.model.load_based_token_gate,
+            LoadBasedTokenGate::default()
+        );
+
+        let tuned = cfg_of(
+            "--policy load_based --load-based-metric tokens \
+             --load-based-token-slack 3 --load-based-token-tie-band 0",
+        )
+        .unwrap();
+        assert_eq!(
+            tuned.model.load_based_token_gate,
+            LoadBasedTokenGate {
+                slack: 3,
+                tie_band: 0
+            }
+        );
+    }
+
+    /// `tokens` only changes `load_based`; a config with no `load_based`
+    /// instance must fail loudly instead of silently ranking by requests.
+    #[test]
+    fn load_based_metric_tokens_requires_a_load_based_instance() {
+        for ok in [
+            "--policy load_based --load-based-metric tokens",
+            "--policy fused_score --fuse load_based --load-based-metric tokens",
+            "--policy score_policy --load-based-metric tokens", // DEFAULT_FUSE has load_based
+            "--policy sticky --sticky-fallback-policy load_based --load-based-metric tokens",
+        ] {
+            assert!(cfg_of(ok).is_ok(), "{ok}: {:?}", cfg_of(ok).err());
+        }
+        for bad in [
+            "--policy power_of_two --load-based-metric tokens",
+            "--policy fused_score --fuse prefix_cache --load-based-metric tokens",
+            "--policy sticky --load-based-metric tokens", // round_robin fallback
+        ] {
+            let err = cfg_of(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("--load-based-metric tokens has no effect"),
+                "{bad}: {err}"
+            );
+        }
+        // `requests` is the default and never needs a load_based instance.
+        assert!(cfg_of("--policy power_of_two --load-based-metric requests").is_ok());
     }
 
     #[test]

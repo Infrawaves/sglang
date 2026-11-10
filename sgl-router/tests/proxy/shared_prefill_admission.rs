@@ -156,6 +156,8 @@ fn config(policy: PolicyKind) -> Config {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),
@@ -312,6 +314,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
             max_running_requests: 16,
             total_prefill_uncached_tokens,
             total_prefill_busy_us,
+            total_prefill_input_tokens: None,
         }),
     };
     fixture.ctx.engine_reported_load.set(
@@ -372,6 +375,7 @@ async fn capacity_exhaustion_does_not_return_503() {
                     max_running_requests: 16,
                     total_prefill_uncached_tokens: 1,
                     total_prefill_busy_us: 1,
+                    total_prefill_input_tokens: None,
                 }),
             },
             Instant::now(),
@@ -455,6 +459,7 @@ async fn chat_records_cache_candidates_exhausted() {
                 max_running_requests: 16,
                 total_prefill_uncached_tokens: 1,
                 total_prefill_busy_us: 1,
+                total_prefill_input_tokens: None,
             }),
         },
         Instant::now(),

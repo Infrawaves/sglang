@@ -201,7 +201,7 @@ async fn dispatch<T: Transport>(
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
-        prefill.timestamped_load_guard()
+        prefill.timestamped_load_guard(request.prefill_token_estimate())
     } else {
         prefill.load_guard()
     };

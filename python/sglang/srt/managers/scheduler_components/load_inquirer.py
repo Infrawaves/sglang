@@ -62,6 +62,17 @@ class SchedulerLoadInquirer:
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
     ) = None
     get_round_robin_requests: Callable = lambda: ()
+    # Maps a req to the prefix end of its queried L3 hit, or None.
+    get_pending_storage_hit_end: Callable = lambda req: None
+    get_total_prefill_input_tokens: Callable = lambda: 0
+
+    def _cached_prefix_len(self, req, device_host_len: int) -> int:
+        # storage_hit_end already counts the device+host prefix the L3 span
+        # starts after, so take the max instead of adding the two.
+        storage_hit_end = self.get_pending_storage_hit_end(req)
+        if storage_hit_end is not None:
+            device_host_len = max(device_host_len, storage_hit_end)
+        return min(device_host_len, req.seqlen)
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -99,17 +110,29 @@ class SchedulerLoadInquirer:
             if waiting_queue_prefix_matched:
                 matched = req.num_matched_prefix_tokens
                 uncached = max(0, req.seqlen - matched)
+                span = None
                 if self.get_waiting_storage_span is not None:
                     span = self.get_waiting_storage_span(req.cache_request_handle)
-                    if span is not None:
-                        storage_tokens = max(
-                            0, min(span[1], req.seqlen) - max(span[0], matched)
-                        )
-                        uncached -= storage_tokens
+                if span is not None:
+                    storage_tokens = max(
+                        0, min(span[1], req.seqlen) - max(span[0], matched)
+                    )
+                    uncached -= storage_tokens
+                else:
+                    # Cache mode reports no span; use the queried L3 hit end.
+                    uncached = req.seqlen - self._cached_prefix_len(req, matched)
             else:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
             num_tokens += uncached
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Discount by the enqueue-time match plus the queried L3 hit, not the
+            # windowed hit rate: that rate freezes when bootstrap stalls.
+            num_tokens += sum(
+                req.seqlen
+                - self._cached_prefix_len(req, req.storage_prefetch_last_match_len or 0)
+                for req in self.get_request_lists()[ListKind.PD_BOOTSTRAP]
+            )
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
@@ -286,5 +309,6 @@ class SchedulerLoadInquirer:
             queues=queues,
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_prefill_input_tokens=self.get_total_prefill_input_tokens(),
             decode_moments=decode_moments,
         )

@@ -119,6 +119,8 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            load_based_metric: Default::default(),
+            load_based_token_gate: Default::default(),
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

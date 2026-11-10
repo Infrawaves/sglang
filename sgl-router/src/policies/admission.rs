@@ -20,7 +20,7 @@
 use crate::policies::power_of_two::select_k_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
 pub(crate) use crate::state::load_monitor::engine_ranking::{
-    compare_decode_engines, compare_prefill_engines, CandidateLoads,
+    compare_decode_engines, compare_prefill_engines, engine_pending_prefill_tokens, CandidateLoads,
 };
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
@@ -841,6 +841,8 @@ mod tests {
                             max_running_requests: 64,
                             prefill_throughput_tokens_per_s: None,
                             estimated_prefill_queue_ms: None,
+                            total_prefill_uncached_tokens: 0,
+                            total_prefill_input_tokens: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1451,6 +1453,8 @@ mod tests {
                 max_running_requests: 64,
                 prefill_throughput_tokens_per_s: None,
                 estimated_prefill_queue_ms: None,
+                total_prefill_uncached_tokens: 0,
+                total_prefill_input_tokens: None,
                 captured_at: Instant::now(),
             }
         };

@@ -3,10 +3,11 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::workers::cold_ratio::ColdRatioEstimator;
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -121,16 +122,26 @@ fn parse_bootstrap_host(url: &str) -> String {
     "localhost".to_string()
 }
 
-/// Tracks each in-flight slot with an acquisition timestamp so a routing
-/// policy can ask how many slots were claimed recently
-/// ([`count_acquired_since`](SlotRegistry::count_acquired_since)). The
+/// One timestamped in-flight slot: when it was dispatched and how many
+/// prompt tokens it asked the worker to prefill.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    acquired_at: Instant,
+    prefill_tokens: u64,
+}
+
+/// Tracks each in-flight slot with an acquisition timestamp and prompt token
+/// count so a routing policy can ask how many slots (or tokens) were claimed
+/// recently ([`count_acquired_since`](SlotRegistry::count_acquired_since)). The
 /// registry is separate from [`Worker::active_requests`]: ordinary load
 /// tracking stays lock-free, while policies that correct an engine snapshot
 /// explicitly opt into timestamp tracking.
 #[derive(Debug)]
 pub struct SlotRegistry {
-    slots: Mutex<HashMap<u64, Instant>>,
+    slots: Mutex<HashMap<u64, Slot>>,
     next_id: AtomicU64,
+    /// Running sum of claimed `prefill_tokens`; read lock-free on the hot path.
+    inflight_tokens: AtomicU64,
 }
 
 impl SlotRegistry {
@@ -138,19 +149,31 @@ impl SlotRegistry {
         Arc::new(Self {
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
+            inflight_tokens: AtomicU64::new(0),
         })
     }
 
-    /// Records one timestamped slot and returns its identity.
-    fn claim(&self) -> u64 {
+    /// Records one timestamped slot carrying `prefill_tokens` and returns its identity.
+    fn claim(&self, prefill_tokens: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.slots.lock().unwrap().insert(id, Instant::now());
+        self.slots.lock().unwrap().insert(
+            id,
+            Slot {
+                acquired_at: Instant::now(),
+                prefill_tokens,
+            },
+        );
+        self.inflight_tokens
+            .fetch_add(prefill_tokens, Ordering::Relaxed);
         id
     }
 
     /// Releases timestamped slot `id`.
     fn release(&self, id: u64) {
-        self.slots.lock().unwrap().remove(&id);
+        if let Some(slot) = self.slots.lock().unwrap().remove(&id) {
+            self.inflight_tokens
+                .fetch_sub(slot.prefill_tokens, Ordering::Relaxed);
+        }
     }
 
     /// Count of currently-claimed slots acquired at or after `since`. Used to
@@ -165,8 +188,23 @@ impl SlotRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter(|&&t| t >= since)
+            .filter(|slot| slot.acquired_at >= since)
             .count()
+    }
+
+    /// Token-weighted counterpart of [`Self::count_acquired_since`].
+    pub fn tokens_acquired_since(&self, since: Instant) -> u64 {
+        self.slots
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|slot| slot.acquired_at >= since)
+            .fold(0u64, |sum, slot| sum.saturating_add(slot.prefill_tokens))
+    }
+
+    /// Prompt tokens of every currently-claimed slot.
+    pub fn inflight_tokens(&self) -> u64 {
+        self.inflight_tokens.load(Ordering::Relaxed)
     }
 }
 
@@ -233,6 +271,8 @@ pub struct Worker {
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
+    cold_ratio: Mutex<ColdRatioEstimator>,
+    warned_no_input_tokens: AtomicBool,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -295,6 +335,8 @@ impl Worker {
             breaker,
             active_requests,
             slots,
+            cold_ratio: Mutex::new(ColdRatioEstimator::new()),
+            warned_no_input_tokens: AtomicBool::new(false),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
@@ -423,6 +465,49 @@ impl Worker {
         self.slots.count_acquired_since(since)
     }
 
+    /// Prompt tokens of this worker's in-flight requests dispatched at or
+    /// after `since`. See [`SlotRegistry::tokens_acquired_since`].
+    pub fn prefill_tokens_acquired_since(&self, since: Instant) -> u64 {
+        self.slots.tokens_acquired_since(since)
+    }
+
+    /// Prompt tokens of this worker's timestamped in-flight requests. Plain
+    /// [`Self::load_guard`] requests carry no token count and are not included.
+    pub fn router_inflight_prefill_tokens(&self) -> u64 {
+        self.slots.inflight_tokens()
+    }
+
+    /// Fraction of prompt tokens this worker actually prefills, from the
+    /// engine's cumulative uncached and input counters; `1.0` until a window
+    /// closes. Without the engine's input counter it stays `1.0`: this
+    /// replica's dispatch total misses other replicas' traffic.
+    pub fn prefill_cold_ratio(
+        &self,
+        engine_total_prefill_uncached_tokens: u64,
+        engine_total_prefill_input_tokens: Option<u64>,
+    ) -> f64 {
+        let Some(input) = engine_total_prefill_input_tokens else {
+            if !self.warned_no_input_tokens.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    worker = %self.id.0,
+                    "engine reports no total_prefill_input_tokens; in-flight prefill \
+                     tokens are not cache-discounted until the engine is upgraded"
+                );
+            }
+            return self.cold_ratio.lock().unwrap().current();
+        };
+        self.cold_ratio
+            .lock()
+            .unwrap()
+            .observe(engine_total_prefill_uncached_tokens, input)
+    }
+
+    /// Last measured cold ratio without feeding the estimator; `None` until a
+    /// window closes.
+    pub fn measured_prefill_cold_ratio(&self) -> Option<f64> {
+        self.cold_ratio.lock().unwrap().measured()
+    }
+
     /// Returns a RAII guard that increments `active_requests` now and
     /// decrements when the guard is dropped.
     pub fn load_guard(&self) -> LoadGuard {
@@ -433,9 +518,12 @@ impl Worker {
         }
     }
 
-    /// Returns a load guard that also records when the request was dispatched.
-    pub(crate) fn timestamped_load_guard(&self) -> LoadGuard {
-        let slot_id = self.slots.claim();
+    /// Returns a load guard that also records when the request was dispatched
+    /// and how many prompt tokens it asked this worker to prefill.
+    pub(crate) fn timestamped_load_guard(&self, prefill_tokens: usize) -> LoadGuard {
+        let slot_id = self
+            .slots
+            .claim(prefill_tokens.try_into().unwrap_or(u64::MAX));
         self.active_requests.fetch_add(1, Ordering::Relaxed);
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
@@ -511,7 +599,7 @@ mod tests {
     fn timestamped_load_guard_tracks_and_releases_its_slot() {
         let w = test_worker();
         let cutoff = Instant::now() - Duration::from_secs(1);
-        let guard = w.timestamped_load_guard();
+        let guard = w.timestamped_load_guard(1);
 
         assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 1);
@@ -674,7 +762,7 @@ mod tests {
     #[test]
     fn slots_acquired_since_excludes_earlier_slots() {
         let w = test_worker();
-        let _g_old = w.timestamped_load_guard();
+        let _g_old = w.timestamped_load_guard(1);
         // A real (small) sleep, not a synthetic `Instant` offset: the slot's
         // acquisition time is captured internally by `claim()`, not
         // injectable, so the ordering guarantee has to come from wall-clock
@@ -682,8 +770,8 @@ mod tests {
         // resolution.
         std::thread::sleep(Duration::from_millis(5));
         let cutoff = Instant::now();
-        let _g_new1 = w.timestamped_load_guard();
-        let _g_new2 = w.timestamped_load_guard();
+        let _g_new1 = w.timestamped_load_guard(1);
+        let _g_new2 = w.timestamped_load_guard(1);
         assert_eq!(w.router_inflight_load(), 3);
         assert_eq!(
             w.slots_acquired_since(cutoff),
@@ -696,15 +784,34 @@ mod tests {
     fn slots_acquired_since_counts_all_slots_for_a_cutoff_before_every_claim() {
         let w = test_worker();
         let long_ago = Instant::now() - Duration::from_secs(3600);
-        let _g1 = w.timestamped_load_guard();
-        let _g2 = w.timestamped_load_guard();
+        let _g1 = w.timestamped_load_guard(1);
+        let _g2 = w.timestamped_load_guard(1);
         assert_eq!(w.slots_acquired_since(long_ago), 2);
+    }
+
+    #[test]
+    fn prefill_tokens_are_tracked_per_slot_and_released_on_drop() {
+        let w = test_worker();
+        let old = w.timestamped_load_guard(20_000);
+        std::thread::sleep(Duration::from_millis(5));
+        let cutoff = Instant::now();
+        let new = w.timestamped_load_guard(3_000);
+        let _untracked = w.load_guard();
+
+        assert_eq!(w.router_inflight_prefill_tokens(), 23_000);
+        assert_eq!(w.prefill_tokens_acquired_since(cutoff), 3_000);
+
+        drop(old);
+        assert_eq!(w.router_inflight_prefill_tokens(), 3_000);
+        drop(new);
+        assert_eq!(w.router_inflight_prefill_tokens(), 0);
+        assert_eq!(w.prefill_tokens_acquired_since(cutoff), 0);
     }
 
     #[test]
     fn slots_acquired_since_is_zero_for_a_cutoff_after_every_claim() {
         let w = test_worker();
-        let _g = w.timestamped_load_guard();
+        let _g = w.timestamped_load_guard(1);
         std::thread::sleep(Duration::from_millis(5));
         let cutoff = Instant::now();
         assert_eq!(w.slots_acquired_since(cutoff), 0);
