@@ -1131,11 +1131,14 @@ class TestReasonerGrammarObjectReasoningInGrammar(CustomTestCase):
             with self.subTest(allowed=allowed):
                 obj, _ = self._make_object(allowed, max_think_tokens=1)
                 obj.accept_token(10)
-                mask = obj.allocate_vocab_mask(64, 1, "cpu")
+                mask = obj.allocate_vocab_mask(64, 3, "cpu")
+                before = mask.clone()
 
-                obj.fill_vocab_mask(mask, 0)
+                obj.fill_vocab_mask(mask, 1)
 
-                self.assertEqual(_allowed_token_ids(mask, [7, 10, 11]), expected)
+                self.assertEqual(_allowed_token_ids(mask[1:2], [7, 10, 11]), expected)
+                self.assertTrue(torch.equal(mask[0], before[0]))
+                self.assertTrue(torch.equal(mask[2], before[2]))
 
     def test_thinking_controls_need_the_opener(self):
         """Budget and strict thinking filters must not bound output that skipped the

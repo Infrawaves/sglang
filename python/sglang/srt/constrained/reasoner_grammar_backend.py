@@ -256,7 +256,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 )
             return
         token = self.think_end_ids[self._matched_think_end_tokens]
-        if (int(vocab_mask[idx, token // 32]) >> (token % 32)) & 1:
+        if vocab_mask.device.type == "cpu":
+            word = vocab_mask.numpy().item(idx, token // 32)
+        else:
+            word = int(vocab_mask[idx, token // 32])
+        if (word >> (token % 32)) & 1:
             self._do_token_filter(vocab_mask, [token], idx, is_allowed=True)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:

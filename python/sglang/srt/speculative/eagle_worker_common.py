@@ -933,7 +933,7 @@ def run_eagle_verify(
     if batch.has_grammar:
         grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
-            tree=grammar_tree,
+            drafts=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
             barrier=grammar_barrier,
