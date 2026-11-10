@@ -848,6 +848,11 @@ class GrammarTree:
             self._done.synchronize()
         return self._host
 
+    def generate_bitmask(
+        self, *, reqs: List[Req], vocab_size: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
+        return generate_token_bitmask(reqs, *self.resolve(), vocab_size)
+
 
 class GrammarChain(msgspec.Struct, frozen=True):
     """The (bs, chain_len) verify ids of a chain-verify algorithm, on the host.
@@ -874,6 +879,13 @@ class GrammarChain(msgspec.Struct, frozen=True):
         if self.done is not None:
             self.done.synchronize()
         return self.host_verify_ids
+
+    def generate_bitmask(
+        self, *, reqs: List[Req], vocab_size: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
+        return generate_chain_token_bitmask(
+            reqs=reqs, verify_ids_cpu=self.resolve(), vocab_size=vocab_size
+        )
 
 
 def generate_chain_token_bitmask(
@@ -932,7 +944,7 @@ def generate_chain_token_bitmask(
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
-    tree: Union[GrammarTree, GrammarChain],
+    drafts: Union[GrammarTree, GrammarChain],
     sampling_info: SamplingBatchInfo,
     device,
     barrier: Optional[Callable[[], None]],
@@ -945,18 +957,9 @@ def build_grammar_vocab_mask(
     """
     if barrier is not None:
         barrier()
-    if isinstance(tree, GrammarChain):
-        vocab_mask, grammar = generate_chain_token_bitmask(
-            reqs=reqs,
-            verify_ids_cpu=tree.resolve(),
-            vocab_size=sampling_info.vocab_size,
-        )
-    else:
-        vocab_mask, grammar = generate_token_bitmask(
-            reqs,
-            *tree.resolve(),
-            sampling_info.vocab_size,
-        )
+    vocab_mask, grammar = drafts.generate_bitmask(
+        reqs=reqs, vocab_size=sampling_info.vocab_size
+    )
     if vocab_mask is None:
         return None
 

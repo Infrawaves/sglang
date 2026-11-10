@@ -459,7 +459,7 @@ class NGRAMWorker(BaseSpecWorker):
                 )
                 grammar_mask = build_grammar_vocab_mask(
                     reqs=batch.reqs,
-                    tree=GrammarTree.from_host(
+                    drafts=GrammarTree.from_host(
                         retrieve_next_token_cpu,
                         retrieve_next_sibling_cpu,
                         torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),

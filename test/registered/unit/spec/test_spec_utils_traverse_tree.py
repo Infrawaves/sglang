@@ -115,6 +115,20 @@ class TestTraverseTreePassesIntsToGrammar(CustomTestCase):
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
 
+    def test_linear_chain_stops_at_id_past_vocab(self):
+        # A vocab that fills whole mask words leaves no word for id == vocab_size,
+        # so the id check must stop the chain before the parent row is read.
+        bitmask = torch.full((4, 1), -1, dtype=torch.int32)
+        grammar, accept_calls, fill_calls = self._record_grammar(bitmask)
+        generate_chain_token_bitmask(
+            reqs=[SimpleNamespace(grammar=grammar)],
+            verify_ids_cpu=torch.tensor([[100, 5, 32, 9]]),
+            vocab_size=32,
+        )
+
+        self.assertEqual(accept_calls, [5])
+        self.assertEqual(fill_calls, [0, 1])
+
 
 # Synthetic vocab: no tokenizer download. Grammar: "a" "b"* "c", then <eos>.
 _EOS, _A, _B, _C, _X, _THINK_END = range(6)

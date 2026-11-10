@@ -4141,7 +4141,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.has_grammar:
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                tree=grammar_chain,
+                drafts=grammar_chain,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,

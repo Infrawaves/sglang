@@ -1235,7 +1235,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             # lines up with the logits on both verify paths.
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                tree=grammar_chain,
+                drafts=grammar_chain,
                 sampling_info=sampling_info,
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,
