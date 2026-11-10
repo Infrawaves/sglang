@@ -317,6 +317,38 @@ mod tests {
         assert_eq!(second.router_inflight_load(), 1);
     }
 
+    /// Repairing registration must preserve the learned cache discount and
+    /// the open window, including observations from selectors holding the old worker.
+    #[test]
+    fn upsert_keeps_prefill_cold_ratio_and_window() {
+        use crate::workers::cold_ratio::{COLD_RATIO_EMA_ALPHA, COLD_RATIO_WINDOW_TOKENS};
+
+        let r = WorkerRegistry::default();
+        let mut spec = spec("p", WorkerMode::Prefill, &["m"]);
+        let id = spec.id.clone();
+        r.add(spec.clone()).unwrap();
+        let first = r.get(&id).unwrap();
+        let window = COLD_RATIO_WINDOW_TOKENS;
+        first.prefill_cold_ratio(0, Some(0));
+        assert_eq!(first.prefill_cold_ratio(window / 4, Some(window)), 0.25);
+        first.prefill_cold_ratio(window / 2, Some(3 * window / 2));
+
+        spec.bootstrap_port = Some(8997);
+        r.add(spec).unwrap();
+        let second = r.get(&id).unwrap();
+        assert_eq!(second.measured_prefill_cold_ratio(), Some(0.25));
+        assert_eq!(
+            second.prefill_cold_ratio(window / 2, Some(3 * window / 2)),
+            0.25
+        );
+
+        // The next half-window completes a 50%-cold sample using the old
+        // baseline. An in-flight selector's observation must reach the new worker.
+        first.prefill_cold_ratio(3 * window / 4, Some(2 * window));
+        let expected = 0.25 + COLD_RATIO_EMA_ALPHA * (0.5 - 0.25);
+        assert!((second.measured_prefill_cold_ratio().unwrap() - expected).abs() < 1e-9);
+    }
+
     #[test]
     fn upsert_adopts_a_changed_breaker_config() {
         let r = WorkerRegistry::default();

@@ -271,7 +271,8 @@ pub struct Worker {
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
-    cold_ratio: Mutex<ColdRatioEstimator>,
+    /// Shared across re-registration so in-flight selectors keep the same estimator.
+    cold_ratio: Arc<Mutex<ColdRatioEstimator>>,
     warned_no_input_tokens: AtomicBool,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
@@ -335,7 +336,7 @@ impl Worker {
             breaker,
             active_requests,
             slots,
-            cold_ratio: Mutex::new(ColdRatioEstimator::new()),
+            cold_ratio: Arc::new(Mutex::new(ColdRatioEstimator::new())),
             warned_no_input_tokens: AtomicBool::new(false),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
@@ -379,8 +380,8 @@ impl Worker {
     }
 
     /// Continue `prev`'s identity on re-registration: its load counters (which
-    /// in-flight guards still hold), its breaker unless the config changed, and its
-    /// grace clock unless it joined a new pool.
+    /// in-flight guards still hold), cold-ratio estimator, breaker unless the
+    /// config changed, and grace clock unless it joined a new pool.
     pub(crate) fn inherit(&mut self, prev: &Worker) {
         if (&prev.model_ids, prev.mode()) == (&self.model_ids, self.mode()) {
             self.pooled_at = prev.pooled_at;
@@ -390,6 +391,7 @@ impl Worker {
         }
         self.active_requests = Arc::clone(&prev.active_requests);
         self.slots = Arc::clone(&prev.slots);
+        self.cold_ratio = Arc::clone(&prev.cold_ratio);
     }
 
     /// A prefill whose bootstrap port `/server_info` has not reported.
