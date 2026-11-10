@@ -2527,6 +2527,17 @@ class Envs:
     # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
     # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
+    # Stream the TP-sharded shared-expert weights instead of the activations:
+    # peers' shards are copied (copy engine, CUDA IPC, no NCCL) into a
+    # full-width staging buffer and the shared MLP runs on local rows as in
+    # TP1. Needs --shared-experts-tp-size > 1 with the subgroup on one node.
+    # Unset: on for PD prefill when eligible, off elsewhere. Decode always
+    # keeps the activation AG/RS and ignores it (weight_stream_policy).
+    SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM = EnvBool(False)
+    # Fewer local rows than this keep the activation AG/RS path. Arbitrary;
+    # the weight bytes are fixed per layer while the activation bytes scale
+    # with rows, so re-tune from a prefill-length sweep.
+    SGLANG_K3_SHARED_EXPERTS_WEIGHT_STREAM_MIN_ROWS = EnvInt(1024)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
