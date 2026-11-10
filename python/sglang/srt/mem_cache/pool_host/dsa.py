@@ -80,7 +80,13 @@ class DSAIndexerPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         is_dummy: bool = False,
+        host_allocator=None,
+        host_buffer_read_only: bool = False,
     ):
+        """``host_allocator`` set to a ``NodeSharedHostTensorAllocator`` shares one
+        indexer host buffer per node (per-node MLA HiCache): the leader owns and
+        pins it, a follower (``is_dummy`` and ``host_buffer_read_only``) only
+        joins the collective allocation and keeps no mapping."""
         buffers = buffer_info.buffers
         if buffers:
             buffer_info.validate()
@@ -104,7 +110,11 @@ class DSAIndexerPoolHost(HostKVCache):
                 layout=layout,
                 ops=self._kvcacheio_ops,
             )
+        if host_buffer_read_only and not is_dummy:
+            raise ValueError("A read-only DSA indexer host pool keeps no buffer")
         self._is_dummy = is_dummy
+        # This rank does not own the indexer host data; the node leader writes it.
+        self.host_buffer_read_only = host_buffer_read_only
         self._destroyed = False
         self.device_pool = None
         # DCP: transfer_page_size is the physical (per-rank) page; the anchor KV
@@ -113,7 +123,11 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dcp_rank = dcp_rank
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = (
+            get_allocator_from_storage(allocator_type)
+            if host_allocator is None
+            else host_allocator
+        )
         self._layer_sharded = layer_sharded
         self._buffer_device = torch.device(buffer_device)
         self.page_size = transfer_page_size
@@ -147,26 +161,44 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        requested_bytes = self.size * self.size_per_token
+        node_shared = self._uses_node_shared_allocator()
         if self._is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
+            if node_shared:
+                # Collective with the leader's allocate: prefault this rank's
+                # share, then drop the mapping.
+                self._sync_node_shared_budget(None)
+                self.allocator.allocate(
+                    self._host_buffer_dims(), dtype=self.indexer_dtype, device=self.device
+                )
             logger.info(
                 "DSAIndexerPoolHost dummy mode: allocator-only, size=%d tokens, "
-                "skipping indexer buffer allocation",
+                "no retained %.2f GB indexer host mapping",
                 self.size,
+                requested_bytes / 1e9,
             )
             self.lock = threading.RLock()
             self.clear()
             return
 
-        requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
-            raise ValueError(
+        budget_error = (
+            ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
+            if requested_bytes > available_bytes
+            else None
+        )
+        if node_shared:
+            # Followers wait in the allocation collective: fail every rank
+            # together instead of leaving them blocked.
+            self._sync_node_shared_budget(budget_error)
+        elif budget_error is not None:
+            raise budget_error
         draft_layer_num = self.layer_num - self.target_layer_num
         if draft_layer_num > 0:
             logger.info(
@@ -189,6 +221,34 @@ class DSAIndexerPoolHost(HostKVCache):
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _uses_node_shared_allocator(self) -> bool:
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeSharedHostTensorAllocator,
+        )
+
+        return isinstance(self.allocator, NodeSharedHostTensorAllocator)
+
+    def _sync_node_shared_budget(self, error: Exception | None) -> None:
+        """Collective over the cache group; every rank calls it once, before the
+        shared allocation, passing its budget failure or None."""
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            synchronize_shared_host_error,
+        )
+
+        synchronize_shared_host_error(
+            self.allocator.tp_cache_group, error, operation="DSA indexer budget"
+        )
+
+    def _host_buffer_dims(self) -> tuple:
+        """Host buffer shape; leader and followers must agree on it, since a
+        node-shared buffer is one memfd mapped by every rank."""
+        if self.layout == "layer_first":
+            return (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size)
+        if self.layout in ("page_first", "page_first_direct"):
+            return (self.indexer_page_num, self.layer_num, 1, self.indexer_page_stride_size)
+        raise ValueError(f"Unsupported layout: {self.layout}")
 
     def destroy(self):
         if self._destroyed:
@@ -229,7 +289,7 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
-                (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
+                self._host_buffer_dims(),
                 dtype=self.indexer_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -245,12 +305,7 @@ class DSAIndexerPoolHost(HostKVCache):
             )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(
-                (
-                    self.indexer_page_num,
-                    self.layer_num,
-                    1,
-                    self.indexer_page_stride_size,
-                ),
+                self._host_buffer_dims(),
                 dtype=self.indexer_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,

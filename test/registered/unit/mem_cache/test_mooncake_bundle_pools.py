@@ -387,20 +387,25 @@ class TestMooncakeBundlePools(CustomTestCase):
             keys[bundle] = sorted(objects)
         self.assertEqual(keys[False], keys[True])
 
-    def test_per_node_mla_host_disables_bundling(self):
+    def _node_shared(self, host, kind):
+        """Make ``host`` the per-node MLA HiCache ``kind`` ("follower" or
+        "leader") view of a node-shared host pool."""
         from sglang.srt.mem_cache.mla_host_node_leader import (
             NodeSharedHostTensorAllocator,
         )
 
+        if kind == "follower":
+            host.host_buffer_read_only = True
+        else:
+            host.allocator = NodeSharedHostTensorAllocator.__new__(
+                NodeSharedHostTensorAllocator
+            )
+        return host
+
+    def test_per_node_mla_keeps_a_per_rank_indexer_out_of_the_kv_object(self):
         for kind in ("follower", "leader"):
             with self.subTest(kind=kind):
-                kv = self._mla_host("page_first", 1, 0)
-                if kind == "follower":
-                    kv.host_buffer_read_only = True
-                else:
-                    kv.allocator = NodeSharedHostTensorAllocator.__new__(
-                        NodeSharedHostTensorAllocator
-                    )
+                kv = self._node_shared(self._mla_host("page_first", 1, 0), kind)
                 store = self._store(
                     kv,
                     {PoolName.INDEXER: self._indexer_host(1, 0)},
@@ -410,6 +415,23 @@ class TestMooncakeBundlePools(CustomTestCase):
                     bundle=True,
                 )
                 self.assertEqual(store.bundled_pools, ())
+
+    def test_per_node_mla_bundles_a_node_shared_indexer(self):
+        # Leader and follower resolve the same bundle, so the key suffix the
+        # writing leader uses is the one every reading leader queries.
+        for kind in ("follower", "leader"):
+            with self.subTest(kind=kind):
+                kv = self._node_shared(self._mla_host("page_first", 1, 0), kind)
+                indexer = self._node_shared(self._indexer_host(1, 0), kind)
+                store = self._store(
+                    kv,
+                    {PoolName.INDEXER: indexer},
+                    dcp=1,
+                    rank=0,
+                    objects={},
+                    bundle=True,
+                )
+                self.assertEqual(store.bundled_pools, (PoolName.INDEXER,))
 
     def test_bundle_composes_with_page_groups(self):
         objects = {}

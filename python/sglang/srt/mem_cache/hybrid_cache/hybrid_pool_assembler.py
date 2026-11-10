@@ -1212,6 +1212,9 @@ def build_hybrid_mamba_stack(
         tp_cache_group=params.tp_cache_group,
         draft_pools=config.packed_draft_device_pools,
     )
+    indexer_node_shared = node_leader is not None and node_leader.shares_dsa_indexer(
+        layer_sharded=config.root.layer_shard_enabled
+    )
     with (
         node_leader.leader_budget_scope()
         if node_leader is not None
@@ -1231,11 +1234,20 @@ def build_hybrid_mamba_stack(
             else node_leader.shared_allocator,
             host_buffer_read_only=node_leader is not None and node_leader.is_follower,
         )
+        if indexer_node_shared:
+            # The node-shared DSA indexer books the node budget with the MLA pool.
+            kv_entries = _build_pool_entries(
+                config=config, root_host_pool=kv_host_pool, node_leader=node_leader
+            )
     if node_leader is not None:
-        # Mamba's budget check must observe the leader's completed MLA pin.
-        # Use Gloo: pinning can outlast the NCCL watchdog.
+        # Mamba's budget check must observe the leader's completed MLA (and
+        # shared indexer) pins. Use Gloo: pinning can outlast the NCCL watchdog.
         dist.barrier(group=params.tp_cache_group)
-    entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
+    if not indexer_node_shared:
+        kv_entries = _build_pool_entries(
+            config=config, root_host_pool=kv_host_pool, node_leader=node_leader
+        )
+    entries = kv_entries + [
         _mamba_entry(
             params=params,
             mamba_pool=mamba_pool,
@@ -1592,12 +1604,27 @@ def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
 
 
 def _build_sidecar_host_pool(
-    *, config: HostPoolConfig, root: Any, root_host_pool: Any
+    *,
+    config: HostPoolConfig,
+    root: Any,
+    root_host_pool: Any,
+    node_leader: Optional[Any] = None,
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
+    """``node_leader`` (per-node MLA HiCache) shares the DSA indexer host pool
+    per node when its broadcast restores the indexer; otherwise it stays per
+    rank. Collective over the cache group when shared."""
     if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
         return _build_qsa_indexer_host_pool(
             config=config, root_host_pool=root_host_pool
         )
+    # The leader's broadcast covers the KV pool's own index buffers (INDEXER)
+    # only; any other DSA-layout sidecar stays per rank.
+    host_allocator = (
+        node_leader.dsa_indexer_allocator(layer_sharded=root.layer_shard_enabled)
+        if node_leader is not None and config.pool_name == PoolName.INDEXER
+        else None
+    )
+    follower = host_allocator is not None and node_leader.is_follower
     host = DSAIndexerPoolHost(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
@@ -1611,8 +1638,21 @@ def _build_sidecar_host_pool(
         dcp_size=root_host_pool.dcp_size,
         dcp_rank=root_host_pool.dcp_rank,
         allocator_type=_get_allocator_type(),
+        is_dummy=follower,
+        host_allocator=host_allocator,
+        host_buffer_read_only=follower,
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
+    if (
+        node_leader is not None
+        and config.pool_name == PoolName.INDEXER
+        and host_allocator is None
+    ):
+        logger.info(
+            "Per-node MLA HiCache keeps the DSA indexer host pool per rank: the "
+            "node leader's broadcast does not restore it (packed draft indexer "
+            "layers, layer sharding, or no indexer broadcast)."
+        )
     return host
 
 
@@ -1659,9 +1699,11 @@ def _build_pool_entries(
     root_host_pool: Any,
     root_host_evict_fn: Optional[Callable[[int], Any]] = None,
     device_translate: Optional[Callable[[Any], Any]] = None,
+    node_leader: Optional[Any] = None,
 ) -> list[PoolEntry]:
     """``device_translate`` maps controller ids to rows of ``config.root`` (a
-    unified owner's view), which every entry here indexes."""
+    unified owner's view), which every entry here indexes. ``node_leader``
+    (per-node MLA HiCache) may share the DSA indexer host pool per node."""
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1677,7 +1719,10 @@ def _build_pool_entries(
     ]
     for sidecar in config.sidecars:
         host_pool = _build_sidecar_host_pool(
-            config=sidecar, root=config.root, root_host_pool=root_host_pool
+            config=sidecar,
+            root=config.root,
+            root_host_pool=root_host_pool,
+            node_leader=node_leader,
         )
         entries.append(
             build_pool_entry(

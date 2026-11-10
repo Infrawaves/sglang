@@ -8,8 +8,10 @@ NUMA placement and binding are deployment responsibilities.
 
 Followers keep only dummy slot metadata; the leader restores MLA layers and the
 forward layer-wait hook broadcasts them over NCCL. Only the leader does MLA D2H,
-L3 reads and Mooncake registration; KDA/Mamba stays per rank. An MHA draft
-sidecar can share a node buffer too (see hicache_draft_node_merge.py).
+L3 reads and Mooncake registration; KDA/Mamba stays per rank. The DSA indexer
+(Kimi-K3.1) shares a node buffer the same way when the broadcast carries it
+(NodeLeaderMLAContext.shares_dsa_indexer); otherwise it stays per rank. An MHA
+draft sidecar can share a node buffer too (see hicache_draft_node_merge.py).
 
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.
@@ -281,6 +283,34 @@ class NodeLeaderMLAContext(msgspec.Struct, frozen=True):
             host_memory_budget_bytes() * self.capacity_multiplier
         ):
             yield
+
+    def shares_dsa_indexer(self, *, layer_sharded: bool) -> bool:
+        """Whether the DSA indexer host pool is shared per node. Rank-independent,
+        so every rank of the cache group decides alike.
+
+        Sharing needs the leader's broadcast to restore every indexer row a
+        follower would otherwise load itself: the broadcast carries the target
+        indexer layers, not packed draft ones, and a layer-sharded pool has no
+        single owner of every layer."""
+        broadcast = self.broadcast
+        return (
+            broadcast.broadcaster.idx_bufs is not None
+            and not broadcast.draft_pools
+            and not layer_sharded
+        )
+
+    def dsa_indexer_allocator(
+        self, *, layer_sharded: bool
+    ) -> Optional[NodeSharedHostTensorAllocator]:
+        """A node-shared allocator for the DSA indexer host pool, or None to keep
+        it per rank (see shares_dsa_indexer)."""
+        if not self.shares_dsa_indexer(layer_sharded=layer_sharded):
+            return None
+        shared = self.shared_allocator
+        # One allocator per buffer: allocate() records its dims.
+        return NodeSharedHostTensorAllocator(
+            node_ranks=shared.node_ranks, tp_cache_group=shared.tp_cache_group
+        )
 
 
 def _build_broadcast(

@@ -1122,6 +1122,11 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 continue
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            if entry.host_pool.host_buffer_read_only:
+                # A node-shared side pool (the DSA indexer under per-node MLA):
+                # the leader owns the host copy and its broadcast restores the
+                # device rows, like the anchor above.
+                continue
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
@@ -1894,6 +1899,14 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=extra_info.prefix_keys,
             extra_info=trace_extra or None,
         )
+        # A node-shared side pool is read into by the node leader only, like the
+        # MLA anchor (_page_get_shared_by_leader); the cache-group MIN takes its
+        # hits.
+        kv_derived_transfers = [
+            transfer
+            for transfer in kv_derived_transfers
+            if not self._is_read_only_host_pool(transfer.name)
+        ]
         return super()._page_transfer_kv_batch(
             operation,
             batch_hashes,
@@ -1901,6 +1914,10 @@ class HybridCacheController(BaseHiCacheController):
             extra_info,
             kv_derived_transfers,
         )
+
+    def _is_read_only_host_pool(self, name: PoolName) -> bool:
+        entry = self.mem_pool_host.entry_map.get(name)
+        return entry is not None and entry.host_pool.host_buffer_read_only
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
@@ -2099,6 +2116,10 @@ class HybridCacheController(BaseHiCacheController):
             and self.storage_backend_type == "mooncake"
         ):
             return self.draft_node_merge.is_leader
+        if self._is_read_only_host_pool(transfer.name):
+            # No host copy on this rank. TP0 is the first node's leader, so this
+            # never drops the cache group's writer.
+            return False
         if not self.backup_skip:
             return True
 

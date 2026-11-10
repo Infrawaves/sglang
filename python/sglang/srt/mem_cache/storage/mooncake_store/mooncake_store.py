@@ -975,6 +975,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
+        if getattr(host_pool, "host_buffer_read_only", False):
+            # Node-leader follower: no host mapping to register; the leader reads
+            # and writes this pool's L3 objects (see _object_layout).
+            return
 
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
@@ -1143,25 +1147,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if not self.storage_bundle_pools or not self.is_mla_backend:
             return ()
         host = self.mem_pool_host
-        if (
-            host is None
-            or getattr(host, "kv_buffer", None) is None
-            or not isinstance(host, MLATokenToKVPoolHost)
-        ):
+        if host is None or not isinstance(host, MLATokenToKVPoolHost):
             return ()
-        from sglang.srt.mem_cache.mla_host_node_leader import (
-            NodeSharedHostTensorAllocator,
-        )
-
-        if host.host_buffer_read_only or isinstance(
-            getattr(host, "allocator", None), NodeSharedHostTensorAllocator
-        ):
-            # Per-node MLA: a follower skips the KV read, so it would skip the
-            # bundled pools too. Every rank of the node takes this branch.
-            logger.info(
-                "--hicache-storage-bundle-pools has no effect with per-node MLA "
-                "HiCache; each pool keeps its own Mooncake objects."
-            )
+        kv_node_shared = self._is_node_shared_host_pool(host)
+        if not kv_node_shared and host.kv_buffer is None:
             return ()
         span = l3_page_span(host)
         bundled = []
@@ -1170,6 +1159,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if pool is None or isinstance(pool, DevicePoolEntry):
                 continue
             if l3_page_span(pool) != span:
+                continue
+            if self._is_node_shared_host_pool(pool) != kv_node_shared:
+                # Per-node MLA: the node leader alone reads the shared KV and a
+                # follower skips it, so only a pool shared the same way (the DSA
+                # indexer) can ride in it; a per-rank pool keeps its own objects.
+                # Rank-independent, so every rank of the node decides alike.
                 continue
             if name == PoolName.DRAFT and (
                 not isinstance(pool, MLATokenToKVPoolHost)
@@ -1181,6 +1176,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 continue
             bundled.append(name)
         return tuple(bundled)
+
+    @staticmethod
+    def _is_node_shared_host_pool(pool: Any) -> bool:
+        """One host copy per node, owned by the node leader (per-node MLA
+        HiCache): a follower's read-only view or the leader's buffer. A draft
+        node-merge buffer is not one: every rank owns a slice of it."""
+        # Lazy: these modules pull in distributed state.
+        from sglang.srt.mem_cache.hicache_draft_node_merge import (
+            DraftNodeShareAllocator,
+        )
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeSharedHostTensorAllocator,
+        )
+
+        if getattr(pool, "host_buffer_read_only", False):
+            return True
+        allocator = getattr(pool, "allocator", None)
+        return isinstance(allocator, NodeSharedHostTensorAllocator) and not isinstance(
+            allocator, DraftNodeShareAllocator
+        )
 
     def on_host_pools_registered(self) -> None:
         self.bundled_pools = self._resolve_bundled_pools()
@@ -1450,6 +1465,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         merge = self.draft_node_merge if transfer.name == PoolName.DRAFT else None
         if merge is not None and not merge.is_leader:
+            return _ObjectLayout(
+                keys=keys, objects_per_page=objects_per_page, skip_io=True
+            )
+        registered = self.registered_pools.get(transfer.name)
+        if getattr(registered, "host_buffer_read_only", False):
+            # A node-shared side pool on a follower (the DSA indexer under
+            # per-node MLA): the node leader does its L3 IO, and the cache-group
+            # MIN takes the leader's result.
             return _ObjectLayout(
                 keys=keys, objects_per_page=objects_per_page, skip_io=True
             )
