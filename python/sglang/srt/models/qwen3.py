@@ -11,6 +11,10 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     make_stages,
 )
+from sglang.srt.layers.layer_boundary.fusions.sm90_gemm_norm import (
+    install_sm90_gemm_norm_fusion,
+    make_sm90_gemm_norm_fusion,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -307,7 +311,7 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, forward_batch=forward_batch)
         return output
 
 
@@ -376,11 +380,13 @@ class Qwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
+        boundary_fusions = make_sm90_gemm_norm_fusion(config, layer_id=layer_id)
         self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
+            (declare_attn(), self.input_layernorm, {"fusions": boundary_fusions}),
             (
                 declare_ffn(sparse=False, next_sparse=False),
                 self.post_attention_layernorm,
+                {"fusions": boundary_fusions},
             ),
             previous=declare_ffn() if layer_id != 0 else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -543,6 +549,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        install_sm90_gemm_norm_fusion(self)
 
     @torch.no_grad()
     def forward(

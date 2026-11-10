@@ -35,6 +35,10 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     make_stages,
 )
+from sglang.srt.layers.layer_boundary.fusions.sm90_gemm_norm import (
+    install_sm90_gemm_norm_fusion,
+    make_sm90_gemm_norm_fusion,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -776,7 +780,7 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, forward_batch=fb)
         return output
 
     def forward(
@@ -866,14 +870,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        boundary_fusions = make_sm90_gemm_norm_fusion(config, layer_id=layer_id)
         self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
+            (declare_attn(), self.input_layernorm, {"fusions": boundary_fusions}),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
+                {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
                 sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
@@ -1041,6 +1047,9 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        install_sm90_gemm_norm_fusion(self)
 
     @torch.no_grad()
     def forward(

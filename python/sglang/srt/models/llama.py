@@ -29,6 +29,10 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary.fusions.sm90_gemm_norm import (
+    install_sm90_gemm_norm_fusion,
+    o_proj_output_into,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -366,6 +370,49 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        *,
+        service,
+        m_pad: int,
+        next_norm: Optional[nn.Module],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One layer under the SM90 GEMM norm fusion.
+
+        hidden_states arrives normed except at layer 0; residual is this rank's
+        [m_pad / tp, hidden] shard, and the full [m, hidden] after the last layer.
+        """
+        if residual is None:
+            residual = service.shard(hidden_states, m_pad)
+            hidden_states = self.input_layernorm(
+                hidden_states, quant_linear=self.self_attn.qkv_proj
+            )
+        m = hidden_states.shape[0]
+        buffer = service.col_input(m=m, m_pad=m_pad)
+        with o_proj_output_into(buffer[:m]):
+            self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        col = service.run_col(
+            buffer,
+            self.mlp.gate_up_proj,
+            self.post_attention_layernorm,
+            residual,
+            m,
+        )
+        x = self.mlp.act_fn(col.output)
+        if next_norm is None:
+            x, _ = self.mlp.down_proj(x)
+            return x, service.gather(residual, m)
+        row = service.run_row(x, self.mlp.down_proj, next_norm, residual, m_pad)
+        return row.normed, row.residual
+
 
 class LlamaModel(nn.Module):
     def __init__(
@@ -413,6 +460,8 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+        # Set by install_sm90_gemm_norm_fusion for LlamaForCausalLM only.
+        self.gemm_norm_fusion = None
 
     def forward(
         self,
@@ -434,6 +483,13 @@ class LlamaModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
             deferred_norm = None
+
+        if self.gemm_norm_fusion is not None and not self.layers_to_capture:
+            m_pad = self.gemm_norm_fusion.active(forward_batch)
+            if m_pad is not None:
+                return self._forward_fused(
+                    positions, hidden_states, forward_batch, m_pad=m_pad
+                )
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
@@ -461,6 +517,32 @@ class LlamaModel(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        m_pad: int,
+    ) -> torch.Tensor:
+        """The SM90 GEMM norm fusion path; every layer boundary is fused."""
+        residual = None
+        for i in range(self.start_layer, self.end_layer):
+            next_norm = (
+                self.layers[i + 1].input_layernorm if i + 1 < self.end_layer else None
+            )
+            hidden_states, residual = self.layers[i].forward_fused(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                service=self.gemm_norm_fusion,
+                m_pad=m_pad,
+                next_norm=next_norm,
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -644,6 +726,9 @@ class LlamaForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        install_sm90_gemm_norm_fusion(self)
 
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:

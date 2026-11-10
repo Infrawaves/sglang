@@ -789,6 +789,10 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Fuse the TP layer-boundary all-reduce, residual add and RMSNorm into the
+    # adjacent GEMM with the SM90 mega_ops kernels (Qwen3, Qwen3-MoE, Llama
+    # prefill). See srt/layers/layer_boundary/fusions/sm90_gemm_norm.py.
+    SGLANG_ENABLE_SM90_GEMM_NORM_FUSION = EnvBool(False)
 
     # ===================================================================
     # Tool calling and native web search
