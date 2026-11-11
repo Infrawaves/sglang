@@ -192,11 +192,14 @@ def validate_hicache_draft_node_merge_layout(server_args: Any):
 def validate_hicache_storage_page_size(server_args: Any):
     # Pool-level limits (standalone_storage, split heads) are checked by Mooncake.
     cfg = resolving_view(server_args)
-    size, page_size = cfg.hicache_storage_page_size, cfg.page_size
+    size = cfg.hicache_storage_page_size
+    # Under DCP the HiCache page is the widened one (the allocator's
+    # page_size x dcp_size), which the controller groups by.
+    page_size = cfg.page_size * (cfg.dcp_size if cfg.dcp_size > 1 else 1)
     if size <= 0 or size % page_size != 0:
         raise ValueError(
             f"--hicache-storage-page-size ({size}) must be a positive multiple "
-            f"of --page-size ({page_size})."
+            f"of the HiCache page ({page_size} tokens: --page-size x --dcp-size)."
         )
     group = size // page_size
     if group == 1:
@@ -204,7 +207,7 @@ def validate_hicache_storage_page_size(server_args: Any):
     # STORAGE_BATCH_SIZE pages per L3 batch; a group must not straddle two.
     if 128 % group != 0:
         raise ValueError(
-            "--hicache-storage-page-size / --page-size must divide 128, "
+            "--hicache-storage-page-size / HiCache page must divide 128, "
             f"got {group}."
         )
     unsupported = {
@@ -213,7 +216,6 @@ def validate_hicache_storage_page_size(server_args: Any):
             cfg.hicache_storage_backend != "mooncake"
         ),
         "--pp-size > 1": cfg.pp_size > 1,
-        "--dcp-size > 1": cfg.dcp_size > 1,
         "PD decode": cfg.disaggregation_mode == "decode",
         # Buffer mode writes staged spans without a radix node position.
         "--hicache-host-memory-mode buffer_only": (

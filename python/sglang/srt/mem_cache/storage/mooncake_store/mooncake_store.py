@@ -2037,7 +2037,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for i in range(len(segments))
             ]
 
-        return plan_group_reads(start_page, len(page_keys), group, probe)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            return plan_group_reads(start_page, len(page_keys), group, probe)
 
     def _grouped_get(
         self,

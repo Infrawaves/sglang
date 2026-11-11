@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPoo
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_page_group import batch_spans
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -190,9 +191,7 @@ def _trailing_chain_groups(
         (
             HiCacheStorageExtraInfo(
                 prefix_keys=(
-                    None
-                    if prefix_keys is None
-                    else prefix_keys + span_hashes[:covered]
+                    None if prefix_keys is None else prefix_keys + span_hashes[:covered]
                 ),
                 extra_info=extra_info,
                 start_page=start_page + covered,
@@ -272,6 +271,7 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        self.agreed_restorable_pages: Optional[list[int]] = None
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
         # Observability only, all on the IO / prefetch threads' monotonic clock:
@@ -1037,9 +1037,25 @@ class HybridCacheController(BaseHiCacheController):
         else:
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
-        if alloc_len >= min_tokens:
+        alloc_len = self._floor_to_restorable(operation, alloc_len)
+        if alloc_len > 0 and alloc_len >= min_tokens:
             host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
         return host_indices, alloc_len
+
+    def _floor_to_restorable(self, operation: StorageOperation, alloc_len: int) -> int:
+        if self.storage_page_group == 1 or not isinstance(operation, PrefetchOperation):
+            return alloc_len
+        pages = operation.agreed_restorable_pages
+        if pages is None:
+            return alloc_len
+        # The agreed endpoints are relative to the original query, before any
+        # device-resident head is trimmed from the host transfer.
+        offset = operation.prefetch_kv_page_offset
+        limit = offset + alloc_len // self.page_size
+        return (
+            max((p - offset for p in pages if offset < p <= limit), default=0)
+            * self.page_size
+        )
 
     def free_prefetch_host_buffers(
         self, operation: StorageOperation, host_indices: torch.Tensor
@@ -1729,14 +1745,14 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
-        if any(
+        if self.storage_page_group > 1 or any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
         ):
             # A trailing state can exist at 512 and 1024 but not at 768. Taking
-            # MIN of each rank's longest hit would choose a missing checkpoint,
-            # so reduce one restorable flag per prefix length instead. Use the
-            # request span (identical on every rank) for the collective shape,
+            # MIN of the longest hits can land inside a grouped object or at
+            # a missing checkpoint. Reduce one flag per restorable prefix.
+            # Use the request span (identical on every rank) for the shape,
             # including when one rank skipped its query due to cancellation.
             hits = [0] * (len(operation.token_ids) // self.page_size + 1)
             hits[0] = 1
@@ -1759,9 +1775,7 @@ class HybridCacheController(BaseHiCacheController):
         # The flag is read once at init, so every rank packs the same shape.
         spread = [-storage_hit_count] if self.enable_diagnostic_metrics else []
         packed = torch.tensor(
-            hits
-            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            + spread,
+            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools] + spread,
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1770,7 +1784,16 @@ class HybridCacheController(BaseHiCacheController):
             self.prefetch_hits_sync_groups,
         )
         reduced = packed.tolist()
-        storage_hit_count = int(reduced[0])
+        if len(hits) == 1:
+            operation.agreed_restorable_pages = None
+            storage_hit_count = int(reduced[0])
+        else:
+            operation.agreed_restorable_pages = [
+                i for i, ok in enumerate(reduced[: len(hits)]) if ok and i > 0
+            ]
+            storage_hit_count = (
+                max(operation.agreed_restorable_pages, default=0) * self.page_size
+            )
         if storage_hit_count == 0:
             # A miss is never sent to the transfer worker, so finish its span here.
             _finish_op_trace(operation)
@@ -1784,10 +1807,7 @@ class HybridCacheController(BaseHiCacheController):
         if spread:
             # Cross-rank spread of the raw storage hit (observability only).
             operation.query_rank_spread = -reduced[-1] - storage_hit_count
-        if len(hits) == 1:
-            return storage_hit_count
-        restorable = reduced[: len(hits)]
-        return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+        return storage_hit_count
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1895,10 +1915,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
         trace_extra = _storage_trace_extra(operation, include_request_id=True)
-        extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=extra_info.prefix_keys,
-            extra_info=trace_extra or None,
-        )
+        extra_info = replace(extra_info, extra_info=trace_extra or None)
         # A node-shared side pool is read into by the node leader only, like the
         # MLA anchor (_page_get_shared_by_leader); the cache-group MIN takes its
         # hits.
@@ -2021,15 +2038,21 @@ class HybridCacheController(BaseHiCacheController):
     def _page_backup_kv_with_trace(self, operation):
         """Write the main KV pool with hybrid RPC context."""
         prefix_keys = operation.prefix_keys
-        for start in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[start : start + STORAGE_BATCH_SIZE]
+        for start, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
+            batch_hashes = operation.hash_value[start:batch_end]
             batch_host_indices = operation.host_indices[
-                start * self.page_size : (start + len(batch_hashes)) * self.page_size
+                start * self.page_size : batch_end * self.page_size
             ]
             trace_extra = _storage_trace_extra(operation, include_request_id=False)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
                 extra_info=trace_extra or None,
+                start_page=operation.start_page + start,
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
