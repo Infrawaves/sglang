@@ -169,13 +169,19 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
         params = request.to_sampling_params(default_max_tokens=None)
         self.assertIsNone(params["max_new_tokens"])
 
-    def test_none_default_with_max_output_tokens_honored(self):
-        request = ResponsesRequest(
-            model="x", input="hi", store=False, max_output_tokens=100
-        )
-        params = request.to_sampling_params(default_max_tokens=None)
-        # 100 minus the 2-token BOS/EOS headroom.
-        self.assertEqual(params["max_new_tokens"], 98)
+    def test_explicit_max_output_tokens_respects_server_cap(self):
+        for requested, default, expected in (
+            (1, None, 1),
+            (2, None, 2),
+            (100, None, 100),
+            (100, 64, 64),
+        ):
+            with self.subTest(requested=requested, default=default):
+                request = ResponsesRequest(
+                    model="x", input="hi", store=False, max_output_tokens=requested
+                )
+                params = request.to_sampling_params(default_max_tokens=default)
+                self.assertEqual(params["max_new_tokens"], expected)
 
     def test_default_budget_still_caps_when_provided(self):
         # Backwards compatible: an explicit default budget still applies.

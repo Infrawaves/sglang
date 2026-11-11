@@ -2504,17 +2504,15 @@ class ResponsesRequest(PDRoutingFields):
         if default_params is None:
             default_params = {}
 
-        # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
             max_tokens = self.max_output_tokens
             if default_max_tokens is not None:
                 max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
+            # Keep the existing context headroom for server-derived budgets.
+            if max_tokens is not None:
+                max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:
