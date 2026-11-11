@@ -588,7 +588,9 @@ def _gpu_preprocess_k3_visual_items(
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-    def __init__(self, hf_processor, image_token, image_token_id, config):
+    def __init__(
+        self, hf_processor, image_token, image_token_id, config, output_dtype=None
+    ):
         self.preprocess_config = config
         super().__init__(
             hf_processor,
@@ -603,6 +605,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             image_std=config.image_std,
         )
         self._transparent_bg_config = config.transparent_bg_config
+        self._output_dtype = output_dtype
         self._image_preprocess_mode = _resolve_image_preprocess_mode()
         self._log_preprocess_backend = envs.SGLANG_K3_IMAGE_PREPROCESS_LOG.get()
         self._oom_fallback = envs.SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK.get()
@@ -695,7 +698,14 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
     def preprocess_fingerprint_payload(self):
-        return self.preprocess_config
+        # A cached fp32 feature is not interchangeable with a bf16 one, so the
+        # dtype this wrapper emits has to scope its artifact keys. Kept here
+        # rather than on the base processor: only a processor that actually
+        # casts should change its keys.
+        return {
+            "preprocess_config": self.preprocess_config,
+            "output_dtype": self._output_dtype,
+        }
 
     def _normalize_visual_items(self, images) -> list[_KimiK3VisualItem]:
         return [
@@ -842,6 +852,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            output_dtype=self._output_dtype,
         )
 
         return {
@@ -930,12 +941,16 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             for width, height in image_sizes
         ]
 
-        pixel_values = None
+        features = None
+        packed = None
         if self._use_gpu(images, use_gpu):
             self._log_backend("gpu", images, resize_configs)
             image_scale, image_bias = self._get_gpu_norm_tensors()
             try:
-                pixel_values, grid_thws = _gpu_preprocess_images(
+                # Ask for per-image tensors directly: this method's contract is a
+                # list, so packing them into one block here only to split it again
+                # would keep a full duplicate of every feature alive across the cat.
+                features, grid_thws = _gpu_preprocess_images(
                     images,
                     resize_configs,
                     image_scale,
@@ -945,31 +960,45 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     post_resize=lambda x: _fill_transparent_bg(
                         x, self._transparent_bg_config
                     ),
+                    per_image=True,
+                    output_dtype=self._output_dtype,
                 )
             except torch.OutOfMemoryError:
                 if not self._can_retry_on_cpu(images):
                     raise
-            if pixel_values is None:
+            if features is None:
                 # Outside the except block: see _after_gpu_oom.
                 images = self._after_gpu_oom(images)
-        if pixel_values is None:
+        if features is None:
             # `_cpu_call` logs the backend itself.
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
             # image features and grids are independent of its text.
             output = self._cpu_call(self._image_token * len(images), images)
-            pixel_values = output["pixel_values"]
+            packed = output["pixel_values"]
             grid_thws = output["image_grid_thw"]
 
         grids = [tuple(int(value) for value in grid) for grid in grid_thws.tolist()]
         patch_counts = [math.prod(grid) for grid in grids]
-        if sum(patch_counts) != pixel_values.shape[0]:
+        if packed is not None:
+            # The CPU fallback still returns one block; split it as before.
+            if sum(patch_counts) != packed.shape[0]:
+                raise RuntimeError(
+                    "Kimi-K3 processor feature length does not match image grids: "
+                    f"{packed.shape[0]} != {sum(patch_counts)}"
+                )
+            features = list(packed.split(patch_counts))
+        elif len(features) != len(patch_counts) or any(
+            feature.shape[0] != count for feature, count in zip(features, patch_counts)
+        ):
+            # Per image rather than on the total: two images whose errors cancel
+            # in the sum would pass the packed check and silently mismatch.
             raise RuntimeError(
                 "Kimi-K3 processor feature length does not match image grids: "
-                f"{pixel_values.shape[0]} != {sum(patch_counts)}"
+                f"{[feature.shape[0] for feature in features]} != {patch_counts}"
             )
         return (
-            list(pixel_values.split(patch_counts)),
+            features,
             image_sizes,
             resize_configs,
             grids,
@@ -995,6 +1024,12 @@ class KimiK3ImageProcessor(
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
     uses_wide_image_identity = True
+    # nvJPEG decodes onto the serving GPU, so a request's decoded images and
+    # the preprocessing peak both come out of the tokenizer process's slice of
+    # the device -- about 9 GiB in production, against 512-image requests whose
+    # sources alone can exceed that. Chunk the decode+preprocess loop so
+    # neither scales with the image count.
+    mm_preprocess_chunk_mb = 1024
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
@@ -1012,6 +1047,11 @@ class KimiK3ImageProcessor(
             image_token=mm_tokens.image_token,
             image_token_id=mm_tokens.image_token_id,
             config=preprocess_config,
+            # ModelConfig.dtype is the resolved dtype the weights load with, so
+            # the encoder receives exactly what it would have cast to itself.
+            # None (the scheduler's M-RoPE fallback processor passes no
+            # model_config) leaves the output in its resize dtype.
+            output_dtype=getattr(kwargs.get("model_config"), "dtype", None),
         )
         self._image_preprocess_mode = _resolve_image_preprocess_mode()
         # `_load_single_item` is a classmethod and reads `cls.gpu_image_decode`,

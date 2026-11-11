@@ -2,10 +2,12 @@
 
 import asyncio
 import base64
+import contextlib
 import functools
 import io
 import pickle
 import tempfile
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,7 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k3_vl import Learnable2DInterpPosEmbDividedFixed
 from sglang.srt.models.kimi_k25 import (
@@ -68,6 +71,8 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _ensure_chw_rgb,
     _expand_image_token_ids,
+    _gpu_preprocess_images,
+    _process_single_image,
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
@@ -142,6 +147,278 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_gpu_preprocess_group_batching_matches_the_single_image_path():
+    # The batched branch frees its intermediate resize list before patchify, so
+    # nothing may read that list afterwards and every image must still land on
+    # its own original index. Mixed target sizes make the indices inside one
+    # group non-contiguous, which a same-size-only batch cannot expose.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    # Alternating configs put indices {0, 2} in one group and {1, 3} in the other.
+    resize_configs = [wide, tall, wide, tall]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+
+    pixel_values, grid_thws = _gpu_preprocess_images(
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    expected_grids = [
+        (1, config["new_height"] // patch_size, config["new_width"] // patch_size)
+        for config in resize_configs
+    ]
+    assert [tuple(row.tolist()) for row in grid_thws] == expected_grids
+    patch_counts = [grid[1] * grid[2] for grid in expected_grids]
+    assert pixel_values.shape[0] == sum(patch_counts)
+
+    # Each image's slice must equal what the one-image-per-group branch produces
+    # for that same image. A lost or shifted index silently returns another
+    # image's features instead of raising.
+    offset = 0
+    for image, config, count in zip(images, resize_configs, patch_counts):
+        reference = _process_single_image(
+            image,
+            config,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+        )
+        torch.testing.assert_close(pixel_values[offset : offset + count], reference)
+        offset += count
+
+
+def test_kimi_gpu_preprocess_frees_the_uint8_sources_before_patchify():
+    # to_chw makes a device copy of each source. For a large source that copy
+    # outweighs the resized image, so both branches must drop it once the
+    # resize is done instead of holding it across patchify. post_resize runs
+    # after the resize and before patchify, so every source copied so far must
+    # already be gone there. One image per group exercises the single-image
+    # branch; two share a group and exercise the batched one.
+    patch_size = 4
+    small = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    large = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    resize_configs = [small, large, large]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    sources = []
+
+    def copying_to_chw(image):
+        source = image.clone()
+        sources.append(weakref.ref(source))
+        return source
+
+    live_at_post_resize = []
+
+    def probe(x):
+        live_at_post_resize.append(sum(ref() is not None for ref in sources))
+        return x
+
+    _gpu_preprocess_images(
+        images,
+        resize_configs,
+        torch.full((1, 3, 1, 1), 1.0 / 255.0),
+        torch.zeros(1, 3, 1, 1),
+        patch_size,
+        to_chw=copying_to_chw,
+        post_resize=probe,
+    )
+
+    assert len(sources) == len(images)
+    assert live_at_post_resize and all(n == 0 for n in live_at_post_resize)
+
+
+@pytest.mark.parametrize("chunk", [1, 2, None])
+def test_kimi_gpu_preprocess_streamed_group_matches_the_single_image_path(chunk):
+    # The batched branch now resizes and patchifies a group in chunks written
+    # into one preallocated output. Every chunk size must give exactly what the
+    # one-image path gives, with each image on its own index. Two source sizes
+    # share one target group, and RGBA sources only become RGB in post_resize,
+    # so the output's channel count is unknown until the first chunk ran.
+    torch.manual_seed(0)
+    patch_size = 4
+    config = {"new_height": 16, "new_width": 12, "pad_height": 4, "pad_width": 4}
+    images = [
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 28, 20), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 16, 12), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 28, 20), dtype=torch.uint8),
+        torch.randint(0, 256, (4, 32, 24), dtype=torch.uint8),
+    ]
+    resize_configs = [config] * len(images)
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.full((1, 3, 1, 1), -0.5)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    drop_alpha = lambda x: x[:, :3]  # noqa: E731 - RGBA -> RGB like K3
+
+    batch_sizes = []
+    real_patchify = normalize_and_patchify
+
+    def record_patchify(x, *args, **kwargs):
+        batch_sizes.append(x.shape[0])
+        return real_patchify(x, *args, **kwargs)
+
+    # None leaves the CPU default: the whole group in one chunk.
+    chunk_patch = (
+        patch(
+            "sglang.srt.multimodal.processors.kimi_k25._group_chunk_size",
+            return_value=chunk,
+        )
+        if chunk is not None
+        else contextlib.nullcontext()
+    )
+    with chunk_patch, patch(
+        "sglang.srt.multimodal.processors.kimi_k25.normalize_and_patchify",
+        side_effect=record_patchify,
+    ):
+        pixel_values, grid_thws = _gpu_preprocess_images(
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+            post_resize=drop_alpha,
+        )
+
+    if chunk is not None:
+        assert max(batch_sizes) <= chunk
+    assert sum(batch_sizes) == len(images)
+    count = (20 // patch_size) * (16 // patch_size)
+    assert pixel_values.shape[0] == count * len(images)
+    offset = 0
+    for image in images:
+        reference = _process_single_image(
+            image,
+            config,
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=identity_to_chw,
+            post_resize=drop_alpha,
+        )
+        assert torch.equal(pixel_values[offset : offset + count], reference)
+        offset += count
+
+
+def test_kimi_gpu_preprocess_per_image_matches_the_packed_block_without_copying():
+    # per_image must be a pure repackaging of the same features: equal values in
+    # the same order, and no extra copy. The packed path keeps every group's
+    # patchify output alive while torch.cat builds a full duplicate; the
+    # per-image path hands back tensors that still index into their own group's
+    # output, so same-group images keep sharing one storage.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    resize_configs = [wide, tall, wide, tall]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    call = functools.partial(
+        _gpu_preprocess_images,
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    packed, packed_grids = call()
+    per_image, per_image_grids = call(per_image=True)
+
+    torch.testing.assert_close(packed_grids, per_image_grids)
+    patch_counts = [row[1] * row[2] for row in per_image_grids.tolist()]
+    assert [feature.shape[0] for feature in per_image] == patch_counts
+    offset = 0
+    for feature, count in zip(per_image, patch_counts):
+        torch.testing.assert_close(feature, packed[offset : offset + count])
+        offset += count
+
+    # Indices 0/2 share the `wide` group and 1/3 share `tall`. Same group means
+    # one patchify output, so a reintroduced clone() or cat would break this.
+    storage_of = lambda t: t.untyped_storage().data_ptr()  # noqa: E731
+    assert storage_of(per_image[0]) == storage_of(per_image[2])
+    assert storage_of(per_image[1]) == storage_of(per_image[3])
+    assert storage_of(per_image[0]) != storage_of(per_image[1])
+
+
+def test_kimi_gpu_preprocess_output_dtype_applies_to_both_group_branches():
+    # _gpu_preprocess_images has two branches: one image in a target group goes
+    # through _process_single_image, several go through the batched path. A cast
+    # added to only one leaves the other at the wider dtype, and then the packed
+    # torch.cat promotes everything back -- the saving disappears with no error.
+    # `tall` has one member and `wide` has three, so both branches run here.
+    torch.manual_seed(0)
+    patch_size = 4
+    wide = {"new_height": 16, "new_width": 12, "pad_height": 0, "pad_width": 0}
+    tall = {"new_height": 8, "new_width": 8, "pad_height": 0, "pad_width": 0}
+    resize_configs = [wide, tall, wide, wide]
+    images = [
+        torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8) for _ in resize_configs
+    ]
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+    identity_to_chw = lambda image: image  # noqa: E731 - CPU test, no .cuda()
+    call = functools.partial(
+        _gpu_preprocess_images,
+        images,
+        resize_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=identity_to_chw,
+    )
+
+    reference, _ = call(per_image=True)
+    narrow, _ = call(per_image=True, output_dtype=torch.bfloat16)
+    packed, _ = call(output_dtype=torch.bfloat16)
+
+    assert [feature.dtype for feature in reference] == [torch.float32] * 4
+    assert [feature.dtype for feature in narrow] == [torch.bfloat16] * 4
+    # The packed path must not promote, which it would if either branch skipped
+    # the cast.
+    assert packed.dtype == torch.bfloat16
+
+    # Cast after patchify, not before: the normalize affine still runs in the
+    # resize dtype, so the result is bit-identical to casting the fp32 output.
+    # Casting the patchify *input* instead would move the low bits.
+    for feature, expected in zip(narrow, reference):
+        assert torch.equal(feature, expected.to(torch.bfloat16))
+
+
+def test_kimi_gpu_preprocess_per_image_is_empty_for_no_images():
+    # The packed path returns a zero-row tensor here; the list contract has to
+    # return an empty list instead of that tensor.
+    image_scale = torch.full((1, 3, 1, 1), 1.0 / 255.0)
+    image_bias = torch.zeros(1, 3, 1, 1)
+
+    features, grid_thws = _gpu_preprocess_images(
+        [], [], image_scale, image_bias, 4, per_image=True
+    )
+
+    assert features == []
+    assert grid_thws.shape == (0, 3)
 
 
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
@@ -752,11 +1029,16 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
             assert isinstance(worker_processor, wrapper_cls)
             assert worker_processor is not processor._processor
             if processor_cls is KimiK3ImageProcessor:
-                fingerprint_config = processor.preprocess_fingerprint_payload()[
+                wrapped = processor.preprocess_fingerprint_payload()[
                     "wrapped_processor"
                 ]
+                fingerprint_config = wrapped["preprocess_config"]
                 assert isinstance(fingerprint_config, KimiK3PreprocessConfig)
                 assert fingerprint_config.patch_size == 14
+                # No model_config was passed, so the wrapper keeps the resize
+                # dtype and says so in its key.
+                assert wrapped["output_dtype"] is None
+                assert "feature_dtype" not in processor.preprocess_fingerprint_payload()
         finally:
             processor.mm_processor_executor.shutdown()
             processor.io_executor.shutdown()
