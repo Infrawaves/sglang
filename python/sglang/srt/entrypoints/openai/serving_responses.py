@@ -74,6 +74,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseTool,
     Tool,
     UsageInfo,
 )
@@ -868,7 +869,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             request, prev_response, tool_adapter=tool_adapter
         )
 
-        chat_tools = self._response_tools_to_chat_tools(request)
+        # Tools declared by additional_tools items stay in their own messages.
+        chat_tools = self._response_tools_to_chat_tools(request, request.tools)
         tool_choice = request.effective_tool_choice()
         is_allowed_tools = (
             isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools"
@@ -1445,7 +1447,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
-        custom_names = custom_tool_names(request.tools)
+        custom_names = custom_tool_names(self._response_tools(request))
         tool_names = request._tool_state.names
         if self.tool_call_parser == "muse":
             tool_names = {
@@ -1584,12 +1586,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
-    def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
+    def _response_tools_to_chat_tools(
+        self,
+        request: ResponsesRequest,
+        tools: Optional[list[ResponseTool]] = None,
+    ) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
+        if tools is None:
+            tools = self._response_tools(request)
         chat_tools = []
         is_muse = self.tool_call_parser == "muse"
-        for tool in request.tools:
+        for tool in tools:
             if is_muse and tool.type == "namespace" and tool.name:
                 # Members are called as ``<namespace>.<function>``; register those
                 # names so the tool-call parser accepts the calls.
@@ -1931,6 +1939,27 @@ class OpenAIServingResponses(OpenAIServingChat):
             history.extend(request.input)
         return history
 
+    def _additional_tools(self, item: Any) -> Optional[list[ResponseTool]]:
+        # Only the K3 encoding renders tools declared mid-conversation, from a
+        # system message without content; elsewhere the item stays unsupported.
+        if (
+            self.chat_encoding_spec != "kimi_k3"
+            or not isinstance(item, dict)
+            or item.get("type") != "additional_tools"
+        ):
+            return None
+        tools = [ResponseTool.model_validate(tool) for tool in item.get("tools") or []]
+        if any(tool.type not in ("function", "custom") for tool in tools):
+            raise ValueError("additional_tools supports function and custom tools.")
+        return tools
+
+    def _response_tools(self, request: ResponsesRequest) -> list[ResponseTool]:
+        return request.tools + [
+            tool
+            for item in self._response_input_history(request)
+            for tool in self._additional_tools(item) or []
+        ]
+
     def _construct_input_messages(
         self,
         request: ResponsesRequest,
@@ -1950,6 +1979,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         for input_item in self._response_input_history(request):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
+            additional_tools = self._additional_tools(input_item)
+            if additional_tools is not None:
+                tools = self._response_tools_to_chat_tools(request, additional_tools)
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "",
+                        "tools": [
+                            tool.model_dump(exclude_unset=True) for tool in tools
+                        ],
+                    }
+                )
+                continue
             normalized = self._normalize_response_message_for_chat(
                 input_item,
                 tool_call_parser=self.tool_call_parser,
@@ -2516,7 +2558,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        custom_names = custom_tool_names(request.tools)
+        custom_names = custom_tool_names(self._response_tools(request))
         namespace_names = (
             namespace_function_names(request.tools)
             if self.tool_call_parser == "muse"

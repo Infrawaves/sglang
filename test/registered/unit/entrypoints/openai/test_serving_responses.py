@@ -1250,6 +1250,195 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 )
 
 
+class KimiK3AdditionalToolsTestCase(CustomTestCase):
+    """An ``additional_tools`` input item declares K3 tools mid-conversation."""
+
+    TOOL = {
+        "type": "function",
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }
+    # The same tool in the shape K3 renders from a system message without content.
+    CHAT_TOOL = {
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": TOOL["parameters"]},
+    }
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", enable_response_store=True),
+            role="tokenizer",
+        )
+        self.serving = make_serving()
+        self.serving.chat_encoding_spec = "kimi_k3"
+        self.serving.tool_call_parser = "kimi_k3"
+        self.serving.supports_inline_system = (
+            self.serving._resolve_inline_system_support()
+        )
+        self.serving.default_chat_template_kwargs = {}
+        self.serving.template_manager.chat_template_name = None
+        self.render = self.serving.tokenizer_manager.tokenizer.apply_chat_template
+        self.render.return_value = [1, 2]
+
+    @staticmethod
+    def _declare(*tools):
+        return {"type": "additional_tools", "role": "developer", "tools": list(tools)}
+
+    @staticmethod
+    def _call(value, *, tool="get_weather", key="city"):
+        return (
+            f'<|open|>tools<|sep|><|open|>call tool="{tool}" index="1"<|sep|>'
+            f'<|open|>argument key="{key}" type="string"<|sep|>{value}'
+            "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+        )
+
+    def _respond(self, request, text):
+        async def generate(internal_request, raw_request):
+            for end in ([len(text) // 2] if request.stream else []) + [len(text)]:
+                chunk = engine_chunk(text[:end])
+                chunk["meta_info"]["finish_reason"] = (
+                    {"type": "stop"} if end == len(text) else None
+                )
+                yield chunk
+
+        async def respond():
+            self.serving.tokenizer_manager.generate_request = generate
+            response = await self.serving.create_responses(request)
+            if isinstance(response, AsyncIterator):
+                events = event_payloads(await collect_stream_events(response))
+                self.assertEqual(events[-1]["type"], "response.completed")
+                return ResponsesResponse.model_validate(events[-1]["response"])
+            return response
+
+        return asyncio.run(respond())
+
+    def test_declares_tools_in_place_and_parses_their_calls(self):
+        """Declared tools render at their position and their calls are parsed."""
+        before = {"role": "user", "content": "Hi"}
+        after = {"role": "user", "content": "Weather in Paris?"}
+        for stream in (False, True):
+            for tools in ([], [{"type": "function", "name": "lookup"}]):
+                with self.subTest(stream=stream, tools=tools):
+                    response = self._respond(
+                        ResponsesRequest(
+                            model="x",
+                            input=[before, self._declare(self.TOOL), after],
+                            tools=tools,
+                            stream=stream,
+                            store=False,
+                        ),
+                        self._call("Paris"),
+                    )
+
+                    (call,) = response.output
+                    self.assertEqual(
+                        (call.type, call.name, orjson.loads(call.arguments)),
+                        ("function_call", "get_weather", {"city": "Paris"}),
+                    )
+                    rendered = self.render.call_args
+                    messages = [
+                        {k: v for k, v in message.items() if v is not None}
+                        for message in rendered.args[0]
+                    ]
+                    declaration = {
+                        "role": "system",
+                        "content": "",
+                        "tools": [self.CHAT_TOOL],
+                    }
+                    self.assertEqual(messages, [before, declaration, after])
+                    # Request-level tools keep their own section.
+                    self.assertEqual(
+                        [t["function"]["name"] for t in rendered.kwargs["tools"] or []],
+                        [t["name"] for t in tools],
+                    )
+
+    def test_previous_response_keeps_declared_tools_callable(self):
+        """Tools declared in a stored response stay callable in a follow-up."""
+        first = self._respond(
+            ResponsesRequest(
+                model="x",
+                input=[self._declare(self.TOOL), {"role": "user", "content": "Hi"}],
+            ),
+            self._call("Paris"),
+        )
+        result = {
+            "type": "function_call_output",
+            "call_id": first.output[0].call_id,
+            "output": "Sunny",
+        }
+
+        followup = self._respond(
+            ResponsesRequest(model="x", previous_response_id=first.id, input=[result]),
+            self._call("Lyon"),
+        )
+
+        (call,) = followup.output
+        self.assertEqual(
+            (call.name, orjson.loads(call.arguments)), ("get_weather", {"city": "Lyon"})
+        )
+        messages = self.render.call_args.args[0]
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(messages[0]["tools"], [self.CHAT_TOOL])
+
+    def test_declared_custom_tool_returns_custom_tool_calls(self):
+        """Custom tools declared mid-conversation return custom_tool_call items."""
+        apply_patch = {
+            "type": "custom",
+            "name": "apply_patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/",
+            },
+        }
+        fix = {"role": "user", "content": "Fix it."}
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(
+                    ResponsesRequest(
+                        model="x",
+                        input=[self._declare(apply_patch), fix],
+                        stream=stream,
+                        store=False,
+                    ),
+                    self._call("*** Begin Patch", tool="apply_patch", key="input"),
+                )
+
+                (call,) = response.output
+                self.assertEqual(
+                    (call.type, call.name, call.input),
+                    ("custom_tool_call", "apply_patch", "*** Begin Patch"),
+                )
+
+    def test_accepts_only_declarations_k3_can_render(self):
+        """Unsupported declarations fail instead of being silently dropped."""
+        namespace = {"type": "namespace", "name": "ns", "tools": [self.TOOL]}
+        cases = {
+            # Kimi's Responses schema sets no minimum on additional_tools.tools.
+            "no tools": ("kimi_k3", [], True),
+            "namespace": ("kimi_k3", [namespace], False),
+            "name with a dot": ("kimi_k3", [{**self.TOOL, "name": "ns.f"}], False),
+            "other encoding": (None, [self.TOOL], False),
+        }
+        for case, (spec, tools, accepted) in cases.items():
+            with self.subTest(case):
+                self.serving.chat_encoding_spec = spec
+                request = ResponsesRequest(
+                    model="x", input=[self._declare(*tools)], store=False
+                )
+                response = self._respond(request, "ok")
+                if accepted:
+                    self.assertIsInstance(response, ResponsesResponse)
+                else:
+                    self.assertEqual(response.status_code, 400)
+
+
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
         serving = make_serving()
