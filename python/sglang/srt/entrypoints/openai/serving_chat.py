@@ -1728,6 +1728,16 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        # K3 reports the generation stub as output, so reserve it in the budget.
+        # Preserve tiny limits (1..3) rather than turning them into zero/negative.
+        max_new_tokens = sampling_params["max_new_tokens"]
+        if (
+            self.chat_encoding_spec == "kimi_k3"
+            and request.input_ids is None
+            and max_new_tokens is not None
+            and max_new_tokens > self._KIMI_K3_GENERATION_STUB_TOKENS
+        ):
+            sampling_params["max_new_tokens"] -= self._KIMI_K3_GENERATION_STUB_TOKENS
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
