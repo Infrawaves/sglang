@@ -817,7 +817,13 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
                 if cache_context.get("usage") is not None:
-                    headers.update(cache_context["usage"].response_headers())
+                    snapshot = self._reported_cache_usage(
+                        {
+                            "prompt_tokens": cache_context.get("prompt_tokens", 0),
+                            "cache_usage": cache_context["usage"],
+                        }
+                    )
+                    headers.update(snapshot.response_headers())
                 try:
                     return StreamingResponse(
                         close_stream(),
@@ -1141,12 +1147,34 @@ class OpenAIServingResponses(OpenAIServingChat):
         counters = cache_context or {}
         cache_usage = counters.get("usage")
         if cache_usage is not None:
+            completion_tokens = counters.get("completion_tokens", completion_tokens)
+            meta_info = {
+                "prompt_tokens": counters.get("prompt_tokens", prompt_tokens),
+                "completion_tokens": completion_tokens,
+                "cache_usage": cache_usage,
+            }
+            if self.chat_encoding_spec == "kimi_k3" and completion_tokens > 0:
+                completion_tokens += self._KIMI_K3_GENERATION_STUB_TOKENS
             return UsageProcessor.calculate_token_usage(
-                prompt_tokens=counters.get("prompt_tokens", prompt_tokens),
-                completion_tokens=counters.get("completion_tokens", completion_tokens),
+                prompt_tokens=self._reported_prompt_tokens(meta_info),
+                completion_tokens=completion_tokens,
                 reasoning_tokens=counters.get("reasoning_tokens", reasoning_tokens),
-                cache_usage=cache_usage,
+                cache_usage=self._reported_cache_usage(meta_info),
             )
+        # Both response modes retain raw engine counters until this reporting
+        # boundary, so repeated or missing stream metadata cannot subtract twice.
+        if self.chat_encoding_spec == "kimi_k3":
+            raw_completion_tokens = completion_tokens
+            if raw_completion_tokens > 0:
+                completion_tokens += self._KIMI_K3_GENERATION_STUB_TOKENS
+            prompt_tokens = self._reported_prompt_tokens(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": raw_completion_tokens,
+                }
+            )
+            cached_tokens = min(cached_tokens, prompt_tokens)
+            total_tokens = prompt_tokens + completion_tokens
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,

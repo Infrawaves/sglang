@@ -1006,16 +1006,42 @@ class OpenAIServingChat(OpenAIServingBase):
             cached_tokens=content["meta_info"].get("cached_tokens", 0)
         )
 
-    def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
+    def _reported_prompt_tokens(
+        self, meta_info: dict[str, Any], *, generation_stub_tokens: int = 3
+    ) -> int:
         prompt_tokens = meta_info.get("prompt_tokens", 0)
         if (
             self.chat_encoding_spec == "kimi_k3"
-            and meta_info.get("cache_usage") is None
+            and generation_stub_tokens
+            and meta_info.get("completion_tokens", 0) > 0
         ):
-            # K3's three-token assistant generation stub is model input, but the
-            # reference API excludes it from billed/reported prompt tokens.
-            prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
+            # Transfer the stub only after generation starts; raw input_ids do
+            # not imply that the chat template added a K3 generation stub.
+            prompt_tokens = max(0, prompt_tokens - generation_stub_tokens)
         return prompt_tokens
+
+    def _reported_cache_usage(
+        self, meta_info: dict[str, Any], *, generation_stub_tokens: int = 3
+    ) -> CacheUsage | None:
+        cache_usage = meta_info.get("cache_usage")
+        if cache_usage is None:
+            return None
+        snapshot = CacheUsage.model_validate(cache_usage)
+        if self.chat_encoding_spec != "kimi_k3":
+            return snapshot
+        prompt_tokens = self._reported_prompt_tokens(
+            meta_info, generation_stub_tokens=generation_stub_tokens
+        )
+        # Reads cover the cached prefix; writes cover the following suffix.
+        # Exclude the generation stub from reporting without changing the
+        # engine/Redis snapshot or shifting a partial hit's read/write boundary.
+        read_tokens = min(snapshot.read_tokens, prompt_tokens)
+        return snapshot.model_copy(
+            update={
+                "read_tokens": read_tokens,
+                "write_tokens": min(snapshot.write_tokens, prompt_tokens - read_tokens),
+            }
+        )
 
     def _cache_request_params(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -2806,24 +2832,27 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
-    def _usage_headers(self, meta_info: Dict[str, Any]) -> Dict[str, str]:
+    def _usage_headers(
+        self, meta_info: Dict[str, Any], *, generation_stub_tokens: int = 3
+    ) -> Dict[str, str]:
         """Return fixed cache-write headers and optional K3 prompt/read headers.
 
         Streaming uses the first engine event so prompt-side accounting is
         available even if the stream ends before the final usage frame.
         """
-        cache_usage = meta_info.get("cache_usage")
-        snapshot = (
-            CacheUsage.model_validate(cache_usage) if cache_usage is not None else None
+        snapshot = self._reported_cache_usage(
+            meta_info, generation_stub_tokens=generation_stub_tokens
         )
         headers = snapshot.response_headers() if snapshot is not None else {}
         prefix = envs.SGLANG_USAGE_HEADER_PREFIX.get()
         if self.chat_encoding_spec == "kimi_k3" and prefix:
-            prompt = self._reported_prompt_tokens(meta_info)
+            prompt = self._reported_prompt_tokens(
+                meta_info, generation_stub_tokens=generation_stub_tokens
+            )
             cached = (
                 snapshot.read_tokens
                 if snapshot is not None
-                else meta_info.get("cached_tokens", 0) or 0
+                else min(meta_info.get("cached_tokens", 0) or 0, prompt)
             )
             headers.update(
                 {
@@ -2941,7 +2970,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
-                    content["meta_info"]
+                    content["meta_info"],
+                    generation_stub_tokens=(
+                        self._KIMI_K3_GENERATION_STUB_TOKENS
+                        if request.input_ids is None
+                        else 0
+                    ),
                 )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
@@ -2951,7 +2985,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 if content["meta_info"].get("cache_usage") is not None:
-                    cache_usage[index] = content["meta_info"]["cache_usage"]
+                    cache_usage[index] = self._reported_cache_usage(
+                        content["meta_info"],
+                        generation_stub_tokens=(
+                            self._KIMI_K3_GENERATION_STUB_TOKENS
+                            if request.input_ids is None
+                            else 0
+                        ),
+                    )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -3048,7 +3089,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 # engine event's meta_info arrives (before any byte is yielded;
                 # _handle_streaming_request awaits the first chunk).
                 if usage_headers is not None and not usage_headers:
-                    usage_headers.update(self._usage_headers(content["meta_info"]))
+                    usage_headers.update(
+                        self._usage_headers(
+                            content["meta_info"],
+                            generation_stub_tokens=(
+                                self._KIMI_K3_GENERATION_STUB_TOKENS
+                                if request.input_ids is None
+                                else 0
+                            ),
+                        )
+                    )
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -3304,6 +3354,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 usage = self._apply_k3_usage_details(
                     usage,
+                    n_choices=sum(
+                        bool(prompt_tokens.get(index, 0) or tokens)
+                        for index, tokens in completion_tokens.items()
+                    ),
                     reasoning_tokens=sum(reasoning_tokens.values()),
                     cached_tokens=sum(
                         tok
@@ -3379,7 +3433,14 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Non-streaming responses carry the same usage headers.
-        usage_headers = self._usage_headers(ret[0]["meta_info"])
+        usage_headers = self._usage_headers(
+            ret[0]["meta_info"],
+            generation_stub_tokens=(
+                self._KIMI_K3_GENERATION_STUB_TOKENS
+                if request.input_ids is None
+                else 0
+            ),
+        )
         if usage_headers and isinstance(response, ChatCompletionResponse):
             return ORJSONResponse(content=response.model_dump(), headers=usage_headers)
 
@@ -3399,7 +3460,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     "meta_info": {
                         **item["meta_info"],
                         "prompt_tokens": self._reported_prompt_tokens(
-                            item["meta_info"]
+                            item["meta_info"],
+                            generation_stub_tokens=(
+                                self._KIMI_K3_GENERATION_STUB_TOKENS
+                                if request.input_ids is None
+                                else 0
+                            ),
+                        ),
+                        "cache_usage": self._reported_cache_usage(
+                            item["meta_info"],
+                            generation_stub_tokens=(
+                                self._KIMI_K3_GENERATION_STUB_TOKENS
+                                if request.input_ids is None
+                                else 0
+                            ),
                         ),
                     },
                 }
@@ -3604,6 +3678,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # The K3 usage rules cover every usage object, non-streaming responses included.
         usage = self._apply_k3_usage_details(
             usage,
+            n_choices=sum(
+                r["meta_info"].get("completion_tokens", 0) > 0 for r in ret
+            ),
             reasoning_tokens=sum(
                 r["meta_info"].get("reasoning_tokens", 0) or 0 for r in ret
             ),
@@ -3785,25 +3862,33 @@ class OpenAIServingChat(OpenAIServingBase):
         *,
         reasoning_tokens: int,
         cached_tokens: int,
+        n_choices: int = 1,
     ) -> UsageInfo:
-        """Fill both mandatory K3 token-detail objects on an existing usage.
+        """Account for K3's generation stub and fill mandatory token details.
 
         A no-op under every other encoding, so their usage keeps its shape.
         """
         if self.chat_encoding_spec != "kimi_k3":
             return usage
+        # Each assistant choice reports the prompt's generation stub as output.
+        # Keep engine completion counters unchanged for decoding and token IDs.
+        if usage.completion_tokens > 0:
+            stub_tokens = self._KIMI_K3_GENERATION_STUB_TOKENS * n_choices
+            usage.completion_tokens += stub_tokens
+            usage.total_tokens += stub_tokens
         usage.completion_tokens_details = CompletionTokensDetails(
             reasoning_tokens=int(reasoning_tokens or 0)
         )
         if usage.cache_usage is not None:
             # UsageProcessor has already populated the Redis read/write snapshot.
             return usage
+        cached_tokens = min(int(cached_tokens or 0), usage.prompt_tokens)
         if usage.prompt_tokens_details is None:
             usage.prompt_tokens_details = PromptTokensDetails(
-                cached_tokens=int(cached_tokens or 0)
+                cached_tokens=cached_tokens
             )
         else:
-            usage.prompt_tokens_details.cached_tokens = int(cached_tokens or 0)
+            usage.prompt_tokens_details.cached_tokens = cached_tokens
         return usage
 
     def create_error_response(
