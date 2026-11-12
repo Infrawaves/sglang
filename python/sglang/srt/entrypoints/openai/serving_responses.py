@@ -569,6 +569,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    # Match Chat's budget including the reported K3 stub;
+                    # tiny limits keep their original generation budget.
+                    max_new_tokens = sampling_params["max_new_tokens"]
+                    if (
+                        self.chat_encoding_spec == "kimi_k3"
+                        and max_new_tokens is not None
+                        and max_new_tokens > self._KIMI_K3_GENERATION_STUB_TOKENS
+                    ):
+                        sampling_params["max_new_tokens"] = (
+                            max_new_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS
+                        )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,
