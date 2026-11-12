@@ -243,7 +243,9 @@ class TestMooncakeBundlePools(CustomTestCase):
             store.batch_set_v1(pages, self._indices(logical_page, 1, len(pages)), info),
             [True] * len(pages),
         )
-        written = {n: self._buffer(p).clone() for n, p in {**sidecars, "kv": kv}.items()}
+        written = {
+            n: self._buffer(p).clone() for n, p in {**sidecars, "kv": kv}.items()
+        }
         for pool in (kv, *sidecars.values()):
             self._buffer(pool).zero_()
 
@@ -268,7 +270,9 @@ class TestMooncakeBundlePools(CustomTestCase):
         for i in range(n):
             torch.testing.assert_close(
                 buf[(dst_first + i) * page_bytes : (dst_first + i + 1) * page_bytes],
-                written[(src_first + i) * page_bytes : (src_first + i + 1) * page_bytes],
+                written[
+                    (src_first + i) * page_bytes : (src_first + i + 1) * page_bytes
+                ],
             )
 
     def test_dcp4_bundles_kv_indexer_and_mla_draft_into_one_object(self):
@@ -396,6 +400,10 @@ class TestMooncakeBundlePools(CustomTestCase):
 
         if kind == "follower":
             host.host_buffer_read_only = True
+            if hasattr(host, "kv_buffer"):
+                host.kv_buffer = None
+            if hasattr(host, "index_k_with_scale_buffer"):
+                host.index_k_with_scale_buffer = None
         else:
             host.allocator = NodeSharedHostTensorAllocator.__new__(
                 NodeSharedHostTensorAllocator
@@ -432,6 +440,117 @@ class TestMooncakeBundlePools(CustomTestCase):
                     bundle=True,
                 )
                 self.assertEqual(store.bundled_pools, (PoolName.INDEXER,))
+
+    def test_per_node_indexer_bytes_round_trip(self):
+        for bundle in (False, True):
+            for group in (1, 4):
+                with self.subTest(bundle=bundle, group=group):
+                    objects = {}
+                    kv = self._node_shared(self._mla_host("page_first", 1, 0), "leader")
+                    indexer = self._node_shared(self._indexer_host(1, 0), "leader")
+                    store = self._store(
+                        kv,
+                        {PoolName.INDEXER: indexer},
+                        dcp=1,
+                        rank=0,
+                        objects=objects,
+                        bundle=bundle,
+                        group=group,
+                    )
+                    pages = [f"h{i}" for i in range(1, 7)]
+                    written = self._write_then_read(
+                        store,
+                        kv,
+                        {PoolName.INDEXER: indexer},
+                        self.PHYS_PAGE,
+                        pages,
+                        group=group,
+                    )
+                    kv_objects = 6 if group == 1 else 2
+                    self.assertEqual(len(objects), kv_objects + (0 if bundle else 6))
+                    self.assertEqual(
+                        sum("_kb_indexer" in key for key in objects),
+                        kv_objects if bundle else 0,
+                    )
+                    self._assert_pages(
+                        kv,
+                        written["kv"],
+                        self.LAYERS * self.KV_DIM * self.PHYS_PAGE,
+                        2,
+                        9,
+                        5,
+                    )
+                    self._assert_pages(
+                        indexer,
+                        written[PoolName.INDEXER],
+                        self.LAYERS * self.INDEX_STRIDE,
+                        2,
+                        9,
+                        5,
+                    )
+
+    def test_per_node_follower_indexer_never_accesses_storage_or_buffers(self):
+        for bundle in (False, True):
+            for group in (1, 4):
+                with self.subTest(bundle=bundle, group=group):
+                    kv = self._node_shared(
+                        self._mla_host("page_first", 1, 0), "follower"
+                    )
+                    indexer = self._node_shared(self._indexer_host(1, 0), "follower")
+                    with patch.object(_ByteStore, "register_buffer") as register:
+                        store = self._store(
+                            kv,
+                            {PoolName.INDEXER: indexer},
+                            dcp=1,
+                            rank=0,
+                            objects={},
+                            bundle=bundle,
+                            group=group,
+                        )
+                    register.assert_not_called()
+                    self.assertEqual(
+                        store.bundled_pools, (PoolName.INDEXER,) if bundle else ()
+                    )
+                    transfer = PoolTransfer(
+                        name=PoolName.INDEXER,
+                        keys=["absent"],
+                        host_indices=self._indices(self.PHYS_PAGE, 1, 1),
+                    )
+                    with (
+                        patch.object(
+                            _ByteStore,
+                            "_put",
+                            side_effect=AssertionError("follower put"),
+                        ),
+                        patch.object(
+                            _ByteStore,
+                            "_get",
+                            side_effect=AssertionError("follower get"),
+                        ),
+                        patch.object(
+                            _ByteStore,
+                            "batch_is_exist",
+                            side_effect=AssertionError("follower exists"),
+                        ),
+                        patch.object(
+                            indexer,
+                            "get_page_buffer_meta",
+                            side_effect=AssertionError("follower buffer"),
+                        ),
+                    ):
+                        self.assertTrue(
+                            store._object_layout(["absent"], transfer).skip_io
+                        )
+                        self.assertEqual(
+                            store.batch_set_v2([transfer])[PoolName.INDEXER], [True]
+                        )
+                        self.assertEqual(
+                            store.batch_get_v2([transfer])[PoolName.INDEXER], [True]
+                        )
+                        self.assertEqual(
+                            store._pools_page_exists(["absent"], [transfer], 1),
+                            [[True]],
+                        )
 
     def test_bundle_composes_with_page_groups(self):
         objects = {}

@@ -415,6 +415,10 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
         self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
+        if node_leader_broadcast is not None:
+            node_leader_broadcast.device_translate = (
+                mem_pool_host.anchor_entry.device_translate
+            )
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,

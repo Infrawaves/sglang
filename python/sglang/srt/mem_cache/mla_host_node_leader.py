@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -173,6 +173,8 @@ class NodeLeaderMLABroadcast(msgspec.Struct):
     mla_layers: list[tuple[int, int]]
     # Packed MTP draft pools; each holds its KV in layer 0.
     draft_pools: tuple[MLATokenToKVPool, ...] = ()
+    # Bound from the anchor PoolEntry, exactly like its L2 transfers.
+    device_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     pending_loads: dict[int, _PendingLoad] = msgspec.field(default_factory=dict)
 
     @property
@@ -232,7 +234,7 @@ class NodeLeaderMLABroadcast(msgspec.Struct):
         broadcaster = self.broadcaster
         if load.prepared is None:
             load.prepared = broadcaster.prepare_broadcast(
-                self._device_rows(broadcaster.device_pool, load.device_indices),
+                self._device_rows(load.device_indices),
                 device_module.current_stream(),
             )
         slot = load.next_slot
@@ -250,21 +252,19 @@ class NodeLeaderMLABroadcast(msgspec.Struct):
             broadcaster._bcast_layer(
                 pool.kv_buffer,
                 broadcaster.kv_staging,
-                self._device_rows(pool, load.device_indices),
+                # Packed draft L2 transfers use controller IDs without translation.
+                load.device_indices.to(broadcaster.device),
                 pool.kv_cache_dim,
                 0,
             )
         return True
 
-    def _device_rows(
-        self, device_pool: MLATokenToKVPool, device_indices: torch.Tensor
-    ) -> torch.Tensor:
+    def _device_rows(self, device_indices: torch.Tensor) -> torch.Tensor:
         # Same controller-ID -> buffer-row translation as L2TransferEngine.
         indices = device_indices.to(self.broadcaster.device)
-        translate = device_pool.host_transfer_translate
-        if translate is None:
+        if self.device_translate is None:
             return indices
-        return translate(indices)
+        return self.device_translate(indices)
 
 
 class NodeLeaderMLAContext(msgspec.Struct, frozen=True):
