@@ -540,25 +540,54 @@ class MediaArtifactCacheMixin:
         """
         override = envs.SGLANG_MM_PREPROCESS_CHUNK_MB.get()
         budget_mb = self.mm_preprocess_chunk_mb if override is None else override
+        log_chunks = getattr(self, "_log_preprocess_backend", False)
         if budget_mb <= 0 or len(misses_to_compute) <= 1:
+            if log_chunks:
+                logger.info(
+                    "Media preprocess chunk: no split, chunk_budget_mib=%d items=%d",
+                    budget_mb,
+                    len(misses_to_compute),
+                )
             return [misses_to_compute]
 
         budget = budget_mb * 1024 * 1024
         chunks: list[list[CacheMiss[str, MediaArtifact]]] = []
         current: list[CacheMiss[str, MediaArtifact]] = []
         current_bytes = 0
+        current_hints: list[int] = []
+
+        def append_chunk():
+            chunks.append(current)
+            if log_chunks:
+                logger.info(
+                    "Media preprocess chunk: batch=%s chunk=%d items=%d "
+                    "decoded_hint_bytes=%d decoded_hint_mib=%.2f "
+                    "item_hint_bytes=%s chunk_budget_mib=%d chunking_enabled=%s",
+                    current[0].key[:16],
+                    len(chunks),
+                    len(current),
+                    current_bytes,
+                    current_bytes / 2**20,
+                    current_hints,
+                    budget_mb,
+                    budget_mb > 0,
+                )
+
         for missed in misses_to_compute:
             snapshot = snapshots[first_index_by_key[missed.key]]
             assert snapshot is not None
             hint = self.decoded_size_hint(snapshot)
             if current and current_bytes + hint > budget:
-                chunks.append(current)
+                append_chunk()
                 current = []
                 current_bytes = 0
+                current_hints = []
             current.append(missed)
             current_bytes += hint
+            if log_chunks:
+                current_hints.append(hint)
         if current:
-            chunks.append(current)
+            append_chunk()
         return chunks
 
     async def _compute_cache_misses(
