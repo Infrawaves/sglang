@@ -21,6 +21,8 @@ class PrefillCapacity(msgspec.Struct, frozen=True):
     tokens: int
     requests: int
     metadata: int
+    # Free plus evictable recurrent-state slots; None without a state pool.
+    state_slots: Optional[int] = None
 
 
 class _Reservation(msgspec.Struct):
@@ -49,16 +51,27 @@ class PrefillWorkAdmission:
         page_size: int = 1,
         safety_margin_tokens: int = 0,
         reservation_ttl: float = 120.0,
+        fresh_state_slots: int = 0,
+        state_slot_cost: int = 0,
+        pending_state_slots: Callable[[Any], int] = lambda req: 0,
     ):
         if max_tokens <= 0 or max_requests <= 0 or page_size <= 0:
             raise ValueError("Prefill pull requires positive token/request/page limits")
         if safety_margin_tokens < 0 or reservation_ttl <= 0:
             raise ValueError("Invalid prefill pull safety margin or reservation TTL")
+        if fresh_state_slots < 0 or state_slot_cost < 0:
+            raise ValueError("Invalid prefill pull state slot accounting")
         self.max_tokens = max_tokens
         self.max_requests = max_requests
         self.page_size = page_size
         self.safety_margin_tokens = safety_margin_tokens
         self.reservation_ttl = reservation_ttl
+        # Slots acquire takes for a request that holds none yet.
+        self.fresh_state_slots = fresh_state_slots
+        # FULL-token equivalents of one state slot in a shared arena; 0 when
+        # state and token pools do not compete for the same bytes.
+        self.state_slot_cost = state_slot_cost
+        self.pending_state_slots = pending_state_slots
         self.reservations: dict[str, _Reservation] = {}
         # Bounded replay history. Old UUIDs are never reissued by the agent.
         self._terminal: OrderedDict[str, str] = OrderedDict()
@@ -84,6 +97,7 @@ class PrefillWorkAdmission:
         promised_kv = 0
         promised_rows = 0
         promised_metadata = 0
+        promised_state = 0
         for reservation in self.reservations.values():
             work += reservation.tokens
             req = reservation.request
@@ -93,15 +107,29 @@ class PrefillWorkAdmission:
             promised_kv += max(0, self._kv_charge(reservation.tokens) - allocated)
             promised_rows += req is None or req.kv.req_pool_idx is None
             promised_metadata += req is None or req.metadata_buffer_index == -1
+            promised_state += (
+                self.fresh_state_slots if req is None else self.pending_state_slots(req)
+            )
+        # The new grant's own state slots compete for the token arena as well.
+        state_tokens = (promised_state + self.fresh_state_slots) * self.state_slot_cost
         tokens = min(
             self.max_tokens - work,
-            capacity.tokens - promised_kv - self.safety_margin_tokens - self.page_size,
+            capacity.tokens
+            - promised_kv
+            - state_tokens
+            - self.safety_margin_tokens
+            - self.page_size,
         )
         requests = min(
             self.max_requests - len(self.reservations),
             capacity.requests - promised_rows,
             capacity.metadata - promised_metadata,
         )
+        if capacity.state_slots is not None and self.fresh_state_slots > 0:
+            requests = min(
+                requests,
+                (capacity.state_slots - promised_state) // self.fresh_state_slots,
+            )
         return max(0, tokens), max(0, requests)
 
     def remaining_capacity(
@@ -289,24 +317,41 @@ class SchedulerPrefillWorkAdmission:
         cpu_group,
         group_rank,
         group_size,
+        token_to_kv_pool_allocator=None,
+        tree_cache=None,
     ):
         stats = pool_stats.get_pool_stats()
-        usage = pool_stats.storage.usage()
+        metrics = sorted(u.metrics for u in pool_stats.storage.usage())
         if (
             stats.is_hybrid_swa
-            or stats.is_hybrid_ssm
             or stats.is_hisparse
-            or len(usage) != 1
-            or usage[0].metrics != "full"
+            or metrics not in (["full"], ["full", "mamba"])
         ):
             raise ValueError(
-                "Prefill pull currently supports a single dense/MLA KV pool; SWA, Mamba and HiSparse require separate pool admission"
+                "Prefill pull supports a dense/MLA KV pool with an optional recurrent-state pool; SWA and HiSparse require separate pool admission"
             )
+        state = (
+            token_to_kv_pool_allocator.state
+            if token_to_kv_pool_allocator is not None
+            else None
+        )
+        if stats.is_hybrid_ssm and state is None:
+            raise ValueError("Prefill pull needs the allocator's state slots")
+        self.has_state_pool = stats.is_hybrid_ssm
         self.ledger = PrefillWorkAdmission(
             max_tokens=max_tokens,
             max_requests=max_requests,
             page_size=page_size,
             safety_margin_tokens=safety_margin_tokens,
+            **(
+                _state_slot_accounting(
+                    allocator=token_to_kv_pool_allocator,
+                    req_pool=req_pool,
+                    tree_cache=tree_cache,
+                )
+                if self.has_state_pool
+                else {}
+            ),
         )
         self.pool_stats = pool_stats
         self.req_pool = req_pool
@@ -328,15 +373,24 @@ class SchedulerPrefillWorkAdmission:
         return now
 
     def _capacity(self, paused: bool) -> PrefillCapacity:
-        stats = self.pool_stats.get_pool_stats()
-        values = [
-            stats.full_available_size + stats.full_evictable_size,
-            self.req_pool.available_size(),
-            self.metadata_allocator.available_size(),
-        ]
         if paused:
-            values = [0, 0, 0]
-        return PrefillCapacity(*values)
+            return PrefillCapacity(
+                tokens=0,
+                requests=0,
+                metadata=0,
+                state_slots=0 if self.has_state_pool else None,
+            )
+        stats = self.pool_stats.get_pool_stats()
+        return PrefillCapacity(
+            tokens=stats.full_available_size + stats.full_evictable_size,
+            requests=self.req_pool.available_size(),
+            metadata=self.metadata_allocator.available_size(),
+            state_slots=(
+                stats.mamba_available_size + stats.mamba_evictable_size
+                if self.has_state_pool
+                else None
+            ),
+        )
 
     def handle_control(self, req, *, paused: bool):
         from sglang.srt.managers.io_struct import PrefillPullBudgetReqOutput
@@ -417,6 +471,27 @@ class SchedulerPrefillWorkAdmission:
             failed = False
         finally:
             self.ledger.finish_intake(req.prefill_pull_reservation_id, failed)
+
+
+def _state_slot_accounting(*, allocator, req_pool, tree_cache) -> dict:
+    """Ledger arguments that price recurrent state like the scheduler's admission."""
+    from types import SimpleNamespace
+
+    state = allocator.state
+
+    def pending_state_slots(req) -> int:
+        return state.pending_request_slots(req_pool, req)
+
+    # A request that holds no state slot or tracking buffer yet, as acquire sees it.
+    fresh = SimpleNamespace(
+        kv=SimpleNamespace(holds_mamba=False, mamba_ping_pong_track_buffer=None)
+    )
+    return dict(
+        fresh_state_slots=pending_state_slots(fresh),
+        # Nonzero only where state and tokens share one arena (unified pools).
+        state_slot_cost=allocator.create_prefill_budget(tree_cache).state_slot_cost,
+        pending_state_slots=pending_state_slots,
+    )
 
 
 class PrefillPullBudgetClient:

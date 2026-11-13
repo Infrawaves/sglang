@@ -337,8 +337,10 @@ def validate_prefill_pull(cfg) -> None:
         unsupported.append("optimistic prefill")
     if cfg.dp_size != 1 or cfg.attn_dp_size != 1:
         unsupported.append("DP > 1")
-    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
-        unsupported.append("PP/CP/DCP > 1")
+    # DCP shards KV within the TP group, which already agrees on every grant;
+    # PP stages and attention CP each own separate rank groups.
+    if cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        unsupported.append("PP/CP > 1")
     if cfg.tokenizer_worker_num != 1:
         unsupported.append("multiple tokenizer workers")
     if (
@@ -352,8 +354,13 @@ def validate_prefill_pull(cfg) -> None:
         unsupported.append("runtime topology/role changes")
     if cfg.encoder_only or cfg.language_only:
         unsupported.append("encoder disaggregation")
-    if cfg.speculative_algorithm is not None or cfg.decoupled_spec_role != "null":
-        unsupported.append("speculative decoding")
+    # DFLASH draft KV lives in the target's token pages or a per-row ring, so
+    # the token and request-row budgets already cover it.
+    if (
+        cfg.speculative_algorithm not in (None, "DFLASH")
+        or cfg.decoupled_spec_role != "null"
+    ):
+        unsupported.append("speculative decoding other than DFLASH")
     if cfg.dllm_algorithm is not None or cfg.is_embedding:
         unsupported.append("diffusion or embedding models")
     if cfg.enable_hisparse:

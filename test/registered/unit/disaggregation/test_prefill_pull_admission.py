@@ -321,6 +321,108 @@ class TestPrefillPullAdmission(CustomTestCase):
         result = self.reserve("second", capacity=PrefillCapacity(16, 1, 1))
         self.assertEqual(result["data"]["max_tokens"], 8)
 
+    def test_recurrent_state_slots_bound_grants_without_double_counting(self):
+        """A grant needs free state slots for its working and tracking state; a
+        request that already holds them is charged by the allocator, not again."""
+        holds = {}
+        ledger = PrefillWorkAdmission(
+            max_tokens=64,
+            max_requests=4,
+            page_size=4,
+            reservation_ttl=10,
+            fresh_state_slots=3,
+            state_slot_cost=2,
+            pending_state_slots=lambda req: 0 if holds.get(id(req)) else 3,
+        )
+
+        def reserve(reservation_id, capacity):
+            return ledger.control(
+                action="reserve",
+                reservation_id=reservation_id,
+                now=0,
+                capacity=capacity,
+            )
+
+        self.assertFalse(
+            reserve("r", PrefillCapacity(128, 4, 4, state_slots=2))["success"]
+        )
+        # 128 free tokens, less 3 slots * 2 tokens for the grant's state, less a page.
+        granted = reserve("r", PrefillCapacity(128, 4, 4, state_slots=5))
+        self.assertEqual(granted["data"]["max_tokens"], 64)
+        ledger.control(
+            action="bind",
+            reservation_id="r",
+            now=0,
+            assignment_id="a",
+            request_id="rid",
+            tokens=8,
+        )
+        # The unbound promise still owns 3 of the 5 slots.
+        self.assertFalse(
+            reserve("second", PrefillCapacity(128, 4, 4, state_slots=5))["success"]
+        )
+        ledger.consume(
+            reservation_id="r", assignment_id="a", request_id="rid", tokens=8, now=0
+        )
+        req = _request(allocated=8, row=0, metadata=0)
+        ledger.attach_request("r", req)
+        holds[id(req)] = True
+        # The allocator already took the request's 3 slots out of the 5.
+        second = reserve("second", PrefillCapacity(120, 3, 3, state_slots=3))
+        self.assertTrue(second["success"])
+        self.assertEqual(second["data"]["max_tokens"], 56)
+
+    def test_static_state_pool_reports_free_and_evictable_slots(self):
+        """A hybrid model's grants follow its state pool, not only token space."""
+        stats = SimpleNamespace(
+            **vars(_stats(128)),
+            mamba_available_size=1,
+            mamba_evictable_size=2,
+        )
+        stats.is_hybrid_ssm = True
+        req_pool = SimpleNamespace(available_size=lambda: 4)
+        adapter = SchedulerPrefillWorkAdmission(
+            max_tokens=64,
+            max_requests=4,
+            safety_margin_tokens=0,
+            pool_stats=SimpleNamespace(
+                get_pool_stats=lambda: stats,
+                storage=SimpleNamespace(
+                    usage=lambda: [
+                        SimpleNamespace(metrics="mamba"),
+                        SimpleNamespace(metrics="full"),
+                    ]
+                ),
+            ),
+            req_pool=req_pool,
+            metadata_allocator=SimpleNamespace(available_size=lambda: 4),
+            page_size=4,
+            cpu_group=None,
+            group_rank=0,
+            group_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(
+                    pending_request_slots=lambda table, req: (
+                        3 if table is req_pool and not req.kv.holds_mamba else 0
+                    )
+                ),
+                # A static state pool does not share bytes with token pages.
+                create_prefill_budget=lambda tree_cache: SimpleNamespace(
+                    state_slot_cost=0
+                ),
+            ),
+        )
+
+        def reserve(reservation_id):
+            return adapter.handle_control(
+                PrefillPullBudgetReq(action="reserve", reservation_id=reservation_id),
+                paused=False,
+            )
+
+        # One free and two evictable slots fit exactly one fresh request.
+        self.assertTrue(reserve("first").success)
+        self.assertEqual(reserve("second").error, "no_capacity")
+
     def test_failed_intake_retires_without_releasing_a_started_sender(self):
         self.reserve()
         self.bind()
@@ -473,6 +575,14 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
             prefill_pull_max_requests=4,
         )
         validate_prefill_pull(resolving_view(ServerArgs(**base, tp_size=2)))
+        # The Kimi-K3.1 prefill shape: DCP within TP and a DFLASH draft.
+        validate_prefill_pull(
+            resolving_view(
+                ServerArgs(
+                    **base, tp_size=8, dcp_size=8, speculative_algorithm="DFLASH"
+                )
+            )
+        )
         for changes in (
             {"disaggregation_mode": "decode"},
             {"disaggregation_decode_allocation_policy": "prefill_complete"},
@@ -481,6 +591,7 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
             {"attn_dp_size": 2},
             {"pp_size": 2},
             {"attn_cp_size": 2},
+            {"speculative_algorithm": "EAGLE"},
             {"tokenizer_worker_num": 2},
             {"grpc_port": 9000},
             {"enable_pd_role_switch": True},

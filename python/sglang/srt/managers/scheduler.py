@@ -3094,6 +3094,8 @@ class Scheduler(
                 pool_stats=self.pool_stats_observer,
                 req_pool=self.req_to_token_pool,
                 metadata_allocator=self.req_to_metadata_buffer_idx_allocator,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
                 page_size=self.tree_cache.page_size,
                 cpu_group=self.dp_tp_cpu_group,
                 group_rank=self.dp_tp_group.first_rank,
