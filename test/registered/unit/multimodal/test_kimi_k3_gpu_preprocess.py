@@ -365,13 +365,15 @@ def _allocator_stats(*, reserved: int, allocated: int, inactive_split: int) -> d
     [
         # An idle tokenizer still holding an earlier request's preprocessing peak.
         (_allocator_stats(reserved=27 * _GIB, allocated=0, inactive_split=0), True),
+        # Above the threshold.
+        (_allocator_stats(reserved=3 * _GIB // 4, allocated=0, inactive_split=0), True),
         # A small leftover is kept for the next request.
-        (_allocator_stats(reserved=_GIB // 2, allocated=0, inactive_split=0), False),
+        (_allocator_stats(reserved=_GIB // 4, allocated=0, inactive_split=0), False),
         # The free bytes share segments with a feature still waiting for
         # dispatch, so empty_cache could not return them anyway.
         (
             _allocator_stats(
-                reserved=4 * _GIB, allocated=_GIB // 4, inactive_split=3 * _GIB
+                reserved=4 * _GIB, allocated=_GIB // 4, inactive_split=7 * _GIB // 2
             ),
             False,
         ),
@@ -389,7 +391,7 @@ def test_preprocess_cache_release_counts_only_returnable_memory(stats, released)
         mock.patch("torch.cuda.memory_reserved", return_value=0),
         mock.patch("torch.cuda.empty_cache") as empty_cache,
     ):
-        _release_preprocess_cache()
+        _release_preprocess_cache(threshold_bytes=_GIB // 2)
     assert empty_cache.called is released
 
 
@@ -398,13 +400,17 @@ def test_preprocess_cache_release_skips_a_process_without_cuda():
     that never initialized CUDA (CPU preprocessing, CPU-only hosts)."""
     if torch.cuda.is_initialized():
         pytest.skip("needs a process that has not initialized CUDA")
-    _release_preprocess_cache()
+    _release_preprocess_cache(threshold_bytes=0)
     assert not torch.cuda.is_initialized()
+
+
+_PROBE_RELEASE_THRESHOLD_BYTES = 123
 
 
 def _release_order_probe(events: list, *, cache_enabled: bool):
     """Bare object carrying only what process_mm_data_async reads."""
     probe = type("_Probe", (), {})()
+    probe._preprocess_release_threshold_bytes = _PROBE_RELEASE_THRESHOLD_BYTES
     probe.mm_tokens = SimpleNamespace(image_token="<|media_pad|>", image_token_id=7)
     probe.mm_preprocess_cache = SimpleNamespace(enabled=cache_enabled)
     probe.reject_caller_image_identity = lambda image_data, request_obj: None
@@ -428,16 +434,20 @@ def test_request_releases_preprocess_cache_around_its_preprocessing(cache_enable
     The release after preprocessing returns the request's own scratch; the one
     before returns features of earlier requests that stayed on the GPU until
     dispatch, which this request's allocations would otherwise reuse and pin.
+    Both pass the threshold the processor read at construction.
     """
     events = []
     process = _release_order_probe(events, cache_enabled=cache_enabled)
     request = SimpleNamespace(audio_data=None, video_data=None, mm_content_hashes=None)
     with mock.patch(
         "sglang.srt.multimodal.processors.kimi_k3._release_preprocess_cache",
-        side_effect=lambda: events.append("release"),
+        side_effect=lambda *, threshold_bytes: events.append(
+            ("release", threshold_bytes)
+        ),
     ):
         asyncio.run(process(["image"], "<|media_pad|>", request))
-    assert events == ["release", "preprocess", "release"]
+    release = ("release", _PROBE_RELEASE_THRESHOLD_BYTES)
+    assert events == [release, "preprocess", release]
 
 
 if __name__ == "__main__":

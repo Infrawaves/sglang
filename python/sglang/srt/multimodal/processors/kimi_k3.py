@@ -1006,12 +1006,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
 
-# Arbitrary: a smaller leftover stays cached for the next request instead of
-# paying cudaFree and cudaMalloc again.
-_PREPROCESS_CACHE_RELEASE_BYTES = 1 << 30
-
-
-def _release_preprocess_cache() -> None:
+def _release_preprocess_cache(*, threshold_bytes: int) -> None:
     if not torch.cuda.is_initialized():
         return
     stats = torch.cuda.memory_stats()
@@ -1022,7 +1017,9 @@ def _release_preprocess_cache() -> None:
         - stats["allocated_bytes.all.current"]
         - stats["inactive_split_bytes.all.current"]
     )
-    if releasable <= _PREPROCESS_CACHE_RELEASE_BYTES:
+    # A smaller leftover stays cached for the next request instead of paying
+    # cudaFree and cudaMalloc again.
+    if releasable <= threshold_bytes:
         return
     # The caching allocator keeps freed preprocessing memory reserved; the
     # scheduler sharing this GPU can only use it once it is back with the driver.
@@ -1103,6 +1100,9 @@ class KimiK3ImageProcessor(
         self.mm_tokens = mm_tokens
         self.media_proc_cfg = _apply_k3_video_config_overrides(
             dict(_processor.media_processor.media_proc_cfg)
+        )
+        self._preprocess_release_threshold_bytes = (
+            envs.SGLANG_K3_PREPROCESS_RELEASE_THRESHOLD_MB.get() * 1024 * 1024
         )
 
         # "auto" GPU budget, shared by every request this tokenizer worker is
@@ -1960,7 +1960,9 @@ class KimiK3ImageProcessor(
             )
         # Features kept on the GPU until dispatch outlive their own request's
         # release below; free them before this request's allocations pin them.
-        _release_preprocess_cache()
+        _release_preprocess_cache(
+            threshold_bytes=self._preprocess_release_threshold_bytes
+        )
         if (
             video_data
             or any(self._is_preprocessed_input(item) for item in image_data)
@@ -1979,7 +1981,9 @@ class KimiK3ImageProcessor(
             )
             output = self.compose_request(input_text, artifacts)
         # Under CPU transport no GPU tensor of this request is alive any more.
-        _release_preprocess_cache()
+        _release_preprocess_cache(
+            threshold_bytes=self._preprocess_release_threshold_bytes
+        )
         return output
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
