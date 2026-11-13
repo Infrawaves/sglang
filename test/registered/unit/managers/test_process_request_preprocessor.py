@@ -94,6 +94,41 @@ class FailingTokenizerManager(TokenizerManager):
 
 
 class TestHelpers(CustomTestCase):
+    def test_router_media_conversion_stays_with_parent_processor(self):
+        """A child has no MM processor and would re-encode an offloaded prompt."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        handler = object()
+        pre = prp.ProcessRequestPreprocessor.__new__(prp.ProcessRequestPreprocessor)
+        pre._ready = True
+        pre._disabled_reason = None
+        pre._handler_classes = (object,)
+        pre._warned = set()
+        media = _chat_request(kimi_k3_media_input_ids=[91, 92])
+        text = _chat_request(kimi_k3_input_ids=[81, 82])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pre._pool = pool
+
+            # Stand in for the child transport, which should still serve text.
+            def child_convert(handler_cls, request, headers):
+                result = (
+                    "child-media"
+                    if request.kimi_k3_media_input_ids is not None
+                    else "child-text"
+                )
+                return (
+                    "ok",
+                    SimpleNamespace(input_ids=None),
+                    None,
+                    ("object", result),
+                )
+
+            with mock.patch.object(prp, "_child_convert", child_convert):
+                self.assertIsNone(asyncio.run(pre.convert(handler, media, None)))
+                self.assertEqual(
+                    asyncio.run(pre.convert(handler, text, None))[1], "child-text"
+                )
+
     def test_token_ids_round_trip(self):
         long_ids = list(range(1000))
         self.assertEqual(prp.pack_token_ids(long_ids)[0], "array")
@@ -146,6 +181,17 @@ class TestHelpers(CustomTestCase):
         snapshot = prp._snapshot_request_state(request)
         request.messages = list(request.messages)
         self.assertIn("messages", prp._collect_request_changes(request, snapshot))
+
+    def test_router_token_ids_track_rebinding_without_copying_long_prompts(self):
+        for field in ("kimi_k3_input_ids", "kimi_k3_media_input_ids"):
+            request = _chat_request(**{field: list(range(1000))})
+            snapshot = prp._snapshot_request_state(request)
+            self.assertNotIn(field, prp._collect_request_changes(request, snapshot))
+            replacement = list(getattr(request, field))
+            setattr(request, field, replacement)
+            self.assertIs(
+                prp._collect_request_changes(request, snapshot)[field], replacement
+            )
 
     def test_exceptions_cross_the_boundary_with_their_type(self):
         http = prp._local_exception(

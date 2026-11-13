@@ -1216,8 +1216,29 @@ class ChatCompletionRequest(PDRoutingFields):
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
-    # and tool_call_constraint.
+    # and tool_call_constraint. Kimi-K3 also extracts media from messages;
+    # provide one unexpanded image placeholder per image for its MM processor.
     input_ids: Optional[List[int]] = None
+
+    # Internal router-worker protocol v1. Unlike caller input_ids, these are
+    # rendered chat prompts and retain K3's generation-stub usage accounting.
+    # Older workers ignore the fields and encode messages locally.
+    kimi_k3_input_ids: Optional[List[int]] = None
+    kimi_k3_media_input_ids: Optional[List[int]] = None
+
+    @field_validator("kimi_k3_input_ids", "kimi_k3_media_input_ids", mode="before")
+    @classmethod
+    def validate_kimi_k3_router_input_ids(cls, value):
+        if value is not None and (
+            not isinstance(value, list)
+            or not value
+            or any(
+                type(token) is not int or not 0 <= token <= 0xFFFFFFFF
+                for token in value
+            )
+        ):
+            raise ValueError("Kimi-K3 router input IDs must be a nonempty uint32 array")
+        return value
 
     # For request id
     rid: Optional[Union[List[str], str]] = None

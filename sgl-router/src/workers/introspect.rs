@@ -33,6 +33,7 @@ use sglang_processor::openai::OpenAiSettings;
 use tracing::warn;
 use url::Url;
 
+use super::WorkerCapabilities;
 use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
@@ -56,6 +57,7 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// for prefill workers) — see `manager::register_one`.
 #[derive(Debug, Clone, Default)]
 pub struct ServerInfo {
+    pub capabilities: WorkerCapabilities,
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
     pub disaggregation_role: Option<DisaggregationRole>,
@@ -197,6 +199,7 @@ impl WorkerIntrospector {
         );
 
         ServerInfo {
+            capabilities: parsed.capabilities,
             served_model_name,
             event_config,
             disaggregation_role,
@@ -390,6 +393,8 @@ struct ModelInfoBody {
 /// deserialises; downstream callers handle `None` as "absent".
 #[derive(Debug, Default, Deserialize)]
 struct ServerInfoBody {
+    #[serde(flatten)]
+    capabilities: WorkerCapabilities,
     /// The launch record's value, and the fallback for a worker whose
     /// `/model_info` predates the field.
     #[serde(default)]
@@ -516,6 +521,31 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    #[tokio::test]
+    async fn fetch_kimi_input_ids_capabilities_are_explicit_and_versioned() {
+        for (text_version, media_version) in [
+            (None, None),
+            (Some(1), None),
+            (Some(1), Some(1)),
+            (Some(2), Some(1)),
+            (Some(1), Some(2)),
+        ] {
+            let body = json!({
+                "served_model_name": "kimi-k31",
+                "kimi_k3_input_ids_version": text_version,
+                "kimi_k3_media_input_ids_version": media_version,
+            });
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.served_model_name.as_deref(), Some("kimi-k31"));
+            assert_eq!(info.capabilities.kimi_k3_input_ids_version, text_version);
+            assert_eq!(
+                info.capabilities.kimi_k3_media_input_ids_version,
+                media_version
+            );
+        }
     }
 
     /// An engine started with `--api-key` answers `/server_info` only to the key.

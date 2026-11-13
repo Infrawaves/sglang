@@ -36,7 +36,7 @@ from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import common
@@ -113,6 +113,7 @@ def _call_server_info_with(
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
     scheduler_info: dict | None = None,
+    serving_chat=None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -148,12 +149,53 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
-        return asyncio.run(http_server.server_info())
+        raw_request = (
+            SimpleNamespace(
+                app=SimpleNamespace(
+                    state=SimpleNamespace(openai_serving_chat=serving_chat)
+                )
+            )
+            if serving_chat is not None
+            else None
+        )
+        return asyncio.run(http_server.server_info(raw_request))
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
         if published:
             reset_context()
+
+
+class TestServerInfoKimiK3RouterCapabilities(CustomTestCase):
+    def test_capabilities_match_native_encoder_and_processor(self):
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        chat = OpenAIServingChat.__new__(OpenAIServingChat)
+        chat.chat_encoding_spec = "kimi_k3"
+        chat._reasoning_detector = None
+        chat.tokenizer_manager = SimpleNamespace(
+            tokenizer=object(),
+            model_config=SimpleNamespace(is_multimodal=True),
+            mm_processor=SimpleNamespace(kimi_k3_media_input_ids_version=1),
+        )
+        chat.template_manager = SimpleNamespace(chat_template_name=None)
+        chat.default_chat_template_kwargs = {}
+        args = ServerArgs(model_path="dummy")
+        with get_context().override_server_args(enable_multimodal=True):
+            payload = _call_server_info_with(args, serving_chat=chat)
+            self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
+            self.assertEqual(payload["kimi_k3_media_input_ids_version"], 1)
+            chat.tokenizer_manager.mm_processor.kimi_k3_media_input_ids_version = None
+            payload = _call_server_info_with(args, serving_chat=chat)
+            self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
+            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
+            chat.default_chat_template_kwargs = {"chat_template": "custom"}
+            payload = _call_server_info_with(args, serving_chat=chat)
+            self.assertIsNone(payload["kimi_k3_input_ids_version"])
+            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
+            payload = _call_server_info_with(args)
+            self.assertIsNone(payload["kimi_k3_input_ids_version"])
+            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
 
 
 class TestServerInfoTransportParity(CustomTestCase):

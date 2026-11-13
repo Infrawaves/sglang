@@ -328,14 +328,28 @@ mod tests {
         let id = spec.id.clone();
         r.add(spec.clone()).unwrap();
         let first = r.get(&id).unwrap();
+        assert!(!first.supports_kimi_k3_input_ids());
         let window = COLD_RATIO_WINDOW_TOKENS;
         first.prefill_cold_ratio(0, Some(0));
         assert_eq!(first.prefill_cold_ratio(window / 4, Some(window)), 0.25);
         first.prefill_cold_ratio(window / 2, Some(3 * window / 2));
 
         spec.bootstrap_port = Some(8997);
-        r.add(spec).unwrap();
+        r.add_with_cb(
+            spec,
+            None,
+            EngineProfile {
+                capabilities: crate::workers::WorkerCapabilities {
+                    kimi_k3_input_ids_version: Some(1),
+                    kimi_k3_media_input_ids_version: Some(1),
+                },
+                ..WireProtocol::Http1.into()
+            },
+        )
+        .unwrap();
         let second = r.get(&id).unwrap();
+        assert!(second.supports_kimi_k3_input_ids());
+        assert!(second.supports_kimi_k3_media_input_ids());
         assert_eq!(second.measured_prefill_cold_ratio(), Some(0.25));
         assert_eq!(
             second.prefill_cold_ratio(window / 2, Some(3 * window / 2)),
@@ -347,6 +361,33 @@ mod tests {
         first.prefill_cold_ratio(3 * window / 4, Some(2 * window));
         let expected = 0.25 + COLD_RATIO_EMA_ALPHA * (0.5 - 0.25);
         assert!((second.measured_prefill_cold_ratio().unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn upsert_replaces_kimi_capabilities_instead_of_inheriting_them() {
+        let registry = WorkerRegistry::default();
+        let spec = spec("p", WorkerMode::Prefill, &["m"]);
+        for version in [Some(1), Some(2), None] {
+            registry
+                .add_with_cb(
+                    spec.clone(),
+                    None,
+                    EngineProfile {
+                        capabilities: crate::workers::WorkerCapabilities {
+                            kimi_k3_input_ids_version: version,
+                            kimi_k3_media_input_ids_version: version,
+                        },
+                        ..WireProtocol::Http1.into()
+                    },
+                )
+                .unwrap();
+            let worker = registry.get(&spec.id).unwrap();
+            assert_eq!(worker.supports_kimi_k3_input_ids(), version == Some(1));
+            assert_eq!(
+                worker.supports_kimi_k3_media_input_ids(),
+                version == Some(1)
+            );
+        }
     }
 
     #[test]

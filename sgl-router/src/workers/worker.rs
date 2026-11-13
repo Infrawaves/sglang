@@ -4,6 +4,7 @@
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::workers::cold_ratio::ColdRatioEstimator;
+use serde::Deserialize;
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -42,10 +43,24 @@ pub enum WireProtocol {
     H2c,
 }
 
+/// Versioned request semantics advertised by the worker. Missing or unknown
+/// versions leave prompt encoding on the worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct WorkerCapabilities {
+    /// Version 1 distinguishes router text IDs from caller-owned `input_ids`,
+    /// preserving K3/K3.1 generation-stub budgets and usage accounting.
+    #[serde(default)]
+    pub kimi_k3_input_ids_version: Option<u32>,
+    /// Version 1 expands router image placeholders and recovers media from messages.
+    #[serde(default)]
+    pub kimi_k3_media_input_ids_version: Option<u32>,
+}
+
 /// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineProfile {
     pub protocol: WireProtocol,
+    pub capabilities: WorkerCapabilities,
     /// `dp_size * attn_dp_size`; 0 is treated as 1.
     pub dp_ranks: u32,
     /// The engine's OpenAI-layer server args; `None` if unread.
@@ -59,6 +74,7 @@ impl From<WireProtocol> for EngineProfile {
         Self {
             protocol,
             dp_ranks: 1,
+            capabilities: WorkerCapabilities::default(),
             openai: None,
             grpc_port: None,
         }
@@ -263,6 +279,7 @@ pub struct Worker {
     /// Forwarding wire protocol, resolved from `/server_info` before this
     /// worker was constructed. Immutable: see [`WireProtocol`].
     protocol: WireProtocol,
+    capabilities: WorkerCapabilities,
     /// Reaches the engine's native gRPC server, for requests that arrived over gRPC.
     grpc: Option<SglangServiceClient<tonic::transport::Channel>>,
     pub model_ids: Vec<ModelId>,
@@ -314,6 +331,7 @@ impl Worker {
     ) -> Self {
         let EngineProfile {
             protocol,
+            capabilities,
             dp_ranks,
             openai,
             grpc_port,
@@ -331,6 +349,7 @@ impl Worker {
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
             protocol,
+            capabilities,
             grpc,
             model_ids: spec.model_ids,
             breaker,
@@ -347,6 +366,16 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
+    }
+
+    /// Whether this worker preserves the semantics of router-generated K3 IDs.
+    pub fn supports_kimi_k3_input_ids(&self) -> bool {
+        self.capabilities.kimi_k3_input_ids_version == Some(1)
+    }
+
+    /// Whether this worker can expand unprocessed K3 image placeholders.
+    pub fn supports_kimi_k3_media_input_ids(&self) -> bool {
+        self.capabilities.kimi_k3_media_input_ids_version == Some(1)
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {

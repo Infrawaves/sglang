@@ -62,7 +62,9 @@ logger = logging.getLogger(__name__)
 # Request fields too large to deep-copy for change detection. Conversion only
 # reads them (it renders dumps/copies), so the child reports them back only if
 # the attribute was rebound or resized.
-_IDENTITY_TRACKED_FIELDS = frozenset({"messages"})
+_IDENTITY_TRACKED_FIELDS = frozenset(
+    {"messages", "kimi_k3_input_ids", "kimi_k3_media_input_ids"}
+)
 # Token id lists at least this long cross the process boundary as int64 arrays:
 # unpickling a list costs ~40ns per id on the receiving side, an array ~nothing.
 _PACK_MIN_IDS = 256
@@ -563,6 +565,11 @@ class ProcessRequestPreprocessor:
         Conversion errors are re-raised here with the same type the in-process
         path would raise (ValueError, HTTPException, ...).
         """
+        if getattr(request, "kimi_k3_media_input_ids", None) is not None:
+            # Children intentionally have no multimodal processor. The parent
+            # must check its processor's capability and preserve router IDs;
+            # a child would fall back to rendering the same media prompt again.
+            return None
         pool = self._pool
         if pool is None or not self.accepts(handler):
             if pool is not None and type(handler) in self._handler_classes:

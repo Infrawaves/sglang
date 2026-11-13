@@ -55,6 +55,18 @@ jobs:
           filters: |
             sgl_router:
               - 'sgl-router/**'
+              # Python request preparation and worker capability handshake shared
+              # with the optional Kimi-K3/K3.1 router encoder pool.
+              - 'python/sglang/srt/entrypoints/openai/kimi_k3_tokenization.py'
+              - 'python/sglang/srt/entrypoints/openai/chat_encoding.py'
+              - 'python/sglang/srt/entrypoints/openai/protocol.py'
+              - 'python/sglang/srt/entrypoints/openai/serving_chat.py'
+              - 'python/sglang/srt/entrypoints/http_server.py'
+              - 'python/sglang/srt/function_call/utils.py'
+              - 'python/sglang/srt/managers/process_request_preprocessor.py'
+              - 'python/sglang/srt/multimodal/processors/base_processor.py'
+              - 'python/sglang/srt/multimodal/processors/kimi_k3.py'
+              - 'test/registered/unit/entrypoints/test_kimi_k3_router_tokenization.py'
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
               - 'rust/sglang-api-types/**'
@@ -244,6 +256,13 @@ jobs:
         # `parity_matrix` is unique to that test.
         run: cargo test --locked --release --workspace -- --skip parity_matrix
 
+      # Stub-tokenizer tests run on CPU without loading model weights. The
+      # registered CPU suite and the installed-checkout step below also require
+      # the real request schema, so missing dependencies cannot hide that coverage.
+      - name: Kimi-K3 tokenizer helper tests
+        working-directory: sgl-router
+        run: python3 -m unittest discover -s tests -p 'test_kimi_k3*.py' -v
+
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates
       # SGLang's `radix_cache.hash_page` algorithm verbatim (no
@@ -378,6 +397,12 @@ jobs:
       - name: Install e2e test dependencies
         run: |
           python3 -m pip install -r sgl-router/tests/e2e/requirements.txt
+
+      - name: Kimi-K3 tokenizer tests with real request schema
+        working-directory: sgl-router
+        env:
+          SGLANG_REQUIRE_KIMI_K3_SCHEMA_TESTS: "1"
+        run: python3 -m unittest discover -s tests -p 'test_kimi_k3*.py' -v
 
       # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
       # suite is owned by the `sgl-router-k8s-integration` job which has

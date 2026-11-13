@@ -1028,5 +1028,39 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 
 
+class TestKimiK3RouterInputIds(CustomTestCase):
+    def test_router_fields_preserve_chat_accounting_and_caller_precedence(self):
+        messages = [{"role": "user", "content": "hello"}]
+        request = ChatCompletionRequest(
+            messages=messages,
+            kimi_k3_input_ids=[0, 0xFFFFFFFF],
+            kimi_k3_media_input_ids=[5],
+        )
+        restored = ChatCompletionRequest.model_validate_json(request.model_dump_json())
+        self.assertIsNone(restored.input_ids)
+        self.assertEqual(restored.kimi_k3_input_ids, [0, 0xFFFFFFFF])
+        self.assertEqual(restored.kimi_k3_media_input_ids, [5])
+        caller = ChatCompletionRequest(
+            messages=messages,
+            input_ids=[7],
+            **{
+                field: [5] for field in ("kimi_k3_input_ids", "kimi_k3_media_input_ids")
+            },
+        )
+        self.assertEqual(caller.input_ids, [7])
+
+    def test_router_fields_reject_coercion_and_invalid_token_ranges(self):
+        for field in ("kimi_k3_input_ids", "kimi_k3_media_input_ids"):
+            for value in ([], [True], [-1], [0x100000000], [1.5], ["1"], "1"):
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaises(ValidationError),
+                ):
+                    ChatCompletionRequest(
+                        messages=[{"role": "user", "content": "hello"}],
+                        **{field: value},
+                    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

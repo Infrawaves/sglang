@@ -4,15 +4,20 @@
 pub mod adapter;
 pub mod chat_formatter;
 mod kimi;
+pub mod kimi_k3;
+pub mod options;
 pub mod stats;
 
+use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use options::ChatEncodingOptions;
 use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Which chats may carry router-rendered `input_ids`, by how well the model's
 /// renderer is verified against SGLang.
@@ -56,7 +61,6 @@ impl ChatFormatterEntry {
     }
 }
 
-#[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
     /// Per-model chat formatter, present only when the model's prompt format is
@@ -70,6 +74,15 @@ pub struct TokenizerRegistry {
     openai: Option<Arc<dyn OpenAiTokenizer>>,
     /// The model config SGLang's OpenAI chat layer reads.
     chat_model: ChatModel,
+    kimi_encoders: DashMap<String, Arc<kimi_k3::KimiK3Pool>>,
+    pub(crate) kimi_encode_slots: Arc<Semaphore>,
+    pub(crate) kimi_encode_timeout: std::time::Duration,
+}
+
+impl Default for TokenizerRegistry {
+    fn default() -> Self {
+        Self::with_options(&ChatEncodingOptions::default())
+    }
 }
 
 /// `get_context_length` over the model's text config.
@@ -122,9 +135,56 @@ impl std::fmt::Debug for TokenizerRegistry {
 }
 
 impl TokenizerRegistry {
+    fn with_options(options: &ChatEncodingOptions) -> Self {
+        Self {
+            inner: DashMap::new(),
+            formatters: DashMap::new(),
+            stats: Arc::default(),
+            prompt_affixes: None,
+            openai: None,
+            chat_model: ChatModel::default(),
+            kimi_encoders: DashMap::new(),
+            kimi_encode_slots: Arc::new(Semaphore::new(0)),
+            kimi_encode_timeout: std::time::Duration::from_secs(options.tokenizer_timeout_secs),
+        }
+    }
+
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let mut me = TokenizerRegistry::default();
+        Self::load_with_options(cfg, ChatEncodingOptions::default())
+    }
+
+    pub fn load_with_options(
+        cfg: &crate::config::Config,
+        options: ChatEncodingOptions,
+    ) -> Result<Self> {
+        let mut me = Self::with_options(&options);
         let m = &cfg.model;
+        if options.is_kimi_k3() {
+            let source = m.tokenizer_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--chat-encoder kimi-k3 cannot be combined with --no-tokenizer")
+            })?;
+            let count = options
+                .tokenizer_workers
+                .map_or(1, std::num::NonZeroUsize::get);
+            let pool = kimi_k3::KimiK3Pool::new_with_metrics(
+                source,
+                &options,
+                serde_json::to_value(&m.default_chat_template_kwargs)?,
+                EncoderMetrics::new(&m.id),
+            )?;
+            me.kimi_encoders.insert(m.id.clone(), Arc::new(pool));
+            me.kimi_encode_slots = Arc::new(Semaphore::new(count));
+            tracing::info!(model = %m.id, workers = count,
+                "Kimi-K3/K3.1 prompt encoding enabled in persistent Python processes");
+            return Ok(me);
+        }
+        let ignored = options.non_default_kimi_only_flags();
+        anyhow::ensure!(
+            ignored.is_empty(),
+            "{} require --chat-encoder kimi-k3",
+            ignored.join(", ")
+        );
+
         let Some(tokenizer_path) = &m.tokenizer_path else {
             tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
             return Ok(me);
@@ -259,6 +319,57 @@ impl TokenizerRegistry {
             .is_some_and(|e| e.formatter.is_minimax_m31())
     }
 
+    pub fn has_kimi_encoder(&self, model_id: &str) -> bool {
+        self.kimi_encoders.contains_key(model_id)
+    }
+
+    pub(crate) fn kimi_metrics(&self, model_id: &str) -> Option<Arc<EncoderMetrics>> {
+        self.kimi_encoders.get(model_id).map(|pool| pool.metrics())
+    }
+
+    pub(crate) fn render_kimi_metrics(&self) -> String {
+        let mut pools: Vec<_> = self
+            .kimi_encoders
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        pools.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let snapshots: Vec<_> = pools
+            .into_iter()
+            .map(|(_, pool)| (pool.metrics(), pool.process_counts()))
+            .collect();
+        EncoderMetrics::render(&snapshots)
+    }
+
+    pub fn encode_kimi_request(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
+        let pool = self
+            .kimi_encoders
+            .get(model_id)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
+        pool.encode(request, deadline)
+    }
+
+    pub(crate) fn encode_kimi_request_queued(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        deadline: std::time::Instant,
+        queue: EncoderQueueGuard,
+    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
+        let pool = self
+            .kimi_encoders
+            .get(model_id)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
+        pool.encode_queued(request, deadline, queue)
+    }
+
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
         self.formatters
             .get(model_id)
@@ -285,7 +396,11 @@ impl TokenizerRegistry {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.inner.iter().map(|kv| kv.key().clone()).collect()
+        self.inner
+            .iter()
+            .map(|kv| kv.key().clone())
+            .chain(self.kimi_encoders.iter().map(|kv| kv.key().clone()))
+            .collect()
     }
 
     /// Attach a chat formatter to an already-loaded model. Lets policy tests in

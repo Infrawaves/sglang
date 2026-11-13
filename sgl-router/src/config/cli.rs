@@ -26,6 +26,8 @@ use crate::config::{
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
 
+use crate::tokenizer::options::ChatEncodingOptions;
+
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
 
@@ -61,6 +63,9 @@ pub struct Cli {
         next_help_heading = "Session affinity, sticky routing and pressure guards"
     )]
     pub affinity: AffinityArgs,
+    /// Kimi-K3/K3.1 encoder settings; must match the serving workers.
+    #[command(flatten, next_help_heading = "Model, tokenizer and sampling")]
+    pub chat_encoding: ChatEncodingOptions,
 }
 
 #[derive(clap::Args, Debug)]
@@ -539,6 +544,19 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(mut self) -> Result<Config> {
+        anyhow::ensure!(
+            !(self.model.no_tokenizer && self.chat_encoding.is_kimi_k3()),
+            "--chat-encoder kimi-k3 cannot be combined with --no-tokenizer"
+        );
+        if !self.chat_encoding.is_kimi_k3() {
+            let ignored = self.chat_encoding.non_default_kimi_only_flags();
+            anyhow::ensure!(
+                ignored.is_empty(),
+                "{} require --chat-encoder kimi-k3",
+                ignored.join(", ")
+            );
+        }
+
         let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
         if reorg {
             ensure!(
@@ -1266,7 +1284,9 @@ mod tests {
         let config = Cli::try_parse_from(base).unwrap().into_config().unwrap();
         assert_eq!(config.proxy.max_chat_body_bytes, 70_000_000);
 
-        let args = base.iter().chain(["--max-chat-body-bytes", "536870912"].iter());
+        let args = base
+            .iter()
+            .chain(["--max-chat-body-bytes", "536870912"].iter());
         let config = Cli::try_parse_from(args).unwrap().into_config().unwrap();
         assert_eq!(config.proxy.max_chat_body_bytes, 512 << 20);
     }
@@ -1583,6 +1603,83 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.server.termination_grace_secs, Some(120));
+    }
+
+    #[test]
+    fn chat_encoding_flags_preserve_worker_settings() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "kimi-k3",
+            "--worker-urls",
+            "http://x:30000",
+            "--default-chat-template-kwargs",
+            r#"{"enable_thinking":false,"reasoning_effort":"high"}"#,
+            "--chat-encoder",
+            "kimi-k3",
+            "--tokenizer-python",
+            "/opt/sglang/bin/python",
+            "--trust-remote-code",
+            "--tokenizer-revision",
+            "snapshot",
+            "--tokenizer-workers",
+            "3",
+            "--tokenizer-startup-timeout-secs",
+            "600",
+        ])
+        .unwrap();
+        let options = &cli.chat_encoding;
+        assert!(options.is_kimi_k3());
+        assert!(options.trust_remote_code);
+        assert_eq!(options.tokenizer_python, "/opt/sglang/bin/python");
+        assert_eq!(options.tokenizer_revision.as_deref(), Some("snapshot"));
+        assert_eq!(options.tokenizer_workers.unwrap().get(), 3);
+        assert_eq!(options.tokenizer_startup_timeout_secs, 600);
+        assert!(cli.into_config().is_ok());
+    }
+
+    #[test]
+    fn chat_encoder_rejects_disabled_tokenizer_and_unused_flags() {
+        for flags in [
+            vec!["--chat-encoder", "kimi-k3", "--no-tokenizer"],
+            vec!["--tokenizer-python", "/some/python"],
+            vec!["--tokenizer-workers", "2"],
+        ] {
+            let mut args = vec![
+                "sgl-router",
+                "--model-id",
+                "tiny",
+                "--worker-urls",
+                "http://x:30000",
+            ];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).unwrap().into_config().is_err());
+        }
+    }
+
+    #[test]
+    fn chat_encoding_rejects_invalid_options() {
+        for (flag, value) in [
+            ("--tokenizer-workers", "0"),
+            ("--tokenizer-workers", "-1"),
+            ("--tokenizer-timeout-secs", "0"),
+            ("--tokenizer-startup-timeout-secs", "0"),
+            ("--chat-encoder", "unknown"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "sgl-router",
+                    "--model-id",
+                    "tiny",
+                    "--worker-urls",
+                    "http://x:30000",
+                    flag,
+                    value,
+                ])
+                .is_err(),
+                "accepted {flag} {value}"
+            );
+        }
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

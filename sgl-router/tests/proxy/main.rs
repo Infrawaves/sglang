@@ -39,3 +39,6 @@ mod shared_prefill_admission;
 mod sticky_input_ids;
 mod sticky_routing;
 mod timeout;
+
+#[cfg(unix)]
+mod kimi_k3_input_ids;

@@ -45,7 +45,11 @@ pub struct DetokenizeResponse {
 pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
     let model = ctx.config.model.served_name(model);
     ctx.tokenizers.get(model).ok_or_else(|| {
-        if model == ctx.config.model.id {
+        if ctx.tokenizers.has_kimi_encoder(model) {
+            ApiError::NotSupported(format!(
+                "raw tokenize/detokenize is unavailable for {model}; use the worker endpoints"
+            ))
+        } else if model == ctx.config.model.id {
             ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
         } else {
             ApiError::ModelNotFound(model.to_owned())

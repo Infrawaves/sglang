@@ -460,6 +460,79 @@ backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
 
+### Kimi-K3 and K3.1 Python chat encoder
+
+`--chat-encoder kimi-k3` enables a persistent Python process pool for
+`/v1/chat/completions`. It uses the same prompt preparation as the Python serving
+worker, including K3.1's `medium` thinking tier. Without this flag the router
+keeps its native tokenization path.
+
+Add these flags to the existing router command, keeping its worker discovery and
+P/D settings:
+
+```bash
+--tokenizer-path /models/kimi-k31 \
+--chat-encoder kimi-k3 \
+--tokenizer-python /opt/sglang/bin/python \
+--trust-remote-code \
+--tokenizer-workers 4
+```
+
+Here `--tokenizer-path` takes a model directory or Hugging Face repository with a
+loadable `config.json`, rather than a standalone tokenizer file. Startup checks
+that the configuration resolves to Kimi-K3/K3.1 before warming the tokenizer.
+
+The Python executable must import this SGLang checkout and the checkpoint's
+tokenizer dependencies. The default router Docker image is distroless and does
+not include Python; use an environment or a custom image with the Python package
+installed for this mode. Match the workers' model configuration, tokenizer files,
+`--tokenizer-revision`, and `--default-chat-template-kwargs`. Pin the same snapshot
+on both sides. Each encoder process loads its own tokenizer; size the pool for
+the router's CPU and memory budget.
+
+Text chats are encoded once and sent to both P/D workers in `kimi_k3_input_ids`.
+This field distinguishes router encoding from caller-provided `input_ids`, so
+K3/K3.1 output budgets and usage still account for the generation stub. Image
+chats use `kimi_k3_media_input_ids` and retain the original messages. Workers
+still load and preprocess images and expand their placeholders. Placeholder IDs
+are not final KV tokens, so image requests do not use them for prefix matching
+or exact sequence lengths; the router retains its media workload estimate.
+
+Workers advertise `kimi_k3_input_ids_version: 1` in `/server_info`; image chats
+also require `kimi_k3_media_input_ids_version: 1`. The router checks capabilities
+before encoding and again for the selected workers on every dispatch, including
+retries. If the required versions are missing, both P/D workers receive the
+original messages and encode locally. Deploy compatible workers before enabling
+router encoding to realize the offload benefit.
+
+Audio, video, request chat templates (including
+`chat_template_kwargs.chat_template`), and caller-provided IDs bypass the Python
+encoder. Request templates remain subject to the worker's
+`--trust-request-chat-template` setting. Responses, completions, and native gRPC
+requests keep their existing routes. With `--disable-input-ids-forwarding`, text
+encoding may still serve routing, while image requests bypass the pool.
+`--no-tokenizer` cannot be combined with this encoder. `/v1/tokenize` and
+`/v1/detokenize` return 501 for the pool's model.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--chat-encoder` | `auto` | Use `kimi-k3` to enable the Python pool. |
+| `--tokenizer-python` | `python3` | Interpreter in the SGLang environment. |
+| `--tokenizer-revision` | unset | Tokenizer/model snapshot revision matching the workers. |
+| `--trust-remote-code` | false | Permit checkpoint tokenizer code, as on the workers. |
+| `--tokenizer-workers` | 1 | Number of persistent encoder processes. |
+| `--tokenizer-timeout-secs` | 300 | One deadline for request preparation, queueing, and encoding. |
+| `--tokenizer-startup-timeout-secs` | 300 | Deadline for initial and replacement process startup. |
+
+Invalid encoder requests return 400. Encoder failures and timeouts return 503
+with code `encoder_unavailable` before inference dispatch. Failed processes are
+replaced in the background; a request that times out while waiting does not
+consume a healthy encoder process. Monitor `sgl_router_encoder_requests_total`,
+`sgl_router_encoder_waiting_requests`, queue/encode duration histograms, process
+states, and restart outcomes to size the pool and identify failures. Worker
+fallbacks use the `ineligible_worker_capability` outcome of
+`sgl_router_input_ids_forwarding_total`.
+
 ## Native `/generate`
 
 `/generate` (`POST` or `PUT`) has the engine's interface: the same

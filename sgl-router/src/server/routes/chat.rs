@@ -234,6 +234,18 @@ async fn prepare<'a>(
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
+            } else if matches!(endpoint, Endpoint::Chat)
+                && ctx.tokenizers.has_kimi_encoder(&model.0)
+            {
+                PreparedRequest::prepare_kimi_k3(
+                    ctx,
+                    model,
+                    fields,
+                    body,
+                    needs_tokens,
+                    needs_token_count,
+                )
+                .await?
             } else {
                 PreparedRequest::openai(
                     ctx,

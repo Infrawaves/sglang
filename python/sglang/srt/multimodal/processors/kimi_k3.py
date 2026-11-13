@@ -540,8 +540,7 @@ def _gpu_preprocess_k3_visual_items(
     # Each frame contributes one (t=1, h, w) grid. Compute the final row
     # count up front so no second full-size torch.cat allocation is needed.
     total_rows = sum(
-        len(item.frames)
-        * math.prod(_grid_thw_from_resize_config(config, patch_size))
+        len(item.frames) * math.prod(_grid_thw_from_resize_config(config, patch_size))
         for item, config in zip(visual_items, resize_configs)
     )
     pixel_values = None
@@ -1011,6 +1010,7 @@ class KimiK3ImageProcessor(
     SGLangBaseProcessor,
 ):
     models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+    kimi_k3_media_input_ids_version = 1
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
@@ -1868,7 +1868,9 @@ class KimiK3ImageProcessor(
         hashes its sampled frames together with the options that shaped them.
         """
         if item.media_type == "image":
-            digest = item.content_digest or snapshot_media(item.frames[0]).content_digest
+            digest = (
+                item.content_digest or snapshot_media(item.frames[0]).content_digest
+            )
             return self._artifact_key(digest, item.frames[0])
         parts = [
             "video",
@@ -1876,9 +1878,9 @@ class KimiK3ImageProcessor(
             item.timestamp_text,
             *(snapshot_media(frame).content_digest for frame in item.frames),
         ]
-        digest = CONTENT_HASH_PREFIX + hashlib.sha256(
-            "\n".join(parts).encode()
-        ).hexdigest()
+        digest = (
+            CONTENT_HASH_PREFIX + hashlib.sha256("\n".join(parts).encode()).hexdigest()
+        )
         return self._artifact_key(digest, {"in_patch_limit": item.in_patch_limit})
 
     async def process_mm_data_async(

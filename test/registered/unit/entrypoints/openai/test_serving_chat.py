@@ -24,22 +24,21 @@ from unittest.mock import Mock, patch
 import xgrammar as xgr
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
-from fastapi.responses import StreamingResponse
 from xgrammar import Grammar
-from jsonschema import Draft202012Validator, SchemaError
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    Function,
     ChatCompletionResponse,
+    Function,
     MessageProcessingResult,
     StreamOptions,
     Tool,
@@ -1947,6 +1946,191 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_router_ids_preserve_output_budget_and_usage(self):
+        """Router-rendered IDs include the same generation stub as local prompts."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.hf_config.model_type = "kimi_k31"
+        self.tm.tokenizer.apply_chat_template.return_value = [11, 22, 33, 44]
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "router-usage",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "default",
+                },
+            }
+        ]
+        for extra, expected_ids, expected_budget, expected_prompt in (
+            ({}, [11, 22, 33, 44], 7, 7),
+            ({"kimi_k3_input_ids": [11, 22, 33, 44]}, [11, 22, 33, 44], 7, 7),
+            ({"input_ids": [99], "kimi_k3_input_ids": [11, 22]}, [99], 10, 10),
+        ):
+            with self.subTest(extra=extra):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_completion_tokens=10,
+                    **extra,
+                )
+                adapted, _ = self.chat._convert_to_internal_request(request)
+                self.assertEqual(adapted.input_ids, expected_ids)
+                self.assertEqual(
+                    adapted.sampling_params["max_new_tokens"], expected_budget
+                )
+                usage = self.chat._build_chat_response(
+                    request, copy.deepcopy(ret), 123
+                ).usage
+                self.assertEqual(usage.prompt_tokens, expected_prompt)
+                self.assertEqual(usage.completion_tokens, 4)
+                self.assertEqual(usage.total_tokens, expected_prompt + 4)
+
+    def test_kimi_k3_router_stream_usage_and_headers_match_local_encoding(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = None
+        event = {
+            "text": "A",
+            "index": 0,
+            "meta_info": {
+                "id": "router-stream",
+                "prompt_tokens": 10,
+                "completion_tokens": 1,
+                "cached_tokens": 6,
+                "cache_usage": {
+                    "read_tokens": 6,
+                    "write_tokens": 4,
+                    "ttl_seconds": 300,
+                },
+                "finish_reason": {"type": "stop"},
+                "weight_version": "default",
+            },
+        }
+        results = []
+        for extra in ({}, {"kimi_k3_input_ids": [11, 22, 33]}):
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                stream_options={"include_usage": True},
+                **extra,
+            )
+
+            async def generate(*args, **kwargs):
+                yield copy.deepcopy(event)
+
+            self.tm.generate_request = generate
+            headers = {}
+
+            async def collect():
+                return [
+                    chunk
+                    async for chunk in self.chat._generate_chat_stream(
+                        Mock(), request, self.fastapi_request, usage_headers=headers
+                    )
+                ]
+
+            chunks = get_or_create_event_loop().run_until_complete(collect())
+            usages = [
+                frame["usage"]
+                for frame in self._parse_chunks(chunks)
+                if frame.get("usage")
+            ]
+            results.append((usages, headers))
+        self.assertEqual(results[0], results[1])
+        final_usage = results[1][0][-1]
+        self.assertEqual(final_usage["prompt_tokens"], 7)
+        self.assertEqual(final_usage["completion_tokens"], 4)
+        self.assertEqual(final_usage["total_tokens"], 11)
+        self.assertEqual(final_usage["cached_tokens"], 6)
+        self.assertEqual(results[1][1]["Msh-Usage-Cache-Write-Tokens-5m"], "1")
+
+    def test_kimi_k3_local_continuation_keeps_custom_response_template_opener(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        detector = Mock(spec=ResponseTemplateReasoningDetector)
+        detector.answer_opener.return_value = "<answer>"
+        self.chat._reasoning_detector = detector
+        self.tm.tokenizer.apply_chat_template.return_value = [10]
+        self.tm.tokenizer.encode.side_effect = lambda value: {
+            "<answer>Prefix": [1, 20],
+            "Prefix": [1, 30],
+        }[value]
+        request = ChatCompletionRequest(
+            model="x",
+            continue_final_message=True,
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Prefix"},
+            ],
+        )
+        ids = self.chat._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+            image_data=[],
+        )
+        self.assertEqual(ids, [10, 20])
+        self.assertFalse(self.chat.supports_kimi_k3_input_ids())
+
+    def test_kimi_k3_router_media_ids_keep_images_and_fall_back_when_ineligible(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.is_multimodal = True
+        self.tm.mm_processor = Mock(kimi_k3_media_input_ids_version=1)
+        self.tm.tokenizer.apply_chat_template.return_value = [71, 72]
+        body = {
+            "model": "x",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                    ],
+                }
+            ],
+            "kimi_k3_media_input_ids": [81, 82],
+        }
+        result = self.chat._process_messages(ChatCompletionRequest(**body), True)
+        self.assertEqual(result.prompt_ids, [81, 82])
+        self.assertEqual(len(result.image_data), 1)
+        self.assertIn("https://example.com/image.png", str(result.image_data[0]))
+        self.tm.mm_processor.kimi_k3_media_input_ids_version = None
+        fallback = self.chat._process_messages(ChatCompletionRequest(**body), True)
+        self.assertEqual(fallback.prompt_ids, [71, 72])
+        self.assertEqual(fallback.image_data, result.image_data)
+        # A text-only contract never admits image placeholders by accident.
+        body["kimi_k3_input_ids"] = body.pop("kimi_k3_media_input_ids")
+        fallback = self.chat._process_messages(ChatCompletionRequest(**body), True)
+        self.assertEqual(fallback.prompt_ids, [71, 72])
+        self.assertEqual(fallback.image_data, result.image_data)
+
+    def test_kimi_k3_router_capability_follows_effective_config(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.is_multimodal = True
+        self.tm.mm_processor = Mock(kimi_k3_media_input_ids_version=1)
+        self.assertTrue(self.chat.supports_kimi_k3_input_ids())
+        self.assertTrue(self.chat.supports_kimi_k3_media_input_ids())
+        with get_context().override_server_args(chat_template="custom.jinja"):
+            self.assertFalse(self.chat.supports_kimi_k3_input_ids())
+            self.assertFalse(self.chat.supports_kimi_k3_media_input_ids())
+        with get_context().override_server_args(enable_multimodal=False):
+            self.assertTrue(self.chat.supports_kimi_k3_input_ids())
+            self.assertFalse(self.chat.supports_kimi_k3_media_input_ids())
+        self.chat.default_chat_template_kwargs = {"chat_template": "custom"}
+        self.assertFalse(self.chat.supports_kimi_k3_input_ids())
+        self.chat.default_chat_template_kwargs = {}
+        self.chat.chat_encoding_spec = None
+        self.assertFalse(self.chat.supports_kimi_k3_input_ids())
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
@@ -3305,7 +3489,6 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )
-
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):

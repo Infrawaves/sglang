@@ -240,6 +240,7 @@ fn router_ctx_with(
             ..Default::default()
         };
         let profile = EngineProfile {
+            capabilities: Default::default(),
             openai: None,
             protocol: WireProtocol::default(),
             dp_ranks: 1,

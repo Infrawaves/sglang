@@ -282,6 +282,15 @@ per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3)) for which
 chats forward `input_ids`.
 
+### Kimi-K3 and K3.1 Python encoding
+
+`--chat-encoder kimi-k3` renders and tokenizes supported text and image chats once
+in persistent Python processes, then sends the same IDs to compatible P/D
+workers. It shares the Python serving encoder, preserves K3.1 token accounting,
+and falls back to worker encoding when capabilities are missing. See
+[Python encoder pool](REFERENCE.md#kimi-k3-and-k31-python-chat-encoder) for the
+Python environment, flags, compatibility rules, and metrics.
+
 ### Anthropic Messages
 
 `/v1/messages` is converted to a chat completion and back.
