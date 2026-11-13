@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SGLang 代码仓库架构梳理（infrawaves/dev/v0.5.23-k31）</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px 32px; line-height: 1.7; color: #222; background: #fafafa; }
+  h1 { border-bottom: 3px solid #3b6fd8; padding-bottom: 8px; }
+  h2 { margin-top: 40px; color: #2a4f9e; border-left: 5px solid #3b6fd8; padding-left: 10px; }
+  h3 { margin-top: 26px; color: #333; }
+  code { background: #eef1f6; padding: 1px 5px; border-radius: 4px; font-family: Menlo, Consolas, monospace; font-size: 0.92em; }
+  pre { background: #1f2430; color: #e6e6e6; padding: 16px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; background: #fff; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #e8eefb; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .note { background: #fff8e1; border-left: 4px solid #f0b400; padding: 10px 14px; margin: 16px 0; }
+  nav { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px 20px; }
+  nav a { color: #2a4f9e; text-decoration: none; }
+</style>
+</head>
+<body>
+
+<h1>SGLang 代码仓库架构梳理</h1>
+<p>分支：<code>infrawaves/dev/v0.5.23-k31</code></p>
+<div class="note">本文根据目录结构、文件名、该分支的提交记录以及 SGLang 的已知架构整理，并未逐个读完所有文件，各模块的作用说明属于概括性描述。</div>
+
+<nav>
+  <strong>目录</strong>
+  <ul>
+    <li><a href="#top">一、顶层目录</a></li>
+    <li><a href="#pkg">二、python/sglang/ 包结构</a></li>
+    <li><a href="#srt">三、srt/ 运行时：请求流转路径与各模块</a></li>
+    <li><a href="#k3">四、本分支的 Kimi K3/K3.1 定制</a></li>
+  </ul>
+</nav>
+
+<h2 id="top">一、顶层目录</h2>
+<table>
+  <tr><th>目录</th><th>作用</th></tr>
+  <tr><td><code>python/sglang/</code></td><td>主体 Python 包，推理引擎的核心都在这里</td></tr>
+  <tr><td><code>rust/</code></td><td>Rust 组件：<code>sglang-server</code>（Rust HTTP 服务）、<code>sglang-processor</code>（chat 模板渲染和预处理）、<code>sglang-radix-tree</code>（Rust 实现的前缀树）、<code>sglang-grpc</code>、<code>sglang-mm</code>（多模态）、<code>sglang-api-types/codegen</code>（API 类型）、<code>sglang-bench</code></td></tr>
+  <tr><td><code>sgl-model-gateway/</code>、<code>sgl-router/</code></td><td>Rust 写的网关和路由，放在多个推理实例前面，做负载均衡、按缓存亲和性路由和 PD 分离路由</td></tr>
+  <tr><td><code>proto/</code></td><td>gRPC 协议定义</td></tr>
+  <tr><td><code>test/</code></td><td>CI 测试，配置固定，用来做正确性和回归检查</td></tr>
+  <tr><td><code>benchmark/</code></td><td>各类性能和精度基准测试（kernel、hicache、PD 分离、LoRA 等）</td></tr>
+  <tr><td><code>docs/</code></td><td>文档，其中 <code>docs/cookbook/</code> 是按模型厂商组织的推荐部署方式</td></tr>
+  <tr><td><code>docker/</code>、<code>scripts/</code>、<code>tools/</code>、<code>examples/</code>、<code>3rdparty/</code></td><td>镜像、脚本、工具、示例、第三方依赖（AMD）</td></tr>
+</table>
+
+<h2 id="pkg">二、python/sglang/ 包结构</h2>
+<ul>
+  <li><strong><code>srt/</code></strong>（SGLang Runtime）：推理服务运行时，见第三部分。</li>
+  <li><strong><code>lang/</code></strong>：SGLang 前端 DSL，包括 <code>api.py</code>、<code>ir.py</code>、<code>interpreter.py</code>、<code>tracer.py</code>，用来写结构化的 LLM 程序（gen、select、fork 等）。</li>
+  <li><strong><code>kernels/</code></strong>：自研 kernel 的注册和选择层，包括 <code>jit</code>、<code>aot</code>、<code>ops</code>、<code>arch</code>、<code>registry.py</code>、<code>selector.py</code>，按硬件选用实现。</li>
+  <li><strong><code>multimodal_gen/</code></strong>：扩散模型运行时，处理图像、视频、3D 生成，和 LLM 的 srt 是两套独立的东西。</li>
+  <li><strong><code>cli/</code></strong>：命令行入口，<code>sglang serve</code>、<code>generate</code>、<code>killall</code> 等。</li>
+  <li><strong><code>launch_server.py</code></strong>：启动服务的入口。</li>
+  <li><strong><code>api/</code>、<code>benchmark/</code>、<code>test/</code>、<code>profiler.py</code>、<code>check_env.py</code></strong>：API 定义、压测工具、测试工具、性能分析、环境检查。</li>
+</ul>
+
+<h2 id="srt">三、srt/ 运行时：请求流转路径与各模块</h2>
+<p>SGLang 用多进程架构，进程之间通过 ZMQ 通信：</p>
+<pre><code>HTTP/gRPC 请求
+  → entrypoints（http_server / OpenAI 兼容 API）
+  → TokenizerManager（分词、多模态预处理）        [主进程]
+  → DataParallelController（DP&gt;1 时分发请求）
+  → Scheduler（调度、组 batch、管理 KV 缓存）       [每个 GPU rank 一个进程]
+      → TpModelWorker → ModelRunner → 模型 forward → Sampler
+  → DetokenizerManager（增量反分词）               [独立进程]
+  → 流式返回给客户端</code></pre>
+
+<h3>1. 入口层：<code>entrypoints/</code></h3>
+<ul>
+  <li><code>http_server.py</code>：FastAPI 服务。</li>
+  <li><code>engine.py</code>：离线 Engine API，可以不起 HTTP 服务直接调用。</li>
+  <li><code>openai/</code>、<code>anthropic/</code>、<code>ollama/</code>：各家 API 协议的兼容层（Chat、Completions、Responses、Embeddings）。</li>
+  <li><code>grpc_server.py</code>、<code>grpc_bridge.py</code>：gRPC 服务。</li>
+  <li><code>warmup.py</code>：服务启动后的预热。</li>
+</ul>
+
+<h3>2. 请求管理与调度：<code>managers/</code></h3>
+<ul>
+  <li><code>tokenizer_manager.py</code>：接收请求、分词、跟踪请求状态、汇总输出。</li>
+  <li><code>scheduler.py</code>：核心事件循环。负责接收请求、组 prefill/decode batch、调用 worker、处理结果。具体功能拆在 <code>scheduler_components/</code> 里：<code>request_receiver</code>、<code>batch_result_processor</code>、<code>output_streamer</code>、<code>metrics_reporter</code>、<code>weight_updater</code> 等。</li>
+  <li><code>schedule_policy.py</code>：调度策略，比如按最长前缀匹配（LPM）优先、FCFS。</li>
+  <li><code>schedule_batch.py</code>：<code>Req</code> 和 <code>ScheduleBatch</code> 这两个数据结构。</li>
+  <li><code>tp_worker.py</code>：张量并行 worker，封装 ModelRunner。</li>
+  <li><code>detokenizer_manager.py</code>：反分词。</li>
+  <li><code>data_parallel_controller.py</code>：数据并行时分发请求。</li>
+  <li><code>io_struct.py</code>：进程间传递的消息结构。</li>
+  <li><code>overlap_utils.py</code>：CPU 调度和 GPU 计算重叠执行。</li>
+</ul>
+
+<h3>3. 模型执行：<code>model_executor/</code></h3>
+<ul>
+  <li><code>model_runner.py</code>：加载模型、初始化 KV 池和 attention 后端、执行 forward。拆分出的部分在 <code>model_runner_components/</code> 里。</li>
+  <li><code>forward_batch_info.py</code>、<code>forward_mode.py</code>：<code>ForwardBatch</code> 结构和 EXTEND/DECODE/IDLE 等执行模式。</li>
+  <li><code>runner/</code>：CUDA Graph 捕获和回放（decode、prefill、按行分桶），以及 eager 模式执行。</li>
+</ul>
+
+<h3>4. 模型与网络层</h3>
+<ul>
+  <li><strong><code>models/</code></strong>：约 260 个模型实现（Llama、Qwen、DeepSeek、Kimi K3 等）。</li>
+  <li><strong><code>layers/</code></strong>：
+    <ul>
+      <li><code>attention/</code>：可插拔的 attention 后端，有 FlashInfer、FlashAttention、Triton、TRT-LLM MHA/MLA、FlashMLA、AITer（ROCm）、DSA 稀疏注意力、线性注意力和 Mamba 等，通过 <code>attention_registry.py</code> 选择。</li>
+      <li><code>moe/</code>：MoE 的 topk 路由、fused_moe_triton、cutlass/flashinfer MoE、EP 的 token dispatcher（DeepEP 等）。</li>
+      <li><code>quantization/</code>：FP8、FP4、INT4、AWQ、GPTQ、ModelOpt 等量化方式。</li>
+      <li><code>linear.py</code>、<code>vocab_parallel_embedding.py</code>、<code>layernorm.py</code>、<code>rotary_embedding/</code>：基础层，大部分支持张量并行。</li>
+      <li><code>communication/</code>、<code>dp_attention.py</code>、<code>cp/</code>、<code>dcp/</code>：通信融合、DP attention、上下文并行。</li>
+      <li><code>logits_processor.py</code>、<code>sampler.py</code>：计算 logits 和采样。</li>
+      <li><code>radix_attention.py</code>：模型调用 attention 的统一接口。</li>
+    </ul>
+  </li>
+  <li><strong><code>model_loader/</code></strong>：权重加载，支持 safetensors、GGUF、expert pack 等格式。</li>
+  <li><strong><code>configs/</code></strong>：各模型的 HF 配置适配。</li>
+</ul>
+
+<h3>5. 显存与 KV 缓存：<code>mem_cache/</code></h3>
+<ul>
+  <li><code>radix_cache.py</code>：RadixAttention 前缀缓存（基数树），让请求复用相同前缀的 KV。这是 SGLang 的核心特性。</li>
+  <li><code>memory_pool.py</code>、<code>allocator/</code>：token 到 KV 的映射表和分页分配器。</li>
+  <li><code>swa_memory_pool.py</code>、<code>hybrid_cache/</code>、<code>mamba_*</code>：滑动窗口注意力、混合架构、Mamba 状态池。</li>
+  <li><code>hicache_*</code>、<code>memory_pool_host.py</code>、<code>storage/</code>：HiCache 分层缓存，把 KV 卸载到 CPU 内存或外部存储（3FS、Mooncake 等）。</li>
+  <li><code>evict_policy.py</code>：缓存淘汰策略。</li>
+</ul>
+
+<h3>6. 采样与约束解码</h3>
+<ul>
+  <li><code>sampling/</code>：采样参数、penalty、自定义 logit processor。</li>
+  <li><code>constrained/</code>：结构化输出（JSON schema、正则、EBNF），后端用 xgrammar、outlines 等。</li>
+  <li><code>function_call/</code>：各模型的工具调用解析器（如 <code>kimik3_detector.py</code>）。</li>
+  <li><code>parser/</code>：推理内容（reasoning）解析。</li>
+</ul>
+
+<h3>7. 高级特性</h3>
+<ul>
+  <li><strong><code>speculative/</code></strong>：投机解码，包括 EAGLE/EAGLE3、多层 EAGLE、NGram、DFlash、Standalone 草稿模型等 worker 和对应的 CUDA Graph runner。</li>
+  <li><strong><code>disaggregation/</code></strong>：Prefill/Decode 分离部署。<code>prefill.py</code>、<code>decode.py</code> 是两种角色，<code>mooncake/</code>、<code>nixl/</code>、<code>mori/</code>、<code>ascend/</code> 是 KV 传输后端。</li>
+  <li><strong><code>distributed/</code></strong>：<code>parallel_state.py</code> 管理 TP/PP/EP 通信组，<code>device_communicators/</code> 是自定义 AllReduce、PyNCCL 等。</li>
+  <li><strong><code>eplb/</code>、<code>elastic_ep/</code></strong>：专家并行的负载均衡和弹性扩缩。</li>
+  <li><strong><code>lora/</code></strong>：多 LoRA 服务。</li>
+  <li><strong><code>multimodal/</code></strong>：VLM 图像和视频预处理（<code>processors/</code>）以及视觉编码器。</li>
+  <li><strong><code>batch_overlap/</code></strong>：Two-Batch Overlap，用两个 micro-batch 让计算和通信重叠。</li>
+  <li><strong><code>weight_sync/</code>、<code>checkpoint_engine/</code>、<code>ray/</code></strong>：给 RL 训练用的在线权重更新和 Ray 集成。</li>
+  <li><strong><code>compilation/</code></strong>：torch.compile 集成。</li>
+  <li><strong><code>hardware_backend/</code>、<code>platforms/</code></strong>：CUDA、ROCm、NPU、XPU、CPU 等平台适配。</li>
+  <li><strong><code>observability/</code></strong>：Prometheus 指标和 tracing。</li>
+</ul>
+
+<h3>8. 配置</h3>
+<ul>
+  <li><code>server_args.py</code>：所有启动参数，<code>arg_groups/</code> 按功能分组，<code>model_overrides/</code> 放各模型的参数覆盖。</li>
+  <li><code>environ.py</code>：<code>SGLANG_*</code> 环境变量的统一定义。</li>
+</ul>
+
+<h2 id="k3">四、本分支的 Kimi K3/K3.1 定制</h2>
+<p>这个分支（Infrawaves fork）为 Kimi K3/K3.1 加了一批代码，分布在整个框架里：</p>
+<table>
+  <tr><th>类别</th><th>文件</th></tr>
+  <tr><td>模型</td><td><code>models/kimi_k3.py</code>、<code>kimi_k3_vl.py</code>、<code>kimi_k3_rocm_quant.py</code>，配置在 <code>configs/kimi_k3.py</code></td></tr>
+  <tr><td>启动参数</td><td><code>arg_groups/kimi_k3_hook.py</code>、<code>arg_groups/model_overrides/kimi_k3.py</code></td></tr>
+  <tr><td>多模态</td><td><code>multimodal/processors/kimi_k3.py</code>、<code>kimi_k3_image_processing.py</code>，以及 ViT 的 CUDA Graph runner（<code>kimi_k3_vit_cuda_graph_runner.py</code>）。最近的 vit[1–5] 系列提交优化了图像预处理的显存，修了 OOM。</td></tr>
+  <tr><td>工具调用</td><td><code>function_call/kimik3_detector.py</code>、<code>kimik3_format.py</code>、<code>kimik3_structural_tag.py</code></td></tr>
+  <tr><td>通信优化</td><td><code>layers/communication/k3_ar_fusion.py</code>、<code>k3_sp_collective.py</code>、<code>k3_sp_gemm_fusion.py</code>、<code>k3_shared_weight_stream.py</code></td></tr>
+  <tr><td>Kernel 插件</td><td><code>kernel_plugins/nvidia/kimi_k31_*</code>（decode、verify、DSA verify，以及 GB 系列 GPU 的运行时优化），还有 B300 TP8 的 FlashInfer tactic 配置（<code>model_executor/runner/flashinfer_tactics/kimi_k31_b300_tp8.json</code>）</td></tr>
+  <tr><td>权重加载</td><td><code>model_loader/kimi_k3_gguf.py</code></td></tr>
+  <tr><td>最近的修复</td><td>Responses API 的输出 token 预算、K3 generation stub 的 token 计数，以及对 <code>additional_tools</code> 输入项的支持</td></tr>
+</table>
+
+<p style="margin-top:40px;color:#888;font-size:0.9em;">注：除特别标明外，第三、四部分的路径都相对于 <code>python/sglang/srt/</code>。</p>
+</body>
+</html>
