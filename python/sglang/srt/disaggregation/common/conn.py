@@ -751,6 +751,13 @@ class CommonKVManager(BaseKVManager):
             )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        notification = self._update_status_state(bootstrap_room, status)
+        self._notify_bootstrap(bootstrap_room, notification)
+
+    def _update_status_state(
+        self, bootstrap_room: int, status: KVPoll
+    ) -> BootstrapNotification:
+        """Update bookkeeping only; callers send notifications after unlocking."""
         if status == KVPoll.Failed and self._transfer_lifetime is not None:
             self._transfer_lifetime.close(bootstrap_room)
         current = self.request_status.get(bootstrap_room)
@@ -771,9 +778,7 @@ class CommonKVManager(BaseKVManager):
         if status == KVPoll.Failed:
             self.request_status[bootstrap_room] = KVPoll.Failed
             if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
-                )
+                return self.deferred_bootstrap.fail(bootstrap_room)
             return
         if current == KVPoll.Failed:
             # Failed is terminal. It also sorts lowest, so the max() below would
@@ -813,7 +818,8 @@ class CommonKVManager(BaseKVManager):
         # Retain cancellation even if it beats source creation. Let the backend
         # process ABORT normally as well, including ACK/draining after allocation.
         self.deferred_bootstrap.fail(room)
-        if room in self.request_status and self.request_status[room] != KVPoll.Success:
+        status = self.request_status.get(room)
+        if status is not None and status != KVPoll.Success:
             self.update_status(room, KVPoll.Failed)
         return False
 
@@ -1200,13 +1206,19 @@ class CommonKVManager(BaseKVManager):
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
+        self._send_abort_acks(room, self._take_drained_abort_targets(room))
+
+    def _take_drained_abort_targets(
+        self, room: int
+    ) -> Optional[Dict[Tuple[str, int], AckTarget]]:
+        """Take ACK targets without doing I/O under a backend's drain lock."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
         if room in self._deferred_ack_poisoned_rooms:
             # A target registered concurrently with the poison must not fire.
             self._deferred_ack_targets.pop(room, None)
             return
-        self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
+        return self._deferred_ack_targets.pop(room, None)
 
     def _send_abort_acks(
         self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
@@ -1351,10 +1363,14 @@ class CommonKVManager(BaseKVManager):
         with self.connection_lock:
             return self._parallel_info_epochs.get(bootstrap_addr, 0)
 
-    def register_receiver_room(self, *, bootstrap_room: int, bootstrap_addr: str):
-        """Make a new receiver the owner of ``bootstrap_room``; returns its generation."""
+    def register_receiver_room(
+        self, *, bootstrap_room: int, bootstrap_addr: str
+    ) -> Optional[object]:
+        """Return a new ownership generation, or None for a force-retired room."""
         generation = object()
         with self.connection_lock:
+            if bootstrap_room in getattr(self, "_force_released_rooms", ()):
+                return None
             self.room_generations[bootstrap_room] = generation
             # Plain dict: a Success for an unseeded (cleared) room is dropped.
             self.prefill_response_tracker.setdefault(bootstrap_room, set())
@@ -2508,23 +2524,13 @@ class CommonKVSender(BaseKVSender):
         self.init_time: Optional[float] = None
         self._prefill_complete_time: Optional[float] = None
         self._owns_bootstrap_room = True
-        if mgr.deferred_bootstrap is not None:
-            room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
-            self._owns_bootstrap_room = room_state is not None
-            mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-            if room_state is None or room_state.failed:
-                mgr.record_failure(
-                    bootstrap_room, "Duplicate or cancelled bootstrap room"
-                )
-                mgr.update_status(bootstrap_room, KVPoll.Failed)
-                self.conclude_state = KVPoll.Failed
-                return
-        if self.kv_mgr.is_dummy_cp_rank:
-            # Non-authoritative CP ranks are dummy participants.
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        notification = self._register_bootstrap_room()
+        # Backends may serialize local registration with room retirement. All
+        # notifications and HTTP registration must run after that lock is gone.
+        mgr._notify_bootstrap(bootstrap_room, notification)
+        if self.conclude_state == KVPoll.Failed or mgr.is_dummy_cp_rank:
             return
 
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if get_parallel().num_dp_ranks > 1 and not req_has_disagg_prefill_dp_rank:
             if (
                 get_parallel().load_balance_method != "follow_bootstrap_room"
@@ -2549,6 +2555,23 @@ class CommonKVSender(BaseKVSender):
                 return
         # Bootstrap timeout clock starts after the registration above.
         self.init_time = time.time()
+
+    def _register_bootstrap_room(self) -> BootstrapNotification:
+        """Claim and publish local room state without performing network I/O."""
+        mgr, room = self.kv_mgr, self.bootstrap_room
+        if mgr.deferred_bootstrap is not None:
+            room_state = mgr.deferred_bootstrap.open(room, self)
+            self._owns_bootstrap_room = room_state is not None
+            mgr._update_status_state(room, KVPoll.Bootstrapping)
+            if room_state is None or room_state.failed:
+                mgr.record_failure(room, "Duplicate or cancelled bootstrap room")
+                self.conclude_state = KVPoll.Failed
+                return mgr._update_status_state(room, KVPoll.Failed)
+        # Non-authoritative CP ranks are dummy participants.
+        status = (
+            KVPoll.WaitingForInput if mgr.is_dummy_cp_rank else KVPoll.Bootstrapping
+        )
+        return mgr._update_status_state(room, status)
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
@@ -2781,10 +2804,16 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        cleared, notification = self._clear_state()
+        if cleared:
+            self._finish_clear(notification)
+
+    def _clear_state(self) -> Tuple[bool, BootstrapNotification]:
+        """Retire room bookkeeping without sending to a potentially dead peer."""
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:
-                return
+                return False, None
             notification = self.kv_mgr.deferred_bootstrap.close(
                 self.bootstrap_room,
                 self,
@@ -2799,15 +2828,18 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
-        # A sender can be cleared while a counted transfer is still writing:
-        # keep the target for the worker, or ACK now if nothing is in flight.
-        self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
         staging_ctx = self.kv_mgr._staging_ctx
         if staging_ctx is not None:
             staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             for key in list(staging_ctx.prefetch_requested):
                 if key[0] == self.bootstrap_room:
                     staging_ctx.prefetch_requested.discard(key)
+        return True, notification
+
+    def _finish_clear(self, notification: BootstrapNotification) -> None:
+        # A sender can be cleared while a counted transfer is still writing:
+        # keep the target for the worker, or ACK now if nothing is in flight.
+        self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
         if notification is not None:
             endpoint, failed = notification
             self.kv_mgr.send_kv_status_message(
@@ -2830,7 +2862,7 @@ class CommonKVSender(BaseKVSender):
         )
 
     def abort(self):
-        if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+        if not self._owns_bootstrap_room:
             return
         self.kv_mgr.conclude_failure(
             bootstrap_room=self.bootstrap_room,
@@ -2917,6 +2949,14 @@ class CommonKVReceiver(BaseKVReceiver):
         self._room_generation = mgr.register_receiver_room(
             bootstrap_room=bootstrap_room, bootstrap_addr=bootstrap_addr
         )
+        if self._room_generation is None:
+            # A retired room is a request rejection, not a scheduler failure.
+            # Registration did not publish state or grant ownership, so abort
+            # and clear must not touch the room held by another lifecycle.
+            self._owns_bootstrap_room = False
+            self._setup_cancelled = True
+            self._local_failure_reason = "Bootstrap room was force-released"
+            self.conclude_state = KVPoll.Failed
 
     def init(self, prefill_dp_rank: int):
         if self._setup_cancelled:

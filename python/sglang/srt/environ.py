@@ -894,6 +894,10 @@ class Envs:
     # remain opted out. The timeout controls warnings/retries, not unsafe reuse.
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Unsafe, opt-in Mooncake device-KV reclamation without a native drain proof.
+    # Seconds held in P's GPU-complete transfer queue / D's failed-release queue;
+    # 0 disables. Set to 600 on both P and D for a ten-minute limit.
+    SGLANG_DISAGGREGATION_FORCE_KV_RELEASE_TIMEOUT = EnvFloat(0.0)
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)

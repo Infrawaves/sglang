@@ -14,6 +14,7 @@ class _RoomLifetime:
     opened: bool = False
     closed: bool = False
     pending: int = 0
+    force_released: bool = False
 
 
 class TransferLifetimeTracker:
@@ -56,6 +57,9 @@ class TransferLifetimeTracker:
         """
         with self._lock:
             state = self._rooms.get(room)
+            if state is not None and state.force_released:
+                # A late worker must not decrement a retired room or ACK drain.
+                return
             if state is None or state.pending <= 0:
                 raise RuntimeError(f"PD transfer lease underflow for room {room}")
             state.pending -= 1
@@ -79,13 +83,31 @@ class TransferLifetimeTracker:
         """
         with self._lock:
             state = self._rooms.get(room)
-            return state is None or state.pending == 0
+            return state is None or (not state.force_released and state.pending == 0)
+
+    def force_release(self, room: int) -> None:
+        """Retire without claiming that native I/O stopped (explicit opt-in).
+
+        Keep a small tombstone until process exit: late ABORTs must never ACK
+        this room as drained, and its ID must not admit another transfer.
+        """
+        with self._lock:
+            state = self._rooms.setdefault(room, _RoomLifetime())
+            state.closed = True
+            state.force_released = True
+
+    def is_force_released(self, room: int) -> bool:
+        with self._lock:
+            state = self._rooms.get(room)
+            return state is not None and state.force_released
 
     def clear(self, room: int) -> None:
         """Retire a drained sender without discarding early-abort tombstones."""
         with self._lock:
             state = self._rooms.get(room)
             if state is None:
+                return
+            if state.force_released:
                 return
             state.closed = True
             if state.pending:

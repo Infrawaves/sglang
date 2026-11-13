@@ -3028,9 +3028,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
+        self.force_kv_release_timeout = (
+            envs.SGLANG_DISAGGREGATION_FORCE_KV_RELEASE_TIMEOUT.get()
+        )
         # Aborted-mid-transfer requests whose KV pages/slot are held until all
-        # writers drain. Mooncake and host destinations never release on the
-        # deadline (it only triggers warnings/abort retries); other backends may.
+        # writers drain. This deadline only triggers Mooncake warnings/retries;
+        # its opt-in force timeout has a separate, fixed per-request deadline.
+        # Host destinations never time out; other backends retain their policy.
         # Entries: (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
@@ -3565,6 +3569,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
         receiver = decode_req.kv_receiver
+        force_timeout = getattr(self, "force_kv_release_timeout", 0)
+        force_supported = (
+            not self.enable_staging
+            and not decode_req.host_staged
+            and callable(getattr(receiver, "force_release", None))
+        )
+        decode_req._force_kv_release_deadline = (
+            start_time + force_timeout
+            if force_timeout > 0
+            and receiver.kv_mgr.requires_transfer_drain
+            and force_supported
+            else None
+        )
+        if (
+            force_timeout > 0
+            and receiver.kv_mgr.requires_transfer_drain
+            and not force_supported
+        ):
+            logger.warning(
+                "Force KV release is unsupported for this receiver or staging/host "
+                "receive room %s; retaining its buffers until remote drain ACKs arrive.",
+                decode_req.req.bootstrap_room,
+            )
         if receiver.kv_mgr.requires_transfer_drain:
             # A skipped nonblocking send should not wait for a 30s warning.
             # Once accepted, allow the normal ACK wait before retrying.
@@ -3651,18 +3678,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return bool(self._deferred_releases or self._failed_deferred_releases)
 
     def _local_deferred_release_ready(
-        self, decode_req: DecodeRequest, required_acks: int
+        self,
+        decode_req: DecodeRequest,
+        required_acks: int,
+        *,
+        ignore_remote_ack: bool = False,
     ) -> bool:
-        """Whether no remote write or local DMA can still touch these pages."""
+        """Check remote ACKs and local DMA, or local DMA alone for an opt-in force."""
         room = decode_req.req.bootstrap_room
         if self._is_host_destination(decode_req):
             if not decode_req.kv_receiver.is_abort_release_safe():
                 return False
-        elif not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
-            room,
-            required_acks,
-            # Only this receiver's ACKs prove its writers stopped.
-            generation=decode_req.kv_receiver._abort_generation,
+        elif (
+            not ignore_remote_ack
+            and not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                room,
+                required_acks,
+                # Only this receiver's ACKs prove its writers stopped.
+                generation=decode_req.kv_receiver._abort_generation,
+            )
         ):
             return False
         if decode_req.hicache_restore_lock is not None:
@@ -3695,8 +3729,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         """Release drained transfers in the same order on every Attention TP rank.
 
         Entries are appended from agreed holds, so every rank reduces the same
-        list in the same order. Mooncake and host destinations never release on
-        timeout; other backends may release device destinations after the deadline.
+        list in the same order. Mooncake force reclamation is opt-in and still
+        waits for local DMA; host destinations always require drain ACKs.
         """
         if not self._deferred_releases:
             return
@@ -3708,8 +3742,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req, start_time, deadline, idx, required_acks = entry
             room = decode_req.req.bootstrap_room
             is_drained = self._local_deferred_release_ready(decode_req, required_acks)
-            # A timeout cannot prove that a remote write has stopped: host
-            # destinations and synchronous Mooncake transfers stay quarantined.
+            # The force option bypasses only missing remote ACKs, never local DMA.
+            # Keep is_drained separate: a timer is not a transfer-drain proof.
+            force_deadline = getattr(decode_req, "_force_kv_release_deadline", None)
+            force_ready = (
+                not is_drained
+                and force_deadline is not None
+                and now >= force_deadline
+                and self._local_deferred_release_ready(
+                    decode_req, required_acks, ignore_remote_ack=True
+                )
+            )
             requires_transfer_drain = getattr(
                 decode_req.kv_receiver.kv_mgr, "requires_transfer_drain", False
             )
@@ -3717,7 +3760,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 not self._is_host_destination(decode_req)
                 and not requires_transfer_drain
             )
-            is_ready = is_drained or (may_time_out and now >= deadline)
+            is_ready = is_drained or force_ready or (may_time_out and now >= deadline)
             if not is_ready and requires_transfer_drain:
                 # Mooncake: re-send the armed ABORT with backoff (an earlier one
                 # may have been skipped or raced sender creation) and keep
@@ -3745,7 +3788,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         to_release = []
         for entry, is_ready, is_drained in zip(refreshed, ready, drained):
-            decode_req, start_time, _, idx, _ = entry
+            decode_req, start_time, _, idx, required_acks = entry
             if is_ready:
                 to_release.append(
                     (
@@ -3754,6 +3797,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         idx,
                         decode_req.req.bootstrap_room,
                         is_drained,
+                        required_acks,
                     )
                 )
         # Commit the survivors (with refreshed deadlines) before releasing so a
@@ -3766,15 +3810,45 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not to_release:
             return
         cleanup_failed = False
-        for decode_req, start_time, idx, room, drained in to_release:
-            if not drained:
-                logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
-                )
+        for decode_req, start_time, idx, room, drained, required_acks in to_release:
             outcome = "drained" if drained else "timeout"
             try:
+                receiver = decode_req.kv_receiver
+                if receiver.kv_mgr.requires_transfer_drain:
+                    if self._local_deferred_release_ready(decode_req, required_acks):
+                        # An ACK may have arrived while the ranks reached consensus.
+                        outcome = "drained"
+                    else:
+                        force_deadline = getattr(
+                            decode_req, "_force_kv_release_deadline", None
+                        )
+                        if (
+                            force_deadline is None
+                            or time.monotonic() < force_deadline
+                            or not self._local_deferred_release_ready(
+                                decode_req, required_acks, ignore_remote_ack=True
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Drain readiness changed before decode release"
+                            )
+                        # Retire late Python control messages before freeing slots.
+                        # This does not cancel or prove completion of native RDMA.
+                        receiver.force_release()
+                        outcome = "forced_timeout"
+                        logger.warning(
+                            "Force releasing decode KV for room %s after %ss without "
+                            "complete remote drain ACKs; late writes may corrupt "
+                            "reused buffers.",
+                            room,
+                            self.force_kv_release_timeout,
+                        )
+                elif not drained:
+                    logger.warning(
+                        f"Deferred KV release for room {room} timed out after "
+                        f"{self.deferred_kv_release_timeout}s without a full drain "
+                        f"ack from prefill; releasing anyway."
+                    )
                 self._do_release(decode_req, idx)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already

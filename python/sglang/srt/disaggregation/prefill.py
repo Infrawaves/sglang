@@ -1269,7 +1269,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.abort()
 
     def poll_prefill_transfer_releasable(self: Scheduler, reqs: List[Req]):
-        """Poll terminal transfers only after source reads and GPU work drain.
+        """Gate retirement on source/GPU drain or the opt-in source override.
 
         PP release-ID consensus uses this same gate, so an early Failed on one
         rank cannot remove a request that a later PP stage must still retain.
@@ -1307,18 +1307,98 @@ class SchedulerDisaggregationPrefillMixin:
                 except Exception:
                     abort_succeeded[i] = False
                     logger.exception("Failed to abort KV sender after peer failure")
-        if terminal_indices:
+        timeout = envs.SGLANG_DISAGGREGATION_FORCE_KV_RELEASE_TIMEOUT.get()
+        release_indices = list(range(len(reqs))) if timeout > 0 else terminal_indices
+        if release_indices:
+            locally_quiescent = [
+                abort_succeeded[i] and not self.has_pending_prefill_result(reqs[i])
+                for i in release_indices
+            ]
             safe = all_reduce_prefill_release_safe(
-                [reqs[i].disagg_kv_sender for i in terminal_indices],
+                [reqs[i].disagg_kv_sender for i in release_indices],
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
-                [
-                    abort_succeeded[i] and not self.has_pending_prefill_result(reqs[i])
-                    for i in terminal_indices
-                ],
+                locally_quiescent,
             )
-            for i, can_release in zip(terminal_indices, safe):
-                if not can_release:
+            for i in release_indices:
+                reqs[i]._pd_force_release_ready = False
+            if timeout > 0:
+                # Only completed/aborted prefill requests reach this transfer
+                # queue. Do not charge active GPU work to the opt-in deadline.
+                eligible = torch.tensor(
+                    [
+                        int(
+                            quiescent
+                            and getattr(
+                                reqs[i].disagg_kv_sender,
+                                "can_force_release",
+                                lambda: False,
+                            )()
+                            and (
+                                polls[i]
+                                in (KVPoll.WaitingForInput, KVPoll.Transferring)
+                                or (not can_release and polls[i] == KVPoll.Failed)
+                            )
+                        )
+                        for i, quiescent, can_release in zip(
+                            release_indices, locally_quiescent, safe
+                        )
+                    ],
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+                    dist.all_reduce(eligible, op=dist.ReduceOp.MIN, group=group)
+                now = time.monotonic()
+                expired = []
+                for i, can_force in zip(release_indices, eligible.tolist()):
+                    req = reqs[i]
+                    if can_force:
+                        if getattr(req, "_pd_force_release_hold_since", None) is None:
+                            req._pd_force_release_hold_since = now
+                        expired.append(
+                            now - req._pd_force_release_hold_since >= timeout
+                        )
+                    else:
+                        expired.append(False)
+                force = torch.tensor(expired, dtype=torch.uint8, device="cpu")
+                for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+                    dist.all_reduce(force, op=dist.ReduceOp.MIN, group=group)
+                if force.any().item():
+                    for j, (i, agreed) in enumerate(
+                        zip(release_indices, force.tolist())
+                    ):
+                        if not agreed:
+                            continue
+                        # Missing terminal notification is also bounded. Abort
+                        # before overriding source drain, never a live producer.
+                        polls[i] = KVPoll.Failed
+                        try:
+                            reqs[i].disagg_kv_sender.abort()
+                        except Exception:
+                            locally_quiescent[j] = False
+                            force[j] = 0
+                            logger.exception("Failed to abort timed-out KV sender")
+                    for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+                        dist.all_reduce(force, op=dist.ReduceOp.MIN, group=group)
+                    # Recheck after closing admission: an open, idle sender
+                    # could acquire a lease between the earlier check and abort.
+                    safe = all_reduce_prefill_release_safe(
+                        [reqs[i].disagg_kv_sender for i in release_indices],
+                        self.attn_cp_cpu_group,
+                        self.attn_tp_cpu_group,
+                        locally_quiescent,
+                    )
+                    for j, (i, agreed) in enumerate(
+                        zip(release_indices, force.tolist())
+                    ):
+                        if agreed and not safe[j]:
+                            # PP still has to agree on release IDs. The actual
+                            # ownership override happens only during retirement.
+                            reqs[i]._pd_force_release_ready = True
+                            safe[j] = True
+            for i, can_release in zip(release_indices, safe):
+                if polls[i] in (KVPoll.Success, KVPoll.Failed) and not can_release:
                     polls[i] = KVPoll.Transferring
 
         return polls
@@ -1338,9 +1418,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        # The polls are reduced across ranks in this order. Terminal polls are
-        # downgraded to Transferring until every rank agrees the source buffers
-        # drained (lease + abort + no pending GPU result).
+        # The polls are reduced across ranks in this order. Retirement requires
+        # drain consensus or the opt-in source override, always retaining the
+        # abort and local GPU completion gates.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
         polls = self.poll_prefill_transfer_releasable(transfer_queue)
 
@@ -1410,6 +1490,17 @@ class SchedulerDisaggregationPrefillMixin:
                     # queue until cancellation and source drain are established.
                     undone_reqs.append(req)
                 continue
+
+            if getattr(req, "_pd_force_release_ready", False):
+                logger.error(
+                    "Force-releasing failed prefill request %s room %s after %.1fs without "
+                    "source drain confirmation; remote access may still be in flight",
+                    req.rid,
+                    req.bootstrap_room,
+                    time.monotonic() - req._pd_force_release_hold_since,
+                )
+                req.disagg_kv_sender.force_release()
+                req._pd_force_release_ready = False
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 # todo: set Transferring correctly in backend
@@ -1484,8 +1575,8 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
-        # The caller has established TP/CP source-drain consensus. Diagnostic
-        # failure lookup itself must never clear state while readers are active.
+        # The caller has established TP/CP release consensus. Diagnostic failure
+        # lookup itself must never clear state while readers may still be active.
         req.disagg_kv_sender.clear()
         # Mute error message for propagated exceptions to avoid duplicate logging
         if getattr(exc, "is_from_another_rank", False):
@@ -1493,9 +1584,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        # The caller reached this only after poll_prefill_transfer_releasable
-        # agreed on every TP/CP rank that the source reads drained, so the
-        # retirer may now free KV, recurrent state and (in the caller) metadata.
+        # The caller established TP/CP drain or the opt-in force override.
+        # Retire KV and recurrent state here, and metadata in the caller.
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR

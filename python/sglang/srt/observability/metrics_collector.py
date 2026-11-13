@@ -1466,7 +1466,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_decode_deferred_kv_release(
         self, duration_seconds: float, outcome: str
     ) -> None:
-        if outcome not in ("drained", "timeout", "error"):
+        if outcome not in ("drained", "timeout", "forced_timeout", "error"):
             raise ValueError(f"Invalid deferred KV release outcome: {outcome}")
         self._log_histogram(self.decode_deferred_kv_release_seconds, duration_seconds)
         self.decode_deferred_kv_release_total.labels(
