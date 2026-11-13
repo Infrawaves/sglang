@@ -16,6 +16,7 @@ import logging
 import math
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from http import HTTPStatus
@@ -1005,6 +1006,41 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
 
+# Arbitrary: a smaller leftover stays cached for the next request instead of
+# paying cudaFree and cudaMalloc again.
+_PREPROCESS_CACHE_RELEASE_BYTES = 1 << 30
+
+
+def _release_preprocess_cache() -> None:
+    if not torch.cuda.is_initialized():
+        return
+    stats = torch.cuda.memory_stats()
+    reserved = stats["reserved_bytes.all.current"]
+    # Free blocks in a segment that still holds a live block cannot be released.
+    releasable = (
+        reserved
+        - stats["allocated_bytes.all.current"]
+        - stats["inactive_split_bytes.all.current"]
+    )
+    if releasable <= _PREPROCESS_CACHE_RELEASE_BYTES:
+        return
+    # The caching allocator keeps freed preprocessing memory reserved; the
+    # scheduler sharing this GPU can only use it once it is back with the driver.
+    start = time.perf_counter()
+    torch.cuda.empty_cache()
+    # Wall time of the caller's stall: cudaFree also waits for this process's
+    # pending GPU work.
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    remaining = torch.cuda.memory_reserved()
+    logger.info(
+        "Kimi-K3 preprocess: released %.2f GiB of cached GPU memory in %.1f ms, "
+        "%.2f GiB still reserved",
+        (reserved - remaining) / 2**30,
+        elapsed_ms,
+        remaining / 2**30,
+    )
+
+
 class KimiK3ImageProcessor(
     KimiGridMMDataMixin,
     MediaArtifactCacheMixin,
@@ -1922,6 +1958,9 @@ class KimiK3ImageProcessor(
             self._resolve_visual_modalities(
                 request_obj, expected_image_count, len(video_data)
             )
+        # Features kept on the GPU until dispatch outlive their own request's
+        # release below; free them before this request's allocations pin them.
+        _release_preprocess_cache()
         if (
             video_data
             or any(self._is_preprocessed_input(item) for item in image_data)
@@ -1929,16 +1968,19 @@ class KimiK3ImageProcessor(
         ):
             # 1. keep video, preprocessed inputs, and cache-off requests on the
             # uncached path. Image artifacts remain image-only.
-            return await self._process_mm_data_uncached(
+            output = await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )
-
-        # 2. resolve per-image artifacts before composing the current prompt
-        artifacts = await self.prepare_media_artifacts(
-            image_data,
-            content_hashes=request_obj.mm_content_hashes,
-        )
-        return self.compose_request(input_text, artifacts)
+        else:
+            # 2. resolve per-image artifacts before composing the current prompt
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=request_obj.mm_content_hashes,
+            )
+            output = self.compose_request(input_text, artifacts)
+        # Under CPU transport no GPU tensor of this request is alive any more.
+        _release_preprocess_cache()
+        return output
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
