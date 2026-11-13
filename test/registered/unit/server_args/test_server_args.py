@@ -2841,6 +2841,49 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_kda_hicache_node_aggregate_admission(self):
+        """KDA node aggregation needs HiCache with shared-client Mooncake, a
+        page-first layout and no PP; each miss is rejected before model load."""
+
+        def mooncake(standalone):
+            return {
+                "hicache_storage_backend": "mooncake",
+                "hicache_storage_backend_extra_config": json.dumps(
+                    {
+                        "client_server_address": "localhost:50052",
+                        "standalone_storage": standalone,
+                    }
+                ),
+            }
+
+        cases = (
+            ({**mooncake(False), "hicache_mem_layout": "page_first"}, None),
+            ({**mooncake(False), "hicache_mem_layout": "page_first_direct"}, None),
+            ({**mooncake(False), "hicache_mem_layout": "page_head"}, "mem-layout"),
+            ({**mooncake(True), "hicache_mem_layout": "page_first"}, "standalone"),
+            ({**mooncake(False), "pp_size": 2}, "--pp-size 1"),
+            (
+                {**mooncake(False), "hicache_host_memory_mode": "buffer_only"},
+                "buffer_only",
+            ),
+            ({"hicache_storage_backend": "file"}, "mooncake"),
+            ({**mooncake(False), "enable_hierarchical_cache": False}, "hierarchical"),
+        )
+        for overrides, error in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    **{
+                        "enable_hierarchical_cache": True,
+                        "enable_kda_hicache_node_aggregate": True,
+                        **overrides,
+                    }
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
         """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""
         standalone = json.dumps(

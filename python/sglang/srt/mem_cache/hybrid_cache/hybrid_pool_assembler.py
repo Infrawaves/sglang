@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.mla_host_node_leader import (
+    maybe_create_kda_node_aggregate_context,
     maybe_create_node_leader_context,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
@@ -1095,6 +1096,7 @@ def build_mamba_host_pool(
     host_size: float,
     layout: str,
     mtp_draft_device_pools=(),
+    node_aggregate=None,
 ):
     draft_buffer_infos = []
     for draft_pool in mtp_draft_device_pools:
@@ -1110,6 +1112,7 @@ def build_mamba_host_pool(
         mtp_draft_buffer_infos=draft_buffer_infos,
         allocator_type=_get_allocator_type(),
         layout=layout,
+        node_aggregate=node_aggregate,
     )
 
 
@@ -1134,6 +1137,7 @@ def _mamba_entry(
     host_size: float,
     host_evict_fn: Optional[Callable[[int], Any]],
     device_evict_fn: Optional[Callable[[int], Any]],
+    node_aggregate=None,
 ) -> PoolEntry:
     drafts = params.mtp_draft_mamba_pools
     allocator = params.token_to_kv_pool_allocator.state_slots
@@ -1145,6 +1149,7 @@ def _mamba_entry(
             host_size=host_size,
             layout=_state_host_layout(),
             mtp_draft_device_pools=drafts,
+            node_aggregate=node_aggregate,
         ),
         device_pool=mamba_pool,
         layer_mapping=with_packed_draft_layer_mapping(
@@ -1235,6 +1240,13 @@ def build_hybrid_mamba_stack(
         # Mamba's budget check must observe the leader's completed MLA pin.
         # Use Gloo: pinning can outlast the NCCL watchdog.
         dist.barrier(group=params.tp_cache_group)
+    # WORLD-collective on every rank when enabled; launch validation already
+    # pinned the backend to Mooncake, so this gate is rank-independent.
+    kda_node_aggregate = (
+        maybe_create_kda_node_aggregate_context(tp_cache_group=params.tp_cache_group)
+        if storage_backend == "mooncake"
+        else None
+    )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         _mamba_entry(
             params=params,
@@ -1245,6 +1257,7 @@ def build_hybrid_mamba_stack(
             host_size=mamba_host_size,
             host_evict_fn=host_mamba_evict_fn,
             device_evict_fn=device_mamba_evict_fn,
+            node_aggregate=kda_node_aggregate,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
@@ -2606,6 +2619,11 @@ def attach_hybrid_pool_to_unified_cache(
                     "--enable-mla-hicache-per-node supports only hybrid MLA + "
                     "Mamba/KDA HiCache stacks; got a unified storage host stack."
                 )
+            if get_memory().enable_kda_hicache_node_aggregate:
+                raise ValueError(
+                    "--enable-kda-hicache-node-aggregate supports only hybrid MLA + "
+                    "Mamba/KDA HiCache stacks; got a unified storage host stack."
+                )
             # A unified pool: one host pool per sub-pool of its plan.
             result = build_unified_host_stack(
                 storage=storage,
@@ -2631,6 +2649,14 @@ def attach_hybrid_pool_to_unified_cache(
             ):
                 raise ValueError(
                     "--enable-mla-hicache-per-node supports only hybrid MLA + "
+                    f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
+                )
+            if get_memory().enable_kda_hicache_node_aggregate and not (
+                isinstance(strategy, _MambaStrategy)
+                and getattr(kvcache, "use_mla", False)
+            ):
+                raise ValueError(
+                    "--enable-kda-hicache-node-aggregate supports only hybrid MLA + "
                     f"Mamba/KDA HiCache stacks; got {type(strategy).__name__}."
                 )
             result = strategy.build(
