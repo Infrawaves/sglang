@@ -1293,11 +1293,16 @@ class KimiK3ImageProcessor(
                 if budget is not None
                 else None
             )
+            inflight_after = self._gpu_preprocess_inflight_bytes
+        # Only a budget rejection represents lost GPU capacity. Empty batches,
+        # disabled budgets, and already-decoded tensors do not compete for it.
+        budget_lost = estimate if reason == "budget_exceeded" else 0
         if self._log_preprocess_backend:
             logger.info(
                 "Kimi-K3 preprocess budget: batch=%s mode=%s backend=%s reason=%s "
                 "items=%d estimate_mib=%.2f inflight_before_mib=%.2f "
-                "reserved_mib=%.2f budget_mib=%s remaining_after_mib=%s "
+                "reserved_mib=%.2f budget_lost_mib=%.2f inflight_after_mib=%.2f "
+                "budget_mib=%s remaining_after_mib=%s "
                 "(logical reservation, not free device memory)",
                 batch_id,
                 self._image_preprocess_mode,
@@ -1307,6 +1312,8 @@ class KimiK3ImageProcessor(
                 estimate / 2**20,
                 inflight / 2**20,
                 reserved / 2**20,
+                budget_lost / 2**20,
+                inflight_after / 2**20,
                 f"{budget / 2**20:.2f}" if budget is not None else "off",
                 f"{remaining / 2**20:.2f}" if remaining is not None else "off",
             )
@@ -1316,6 +1323,20 @@ class KimiK3ImageProcessor(
         if reserved_bytes:
             with self._gpu_preprocess_lock:
                 self._gpu_preprocess_inflight_bytes -= reserved_bytes
+                inflight_after = self._gpu_preprocess_inflight_bytes
+            if self._log_preprocess_backend:
+                logger.info(
+                    "Kimi-K3 preprocess budget: released_mib=%.2f "
+                    "inflight_after_mib=%.2f budget_mib=%s "
+                    "(logical reservation returned)",
+                    reserved_bytes / 2**20,
+                    inflight_after / 2**20,
+                    (
+                        f"{self._gpu_preprocess_budget_bytes / 2**20:.2f}"
+                        if self._gpu_preprocess_budget_bytes is not None
+                        else "off"
+                    ),
+                )
 
     async def _decode_images_for_backend(self, images, use_gpu: Optional[bool]):
         """Decode any ``_K3EncodedImage`` on the IO pool with the chosen backend."""
