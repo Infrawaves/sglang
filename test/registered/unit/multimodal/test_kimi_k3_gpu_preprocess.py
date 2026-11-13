@@ -6,6 +6,7 @@ backend-selection tests cover ``SGLANG_K3_IMAGE_PREPROCESS_MODE``, which
 chooses between that GPU path and the checkpoint's own CPU processor.
 """
 
+import asyncio
 import io
 import sys
 import threading
@@ -30,6 +31,7 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     _K3EncodedImage,
     _KimiK3VisualItem,
     _probe_encoded_image,
+    _release_preprocess_cache,
     _resolve_image_preprocess_mode,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
@@ -345,6 +347,107 @@ def test_header_probe_reads_geometry_and_rejects_garbage():
     # Undecodable input must fall back to the regular decode path, which owns
     # the client-facing error, rather than fail here.
     assert _probe_encoded_image(b"not an image") is None
+
+
+_GIB = 1 << 30
+
+
+def _allocator_stats(*, reserved: int, allocated: int, inactive_split: int) -> dict:
+    return {
+        "reserved_bytes.all.current": reserved,
+        "allocated_bytes.all.current": allocated,
+        "inactive_split_bytes.all.current": inactive_split,
+    }
+
+
+@pytest.mark.parametrize(
+    "stats, released",
+    [
+        # An idle tokenizer still holding an earlier request's preprocessing peak.
+        (_allocator_stats(reserved=27 * _GIB, allocated=0, inactive_split=0), True),
+        # Above the threshold.
+        (_allocator_stats(reserved=3 * _GIB // 4, allocated=0, inactive_split=0), True),
+        # A small leftover is kept for the next request.
+        (_allocator_stats(reserved=_GIB // 4, allocated=0, inactive_split=0), False),
+        # The free bytes share segments with a feature still waiting for
+        # dispatch, so empty_cache could not return them anyway.
+        (
+            _allocator_stats(
+                reserved=4 * _GIB, allocated=_GIB // 4, inactive_split=7 * _GIB // 2
+            ),
+            False,
+        ),
+    ],
+)
+def test_preprocess_cache_release_counts_only_returnable_memory(stats, released):
+    """Release only when more than the threshold could go back to the driver.
+
+    Counting free bytes inside segments that a live tensor still pins would
+    call empty_cache on every request without returning anything.
+    """
+    with (
+        mock.patch("torch.cuda.is_initialized", return_value=True),
+        mock.patch("torch.cuda.memory_stats", return_value=stats),
+        mock.patch("torch.cuda.memory_reserved", return_value=0),
+        mock.patch("torch.cuda.empty_cache") as empty_cache,
+    ):
+        _release_preprocess_cache(threshold_bytes=_GIB // 2)
+    assert empty_cache.called is released
+
+
+def test_preprocess_cache_release_skips_a_process_without_cuda():
+    """Every Kimi-K3 multimodal request runs the release, also in a tokenizer
+    that never initialized CUDA (CPU preprocessing, CPU-only hosts)."""
+    if torch.cuda.is_initialized():
+        pytest.skip("needs a process that has not initialized CUDA")
+    _release_preprocess_cache(threshold_bytes=0)
+    assert not torch.cuda.is_initialized()
+
+
+_PROBE_RELEASE_THRESHOLD_BYTES = 123
+
+
+def _release_order_probe(events: list, *, cache_enabled: bool):
+    """Bare object carrying only what process_mm_data_async reads."""
+    probe = type("_Probe", (), {})()
+    probe._preprocess_release_threshold_bytes = _PROBE_RELEASE_THRESHOLD_BYTES
+    probe.mm_tokens = SimpleNamespace(image_token="<|media_pad|>", image_token_id=7)
+    probe.mm_preprocess_cache = SimpleNamespace(enabled=cache_enabled)
+    probe.reject_caller_image_identity = lambda image_data, request_obj: None
+    probe.count_image_placeholders = lambda text, token_id: 1
+    probe._is_preprocessed_input = lambda item: False
+
+    async def preprocess(*args, **kwargs):
+        events.append("preprocess")
+        return []
+
+    probe.prepare_media_artifacts = preprocess
+    probe._process_mm_data_uncached = preprocess
+    probe.compose_request = lambda input_text, artifacts: artifacts
+    return KimiK3ImageProcessor.process_mm_data_async.__get__(probe)
+
+
+@pytest.mark.parametrize("cache_enabled", [True, False])
+def test_request_releases_preprocess_cache_around_its_preprocessing(cache_enabled):
+    """The tokenizer must not keep a request's preprocessing peak on the GPU.
+
+    The release after preprocessing returns the request's own scratch; the one
+    before returns features of earlier requests that stayed on the GPU until
+    dispatch, which this request's allocations would otherwise reuse and pin.
+    Both pass the threshold the processor read at construction.
+    """
+    events = []
+    process = _release_order_probe(events, cache_enabled=cache_enabled)
+    request = SimpleNamespace(audio_data=None, video_data=None, mm_content_hashes=None)
+    with mock.patch(
+        "sglang.srt.multimodal.processors.kimi_k3._release_preprocess_cache",
+        side_effect=lambda *, threshold_bytes: events.append(
+            ("release", threshold_bytes)
+        ),
+    ):
+        asyncio.run(process(["image"], "<|media_pad|>", request))
+    release = ("release", _PROBE_RELEASE_THRESHOLD_BYTES)
+    assert events == [release, "preprocess", release]
 
 
 if __name__ == "__main__":

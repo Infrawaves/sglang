@@ -2680,6 +2680,9 @@ class Envs:
     # one line per request, matching the always-on video logs; turn it off to
     # silence it entirely.
     SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
+    # MiB of idle preprocessing cache the Kimi-K3 tokenizer may keep on its GPU,
+    # which it shares with TP rank 0; above this, all of it goes back to the driver.
+    SGLANG_K3_PREPROCESS_RELEASE_THRESHOLD_MB = EnvInt(512)
 
     # ===================================================================
     # Symmetric memory
