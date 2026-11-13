@@ -152,6 +152,9 @@ from sglang.srt.managers.request_validation import (
 from sglang.srt.managers.req_types import (
     get_request_return_hidden_states_mode,
 )
+from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    prepare_prefill_pull_request,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -1602,6 +1605,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        prefill_pull_internal = False
+        if get_disagg().prefill_pull_router is not None:
+            prefill_pull_internal = prepare_prefill_pull_request(
+                obj, request, starting=self.server_status == ServerStatus.Starting
+            )
+
         self._resolve_cache_identity(obj, request)
         if isinstance(obj, GenerateReqInput):
             self._validate_cache_request(obj)
@@ -1658,6 +1667,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+                        tokenized_obj.prefill_pull_internal = prefill_pull_internal
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -2340,6 +2351,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
+                prefill_pull_reservation_id=obj.prefill_pull_reservation_id,
+                prefill_pull_assignment_id=obj.prefill_pull_assignment_id,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 kv_hints=obj.kv_hints,

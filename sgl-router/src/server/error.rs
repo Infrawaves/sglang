@@ -30,6 +30,8 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 enum ErrorClass {
     /// 400 — request rejected at ingress as malformed / invalid.
     BadRequest,
+    /// 401 — credentials for a privileged router endpoint were absent or invalid.
+    Unauthorized,
     /// 404 — requested model / resource not found.
     NotFound,
     /// 502 — a selected worker failed to return a usable response (unreachable,
@@ -47,6 +49,7 @@ impl ErrorClass {
     fn status(self) -> StatusCode {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorClass::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorClass::NotFound => StatusCode::NOT_FOUND,
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
@@ -74,6 +77,12 @@ fn grpc_error_class(code: tonic::Code) -> ErrorClass {
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    #[error("pull control authentication required")]
+    PullAuthenticationRequired,
+
+    #[error("pull queue capacity exhausted")]
+    PullQueueFull,
 
     #[error("model not found: {0}")]
     ModelNotFound(String),
@@ -204,6 +213,8 @@ impl ApiError {
     fn class(&self) -> ErrorClass {
         match self {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
+            ApiError::PullAuthenticationRequired => ErrorClass::Unauthorized,
+            ApiError::PullQueueFull => ErrorClass::NoTarget,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
@@ -230,6 +241,8 @@ impl ApiError {
     fn error_code(&self) -> &'static str {
         match self {
             ApiError::BadRequest(_) => "bad_request",
+            ApiError::PullAuthenticationRequired => "pull_authentication_required",
+            ApiError::PullQueueFull => "pull_queue_full",
             // Shares `ErrorClass::BadRequest` (and thus the 400) with
             // `BadRequest`, but keeps its own code: an operator rolling a
             // sampling contract across a fleet has to be able to alert on
@@ -267,6 +280,8 @@ impl ApiError {
             ApiError::UpstreamStatus { status } => Some(*status),
             ApiError::PrefillFailed { status } => *status,
             ApiError::BadRequest(_)
+            | ApiError::PullAuthenticationRequired
+            | ApiError::PullQueueFull
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
@@ -322,6 +337,12 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        if status == StatusCode::UNAUTHORIZED {
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer"),
+            );
+        }
         // Preserve the worker's real status when we synthesized our own.
         if let Some(upstream) = self.upstream_status() {
             resp.headers_mut().insert(
@@ -343,6 +364,7 @@ impl ApiError {
         }
         let code = match self.class() {
             ErrorClass::BadRequest => Code::InvalidArgument,
+            ErrorClass::Unauthorized => Code::Unauthenticated,
             ErrorClass::NotFound => Code::NotFound,
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
             ErrorClass::Timeout => Code::DeadlineExceeded,
@@ -427,6 +449,8 @@ impl ApiError {
                 "service unavailable".to_string()
             }
             ApiError::BadRequest(_)
+            | ApiError::PullAuthenticationRequired
+            | ApiError::PullQueueFull
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. } => self.to_string(),
             ApiError::UpstreamGrpc(status) => status.message().to_string(),

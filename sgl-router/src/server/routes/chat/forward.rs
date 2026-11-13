@@ -62,9 +62,10 @@ pub(super) async fn forward_request(
     headers: HeaderMap,
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
+    pull: Option<Arc<crate::state::work_pull::Assignment>>,
 ) -> Result<HttpDispatched, ApiError> {
     let dispatched = dispatch(
-        Http,
+        Http(pull),
         ctx,
         request,
         workers,
@@ -108,6 +109,14 @@ pub(super) async fn forward_request_grpc<R: EngineRpc>(
     Result<GrpcResponse<R::Reply>, ApiError>,
     Option<RequestLogContext>,
 ) {
+    if ctx.config.proxy.pull.mode == crate::config::PrefillDispatchMode::Pull {
+        return (
+            Err(ApiError::BadRequest(
+                "pull only supports HTTP requests".into(),
+            )),
+            None,
+        );
+    }
     let transport = Grpc(Arc::new(rpc));
     let mut excluded = Vec::new();
     let mut failed = None;
@@ -191,13 +200,18 @@ async fn dispatch<T: Transport>(
     }
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
-    let dp_aware = ctx.config.model.dp_aware && request.accepts_dp_rank();
+    let pull = ctx.config.proxy.pull.mode == crate::config::PrefillDispatchMode::Pull;
+    let dp_aware = (ctx.config.model.dp_aware || pull) && request.accepts_dp_rank();
     // The engine gives fan-out item i the room `room + i`, so in PD decode looks
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
-    let prefill_rank = (dp_aware && !unpin_prefill)
-        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
-        .flatten();
+    let prefill_rank = if pull {
+        Some(0)
+    } else {
+        (dp_aware && !unpin_prefill)
+            .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
+            .flatten()
+    };
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -267,6 +281,9 @@ async fn dispatch<T: Transport>(
         prefill_rank,
         None,
     );
+    transport
+        .prepare_prefill(&prefill_leg, engine_rid.as_deref(), path)
+        .await?;
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -326,9 +343,13 @@ async fn dispatch<T: Transport>(
                 .await?;
                 abort.disarm();
             }
-            let decode_rank = dp_aware
-                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
-                .flatten();
+            let decode_rank = if pull {
+                Some(0)
+            } else {
+                dp_aware
+                    .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                    .flatten()
+            };
             let decode_load_guards = (
                 decode_load,
                 ctx.router_inflight_load.register_aged(
@@ -500,6 +521,16 @@ trait Transport: Clone + Send + Sync + 'static {
         decode_slot: Option<DecodeSlot>,
     ) -> impl Future<Output = Result<Self::Response, ApiError>> + Send;
 
+    /// Publish a pull offer and wait for an atomic commit before dispatching D.
+    fn prepare_prefill(
+        &self,
+        _leg: &Leg,
+        _rid: Option<&str>,
+        _path: &'static str,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Run a PD prefill to completion and judge it.
     fn prefill(
         self,
@@ -540,10 +571,29 @@ impl Leg {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Http;
+#[derive(Clone)]
+struct Http(Option<Arc<crate::state::work_pull::Assignment>>);
 
 impl Transport for Http {
+    async fn prepare_prefill(
+        &self,
+        leg: &Leg,
+        rid: Option<&str>,
+        path: &'static str,
+    ) -> Result<(), ApiError> {
+        if let Some(assignment) = &self.0 {
+            assignment
+                .publish_and_wait(
+                    rid.expect("pull requires PD request ID"),
+                    path,
+                    &leg.body,
+                    &leg.headers,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     type Response = Response<Body>;
     async fn respond(
         request: &mut PreparedRequest,
@@ -598,6 +648,9 @@ impl Transport for Http {
         path: &'static str,
         leg: Leg,
     ) -> PrefillFailure {
+        if let Some(assignment) = self.0 {
+            return prefill_failure(assignment.response().await).await;
+        }
         let result = proxy
             .forward_json_to(
                 &worker.url,

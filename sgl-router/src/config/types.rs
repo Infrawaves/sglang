@@ -15,9 +15,38 @@ pub struct Config {
     pub router_inflight_load: InflightLoadConfig,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillDispatchMode {
+    #[default]
+    Push,
+    Pull,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PullConfig {
+    pub mode: PrefillDispatchMode,
+    pub max_requests: usize,
+    pub max_bytes: usize,
+    pub max_tokens: usize,
+    pub offer_timeout_ms: u64,
+}
+
+impl Default for PullConfig {
+    fn default() -> Self {
+        Self {
+            mode: PrefillDispatchMode::Push,
+            max_requests: 1024,
+            max_bytes: 64 * 1024 * 1024,
+            max_tokens: 4 * 1024 * 1024,
+            offer_timeout_ms: 30_000,
+        }
+    }
+}
+
 /// Outbound request timeout and retry settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
+    pub pull: PullConfig,
     /// Timeout for upstream response headers, and for a non-streaming body.
     /// SGLang's chat endpoint sends streaming headers with the first token.
     /// Counts as a circuit-breaker failure.
@@ -68,6 +97,7 @@ pub const fn default_max_chat_body_bytes() -> usize {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            pull: PullConfig::default(),
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
             max_attempts: NonZeroU32::MIN,

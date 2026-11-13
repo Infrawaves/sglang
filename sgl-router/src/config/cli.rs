@@ -125,6 +125,22 @@ pub struct ModelArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ServerArgs {
+    /// Prefill dispatch: push (default) or worker-initiated request pull.
+    #[arg(long, value_enum, default_value = "push")]
+    pub prefill_dispatch_mode: crate::config::PrefillDispatchMode,
+    /// Maximum queued and active pull requests, including decode until its response ends.
+    #[arg(long, default_value_t = 1024)]
+    pub pull_max_requests: usize,
+    /// Maximum retained request payload bytes in pull mode.
+    #[arg(long, default_value_t = 67_108_864)]
+    pub pull_max_bytes: usize,
+    /// Maximum retained input token budget in pull mode.
+    #[arg(long, default_value_t = 4_194_304)]
+    pub pull_max_tokens: usize,
+    /// Uncommitted offer lease in milliseconds; expiry permits reassignment.
+    #[arg(long, default_value_t = 30_000)]
+    pub pull_offer_timeout_ms: u64,
+
     /// Address to bind the HTTP server to.
     #[arg(long, default_value_t = default_host())]
     pub host: String,
@@ -715,6 +731,13 @@ impl Cli {
             },
             discovery,
             proxy: ProxyConfig {
+                pull: crate::config::PullConfig {
+                    mode: self.server.prefill_dispatch_mode,
+                    max_requests: self.server.pull_max_requests,
+                    max_bytes: self.server.pull_max_bytes,
+                    max_tokens: self.server.pull_max_tokens,
+                    offer_timeout_ms: self.server.pull_offer_timeout_ms,
+                },
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
                 max_attempts: self.server.retry_max_attempts,
@@ -728,6 +751,12 @@ impl Cli {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
+        if self.server.prefill_dispatch_mode == crate::config::PrefillDispatchMode::Pull {
+            ensure!(
+                self.routing.chat_routing == ChatRoutingKind::Reorg,
+                "pull requires --chat-routing reorg"
+            );
+        }
         config.validate()?;
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
             crate::policies_reorg::factory::validate(&config.model)?;

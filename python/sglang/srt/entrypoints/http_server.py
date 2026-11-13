@@ -312,6 +312,7 @@ async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
     sidecar = None
     warmup_thread = None
+    prefill_pull_agent = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -479,9 +480,39 @@ async def lifespan(fast_api_app: FastAPI):
         )
         warmup_thread.start()
 
+        if get_disagg().prefill_pull_router is not None:
+            from sglang.srt.managers.prefill_pull_agent import (
+                PrefillPullAgent,
+                PrefillPullAgentConfig,
+            )
+
+            ssl_verify = ssl_verify_of(server_args)
+            local_ssl = (
+                ssl_verify
+                if isinstance(ssl_verify, bool)
+                else ssl.create_default_context(cafile=ssl_verify)
+            )
+            prefill_pull_agent = PrefillPullAgent(
+                PrefillPullAgentConfig(
+                    router_url=get_disagg().prefill_pull_router,
+                    worker_url=get_disagg().prefill_pull_worker_url,
+                    local_url=server_args.url(),
+                    max_inflight=get_disagg().prefill_pull_max_requests,
+                    api_key=get_serving().api_key,
+                    router_api_key=get_disagg().prefill_pull_router_api_key,
+                    local_ssl=local_ssl,
+                ),
+                budget=_global_state.tokenizer_manager.prefill_pull_budget,
+                abort=_global_state.tokenizer_manager.abort_request,
+                ready=_global_state.tokenizer_manager.is_ready,
+            )
+            await prefill_pull_agent.start()
+
         # Start the HTTP server
         yield
     finally:
+        if prefill_pull_agent is not None:
+            await prefill_pull_agent.close()
         close_cache = getattr(
             _global_state.tokenizer_manager, "close_cache_accounting", None
         )

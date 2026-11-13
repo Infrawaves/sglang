@@ -4,6 +4,7 @@
 mod forward;
 mod openai;
 mod preparation;
+mod pull;
 mod reorg;
 
 pub(super) use preparation::enforce_minimax_m31_thinking;
@@ -369,6 +370,9 @@ impl<'a> ModelRouting<'a> {
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
+        if ctx.config.proxy.pull.mode == crate::config::PrefillDispatchMode::Pull {
+            return pull::dispatch(ctx, self, request, headers, start).await;
+        }
         let mut excluded = Vec::new();
         let mut failed = None;
         let mut duration = None;
@@ -399,9 +403,16 @@ impl<'a> ModelRouting<'a> {
             }
             let duration = duration
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
-            let attempt =
-                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
-                    .await?;
+            let attempt = forward_request(
+                ctx,
+                &mut request,
+                workers,
+                headers.clone(),
+                start,
+                duration,
+                None,
+            )
+            .await?;
             if attempt.retry_excluding.is_empty() {
                 return Ok(attempt.response);
             }

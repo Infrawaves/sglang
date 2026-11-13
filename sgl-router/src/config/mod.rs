@@ -43,6 +43,33 @@ pub fn shutdown_drain_advisory(
 impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.proxy.pull.mode == PrefillDispatchMode::Pull {
+            ensure!(
+                self.server.worker_auth.as_ref().is_some_and(|auth| {
+                    auth.as_bytes()
+                        .strip_prefix(b"Bearer ")
+                        .is_some_and(|key| !key.is_empty() && key.iter().all(u8::is_ascii_graphic))
+                }),
+                "pull requires a non-empty --worker-api-key without whitespace"
+            );
+            ensure!(
+                matches!(self.discovery, DiscoveryBackend::StaticUrls(_)),
+                "pull requires a fixed static worker pool"
+            );
+            ensure!(
+                self.server.grpc_port.is_none(),
+                "pull does not support gRPC"
+            );
+            ensure!(
+                self.proxy.decode_dispatch_limit.is_none(),
+                "pull does not support decode-dispatch-limit"
+            );
+            let p = self.proxy.pull;
+            ensure!(
+                p.max_requests > 0 && p.max_bytes > 0 && p.max_tokens > 0 && p.offer_timeout_ms > 0,
+                "pull queue and lease limits must be positive"
+            );
+        }
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
         // Policies that read the prompt are checked against the built routing at startup.
         ensure!(

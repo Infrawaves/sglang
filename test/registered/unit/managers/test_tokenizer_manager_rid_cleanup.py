@@ -29,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -37,9 +38,11 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     EmbeddingReqInput,
     GenerateReqInput,
     RequestOutputStats,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
+    ServerStatus,
     TokenizerManager,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
@@ -49,7 +52,8 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1188,6 +1192,47 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     request reaches the scheduler (e.g. input-length validation rejecting an
     over-context request) used to leak those entries permanently.
     """
+
+    def test_pull_internal_status_is_explicitly_forwarded_after_tokenization(self):
+        """Normal grants and internal probes retain distinct scheduler admission."""
+        for internal in (False, True):
+            with self.subTest(internal=internal):
+                tm = _make_tm_for_generate(self)
+                tm.server_status = ServerStatus.Up
+                rid = HEALTH_CHECK_RID_PREFIX + "probe" if internal else "assigned"
+                obj = GenerateReqInput(
+                    input_ids=[1],
+                    rid=rid,
+                    prefill_pull_reservation_id=None if internal else "reservation",
+                    prefill_pull_assignment_id=None if internal else "assignment",
+                )
+                tokenized = TokenizedGenerateReqInput(
+                    rid=rid,
+                    input_text=None,
+                    input_ids=array("q", [1]),
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                )
+                tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+                sent = []
+
+                async def stop_at_dispatch(req):
+                    sent.append(req)
+                    raise RuntimeError("stop at dispatch")
+
+                tm._send_one_request = stop_at_dispatch
+                with get_disagg().override(prefill_pull_router="http://router:8000"):
+                    with self.assertRaisesRegex(RuntimeError, "stop at dispatch"):
+                        asyncio.run(tm.generate_request(obj).__anext__())
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0].prefill_pull_internal, internal)
 
     def test_single_failure_before_dispatch_cleans_up(self):
         """Validation failure must return the adapter reference acquired earlier."""

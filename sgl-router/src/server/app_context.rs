@@ -63,6 +63,7 @@ pub struct AppContext {
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
     pub decode_gate: DecodeGate,
+    pub pull_queue: Arc<crate::state::work_pull::PullQueue>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the edge middleware (requests_total /
     /// responses_total), the chat handler (worker_requests_total), the
@@ -131,7 +132,9 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let pull_queue = crate::state::work_pull::PullQueue::new(config.proxy.pull);
         Self {
+            pull_queue,
             config,
             tokenizers,
             proxy,
@@ -252,6 +255,7 @@ impl AppContext {
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
+            pull_queue: crate::state::work_pull::PullQueue::new(Default::default()),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,

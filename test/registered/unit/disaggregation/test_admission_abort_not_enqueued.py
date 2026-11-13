@@ -32,11 +32,17 @@ from sglang.srt.disaggregation.utils import is_unadmitted_reject
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    PrefillCapacity,
+    PrefillWorkAdmission,
+)
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -135,6 +141,93 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         )
         p.start()
         self.addCleanup(p.stop)
+
+    def test_late_prefill_capacity_rejection_retires_pull_reservation(self):
+        """A grammar waiter rejected after intake must return its pull budget."""
+        req = _make_req()
+        ledger = PrefillWorkAdmission(max_tokens=2048, max_requests=1)
+        ledger.control(
+            action="reserve",
+            reservation_id="r",
+            now=0,
+            capacity=PrefillCapacity(4096, 1, 1),
+        )
+        ledger.control(
+            action="bind",
+            reservation_id="r",
+            assignment_id="a",
+            request_id=req.rid,
+            tokens=1500,
+            now=0,
+        )
+        self.assertIsNone(
+            ledger.consume(
+                reservation_id="r",
+                assignment_id="a",
+                request_id=req.rid,
+                tokens=1500,
+                now=0,
+            )
+        )
+        ledger.attach_request("r", req)
+        ledger.finish_intake("r", failed=False)
+        sched = _make_scheduler()
+        sched.request_retirer.on_retired = ledger.retire
+        queue = _prefill_queue(sched)
+        queue.max_input_len = 1024
+
+        self.assertTrue(
+            PrefillBootstrapQueue._check_if_req_exceed_kv_capacity(queue, req)
+        )
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.disagg_kv_sender)
+        self.assertEqual(
+            ledger.control(action="query", reservation_id="r", now=1)["data"]["state"],
+            "retired",
+        )
+
+    def test_push_oversized_prompt_retires_prefetch_before_returning_400(self):
+        """Push previously returned 400 while retaining this cache attempt.
+
+        Exercise the real cache retirement path, with no pull ledger/callback:
+        queued storage retry and loaded-prefix accounting must both disappear.
+        """
+        req = _make_req()
+        handle = req.cache_request_handle
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_wait = {handle: object()}
+        cache.linker = None
+        cache.buffer_pipeline = None
+        cache.prefetch_loaded_tokens_by_reqid = {handle: 128}
+        cache.prefetch_loaded_storage_start_by_reqid = {handle: 0}
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache.storage_prefetch_retries.refetch(req.rid, 128)
+        cache.ongoing_prefetch = {}
+        # External accounting has no controller in this CPU fixture.
+        cache.discard_storage_prefetch_accounting = lambda request: None
+        sched = _make_scheduler()
+        sched.request_retirer = release_only_retirer(cache)
+        returned = []
+        sched.output_streamer.stream_output.side_effect = lambda reqs, return_logprob: (
+            returned.extend(item.finished_reason.status_code for item in reqs)
+        )
+        queue = _prefill_queue(sched)
+        queue.max_input_len = 1024
+        queue._check_if_req_exceed_kv_capacity = MethodType(
+            PrefillBootstrapQueue._check_if_req_exceed_kv_capacity, queue
+        )
+        queue.create_sender = MethodType(PrefillBootstrapQueue.create_sender, queue)
+
+        _admit_prefill(queue, req)
+
+        self.assertEqual(returned, [HTTPStatus.BAD_REQUEST])
+        self.assertIsNone(req.disagg_kv_sender)
+        self.assertEqual(list(queue.queue), [])
+        self.assertNotIn(handle, cache._storage_prefetch_wait)
+        self.assertNotIn(handle, cache.prefetch_loaded_tokens_by_reqid)
+        self.assertNotIn(handle, cache.prefetch_loaded_storage_start_by_reqid)
+        self.assertEqual(cache.storage_prefetch_retries.pop_ready([req], 0, 8), [])
 
     def test_rejected_request_is_retired_at_each_pd_door(self):
         for door in ("prefill", "decode"):

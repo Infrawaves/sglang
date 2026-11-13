@@ -33,12 +33,14 @@ class RequestRetirer:
         hisparse_coordinator: Optional[HiSparseCoordinator],
         uocr_runtime: Optional[UocrSchedulerRuntime],
         send_abort_output: Callable[[AbortReq, Req], None],
+        on_retired: Optional[Callable[[Req], None]] = None,
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
+        self.on_retired = on_retired
 
     def abort(
         self,
@@ -76,6 +78,8 @@ class RequestRetirer:
             self.hisparse_coordinator.request_finished(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        if self.on_retired is not None:
+            self.on_retired(req)
 
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its

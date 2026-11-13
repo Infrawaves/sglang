@@ -56,6 +56,29 @@ class Disagg(msgspec.Struct):
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
+    prefill_pull_router: A[
+        Optional[str],
+        "Router URL from which this prefill worker acquires requests. Enables request-pull admission.",
+    ] = None
+    prefill_pull_worker_url: A[
+        Optional[str],
+        "This prefill worker's externally reachable URL, exactly as registered with the pull router.",
+    ] = None
+    prefill_pull_router_api_key: A[
+        Optional[str],
+        "API key for the pull router's internal endpoints. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_max_tokens: A[
+        Optional[int],
+        "Maximum outstanding prompt tokens, including reservations and requests retaining KV during transfer. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_max_requests: A[
+        Optional[int],
+        "Maximum outstanding pull requests and reservations. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_safety_margin_tokens: A[
+        int, "Additional KV token headroom excluded from prefill pull grants."
+    ] = 0
     disaggregation_decode_allocation_policy: A[
         Literal["early", "prefill_complete"],
         "When to reserve per-request decode KV in disaggregated serving. "

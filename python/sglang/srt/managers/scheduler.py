@@ -297,6 +297,9 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    SchedulerPrefillWorkAdmission,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -511,6 +514,7 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    prefill_work_admission: Optional[SchedulerPrefillWorkAdmission] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     # Class-level default so a scheduler built without init_chunked_prefill
@@ -790,6 +794,7 @@ class Scheduler(
         self.init_dp_attn_adapter()
 
         self.init_pool_stats_observer()
+        self.maybe_init_prefill_work_admission()
 
         self.init_invariant_checker()
 
@@ -2140,6 +2145,8 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        from sglang.srt.managers.io_struct import PrefillPullBudgetReq
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -2216,6 +2223,7 @@ class Scheduler(
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
+                (PrefillPullBudgetReq, self.handle_prefill_pull_budget),
                 (
                     ProfileReq,
                     lambda req: self.profiler_manager._profile(req),
@@ -3070,6 +3078,40 @@ class Scheduler(
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
+            on_retired=(
+                self.prefill_work_admission.ledger.retire
+                if self.prefill_work_admission is not None
+                else None
+            ),
+        )
+
+    def maybe_init_prefill_work_admission(self) -> None:
+        self.prefill_work_admission = (
+            SchedulerPrefillWorkAdmission(
+                max_tokens=get_disagg().prefill_pull_max_tokens,
+                max_requests=get_disagg().prefill_pull_max_requests,
+                safety_margin_tokens=get_disagg().prefill_pull_safety_margin_tokens,
+                pool_stats=self.pool_stats_observer,
+                req_pool=self.req_to_token_pool,
+                metadata_allocator=self.req_to_metadata_buffer_idx_allocator,
+                page_size=self.tree_cache.page_size,
+                cpu_group=self.dp_tp_cpu_group,
+                group_rank=self.dp_tp_group.first_rank,
+                group_size=self.dp_tp_group.world_size,
+            )
+            if get_disagg().prefill_pull_router is not None
+            else None
+        )
+
+    def handle_prefill_pull_budget(self, req):
+        from sglang.srt.managers.io_struct import PrefillPullBudgetReqOutput
+
+        if self.prefill_work_admission is None:
+            return PrefillPullBudgetReqOutput(
+                rid=req.rid, success=False, error="prefill pull is disabled"
+            )
+        return self.prefill_work_admission.handle_control(
+            req, paused=self._engine_paused
         )
 
     def init_batch_result_processor(self) -> None:
@@ -3364,7 +3406,12 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        return Req(*args, **kwargs)
+        req = Req(*args, **kwargs)
+        if self.prefill_work_admission is not None:
+            self.prefill_work_admission.ledger.attach_request(
+                recv_req.prefill_pull_reservation_id, req
+            )
+        return req
 
     def handle_generate_request(
         self,
@@ -3378,9 +3425,21 @@ class Scheduler(
             ):
                 for item in recv_req.mm_inputs.mm_items:
                     mm_cleanup.callback(item.release_transport_proxies)
-            self._handle_generate_request(
-                recv_req, mm_cleanup, mm_input_error=mm_input_error
-            )
+            if self.prefill_work_admission is not None:
+                self.prefill_work_admission.handle_generate_request(
+                    recv_req,
+                    process_request=partial(
+                        self._handle_generate_request,
+                        recv_req,
+                        mm_cleanup,
+                        mm_input_error=mm_input_error,
+                    ),
+                    send_control_output=self.send_control_output,
+                )
+            else:
+                self._handle_generate_request(
+                    recv_req, mm_cleanup, mm_input_error=mm_input_error
+                )
 
     def _handle_generate_request(
         self,

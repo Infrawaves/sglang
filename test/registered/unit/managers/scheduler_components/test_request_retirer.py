@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 import sglang
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
+from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    PrefillWorkAdmission,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
@@ -74,6 +77,26 @@ def _req(finished_reason, calls):
 
 
 class TestRelease(CustomTestCase):
+    def test_pull_budget_retires_only_after_resource_release_succeeds(self):
+        """An allocator failure must not advertise the still-owned KV as idle."""
+        req = _req(FINISH_LENGTH(length=0), [])
+        ledger = PrefillWorkAdmission(max_tokens=16, max_requests=1)
+        reservation_id = ledger.admit_internal("rid", 8)
+        ledger.attach_request(reservation_id, req)
+        retirer = release_only_retirer(MagicMock())
+        retirer.on_retired = ledger.retire
+        with patch.object(
+            request_retirer,
+            "release_kv_cache",
+            side_effect=RuntimeError("release failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release failed"):
+                retirer.release(req, checkpoint=True)
+        self.assertIn(reservation_id, ledger.reservations)
+        with patch.object(request_retirer, "release_kv_cache"):
+            retirer.release(req, checkpoint=True)
+        self.assertNotIn(reservation_id, ledger.reservations)
+
     def _release(self, req, calls, checkpoint=False, verb="release"):
         tree_cache = MagicMock()
         tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)

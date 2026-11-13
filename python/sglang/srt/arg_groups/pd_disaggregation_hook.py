@@ -64,6 +64,7 @@ def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+    validate_prefill_pull(cfg)
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -290,6 +291,78 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         raise ValueError(
             "--disaggregation-decode-allocation-policy prefill_complete does not "
             "yet support " + ", ".join(unsupported)
+        )
+
+
+def validate_prefill_pull(cfg) -> None:
+    """Fail unsupported request-pull topologies before starting workers."""
+    if cfg.prefill_pull_router is None:
+        return
+    from urllib.parse import urlparse
+
+    key = cfg.prefill_pull_router_api_key
+    if not key or any(not 0x21 <= ord(char) <= 0x7E for char in key):
+        raise ValueError(
+            "--prefill-pull-router-api-key must be explicitly set to a nonempty ASCII key without whitespace"
+        )
+
+    for name in ("prefill_pull_router", "prefill_pull_worker_url"):
+        value = getattr(cfg, name)
+        parsed = urlparse(value or "")
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be an HTTP(S) URL without credentials, query or fragment"
+            )
+    for name in ("prefill_pull_max_tokens", "prefill_pull_max_requests"):
+        value = getattr(cfg, name)
+        if value is None or value <= 0:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be explicitly set to a positive integer"
+            )
+    if cfg.prefill_pull_safety_margin_tokens < 0:
+        raise ValueError("--prefill-pull-safety-margin-tokens must be nonnegative")
+    unsupported = []
+    if cfg.disaggregation_mode != "prefill":
+        unsupported.append("modes other than prefill")
+    if cfg.disaggregation_decode_allocation_policy != "early":
+        unsupported.append("decode allocation other than early")
+    if cfg.optimistic_prefill_attempts != 0:
+        unsupported.append("optimistic prefill")
+    if cfg.dp_size != 1 or cfg.attn_dp_size != 1:
+        unsupported.append("DP > 1")
+    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+        unsupported.append("PP/CP/DCP > 1")
+    if cfg.tokenizer_worker_num != 1:
+        unsupported.append("multiple tokenizer workers")
+    if (
+        cfg.grpc_mode
+        or cfg.smg_grpc_mode
+        or cfg.grpc_port is not None
+        or envs.SGLANG_RUST_SERVER.get()
+    ):
+        unsupported.append("non-Python HTTP frontends")
+    if cfg.enable_pd_role_switch or cfg.elastic_ep_backend is not None:
+        unsupported.append("runtime topology/role changes")
+    if cfg.encoder_only or cfg.language_only:
+        unsupported.append("encoder disaggregation")
+    if cfg.speculative_algorithm is not None or cfg.decoupled_spec_role != "null":
+        unsupported.append("speculative decoding")
+    if cfg.dllm_algorithm is not None or cfg.is_embedding:
+        unsupported.append("diffusion or embedding models")
+    if cfg.enable_hisparse:
+        unsupported.append("HiSparse")
+    if cfg.warmups is not None:
+        unsupported.append("custom warmup functions")
+    if unsupported:
+        raise ValueError(
+            "--prefill-pull-router does not yet support " + ", ".join(unsupported)
         )
 
 

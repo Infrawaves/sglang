@@ -22,6 +22,16 @@ Grafana), [BENCHMARKS.md](BENCHMARKS.md),
 [sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer),
 [EXAMPLES.md](EXAMPLES.md) (GLM-5.3-Flash and DeepSeek-V4.1-Flash, end to end).
 
+Experimental **prefill request pull** is available with
+`--chat-routing reorg --prefill-dispatch-mode pull` and matching prefill worker
+flags. Prefill reserves scheduler capacity, acquires a request from the router,
+and executes it locally; the router still dispatches decode and returns its
+output. The default remains push. This first version requires one router,
+static workers, DP1, single text requests, and a nonempty `--worker-api-key`
+matching the prefill agent's `--prefill-pull-router-api-key`. Raw text requires a
+router tokenizer; with `--no-tokenizer`, send `input_ids`. GPU inference and
+performance validation are still pending.
+
 ## Architecture
 
 A deployment is a **router** in front of **buckets of SGLang engines**. A bucket

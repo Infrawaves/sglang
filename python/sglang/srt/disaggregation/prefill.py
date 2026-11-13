@@ -518,6 +518,11 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            # Push and pull both arm cache prefetch before this capacity check.
+            # Retire the cache attempt (including retries) before returning 400.
+            # No sender exists yet; this also releases a pull reservation when
+            # a grammar waiter reaches the check after intake has finished.
+            self.scheduler.request_retirer.release(req, checkpoint=False)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
