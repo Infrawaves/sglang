@@ -759,6 +759,9 @@ class AnthropicServing:
             response = await self.openai_serving_chat._handle_non_streaming_request(
                 adapted_request, processed_request, raw_request
             )
+            if isinstance(response, JSONResponse) and response.status_code == 200:
+                # Chat also wraps successful responses to carry usage headers.
+                response = ChatCompletionResponse.model_validate_json(response.body)
         except asyncio.CancelledError:
             raise
         except ValueError as e:

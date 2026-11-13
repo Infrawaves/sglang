@@ -2845,7 +2845,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _usage_headers(
         self, meta_info: Dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> Dict[str, str]:
-        """Return fixed cache-write headers and optional K3 prompt/read headers.
+        """Return physical cache hits, cache-write and optional K3 usage headers.
 
         Streaming uses the first engine event so prompt-side accounting is
         available even if the stream ends before the final usage frame.
@@ -2870,6 +2870,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     f"{prefix}-Cached-Tokens": str(cached),
                 }
             )
+        # Preserve the engine/logging count, including when the configurable
+        # usage prefix is X-Sgl and would otherwise expose the Redis read count.
+        if prefix.lower() == "x-sgl":
+            headers.pop(f"{prefix}-Cached-Tokens", None)
+        headers["X-Sgl-Cached-Tokens"] = str(meta_info.get("cached_tokens", 0) or 0)
         return headers
 
     async def _handle_streaming_request(

@@ -542,6 +542,7 @@ app.add_middleware(
     expose_headers=[
         "Msh-Usage-Cache-Write-Tokens-5m",
         "Msh-Usage-Cache-Write-Tokens-1h",
+        "X-Sgl-Cached-Tokens",
     ],
 )
 
