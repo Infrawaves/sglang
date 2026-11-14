@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
+from sglang.srt.speculative.dflash_aux_graph import DFlashAuxGraphs
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
     DraftL2Prefetch,
@@ -766,6 +767,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._target_logits_processor = self._defer_target_verify_gather()
         self._aux_graphs = {}
+        self._aux_bucket_graphs: Optional[DFlashAuxGraphs] = None
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
             is_cuda() and envs.SGLANG_DFLASH_COMMIT_METADATA.get()
@@ -1075,6 +1077,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
+        # Outside the draft TP scope: the append enters it, and it does not nest.
+        self._capture_aux_graphs()
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -2480,6 +2484,60 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_swa_cache_loc=swa_cache_loc,
             )
 
+    def _capture_aux_graphs(self) -> None:
+        """Capture the decode aux append for every decode bucket at startup, so its
+        memory is in place before the post-capture KV sizing and serving."""
+        # The graphs hold no sliding-window locations: such drafts append eagerly.
+        if (
+            not self._use_aux_graph
+            or self.draft_model_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
+            is not None
+        ):
+            return
+        projected = self.draft_model.fc_tp_columns is not None
+        hidden_size = int(self.draft_model.config.hidden_size)
+        max_requests = self.draft_model_runner.req_to_token_pool.size
+        graphs = DFlashAuxGraphs(
+            buckets=[
+                min(bs, max_requests)
+                for bs in get_exec().graph.cuda_graph_config.decode.bs
+            ],
+            block_size=int(self.block_size),
+            # Projected: the draft fc's output; else the target's concatenated taps.
+            hidden_width=(
+                hidden_size
+                if projected
+                else self.draft_model.num_context_features * hidden_size
+            ),
+            hidden_dtype=(
+                self.draft_model_runner.dtype
+                if projected
+                else self.model_runner.model_config.dtype
+            ),
+            device=self.device,
+        )
+
+        def append(hidden, cache_loc, cache_loc_2d, positions, commit_lens):
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                projected=projected,
+            )
+
+        graphs.capture(append, small_copy=self._batched_small_copy)
+        self._aux_bucket_graphs = graphs
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DFLASH aux CUDA graphs captured for %d batch sizes up to %d; "
+                "inputs %.1f MiB",
+                len(graphs.buckets),
+                graphs.buckets[-1],
+                graphs.input_bytes / 2**20,
+            )
+
     def _append_target_hidden_decode(
         self,
         *,
@@ -2521,53 +2579,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             with torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
                 target_hidden = self.draft_model.project_target_hidden(target_hidden)
 
-        key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
-        entry = self._aux_graphs.get(key)
-        inputs = (target_hidden, cache_loc, positions, commit_lens)
-        if entry is None:
-            static = tuple(torch.empty_like(t) for t in inputs)
-            for dst, src in zip(static, inputs):
-                dst.copy_(src)
-            hidden_buf, loc_buf, pos_buf, commit_buf = static
-
-            def append():
-                self._append_target_hidden_to_draft_kv_by_loc(
-                    target_hidden=hidden_buf,
-                    cache_loc=loc_buf,
-                    positions=pos_buf,
-                    cache_loc_2d=loc_buf.view(cache_loc_2d.shape),
-                    commit_lens=commit_buf,
-                    projected=projected,
-                )
-
-            stream = torch.cuda.Stream(device=target_hidden.device)
-            current = torch.cuda.current_stream(target_hidden.device)
-            stream.wait_stream(current)
-            # Warm CUBLAS/custom operators before capture. Repeating these
-            # prefix writes is idempotent; uncommitted cache rows stay untouched.
-            with torch.cuda.stream(stream):
-                append()
-            current.wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                append()
-            current.wait_stream(stream)
-            entry = (static, graph)
-            self._aux_graphs[key] = entry
-            logger.info(
-                "DFLASH aux CUDA graph captured rows=%d", target_hidden.shape[0]
+        graphs = self._aux_bucket_graphs
+        graph = (
+            None
+            if graphs is None
+            else graphs.load(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                commit_lens=commit_lens,
+                small_copy=self._batched_small_copy,
             )
-        elif self._batched_small_copy and try_small_copy(
-            list(entry[0][1:]), list(inputs[1:])
-        ):
-            entry[0][0].copy_(inputs[0])
-        else:
-            for dst, src in zip(entry[0], inputs):
-                dst.copy_(src)
+        )
+        if graph is None:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                projected=projected,
+            )
+            return
         if self._aux_overlap:
-            self._replay_aux_overlapped(entry[1])
+            self._replay_aux_overlapped(graph)
         else:
-            entry[1].replay()
+            graph.replay()
 
     def _append_target_hidden_megakernel(
         self,
