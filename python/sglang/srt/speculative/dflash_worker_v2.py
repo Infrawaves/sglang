@@ -2494,6 +2494,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             is not None
         ):
             return
+        if self._use_fused_kv_materialize:
+            raise RuntimeError(
+                "DFLASH aux CUDA graphs cannot capture fused context KV "
+                "materialization because prefill can reallocate its workspaces. "
+                "Set SGLANG_DFLASH_AUX_GRAPH=0 to use eager KV append."
+            )
         projected = self.draft_model.fc_tp_columns is not None
         hidden_size = int(self.draft_model.config.hidden_size)
         max_requests = self.draft_model_runner.req_to_token_pool.size
