@@ -15,8 +15,10 @@ KDA/Mamba stays per rank unless --enable-kda-hicache-node-aggregate is set: then
 each Mamba host buffer is one node-shared memfd laid out as
 ``[rank0 share | rank1 share | ...]`` with an equal, page-aligned stride. Every
 rank keeps a view of its own share, so H2D/D2H and slot allocation are
-unchanged; only the leader registers the full buffers with Mooncake and moves
-one multi-buffer object per checkpoint spanning every rank's slot.
+unchanged. Node rank 0 creates the memfds; node rank 1 is the KDA L3 leader,
+keeping that IO off the rank that already does MLA L3 IO. Only the KDA leader
+registers the full buffers with Mooncake and moves one multi-buffer object per
+checkpoint spanning every rank's slot.
 
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.
@@ -401,7 +403,7 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
         tp_cache_group: torch.distributed.ProcessGroup,
     ):
         super().__init__()
-        # Global ranks of this node; the first one is the leader.
+        # Global ranks of this node; the first one creates the memfds.
         self.node_ranks = node_ranks
         self.tp_cache_group = tp_cache_group
         self.node_rank = node_ranks.index(torch.distributed.get_rank())
@@ -443,7 +445,7 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
                     )
             except Exception as exc:
                 error = exc
-            # Keeps the leader's FD live until every peer reopened it;
+            # Keeps the owner's FD live until every peer reopened it;
             # no rank may pin its share before all shares are populated.
             synchronize_shared_host_error(
                 self.tp_cache_group, error, operation="KDA prefault"
@@ -480,27 +482,27 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
     def _open_shared_fd(
         self, owner: Optional[tuple[int, int, int]], stride: int
     ) -> int:
-        leader_rank = self.node_ranks[0]
+        owner_rank = self.node_ranks[0]
         if owner is None:
             raise RuntimeError(
-                f"KDA HiCache node leader rank {leader_rank} "
+                f"KDA HiCache memfd owner rank {owner_rank} "
                 "did not publish a shared host buffer."
             )
-        pid, owner_fd, leader_stride = owner
-        if leader_stride != stride:
-            # The leader computes peer addresses from its own stride.
+        pid, owner_fd, owner_stride = owner
+        if owner_stride != stride:
+            # Peer addresses assume every rank maps the same stride.
             raise ValueError(
-                f"KDA HiCache share stride {stride} differs from node leader "
-                f"rank {leader_rank}'s {leader_stride}."
+                f"KDA HiCache share stride {stride} differs from memfd owner "
+                f"rank {owner_rank}'s {owner_stride}."
             )
         path = f"/proc/{pid}/fd/{owner_fd}"
         try:
             return os.open(path, os.O_RDWR)
         except OSError as exc:
             raise RuntimeError(
-                f"KDA HiCache cannot reopen node leader rank {leader_rank}'s "
+                f"KDA HiCache cannot reopen memfd owner rank {owner_rank}'s "
                 f"shared host buffer at {path}: {exc}. Ranks on one node must have "
-                "permission and /proc visibility to the same leader descriptor."
+                "permission and /proc visibility to the same owner descriptor."
             ) from exc
 
 
@@ -509,6 +511,11 @@ def _numel(dims: tuple) -> int:
     for dim in dims:
         count *= dim
     return count
+
+
+# Node rank 0 already does the MLA per-node L3 IO and is the MLA storage writer.
+# maybe_create_kda_node_aggregate_context only activates with >= 2 ranks per node.
+KDA_L3_LEADER_NODE_RANK = 1
 
 
 class KDANodeAggregateContext(msgspec.Struct, frozen=True):
@@ -523,7 +530,7 @@ class KDANodeAggregateContext(msgspec.Struct, frozen=True):
 
     @property
     def is_leader(self) -> bool:
-        return self.node_rank == 0
+        return self.node_rank == KDA_L3_LEADER_NODE_RANK
 
 
 def maybe_create_kda_node_aggregate_context(
@@ -567,8 +574,10 @@ def maybe_create_kda_node_aggregate_context(
         ),
     )
     logger.info(
-        "KDA HiCache node aggregation enabled: node_ranks=%s, role=%s, node %d/%d",
+        "KDA HiCache node aggregation enabled: node_ranks=%s, leader=%d, role=%s, "
+        "node %d/%d",
         node_ranks,
+        node_ranks[KDA_L3_LEADER_NODE_RANK],
         "leader" if context.is_leader else "follower",
         node_index,
         len(node_groups),
