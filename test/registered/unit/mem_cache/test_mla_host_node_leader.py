@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
 from sglang.srt.mem_cache.mla_host_node_leader import (
+    KDANodeAggregateContext,
     NodeLeaderMLABroadcast,
     NodeSharedHostTensorAllocator,
     maybe_create_node_leader_context,
@@ -65,6 +66,25 @@ class TestSplitRanksByNode(CustomTestCase):
         self.assertEqual(
             split_ranks_by_node(list(range(6, 12)), 4), [[6, 7], [8, 9, 10, 11]]
         )
+
+
+class TestKDANodeAggregateLeader(CustomTestCase):
+    def test_kda_l3_leader_is_node_rank_one(self):
+        """Node rank 0 already does MLA per-node L3 IO, so KDA leads on rank 1."""
+        leaders = [
+            r
+            for r in range(8)
+            if KDANodeAggregateContext(
+                node_rank=r,
+                node_size=8,
+                node_index=0,
+                num_nodes=1,
+                backup_group=None,
+                prefetch_group=None,
+                allocator=None,
+            ).is_leader
+        ]
+        self.assertEqual(leaders, [1])
 
 
 class TestNodeLeaderBroadcast(CustomTestCase):

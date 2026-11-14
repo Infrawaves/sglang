@@ -26,7 +26,11 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -1208,6 +1212,66 @@ class TestPrefetchRankSpread(CustomTestCase):
         op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
         self.assertEqual(op.storage_hit_count, 128)
         self.assertFalse(hasattr(op, "query_rank_spread"))
+
+
+class TestKDANodeAggregatedRead(CustomTestCase):
+    def _read(self, *, peer_slot, kv_completed_pages=2):
+        """Run one sidecar read on the node leader with a stand-in exchange."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.kda_node_aggregate = SimpleNamespace(is_leader=True, prefetch_group="pg")
+        ctrl.storage_backend = Mock()
+        ctrl.storage_backend.batch_get_v2.return_value = {}
+        ctrl.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=SimpleNamespace(page_size=1))
+            }
+        )
+        ctrl.storage_page_group = 1
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["__placeholder__"],
+            host_indices=torch.tensor([3]),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        operation = SimpleNamespace(
+            request_id="r",
+            is_terminated=lambda: False,
+            hash_value=["h0", "h1"],
+            skip_reason=None,
+            pool_transfers=[mamba],
+            prefix_keys=None,
+            sidecar_hash_values=None,
+            sidecar_hit_pages=0,
+            sidecar_ts=None,
+            start_page=0,
+            storage_plans=None,
+        )
+        exchange = Mock(side_effect=lambda group, slot: [slot, peer_slot])
+        ctrl._exchange_node_slot = exchange
+        pool_hits = ctrl._page_transfer_sidecar(operation, kv_completed_pages)
+        return ctrl, operation, exchange, pool_hits
+
+    def test_peer_skip_stops_leader_io_and_reports_no_mamba_hit(self):
+        """A peer without a slot cannot receive the leader's write into its
+        share, so the leader must not read the node object and the node must
+        report a Mamba miss instead of restoring stale state on that rank."""
+        ctrl, operation, exchange, pool_hits = self._read(peer_slot=-1)
+        exchange.assert_called_once_with("pg", 3)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        self.assertEqual(pool_hits, {PoolName.MAMBA: 0})
+        self.assertEqual(operation.skip_reason, "node_peer_skip")
+
+    def test_locally_skipped_rank_still_joins_the_exchange(self):
+        """A rank whose KV read fell short must still run the exchange once,
+        or its node peers block in the collective forever."""
+        ctrl, operation, exchange, pool_hits = self._read(
+            peer_slot=5, kv_completed_pages=1
+        )
+        exchange.assert_called_once_with("pg", -1)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        ctrl.storage_backend.batch_get_v2.assert_not_called()
+        self.assertEqual(pool_hits, {})
+        self.assertEqual(operation.skip_reason, "kv_short")
 
 
 if __name__ == "__main__":
