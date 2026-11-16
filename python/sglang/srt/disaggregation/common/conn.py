@@ -905,12 +905,22 @@ class CommonKVManager(BaseKVManager):
             status=status,
             failure_reason=failure_reason,
         )
+        nonblocking = self.requires_transfer_drain and status == KVPoll.Failed
         for endpoint, dst_port in targets:
             na = NetworkAddress(endpoint, dst_port)
             try:
-                self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+                self._send_multipart_locked(
+                    na.to_tcp(), parts, is_ipv6=na.is_ipv6, blocking=not nonblocking
+                )
             except Exception as e:
-                logger.warning(
+                # Cancellation is best effort. A dead peer must not stall the
+                # scheduler or flood its logs on every retained-room poll.
+                log = (
+                    logger.debug
+                    if nonblocking and isinstance(e, zmq.Again)
+                    else logger.warning
+                )
+                log(
                     f"Failed to sync status {status} of room {bootstrap_room} to "
                     f"{na.to_host_port_str()}: {e}"
                 )
@@ -1199,6 +1209,8 @@ class CommonKVManager(BaseKVManager):
                 na.to_tcp(),
                 AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
                 is_ipv6=na.is_ipv6,
+                # Decode retries ABORT with the same generation until ACKed.
+                blocking=not self.requires_transfer_drain,
             )
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
@@ -2041,8 +2053,11 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
-        with self._socket_lock:
+    def _connect(self, endpoint: str, is_ipv6: bool = False, *, blocking: bool = True):
+        # The caller holds the endpoint's send lock, including during reconnect.
+        if not self._socket_lock.acquire(blocking=blocking):
+            raise zmq.Again()
+        try:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
                 monitor = self._monitor_cache.get(endpoint)
@@ -2083,17 +2098,36 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
+        finally:
+            self._socket_lock.release()
 
     def _send_multipart_locked(
-        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
+        self,
+        endpoint: str,
+        parts: List[bytes],
+        is_ipv6: bool = False,
+        *,
+        blocking: bool = True,
     ):
-        # Cached sockets are shared across sender threads and zmq sockets are
-        # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
+        # Never wait for a busy endpoint while holding the cache lock: a dead
+        # decode must not prevent notifications to other decode instances.
+        if not self._socket_lock.acquire(blocking=blocking):
+            raise zmq.Again()
+        try:
+            send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
+        finally:
+            self._socket_lock.release()
+        if not send_lock.acquire(blocking=blocking):
+            raise zmq.Again()
+        try:
+            sock = self._connect(endpoint, is_ipv6=is_ipv6, blocking=blocking)
+            if blocking:
+                sock.send_multipart(parts)
+            else:
+                sock.send_multipart(parts, flags=zmq.DONTWAIT)
+        finally:
+            send_lock.release()
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
