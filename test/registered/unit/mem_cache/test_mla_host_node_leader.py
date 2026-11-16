@@ -46,7 +46,7 @@ def _context(mla_layers, *, is_src=True, draft_pools=()):
     broadcaster = mock.create_autospec(MLAHostDedupBroadcaster, instance=True)
     broadcaster.is_src = is_src
     broadcaster.device = torch.device("cpu")
-    broadcaster.device_pool = SimpleNamespace(host_transfer_translate=None)
+    broadcaster.device_pool = SimpleNamespace()
     broadcaster.kv_staging = torch.empty(8)
     broadcaster.prepare_broadcast.side_effect = lambda indices, stream: (
         indices,
@@ -67,6 +67,109 @@ class TestSplitRanksByNode(CustomTestCase):
         )
 
 
+class TestIndexerSharingEligibility(CustomTestCase):
+    def test_assembler_shares_only_the_target_indexer(self):
+        from sglang.srt.mem_cache.device_pool_info import IndexKeyLayout
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+
+        root = SimpleNamespace(
+            layer_shard_enabled=False,
+            layer_num=2,
+            device="cpu",
+            store_dtype=torch.float16,
+            start_layer=0,
+            end_layer=2,
+        )
+        host = SimpleNamespace(
+            page_num=4, page_size=2, layout="page_first", dcp_size=1, dcp_rank=0
+        )
+        for name in (PoolName.INDEXER, PoolName.DRAFT_INDEXER):
+            for follower in (False, True):
+                with self.subTest(name=name, follower=follower):
+                    allocator = object()
+                    leader = SimpleNamespace(
+                        is_follower=follower,
+                        dsa_indexer_allocator=mock.Mock(return_value=allocator),
+                    )
+                    config = SimpleNamespace(
+                        pool_name=name,
+                        device_to_host_layer={0: 0, 1: 1},
+                        buffer_info=SimpleNamespace(
+                            key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+                        ),
+                    )
+                    with (
+                        mock.patch.object(
+                            assembler, "DSAIndexerPoolHost"
+                        ) as constructor,
+                        mock.patch.object(
+                            assembler, "_get_allocator_type", return_value="default"
+                        ),
+                    ):
+                        assembler._build_sidecar_host_pool(
+                            config=config,
+                            root=root,
+                            root_host_pool=host,
+                            node_leader=leader,
+                        )
+                    args = constructor.call_args.kwargs
+                    shared = name == PoolName.INDEXER
+                    self.assertIs(args["host_allocator"], allocator if shared else None)
+                    self.assertEqual(args["is_dummy"], shared and follower)
+                    self.assertEqual(args["host_buffer_read_only"], shared and follower)
+                    self.assertEqual(args["num_host_pages"], host.page_num)
+                    if shared:
+                        leader.dsa_indexer_allocator.assert_called_once_with(
+                            layer_sharded=False
+                        )
+                    else:
+                        leader.dsa_indexer_allocator.assert_not_called()
+
+    def test_sharing_conditions_and_independent_allocators(self):
+        from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLAContext
+
+        shared = NodeSharedHostTensorAllocator(
+            node_ranks=[0, 1], tp_cache_group=object()
+        )
+        for has_indexer in (False, True):
+            for has_draft in (False, True):
+                for sharded in (False, True):
+                    with self.subTest(
+                        indexer=has_indexer, draft=has_draft, sharded=sharded
+                    ):
+                        context = NodeLeaderMLAContext(
+                            is_follower=False,
+                            capacity_multiplier=2,
+                            shared_allocator=shared,
+                            broadcast=SimpleNamespace(
+                                broadcaster=SimpleNamespace(
+                                    idx_bufs=[] if has_indexer else None
+                                ),
+                                draft_pools=(object(),) if has_draft else (),
+                            ),
+                        )
+                        expected = has_indexer and not has_draft and not sharded
+                        self.assertEqual(
+                            context.shares_dsa_indexer(layer_sharded=sharded), expected
+                        )
+                        allocator = context.dsa_indexer_allocator(layer_sharded=sharded)
+                        if expected:
+                            self.assertIsInstance(
+                                allocator, NodeSharedHostTensorAllocator
+                            )
+                            self.assertIsNot(allocator, shared)
+                            self.assertIsNot(
+                                allocator,
+                                context.dsa_indexer_allocator(layer_sharded=sharded),
+                            )
+                            self.assertEqual(allocator.node_ranks, shared.node_ranks)
+                            self.assertIs(
+                                allocator.tp_cache_group, shared.tp_cache_group
+                            )
+                        else:
+                            self.assertIsNone(allocator)
+
+
 class TestNodeLeaderBroadcast(CustomTestCase):
     def setUp(self):
         self.stream = object()
@@ -84,10 +187,65 @@ class TestNodeLeaderBroadcast(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_restore_uses_anchor_translation_but_not_for_packed_draft(self):
+        for is_src in (False, True):
+            for translated in (False, True):
+                with self.subTest(is_src=is_src, translated=translated):
+                    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+                    draft = SimpleNamespace(
+                        kv_buffer=[torch.empty(8, 2)], kv_cache_dim=2
+                    )
+                    ctx = _context(
+                        [(3, 0), (7, 1)], is_src=is_src, draft_pools=(draft,)
+                    )
+                    ctx.broadcaster.device_pool = DSATokenToKVPool.__new__(
+                        DSATokenToKVPool
+                    )
+                    self.assertFalse(
+                        hasattr(ctx.broadcaster.device_pool, "host_transfer_translate")
+                    )
+                    mapper = (
+                        mock.Mock(side_effect=lambda ids: ids + 8)
+                        if translated
+                        else None
+                    )
+                    anchor = PoolEntry(
+                        name=PoolName.KV,
+                        host_pool=SimpleNamespace(host_buffer_read_only=not is_src),
+                        device_pool=ctx.broadcaster.device_pool,
+                        device_translate=mapper,
+                        is_primary_index_anchor=True,
+                    )
+                    group = SimpleNamespace(
+                        anchor_entry=anchor, entry_map={PoolName.KV: anchor}
+                    )
+                    with mock.patch.object(
+                        HiCacheController, "__init__", return_value=None
+                    ):
+                        HybridCacheController(
+                            None, group, 2, None, mock.Mock(), node_leader_broadcast=ctx
+                        )
+                    self.assertIs(ctx.device_translate, mapper)
+                    indices = torch.tensor([2, 3, 0, 1])
+                    finish = mock.Mock()
+                    ctx.start_load(index=0, device_indices=indices, finish_event=finish)
+                    ctx.broadcast_ready_layers(0, 0)
+                    ctx.broadcast_ready_layers(0, 7)
+                    expected = indices + 8 if translated else indices
+                    torch.testing.assert_close(
+                        ctx.broadcaster.prepare_broadcast.call_args.args[0], expected
+                    )
+                    torch.testing.assert_close(
+                        ctx.broadcaster._bcast_layer.call_args.args[2], indices
+                    )
+                    ctx.broadcaster.prepare_broadcast.assert_called_once()
+                    if mapper is not None:
+                        mapper.assert_called_once()
+                    finish.record.assert_called_once()
+
     def test_drafts_broadcast_after_last_mla_layer(self):
-        draft = SimpleNamespace(
-            kv_buffer=[torch.empty(4, 2)], kv_cache_dim=2, host_transfer_translate=None
-        )
+        draft = SimpleNamespace(kv_buffer=[torch.empty(4, 2)], kv_cache_dim=2)
         ctx = _context([(3, 0), (7, 1)], draft_pools=(draft,))
         finish = mock.Mock()
         ctx.start_load(index=0, device_indices=torch.arange(4), finish_event=finish)
@@ -607,12 +765,171 @@ class TestNodeSharedHostTensorAllocator(CustomTestCase):
                 needle = (
                     "expected"
                     if failure == "size"
-                    else "cannot reopen"
-                    if failure == "open"
-                    else f"injected {failure}"
+                    else "cannot reopen" if failure == "open" else f"injected {failure}"
                 )
                 for _, _, message in results:
                     self.assertIn(needle, message)
+
+
+def _shared_indexer_worker(rank, world_size, init_path, layout, failing_rank, out):
+    from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyLayout
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        leader = rank - rank % 2
+        allocator = NodeSharedHostTensorAllocator(
+            node_ranks=[leader, leader + 1],
+            tp_cache_group=torch.distributed.group.WORLD,
+        )
+        info = IndexKeyBufferInfo(
+            page_size=2,
+            compress_ratio=1,
+            key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+            buffers=tuple(torch.zeros((4, 264), dtype=torch.uint8) for _ in range(2)),
+        )
+        original_map = mla_host_node_leader.map_shm
+        mappings = []
+        owners = []
+
+        def map_buffer(fd, dims, dtype, *, populate_shard):
+            buffer = original_map(fd, dims, dtype, populate_shard=populate_shard)
+            mappings.append(weakref.ref(buffer))
+            owners.append(os.fstat(fd).st_ino)
+            # Each node writes a distinct marker before the real prefault fence.
+            if rank == leader:
+                buffer.fill_(leader + 1)
+            return buffer
+
+        with (
+            mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc_with_host_register}),
+            mock.patch.object(mla_host_node_leader, "map_shm", map_buffer),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.dsa.host_memory_budget_bytes",
+                return_value=0 if rank == failing_rank else 1 << 30,
+            ) as budget,
+            mock.patch.object(
+                allocator, "allocate", wraps=allocator.allocate
+            ) as allocate,
+        ):
+            try:
+                pool = DSAIndexerPoolHost(
+                    info,
+                    layer_mapping={0: 0, 1: 1},
+                    target_device_layer_num=2,
+                    num_host_pages=4,
+                    transfer_page_size=2,
+                    layout=layout,
+                    buffer_device="cpu",
+                    dtype=torch.float16,
+                    pin_memory=False,
+                    is_dummy=rank != leader,
+                    host_allocator=allocator,
+                    host_buffer_read_only=rank != leader,
+                )
+            except RuntimeError as exc:
+                out.put((rank, "error", str(exc), allocate.call_count))
+            else:
+                buffer = pool.index_k_with_scale_buffer
+                out.put(
+                    (
+                        rank,
+                        "ok",
+                        allocator.dims,
+                        pool.size,
+                        buffer is not None,
+                        (
+                            None
+                            if buffer is None
+                            else bool(torch.all(buffer == leader + 1))
+                        ),
+                        owners,
+                        sum(ref() is not None for ref in mappings),
+                        budget.call_count,
+                        allocate.call_count,
+                    )
+                )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@unittest.skipUnless(sys.platform == "linux", "shared memfd requires Linux /proc")
+class TestNodeSharedDSAIndexer(CustomTestCase):
+    def _run(self, world_size, layout, failing_rank=None):
+        context = multiprocessing.get_context("spawn")
+        out = context.Queue()
+        with tempfile.TemporaryDirectory() as directory:
+            processes = [
+                context.Process(
+                    target=_shared_indexer_worker,
+                    args=(
+                        rank,
+                        world_size,
+                        os.path.join(directory, "gloo"),
+                        layout,
+                        failing_rank,
+                        out,
+                    ),
+                )
+                for rank in range(world_size)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                results = sorted(out.get(timeout=60) for _ in processes)
+                for process in processes:
+                    process.join(timeout=10)
+                    self.assertEqual(process.exitcode, 0)
+                return results
+            finally:
+                for process in processes:
+                    if process.pid is not None:
+                        if process.is_alive():
+                            process.terminate()
+                        process.join(timeout=10)
+                out.close()
+                out.join_thread()
+
+    def test_one_and_two_nodes_allocate_only_on_leaders(self):
+        for world_size in (2, 4):
+            for layout in ("layer_first", "page_first"):
+                with self.subTest(world_size=world_size, layout=layout):
+                    results = self._run(world_size, layout)
+                    expected_dims = (
+                        (2, 5, 264) if layout == "layer_first" else (5, 2, 1, 264)
+                    )
+                    for row in results:
+                        rank = row[0]
+                        self.assertEqual(row[1], "ok", row)
+                        self.assertEqual(row[2:4], (expected_dims, 8))
+                        self.assertEqual(
+                            row[4:6], (rank % 2 == 0, True if rank % 2 == 0 else None)
+                        )
+                        self.assertEqual(
+                            row[7:],
+                            (1 if rank % 2 == 0 else 0, 1 if rank % 2 == 0 else 0, 1),
+                        )
+                        self.assertEqual(row[6], results[rank - rank % 2][6])
+                    if world_size == 4:
+                        self.assertNotEqual(results[0][6], results[2][6])
+
+    def test_either_leader_budget_failure_reaches_all_nodes_before_allocate(self):
+        for leader in (0, 2):
+            with self.subTest(failing_leader=leader):
+                results = self._run(4, "page_first", failing_rank=leader)
+                self.assertEqual([row[0] for row in results], list(range(4)))
+                for _, status, message, allocations in results:
+                    self.assertEqual(status, "error")
+                    self.assertIn("DSA indexer budget", message)
+                    self.assertIn(f"rank {leader}:", message)
+                    self.assertIn("Not enough host memory", message)
+                    self.assertEqual(allocations, 0)
 
 
 class TestReadOnlyAnchorTransfers(CustomTestCase):
@@ -643,6 +960,89 @@ class TestReadOnlyAnchorTransfers(CustomTestCase):
         controller.transfer_layer_id_max = 2
         controller.mem_pool_host = host_group
         return controller
+
+    def test_indexer_transfers_and_backup_follow_node_roles(self):
+        indices = torch.arange(4)
+        for rank, follower in ((0, False), (1, True), (4, False), (5, True)):
+            with self.subTest(rank=rank):
+                controller = self._controller(
+                    mla_host_read_only=follower,
+                    node_leader_broadcast=_context([(0, 0)], is_src=not follower),
+                )
+                entry = PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=SimpleNamespace(host_buffer_read_only=follower),
+                    device_pool=object(),
+                    layer_mapper=lambda layer: layer,
+                )
+                controller.mem_pool_host.entry_map[PoolName.INDEXER] = entry
+                transfer = PoolTransfer(
+                    name=PoolName.INDEXER,
+                    host_indices=indices,
+                    device_indices=indices,
+                )
+                expected = (
+                    []
+                    if follower
+                    else [
+                        controller.mem_pool_host.anchor_entry.host_pool,
+                        entry.host_pool,
+                    ]
+                )
+                self.assertEqual(
+                    [
+                        t.host_pool
+                        for t in controller._l2_transfers(indices, indices, [transfer])
+                    ],
+                    expected,
+                )
+                self.assertEqual(
+                    [
+                        t.host_pool
+                        for t in controller._l2_load_transfers(
+                            indices, indices, [transfer]
+                        )
+                    ],
+                    expected,
+                )
+                controller.storage_config = SimpleNamespace(is_storage_writer=rank == 0)
+                controller.draft_node_merge = None
+                controller.storage_backend_type = "mooncake"
+                self.assertEqual(controller.should_backup(transfer), rank == 0)
+
+    def test_indexer_l3_reads_are_filtered_before_backend_call(self):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+
+        for follower in (False, True):
+            with self.subTest(follower=follower):
+                controller = self._controller(mla_host_read_only=follower)
+                controller.mem_pool_host.entry_map[PoolName.INDEXER] = SimpleNamespace(
+                    host_pool=SimpleNamespace(host_buffer_read_only=follower),
+                )
+                controller.page_get_func = mock.Mock(return_value=2)
+                controller.storage_backend = SimpleNamespace(
+                    batch_get_v2=mock.Mock(
+                        return_value={PoolName.INDEXER: [True, False]}
+                    ),
+                )
+                transfer = PoolTransfer(name=PoolName.INDEXER)
+                hits = controller._page_transfer_kv_batch(
+                    SimpleNamespace(request_id="indexer-read"),
+                    ["a", "b"],
+                    torch.arange(4),
+                    HiCacheStorageExtraInfo(),
+                    [transfer],
+                )
+                self.assertEqual(hits, 2 if follower else 1)
+                backend = controller.storage_backend.batch_get_v2
+                if follower:
+                    backend.assert_not_called()
+                else:
+                    backend.assert_called_once()
+                    self.assertEqual(
+                        [t.name for t in backend.call_args.args[0]], [PoolName.INDEXER]
+                    )
+                    self.assertEqual(backend.call_args.args[0][0].keys, ["a", "b"])
 
     def test_logical_anchor_has_no_mla_role(self):
         """A non-MLA (logical) anchor must default to writable, not probe an MLA-only field."""

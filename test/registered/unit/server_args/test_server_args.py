@@ -2879,6 +2879,39 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_hicache_storage_bundle_pools_admission(self):
+        """Bundling is a Mooncake L3 key scheme: it needs HiCache with Mooncake.
+        Per-node MLA is allowed (the store then keeps one object per pool)."""
+        mooncake = {
+            "hicache_storage_backend": "mooncake",
+            "hicache_storage_backend_extra_config": json.dumps(
+                {"client_server_address": "localhost:50052"}
+            ),
+        }
+        for overrides, error in (
+            ({"enable_hierarchical_cache": True, **mooncake}, None),
+            (
+                {
+                    "enable_hierarchical_cache": True,
+                    "enable_mla_hicache_per_node": True,
+                    **mooncake,
+                },
+                None,
+            ),
+            (
+                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
+                "not mooncake",
+            ),
+            ({**mooncake}, "--enable-hierarchical-cache is off"),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(hicache_storage_bundle_pools=True, **overrides)
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def test_mla_hicache_per_node_requires_pp_size_one(self):
         """Per-node MLA HiCache must reject PP even on inactive or linker paths."""
         for enabled, cache_path, pp_size, rejects in (

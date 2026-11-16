@@ -57,6 +57,8 @@ class HiCacheStorageConfig:
 
     # HiCache pages per L3 object for the KV and draft pools (see storage_page_group).
     storage_page_group: int = 1
+    # Store eligible KV-derived pools inside the KV object (--hicache-storage-bundle-pools).
+    storage_bundle_pools: bool = False
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
