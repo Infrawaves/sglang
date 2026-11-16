@@ -1536,6 +1536,17 @@ class Envs:
     # (peer copy over NVLink) instead of NCCL P2P.  Cross-node moves keep
     # NCCL.  Falls back to NCCL on every rank if any rank cannot map a peer.
     SGLANG_EPLB_IPC_WEIGHT_TRANSFER = EnvBool(True)
+    # Offline EPLB what-if analysis (stat recorder only, all off by default).
+    # Every N recorded forward passes, dump the recorder window (the last
+    # --expert-distribution-recorder-buffer-size passes, in step order) to
+    # SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR and reset it.  The dump is
+    # collective; it is ignored when --enable-eplb owns the recorder.
+    SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES = EnvInt(0)
+    # With file dumps, every rank also writes its own (pre-all-reduce) counts,
+    # i.e. what this rank routed, summed over chunks of this many steps
+    # (0: one chunk for the whole window).
+    SGLANG_EXPERT_DISTRIBUTION_DUMP_PER_RANK = EnvBool(False)
+    SGLANG_EXPERT_DISTRIBUTION_PER_RANK_CHUNK_STEPS = EnvInt(0)
     # Run the first rebalance after max(interval // 4, recorder buffer size)
     # forward passes instead of a full interval (DeepInfer's schedule).
     SGLANG_EPLB_EARLY_FIRST_REBALANCE = EnvBool(True)

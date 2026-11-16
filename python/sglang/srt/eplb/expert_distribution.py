@@ -266,6 +266,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
+        self._current_pass_num_tokens = None
+        primary_gatherer = self._single_pass_gatherers.get(
+            _SINGLE_PASS_GATHERER_KEY_PRIMARY
+        )
+        if primary_gatherer is not None:
+            self._accumulator.gatherer_kind = type(primary_gatherer).__name__
+        self._auto_dump_passes = _resolve_auto_dump_passes(self._accumulator)
+        self._passes_since_auto_dump = 0
 
         if reports_expert_balancedness():
             logger.info(
@@ -307,6 +315,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._record_current_pass = should_record_forward_pass(forward_batch)
         if not self._record_current_pass:
             return
+        input_ids = getattr(forward_batch, "input_ids", None)
+        self._current_pass_num_tokens = (
+            int(input_ids.shape[0]) if input_ids is not None else -1
+        )
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
@@ -319,6 +331,18 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
+        self._accumulator.record_pass_metadata(
+            forward_pass_id=forward_pass_id,
+            num_tokens=getattr(self, "_current_pass_num_tokens", -1),
+        )
+        if getattr(self, "_auto_dump_passes", 0) > 0:
+            # Counted on the same lockstep passes as the accumulator (the
+            # balancedness all_gather relies on the same contract), so every
+            # rank reaches the collective dump on the same pass.
+            self._passes_since_auto_dump += 1
+            if self._passes_since_auto_dump >= self._auto_dump_passes:
+                self._passes_since_auto_dump = 0
+                self.dump_record(output_mode="file")
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -935,6 +959,9 @@ class _Accumulator(ABC):
     def reset(self):
         pass
 
+    def record_pass_metadata(self, *, forward_pass_id: int, num_tokens: int):
+        pass
+
     def dump(
         self,
         output_mode: _OutputMode,
@@ -1293,6 +1320,19 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             device=get_device_namespace().device,
         )
         self._first_dump = True
+        # Offline-analysis dumps (see SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES
+        # / _DUMP_PER_RANK): file dumps then keep step order and per-step host
+        # metadata. Off by default, which leaves the legacy file format as is.
+        self._analysis_dump = (
+            envs.SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES.get() > 0
+            or envs.SGLANG_EXPERT_DISTRIBUTION_DUMP_PER_RANK.get()
+        )
+        buffer_size = get_exec().moe.expert_distribution_recorder_buffer_size
+        self._pass_metadata = deque(
+            maxlen=buffer_size if buffer_size is not None and buffer_size > 0 else None
+        )
+        self._analysis_dump_seq = 0
+        self.gatherer_kind = "unknown"
 
     def append(
         self,
@@ -1310,6 +1350,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def reset(self):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
+        self._pass_metadata.clear()
+
+    def record_pass_metadata(self, *, forward_pass_id: int, num_tokens: int):
+        if self._analysis_dump:
+            # (forward_pass_id, host wall time at pass end, local input tokens)
+            self._pass_metadata.append((forward_pass_id, time.time(), num_tokens))
 
     def dump(
         self,
@@ -1317,6 +1363,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         *,
         aggregate_steps_for_rebalance: bool = False,
     ):
+        if (
+            output_mode == "file"
+            and self._analysis_dump
+            and not aggregate_steps_for_rebalance
+        ):
+            return self._dump_for_analysis()
         global_physical_count = self._global_physical_count_of_buffered_step.get_all()
         if aggregate_steps_for_rebalance:
             # The default DeepSeek/EPLB solver immediately sums the recorder
@@ -1359,6 +1411,96 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         else:
             raise NotImplementedError
+
+    def _dump_for_analysis(self):
+        """Step-ordered global dump on rank 0, plus optional per-rank files.
+
+        Collective (all_reduce); every rank must call it on the same pass.
+        Files of one dump share ``dump_seq``:
+          expert_distribution_dump{seq}_global.pt   (rank 0)
+          expert_distribution_dump{seq}_rank{r}.pt  (each rank, if per-rank on)
+        """
+        seq = self._analysis_dump_seq
+        self._analysis_dump_seq += 1
+        metadata = list(self._pass_metadata)
+        # [steps, layers, num_physical]: this rank's own routed counts.
+        local_physical = self._global_physical_count_of_buffered_step.get_ordered()
+        num_steps = local_physical.shape[0]
+        metadata = metadata[-num_steps:] if num_steps else []
+        common = dict(
+            dump_seq=seq,
+            num_steps=num_steps,
+            forward_pass_ids=[m[0] for m in metadata],
+            step_end_time=[m[1] for m in metadata],
+            num_layers=self._expert_location_metadata.num_layers,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            ep_size=self._expert_location_metadata.ep_size,
+            physical_to_logical_map=(
+                self._expert_location_metadata.physical_to_logical_map_cpu.clone()
+            ),
+        )
+        stamp = int(time.time())
+
+        if envs.SGLANG_EXPERT_DISTRIBUTION_DUMP_PER_RANK.get() and num_steps > 0:
+            chunk = envs.SGLANG_EXPERT_DISTRIBUTION_PER_RANK_CHUNK_STEPS.get()
+            if chunk <= 0 or chunk > num_steps:
+                chunk = num_steps
+            num_chunks = (num_steps + chunk - 1) // chunk
+            padded = local_physical
+            if num_chunks * chunk != num_steps:
+                padded = torch.cat(
+                    [
+                        local_physical,
+                        local_physical.new_zeros(
+                            (num_chunks * chunk - num_steps, *local_physical.shape[1:])
+                        ),
+                    ]
+                )
+            per_chunk = padded.view(num_chunks, chunk, *local_physical.shape[1:]).sum(
+                dim=1
+            )
+            _dump_to_file_async(
+                f"expert_distribution_dump{seq:05d}_rank{self._rank:03d}_{stamp}.pt",
+                dict(
+                    common,
+                    rank=self._rank,
+                    # What these counts mean depends on the gatherer: for the
+                    # select-experts gatherer (MegaMoE, no-a2a, DeepEP normal
+                    # without dispatch-side counts) it is the tokens this rank
+                    # *sent* to each physical expert.
+                    gatherer=self.gatherer_kind,
+                    chunk_steps=chunk,
+                    local_physical_count_of_chunk=per_chunk.cpu(),
+                    local_num_tokens=[m[2] for m in metadata],
+                ),
+            )
+
+        logical_count_of_step = _convert_global_physical_count_to_logical_count(
+            local_physical,
+            num_layers=self._expert_location_metadata.num_layers,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+        torch.distributed.all_reduce(
+            logical_count_of_step, op=torch.distributed.ReduceOp.SUM
+        )
+        # Collective when balancedness is reported (it flushes the staged
+        # window), so it must run on every rank, not only rank 0.
+        average_utilization_rate = self._get_global_average_utilization_rate()
+        if self._rank == 0:
+            _dump_to_file_async(
+                f"expert_distribution_dump{seq:05d}_global_{stamp}.pt",
+                dict(
+                    common,
+                    rank=self._rank,
+                    # [steps, layers, logical experts], summed over all ranks.
+                    logical_count=logical_count_of_step.cpu(),
+                    local_num_tokens_rank0=[m[2] for m in metadata],
+                    average_utilization_rate_over_window=average_utilization_rate,
+                ),
+            )
+        return None
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
@@ -1403,6 +1545,56 @@ def _dump_to_file(name, data):
     torch.save(data, str(path_output))
 
 
+def _resolve_auto_dump_passes(accumulator) -> int:
+    passes = envs.SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES.get()
+    if passes <= 0:
+        return 0
+    if not isinstance(accumulator, _StatAccumulator):
+        logger.warning(
+            "SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES needs "
+            "--expert-distribution-recorder-mode stat; auto dump disabled"
+        )
+        return 0
+    if get_exec().moe.enable_eplb:
+        # EPLBManager dumps and resets the same recorder for rebalancing.
+        logger.warning(
+            "SGLANG_EXPERT_DISTRIBUTION_AUTO_DUMP_PASSES is ignored with "
+            "--enable-eplb; auto dump disabled"
+        )
+        return 0
+    logger.info(
+        f"ExpertDistributionRecorder auto dump every {passes} recorded passes to "
+        f"{envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()}"
+    )
+    return passes
+
+
+_ASYNC_DUMP_EXECUTOR = None
+
+
+def _dump_to_file_async(name, data):
+    """torch.save on a background thread; ``data`` must already be on CPU.
+
+    Keeps disk latency off the forward pass, where rank 0 stalling would hold
+    every EP rank at the next collective.
+    """
+    global _ASYNC_DUMP_EXECUTOR
+    if _ASYNC_DUMP_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _ASYNC_DUMP_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="expert-dist-dump"
+        )
+
+    def _write():
+        try:
+            _dump_to_file(name, data)
+        except Exception:
+            logger.exception(f"Failed to write expert distribution dump {name}")
+
+    _ASYNC_DUMP_EXECUTOR.submit(_write)
+
+
 class _Buffer:
     @staticmethod
     def init_new(item_shape: Tuple, buffer_size: int, dtype, device):
@@ -1417,6 +1609,10 @@ class _Buffer:
     def get_all(self) -> torch.Tensor:
         raise NotImplementedError
 
+    def get_ordered(self) -> torch.Tensor:
+        """Appended items only, oldest first."""
+        raise NotImplementedError
+
     def reset(self):
         raise NotImplementedError
 
@@ -1427,16 +1623,29 @@ class _CircularBuffer(_Buffer):
             (buffer_size, *item_shape), dtype=dtype, device=device
         )
         self._curr_index = 0
+        self._num_appended = 0
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
         self._curr_index = (self._curr_index + 1) % len(self._buffer)
+        self._num_appended += 1
 
     def get_all(self) -> torch.Tensor:
         return self._buffer
 
+    def get_ordered(self) -> torch.Tensor:
+        if self._num_appended < len(self._buffer):
+            return self._buffer[: self._num_appended]
+        if self._curr_index == 0:
+            return self._buffer
+        return torch.cat(
+            [self._buffer[self._curr_index :], self._buffer[: self._curr_index]]
+        )
+
     def reset(self):
         self._buffer[...] = 0
+        self._curr_index = 0
+        self._num_appended = 0
 
 
 class _InfiniteBuffer(_Buffer):
@@ -1467,6 +1676,9 @@ class _InfiniteBuffer(_Buffer):
 
     def get_all(self) -> torch.Tensor:
         return self._buffer[: self._size]
+
+    def get_ordered(self) -> torch.Tensor:
+        return self.get_all()
 
     def reset(self):
         self._buffer[...] = 0
