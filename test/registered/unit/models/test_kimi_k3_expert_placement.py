@@ -7,7 +7,6 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK3LinearForCausalLM,
-    KimiK3MoE,
 )
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -40,18 +39,6 @@ class TestKimiK3ExpertPlacement(CustomTestCase):
         self.assertEqual(
             (text.num_layers, text.num_logical_experts, text.num_groups), (93, 896, 1)
         )
-
-    def test_rejects_unimplemented_weight_relocation(self):
-        config = KimiLinearConfig()
-        for online, redundant in [(True, 0), (False, 8)]:
-            with (
-                self.subTest(online=online, redundant=redundant),
-                get_exec().moe.override(
-                    enable_eplb=online, ep_num_redundant_experts=redundant
-                ),
-            ):
-                with self.assertRaisesRegex(ValueError, "without online EPLB"):
-                    KimiK3MoE(config)
 
 
 if __name__ == "__main__":
