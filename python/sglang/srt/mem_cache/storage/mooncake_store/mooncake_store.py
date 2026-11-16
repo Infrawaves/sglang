@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import msgspec
 import requests
@@ -507,6 +507,8 @@ class MooncakeBaseStore:
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     # Pages per KV/draft object; __init__ sets it from the storage config.
     storage_page_group = 1
+    # Pools stored inside the KV object; set by on_host_pools_registered().
+    bundled_pools: tuple = ()
 
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
@@ -1055,6 +1057,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 reason="External L3 lookup requires rank-replicated/MLA pools",
             )
             return layout
+        if self.storage_page_group > 1:
+            # Grouped KV/draft objects are keyed per segment (storage_page_group.py),
+            # so no per-page key exists for an external lookup.
+            layout.update(
+                enabled=False,
+                reason="External L3 lookup does not support "
+                "--hicache-storage-page-size larger than --page-size",
+            )
+            return layout
 
         if self.mem_pool_host.kv_buffer is not None:
             suffixes, _, _ = self._batch_preprocess(
@@ -1074,7 +1085,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
         trailing_pages = {PoolName.MAMBA: 1, PoolName.SWA: swa_trailing_pages}
         for pool_name in self.registered_pools:
-            if pool_name == PoolName.KV:
+            # A bundled pool has no objects of its own; the KV suffix covers it.
+            if pool_name == PoolName.KV or pool_name in self.bundled_pools:
                 continue
             spec = specs.get(pool_name)
             policy = (
@@ -1140,31 +1152,42 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     # KV-derived pools that MLA writers store per page under mla_suffix.
     _BUNDLE_CANDIDATES = (PoolName.INDEXER, PoolName.DRAFT, PoolName.DRAFT_INDEXER)
 
-    def _resolve_bundled_pools(self) -> tuple:
+    def _resolve_bundled_pools(self) -> Tuple[tuple, Dict[str, str]]:
         """Pools that can live in the KV object: same host page as the KV
         (one page per logical page, same span), written by the same ranks (MLA
-        keys) and required on every page. Anything else keeps its own object."""
-        if not self.storage_bundle_pools or not self.is_mla_backend:
-            return ()
+        keys) and required on every page. Anything else keeps its own object.
+
+        Returns the bundled pools and why each registered candidate was left
+        out (keyed "kv" when the KV object itself cannot carry a bundle)."""
+        if not self.storage_bundle_pools:
+            return (), {}
+        if not self.is_mla_backend:
+            return (), {"kv": "the model is not MLA"}
         host = self.mem_pool_host
         if host is None or not isinstance(host, MLATokenToKVPoolHost):
-            return ()
+            return (), {"kv": "the KV host pool is not an MLA host pool"}
         kv_node_shared = self._is_node_shared_host_pool(host)
         if not kv_node_shared and host.kv_buffer is None:
-            return ()
+            return (), {"kv": "the KV host pool has no buffer"}
         span = l3_page_span(host)
         bundled = []
+        skipped = {}
         for name in self._BUNDLE_CANDIDATES:
             pool = self.registered_pools.get(name)
-            if pool is None or isinstance(pool, DevicePoolEntry):
+            if pool is None:
+                continue
+            if isinstance(pool, DevicePoolEntry):
+                skipped[name.value] = "it is a direct device pool"
                 continue
             if l3_page_span(pool) != span:
+                skipped[name.value] = "its L3 page span differs from the KV"
                 continue
             if self._is_node_shared_host_pool(pool) != kv_node_shared:
                 # Per-node MLA: the node leader alone reads the shared KV and a
                 # follower skips it, so only a pool shared the same way (the DSA
                 # indexer) can ride in it; a per-rank pool keeps its own objects.
                 # Rank-independent, so every rank of the node decides alike.
+                skipped[name.value] = "its per-node sharing differs from the KV"
                 continue
             if name == PoolName.DRAFT and (
                 not isinstance(pool, MLATokenToKVPoolHost)
@@ -1173,9 +1196,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ):
                 # An MHA draft is written by every rank; a node-merged one by
                 # the node leader. Neither matches the MLA KV writer.
+                skipped[name.value] = "an MHA or node-merged draft has its own writer"
                 continue
             bundled.append(name)
-        return tuple(bundled)
+        return tuple(bundled), skipped
 
     @staticmethod
     def _is_node_shared_host_pool(pool: Any) -> bool:
@@ -1198,13 +1222,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
 
     def on_host_pools_registered(self) -> None:
-        self.bundled_pools = self._resolve_bundled_pools()
+        self.bundled_pools, skipped = self._resolve_bundled_pools()
+        reasons = "; ".join(f"{name}: {why}" for name, why in skipped.items())
         if self.bundled_pools:
             logger.info(
                 "Mooncake L3 stores %s inside the KV object (one object per page "
-                "instead of %d).",
+                "instead of %d).%s",
                 ", ".join(name.value for name in self.bundled_pools),
                 1 + len(self.bundled_pools),
+                f" Kept separate: {reasons}." if reasons else "",
+            )
+        elif self.storage_bundle_pools:
+            logger.warning(
+                "--hicache-storage-bundle-pools has no effect: %s.",
+                reasons or "no indexer or draft host pool is registered",
             )
 
     def _get_hybrid_page_component_keys(
@@ -2240,7 +2271,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        # A short object leaves part of its buffers untouched (for a bundled
+        # object, the indexer/draft rows), so a page hits only when every
+        # component read exactly its expected bytes, as in _get_objects.
+        results = list(get_results)
+        expected = [_object_nbytes(size) for size in buffer_sizes]
+        width = len(key_strs) // len(keys)
+        return [
+            results[i : i + width] == expected[i : i + width]
+            for i in range(0, len(expected), width)
+        ]
 
     def batch_set_v1(
         self,

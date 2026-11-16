@@ -583,6 +583,116 @@ class TestMooncakeBundlePools(CustomTestCase):
             sidecars[PoolName.DRAFT], written[PoolName.DRAFT], kv_page, 2, 9, 5
         )
 
+    def test_v1_read_of_a_short_bundled_object_misses(self):
+        # Mooncake reports the bytes it read; an object holding only the KV
+        # bytes would leave the bundled indexer rows stale.
+        kv = self._mla_host("page_first", 1, 0)
+        sidecars = {PoolName.INDEXER: self._indexer_host(1, 0)}
+        store = self._store(kv, sidecars, dcp=1, rank=0, objects={}, bundle=True)
+        indices = self._indices(self.PHYS_PAGE, 1, 2)
+        _, _, sizes = store._batch_preprocess(store._tag_keys(["a", "b"]), indices)
+        full = sum(sizes[0])
+        short = full - self.LAYERS * self.INDEX_STRIDE
+        for byte_counts, expected in (
+            ([full, full], [True, True]),
+            ([full, short], [True, False]),
+            ([short, full], [False, True]),
+        ):
+            with self.subTest(byte_counts=byte_counts):
+                store.store.batch_get_into_multi_buffers = lambda *_: byte_counts
+                self.assertEqual(store.batch_get_v1(["a", "b"], indices), expected)
+
+    def _layout_keys(self, layout, pages):
+        """Every object key an external router derives from the layout."""
+        objects = layout["hicache_object_layout"]
+        prefix = objects["key_prefix"]
+        return {
+            pool["pool"]: [
+                f"{prefix}_{page}{suffix}" if prefix else f"{page}{suffix}"
+                for page in pages
+                for suffix in pool["suffixes"]
+            ]
+            for pool in objects["pools"]
+        }
+
+    def test_layout_describes_only_objects_that_are_written(self):
+        pages = [f"h{i}" for i in range(1, 7)]
+        for bundle in (False, True):
+            with self.subTest(bundle=bundle):
+                objects = {}
+                kv = self._mla_host("page_first", 1, 0)
+                sidecars = {PoolName.INDEXER: self._indexer_host(1, 0)}
+                store = self._store(
+                    kv, sidecars, dcp=1, rank=0, objects=objects, bundle=bundle
+                )
+                self._write_then_read(
+                    store, kv, sidecars, self.PHYS_PAGE, pages, group=1
+                )
+                layout = store.describe_l3_object_layout(
+                    sidecar_pool_specs=(),
+                    swa_trailing_pages=None,
+                    page_size=self.PHYS_PAGE,
+                )
+                self.assertTrue(layout["enabled"], layout)
+                keys = self._layout_keys(layout, pages)
+                self.assertEqual(
+                    sorted(keys),
+                    sorted(
+                        [str(PoolName.KV)] + ([] if bundle else [str(PoolName.INDEXER)])
+                    ),
+                )
+                for pool, pool_keys in keys.items():
+                    self.assertTrue(set(pool_keys) <= set(objects), pool)
+
+    def test_layout_is_unavailable_with_page_groups(self):
+        for bundle in (False, True):
+            with self.subTest(bundle=bundle):
+                kv = self._mla_host("page_first", 1, 0)
+                store = self._store(
+                    kv,
+                    {PoolName.INDEXER: self._indexer_host(1, 0)},
+                    dcp=1,
+                    rank=0,
+                    objects={},
+                    bundle=bundle,
+                    group=4,
+                )
+                layout = store.describe_l3_object_layout(
+                    sidecar_pool_specs=(),
+                    swa_trailing_pages=None,
+                    page_size=self.PHYS_PAGE,
+                )
+                self.assertFalse(layout["enabled"])
+                self.assertIn("--hicache-storage-page-size", layout["reason"])
+                self.assertEqual(layout["hicache_object_layout"]["pools"], [])
+
+    def test_flag_without_effect_warns_with_the_reason(self):
+        logger_name = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store"
+        cases = (
+            ({PoolName.DRAFT: self._MHADraftHost()}, "MHA or node-merged draft"),
+            ({}, "no indexer or draft host pool is registered"),
+        )
+        for sidecars, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertLogs(logger_name, "WARNING") as logs:
+                    store = self._store(
+                        self._mla_host("page_first", 1, 0),
+                        sidecars,
+                        dcp=1,
+                        rank=0,
+                        objects={},
+                        bundle=True,
+                    )
+                self.assertEqual(store.bundled_pools, ())
+                self.assertTrue(
+                    any(
+                        "--hicache-storage-bundle-pools has no effect" in line
+                        and reason in line
+                        for line in logs.output
+                    ),
+                    logs.output,
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
