@@ -87,6 +87,11 @@ class KdaL3StatsTracker:
         while len(self._pending) > _MAX_PENDING:
             self._pending.popitem(last=False)
 
+    def wants_write(self, node_id: Any) -> bool:
+        """Cheap gate before the caller computes the node depth: only the
+        logging rank, and only nodes whose insert recorded a class."""
+        return self._log and node_id in self._pending
+
     def on_storage_write(
         self, node_id: Any, mamba_key: Optional[str], node_end: int
     ) -> None:

@@ -86,6 +86,48 @@ class TestTracker(unittest.TestCase):
         self.assertEqual(len(t._pending), 0)
 
 
+class TestWriteGate(unittest.TestCase):
+    """The O(depth) prefix walk runs only on the logging rank for recorded nodes."""
+
+    def _cache(self, log_rank):
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        with mock.patch.object(kda_l3_stats, "_is_logging_rank", return_value=log_rank):
+            tracker = kda_l3_stats.KdaL3StatsTracker()
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.kda_l3_stats = tracker
+        cache.tree_core = SimpleNamespace(page_size=512)
+        cache.get_prefix_hash_values = mock.Mock(return_value=["p"] * 31)
+        spec = SimpleNamespace(
+            hash_value=["h"],
+            comp_xfers={ComponentType.MAMBA: [SimpleNamespace(keys=["k32"])]},
+        )
+        return cache, tracker, spec
+
+    def _record(self, tracker, node_id, position):
+        tracker._pending[node_id] = ("middle", "r", position, 58000)
+
+    def test_non_logging_rank_skips_walk(self):
+        cache, tracker, spec = self._cache(log_rank=False)
+        self._record(tracker, 7, 16384)  # even a stray entry must not walk
+        cache._record_kda_l3_write(7, spec)
+        cache.get_prefix_hash_values.assert_not_called()
+
+    def test_unrecorded_node_skips_walk(self):
+        cache, tracker, spec = self._cache(log_rank=True)
+        cache._record_kda_l3_write(7, spec)
+        cache.get_prefix_hash_values.assert_not_called()
+
+    def test_recorded_node_walks_and_logs(self):
+        cache, tracker, spec = self._cache(log_rank=True)
+        self._record(tracker, 7, 32 * 512)
+        with self.assertLogs(kda_l3_stats.logger, level=logging.INFO) as cm:
+            cache._record_kda_l3_write(7, spec)
+        cache.get_prefix_hash_values.assert_called_once_with(7)
+        self.assertIn("key=k32 cls=middle pos=16384", cm.output[0])
+
+
 class TestReadLog(unittest.TestCase):
     def _op(self, kv_pages):
         return SimpleNamespace(

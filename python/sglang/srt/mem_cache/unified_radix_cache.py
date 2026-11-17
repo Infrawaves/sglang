@@ -2482,6 +2482,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _record_kda_l3_write(self, node_id: NodeId, spec) -> None:
+        # Gate before the O(depth) prefix walk: non-logging ranks and nodes
+        # without a recorded class never pay for it.
+        if not self.kda_l3_stats.wants_write(node_id):
+            return
         try:
             mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
             if not mamba_xfers or not mamba_xfers[0].keys:
