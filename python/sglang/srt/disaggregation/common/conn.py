@@ -7,9 +7,10 @@ import functools
 import logging
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from enum import Enum
+from itertools import islice
 from typing import (
     Any,
     Callable,
@@ -99,6 +100,9 @@ _DECODE_BOOTSTRAP_WORKERS = 32
 # Arbitrary; bounds how many bootstrap workers one unresponsive prefill can hold.
 _MAX_SETUP_JOBS_PER_PREFILL = 2
 _PARALLEL_INFO_WORKERS = 4
+_MAX_PENDING_FAILED_STATUS = 4096
+_FAILED_STATUS_RETRY_BATCH = 32
+_FAILED_STATUS_RETRY_INTERVAL = 0.1
 
 
 def _bootstrap_http_timeout() -> Tuple[float, float]:
@@ -466,6 +470,11 @@ class CommonKVManager(BaseKVManager):
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
+        self._pending_failed_status = OrderedDict()
+        self._pending_failed_status_lock = threading.Lock()
+        self._failed_status_attempts = set()
+        self._next_failed_status_retry = 0.0
+        self._failed_status_warning_times = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
@@ -906,23 +915,152 @@ class CommonKVManager(BaseKVManager):
             failure_reason=failure_reason,
         )
         nonblocking = self.requires_transfer_drain and status == KVPoll.Failed
-        for endpoint, dst_port in targets:
-            na = NetworkAddress(endpoint, dst_port)
-            try:
-                self._send_multipart_locked(
-                    na.to_tcp(), parts, is_ipv6=na.is_ipv6, blocking=not nonblocking
+        attempt = (bootstrap_room, object()) if nonblocking else None
+        if attempt is not None:
+            with self._pending_failed_status_lock:
+                self._failed_status_attempts.add(attempt)
+        try:
+            for endpoint, dst_port in targets:
+                na = NetworkAddress(endpoint, dst_port)
+                try:
+                    self._send_multipart_locked(
+                        na.to_tcp(), parts, is_ipv6=na.is_ipv6, blocking=not nonblocking
+                    )
+                except Exception as e:
+                    if nonblocking:
+                        self._queue_failed_status(
+                            bootstrap_room,
+                            na.to_tcp(),
+                            parts,
+                            na.is_ipv6,
+                            error=e,
+                            attempt=attempt,
+                        )
+                        continue
+                    logger.warning(
+                        f"Failed to sync status {status} of room {bootstrap_room} to "
+                        f"{na.to_host_port_str()}: {e}"
+                    )
+        finally:
+            if attempt is not None:
+                with self._pending_failed_status_lock:
+                    self._failed_status_attempts.discard(attempt)
+
+    def _warn_failed_status_retry(
+        self, reason: str, room: int, endpoint: str, error: Optional[Exception] = None
+    ) -> None:
+        now = time.monotonic()
+        # Expected backpressure must not suppress a different transport error.
+        warning_key = (reason, isinstance(error, zmq.Again))
+        with self._pending_failed_status_lock:
+            if (
+                now - self._failed_status_warning_times.get(warning_key, -float("inf"))
+                < 5
+            ):
+                return
+            self._failed_status_warning_times[warning_key] = now
+            pending = len(self._pending_failed_status)
+        logger.warning(
+            "Failed KV status notification %s: room=%s endpoint=%s pending=%s error=%r errno=%s "
+            "(rate limited to once per 5s)",
+            reason,
+            room,
+            endpoint,
+            pending,
+            error,
+            getattr(error, "errno", None),
+        )
+
+    def _queue_failed_status(
+        self,
+        room: int,
+        endpoint: str,
+        parts: List[bytes],
+        is_ipv6: bool,
+        error: Optional[Exception] = None,
+        *,
+        attempt: Tuple[int, object],
+    ) -> None:
+        key = (room, endpoint)
+        with self._pending_failed_status_lock:
+            # A new sender invalidates in-flight attempts even before they
+            # have queued anything. Never resurrect one after room reuse.
+            if attempt not in self._failed_status_attempts:
+                return
+            queued = key in self._pending_failed_status
+            full = (
+                not queued
+                and len(self._pending_failed_status) >= _MAX_PENDING_FAILED_STATUS
+            )
+            if not queued and not full:
+                # Repeated aborts must not extend the original deadline.
+                self._pending_failed_status[key] = (
+                    tuple(parts),
+                    is_ipv6,
+                    time.monotonic() + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(),
                 )
-            except Exception as e:
-                # Cancellation is best effort. A dead peer must not stall the
-                # scheduler or flood its logs on every retained-room poll.
-                log = (
-                    logger.debug
-                    if nonblocking and isinstance(e, zmq.Again)
-                    else logger.warning
-                )
-                log(
-                    f"Failed to sync status {status} of room {bootstrap_room} to "
-                    f"{na.to_host_port_str()}: {e}"
+        self._warn_failed_status_retry(
+            "dropped (queue full)" if full else "queued for nonblocking retry",
+            room,
+            endpoint,
+            error=error,
+        )
+
+    def _discard_pending_failed_status(self, room: int) -> None:
+        # Only a new room lifecycle invalidates retries. Sender clear() must
+        # leave them alive: neither request_status nor transfer_infos is needed.
+        with self._pending_failed_status_lock:
+            self._failed_status_attempts.difference_update(
+                {
+                    attempt
+                    for attempt in self._failed_status_attempts
+                    if attempt[0] == room
+                }
+            )
+            for key in list(self._pending_failed_status):
+                if key[0] == room:
+                    del self._pending_failed_status[key]
+
+    def _retry_failed_status(self) -> None:
+        now = time.monotonic()
+        with self._pending_failed_status_lock:
+            if now < self._next_failed_status_retry:
+                return
+            self._next_failed_status_retry = now + _FAILED_STATUS_RETRY_INTERVAL
+            batch = list(
+                islice(self._pending_failed_status.items(), _FAILED_STATUS_RETRY_BATCH)
+            )
+            for key, _ in batch:
+                self._pending_failed_status.move_to_end(key)
+        for key, notification in batch:
+            room, endpoint = key
+            parts, is_ipv6, expires_at = notification
+            with self._pending_failed_status_lock:
+                if self._pending_failed_status.get(key) is not notification:
+                    continue
+            expired = time.monotonic() >= expires_at
+            if not expired:
+                try:
+                    # Revalidate at the socket, after connection setup, to
+                    # serialize the final send with room invalidation.
+                    self._send_multipart_locked(
+                        endpoint,
+                        parts,
+                        is_ipv6,
+                        blocking=False,
+                        pending_status=(key, notification),
+                    )
+                except Exception as e:
+                    self._warn_failed_status_retry(
+                        "retry failed", room, endpoint, error=e
+                    )
+                    continue
+            with self._pending_failed_status_lock:
+                if self._pending_failed_status.get(key) is notification:
+                    del self._pending_failed_status[key]
+            if expired:
+                self._warn_failed_status_retry(
+                    "dropped (retry expired)", room, endpoint
                 )
 
     def send_chunk_ready(
@@ -1290,28 +1428,27 @@ class CommonKVManager(BaseKVManager):
     def _make_worker_recv(self, socket, timeout_ms: int = 500):
         """Build the blocking multipart recv used by a worker thread.
 
-        Plain blocking recv unless role switching is enabled: teardown flips a
-        stop flag that a blocked recv can never observe, so in that mode poll
-        with a timeout and return None when it expires. Deployments without
-        --enable-pd-role-switch keep the original blocking recv and pay nothing.
+        Poll when role switching or Failed retries need progress while idle.
+        Return None on timeout so teardown can observe its stop flag.
         Deferred allocation consumes endpoint registration here, before backend
         metadata handling; ABORT still reaches the backend's drain/ACK handler.
         """
-        if self.deferred_bootstrap is not None:
-
-            def recv_bootstrap():
-                msg = socket.recv_multipart()
-                return None if self._handle_bootstrap_message(msg) else msg
-
-            return recv_bootstrap
-        if not self.server_args.enable_pd_role_switch:
-            return socket.recv_multipart
-
-        poller = zmq.Poller()
-        poller.register(socket, zmq.POLLIN)
+        retry_failed = (
+            self.requires_transfer_drain
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        )
+        poller = None
+        if retry_failed or self.server_args.enable_pd_role_switch:
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
 
         def recv():
-            return socket.recv_multipart() if poller.poll(timeout_ms) else None
+            if retry_failed:
+                self._retry_failed_status()
+            if poller is not None and not poller.poll(timeout_ms):
+                return None
+            msg = socket.recv_multipart()
+            return None if self._handle_bootstrap_message(msg) else msg
 
         return recv
 
@@ -2109,6 +2246,7 @@ class CommonKVManager(BaseKVManager):
         is_ipv6: bool = False,
         *,
         blocking: bool = True,
+        pending_status=None,
     ):
         # Never wait for a busy endpoint while holding the cache lock: a dead
         # decode must not prevent notifications to other decode instances.
@@ -2122,7 +2260,18 @@ class CommonKVManager(BaseKVManager):
             raise zmq.Again()
         try:
             sock = self._connect(endpoint, is_ipv6=is_ipv6, blocking=blocking)
-            if blocking:
+            if pending_status is not None:
+                # No connection setup or blocking send under this lock: sender
+                # registration uses it to invalidate a room's old notification.
+                if not self._pending_failed_status_lock.acquire(blocking=False):
+                    raise zmq.Again()
+                try:
+                    key, notification = pending_status
+                    if self._pending_failed_status.get(key) is notification:
+                        sock.send_multipart(parts, flags=zmq.DONTWAIT)
+                finally:
+                    self._pending_failed_status_lock.release()
+            elif blocking:
                 sock.send_multipart(parts)
             else:
                 sock.send_multipart(parts, flags=zmq.DONTWAIT)
@@ -2601,6 +2750,14 @@ class CommonKVSender(BaseKVSender):
                 mgr.record_failure(room, "Duplicate or cancelled bootstrap room")
                 self.conclude_state = KVPoll.Failed
                 return mgr._update_status_state(room, KVPoll.Failed)
+        # Deferred bootstrap keeps Failed tombstones longer than retry TTL;
+        # its live room may also have a pending rejection to another endpoint.
+        if (
+            mgr.requires_transfer_drain
+            and mgr.deferred_bootstrap is None
+            and mgr.request_status.get(room) != KVPoll.Failed
+        ):
+            mgr._discard_pending_failed_status(room)
         # Non-authoritative CP ranks are dummy participants.
         status = (
             KVPoll.WaitingForInput if mgr.is_dummy_cp_rank else KVPoll.Bootstrapping
