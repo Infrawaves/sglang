@@ -13,6 +13,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 
 from sglang.srt.configs.model_config import (
@@ -368,6 +369,25 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
+class _DcpFullBatch(msgspec.Struct, frozen=True):
+    """A prefill batch's request tables before prefill CP keeps only the
+    requests a rank has query rows for; the DCP gathers read these."""
+
+    page_table: torch.Tensor  # [bs, max_seq_len], page size 1
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+
+    def local_kv_rows(self, dcp_size: int) -> torch.Tensor:
+        lens = self.seq_lens_cpu
+        flattened = torch.cat(
+            [self.page_table[i, :n] for i, n in enumerate(lens.tolist())]
+        )
+        return (
+            filter_dcp_local_chunk_kv_indices(flattened, torch.zeros_like(lens), lens)
+            // dcp_size
+        )
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -424,6 +444,12 @@ class DSAMetadata:
     topk_indices_offset: Optional[torch.Tensor] = None
     # DCP prefill: this rank's KV rows of page_table_1_flattened, in order
     dcp_local_kv_rows: Optional[torch.Tensor] = None
+    # Prefill CP with DCP: the DCP gathers take every request of the batch, in
+    # the same order on all ranks, though CP leaves out the requests a rank has
+    # no query rows for. None where CP leaves out no request.
+    dcp_real_page_table: Optional[torch.Tensor] = None
+    dcp_seq_lens: Optional[torch.Tensor] = None
+    dcp_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -1501,6 +1527,7 @@ class DeepseekSparseAttnBackend(
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
         # a default value of None indicates that all sequences are selected.
         bs_idx_cpu = None
+        dcp_full: Optional[_DcpFullBatch] = None
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
@@ -1620,6 +1647,14 @@ class DeepseekSparseAttnBackend(
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
             if can_dsa_prefill_cp_interleave(forward_batch):
+                if self.attn_dcp_size > 1:
+                    # Taken before CP drops this rank's query-less requests:
+                    # the DCP gathers need the whole batch on every rank.
+                    dcp_full = _DcpFullBatch(
+                        page_table=page_table,
+                        seq_lens=indexer_seq_lens,
+                        seq_lens_cpu=indexer_seq_lens_cpu,
+                    )
                 strategy = get_cp_strategy()
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
@@ -1698,8 +1733,15 @@ class DeepseekSparseAttnBackend(
                     )
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
+                kv_starts = cu_seqlens_k[:-1]
+                if dcp_full is not None:
+                    # Each kept request starts where it sits in the gathered
+                    # whole-batch KV, not in this rank's kept requests.
+                    kv_starts = compute_cu_seqlens(
+                        dcp_full.seq_lens.to(torch.int32)
+                    )[:-1][bs_idx]
                 topk_indices_offset = torch.repeat_interleave(
-                    cu_seqlens_k[:-1],
+                    kv_starts,
                     extend_seq_lens,
                     output_size=int(sum(extend_seq_lens_cpu)),
                 )
@@ -1707,7 +1749,7 @@ class DeepseekSparseAttnBackend(
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
-            forward_batch, bs_idx_cpu
+            forward_batch, bs_idx_cpu, whole_batch_keys=dcp_full is not None
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         dsa_cache_seqlens_int32 = compute_dsa_seqlens(
@@ -1775,7 +1817,9 @@ class DeepseekSparseAttnBackend(
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             dcp_local_kv_rows=(
-                filter_dcp_local_chunk_kv_indices(
+                dcp_full.local_kv_rows(self.attn_dcp_size)
+                if dcp_full is not None
+                else filter_dcp_local_chunk_kv_indices(
                     page_table_1_flattened,
                     torch.zeros_like(indexer_seq_lens_cpu),
                     indexer_seq_lens_cpu,
@@ -1784,6 +1828,13 @@ class DeepseekSparseAttnBackend(
                 if self.attn_dcp_size > 1 and page_table_1_flattened is not None
                 else None
             ),
+            dcp_real_page_table=(
+                self._transform_table_1_to_real(dcp_full.page_table)
+                if dcp_full is not None
+                else None
+            ),
+            dcp_seq_lens=dcp_full.seq_lens if dcp_full is not None else None,
+            dcp_seq_lens_cpu=dcp_full.seq_lens_cpu if dcp_full is not None else None,
             indexer_k_start_end=indexer_k_start_end,
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
@@ -1804,6 +1855,8 @@ class DeepseekSparseAttnBackend(
         self,
         forward_batch: ForwardBatch,
         bs_idx: Optional[List[int]] = None,
+        *,
+        whole_batch_keys: bool = False,
     ):
         if not forward_batch.forward_mode.is_extend_without_speculative():
             return None, None
@@ -1864,6 +1917,9 @@ class DeepseekSparseAttnBackend(
 
             if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
                 q_offset += extend_seq_len
+                k_offset += seq_len
+            elif whole_batch_keys:
+                # The DCP index-K gather holds every request, kept here or not.
                 k_offset += seq_len
 
         ks = torch.cat(ks_list, dim=0)

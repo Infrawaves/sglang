@@ -74,6 +74,17 @@ class BaseIndexerMetadata(ABC):
         Return: batch idx for each token.
         """
 
+    def get_dcp_whole_batch(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Return: (page table with page size 64, seq lens, CPU seq lens) of every
+                request in the batch, for the DCP index-K gather under prefill
+                CP; None where the indexer's own tables already hold every
+                request.
+        """
+        return None
+
     @abstractmethod
     def topk_transform(
         self,
@@ -136,6 +147,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def get_dcp_whole_batch(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        attn = self.attn_metadata
+        if attn.dcp_real_page_table is None:
+            return None
+        return attn.dcp_real_page_table, attn.dcp_seq_lens, attn.dcp_seq_lens_cpu
 
     def topk_transform(
         self,
