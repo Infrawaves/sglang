@@ -1007,6 +1007,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
+            from prometheus_client import Counter
+
+            self.received_requests = Counter(
+                "sglang:tokenizer_received_requests_total",
+                "Normalized generation requests received, excluding log_metrics=False; "
+                "batch members and parallel samples count separately.",
+                ["worker_pid"],
+            ).labels(worker_pid=str(os.getpid()))
             labels = tokenizer_metric_labels()
             tokenizer_collector_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_TOKENIZER,
@@ -1020,7 +1028,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
             )
 
-            start_cpu_monitor_thread("tokenizer")
+            start_cpu_monitor_thread("tokenizer", per_worker=True)
 
         if get_observability().gc_warning_threshold_secs > 0.0:
             configure_gc_warning(get_observability().gc_warning_threshold_secs)
@@ -1611,6 +1619,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if (
+            self.enable_metrics
+            and isinstance(obj, GenerateReqInput)
+            and obj.log_metrics
+        ):
+            self.received_requests.inc(obj.batch_size * obj.parallel_sample_num)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)

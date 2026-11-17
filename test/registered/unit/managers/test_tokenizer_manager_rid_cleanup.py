@@ -1180,6 +1180,42 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
         asyncio.run(drive())
 
 
+class TestReceivedRequestsMetric(CustomTestCase):
+    def test_counts_parallel_samples_and_skips_unlogged_requests(self):
+        """Explicit RID lists must count each parallel sample, not each RID."""
+        from prometheus_client import CollectorRegistry, Counter
+
+        for log_metrics, expected in ((True, 6), (False, 0)):
+            with self.subTest(log_metrics=log_metrics):
+                tm = _make_tm_for_generate(self)
+                tm.enable_metrics = True
+                registry = CollectorRegistry()
+                tm.received_requests = Counter(
+                    "received_requests_total", "Received requests", registry=registry
+                )
+                obj = GenerateReqInput(
+                    text=["hello", "world"],
+                    rid=["a", "b"],
+                    sampling_params={"n": 3},
+                    log_metrics=log_metrics,
+                )
+
+                async def fail_batch(*args):
+                    raise ValueError("processing failed")
+                    yield
+
+                tm._handle_batch_request = fail_batch
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "processing failed"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                self.assertEqual(
+                    registry.get_sample_value("received_requests_total"), expected
+                )
+
+
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     """generate_request must not leak rid_to_state when dispatch fails.
 

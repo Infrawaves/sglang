@@ -1,17 +1,23 @@
+import os
 import threading
 import time
 
 import psutil
 
 
-def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading.Thread:
+def start_cpu_monitor_thread(
+    component: str, interval: float = 5.0, *, per_worker: bool = False
+) -> threading.Thread:
     from prometheus_client import Counter
 
+    labels = {"component": component}
+    if per_worker:
+        labels["worker_pid"] = str(os.getpid())
     cpu_seconds_total = Counter(
         name="sglang:process_cpu_seconds_total",
         documentation="Total CPU time consumed by this process (user + system)",
-        labelnames=["component"],
-    )
+        labelnames=labels.keys(),
+    ).labels(**labels)
 
     def monitor():
         process = psutil.Process()
@@ -27,7 +33,7 @@ def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading
                 # CRIU restore restarts the process CPU clock near zero. Its
                 # current reading is CPU time since restore, not a decrement.
                 delta = curr_times.user + curr_times.system
-            cpu_seconds_total.labels(component=component).inc(delta)
+            cpu_seconds_total.inc(delta)
             last_times = curr_times
 
     t = threading.Thread(target=monitor, daemon=True)

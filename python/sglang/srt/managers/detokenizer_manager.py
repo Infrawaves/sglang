@@ -15,6 +15,7 @@
 
 import functools
 import logging
+import os
 import signal
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -142,8 +143,17 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
+        self.output_updates = None
         if get_observability().enable_metrics:
-            start_cpu_monitor_thread("detokenizer")
+            from prometheus_client import Counter
+
+            self.output_updates = Counter(
+                "sglang:detokenizer_output_updates_total",
+                "Generation output rows received, "
+                "counting repeated updates per request.",
+                ["worker_pid"],
+            ).labels(worker_pid=str(os.getpid()))
+            start_cpu_monitor_thread("detokenizer", per_worker=True)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -462,6 +472,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return ipcs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        if self.output_updates is not None:
+            self.output_updates.inc(len(recv_obj.rids))
         maybe_perturb_batch_token_id_out(recv_obj)
         states = self._update_detokenize_states(recv_obj)
         headers = [None if s is None else s.header for s in states]
