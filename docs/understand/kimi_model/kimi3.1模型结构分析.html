@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>kimi3.1模型结构分析</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1180px; margin: 0 auto; padding: 24px 32px; line-height: 1.75; color: #222; background: #fafafa; }
+  h1 { border-bottom: 3px solid #3b6fd8; padding-bottom: 8px; }
+  h2 { margin-top: 46px; color: #2a4f9e; border-left: 5px solid #3b6fd8; padding-left: 10px; }
+  h3 { margin-top: 26px; }
+  code { background: #eef1f6; padding: 1px 5px; border-radius: 4px; font-family: Menlo, Consolas, monospace; font-size: 0.9em; }
+  pre { background: #1f2430; color: #e6e6e6; padding: 14px 16px; border-radius: 6px; overflow-x: auto; line-height: 1.5; font-size: 0.87em; }
+  pre code { background: none; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; background: #fff; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid #ddd; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #e8eefb; }
+  .note { background: #fff8e1; border-left: 4px solid #f0b400; padding: 10px 14px; margin: 16px 0; }
+  .ok { background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 10px 14px; margin: 16px 0; }
+  nav { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 20px; }
+  nav a { color: #2a4f9e; text-decoration: none; }
+  .arch { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 20px 0; }
+  .box { border: 2px solid #3b6fd8; border-radius: 8px; padding: 8px 16px; background: #fff; text-align: center; min-width: 360px; }
+  .box.v { border-color: #8e24aa; } .box.k { border-color: #00897b; } .box.m { border-color: #e65100; } .box.r { border-color: #c62828; }
+  .arrow { color: #888; font-size: 1.2em; }
+  .layer { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+  .card { background: #fff; border: 1px solid #ccc; border-radius: 6px; padding: 10px 14px; }
+  .card h4 { margin: 0 0 6px 0; }
+  .src { color: #777; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>kimi3.1模型结构分析</h1>
+<p>分析对象：Kimi-K3.1-Pro，sglang 中的类名是 <code>KimiK31ForConditionalGeneration</code>。代码版本：<code>infrawaves/dev/v0.5.23-k31</code> 分支。</p>
+<p>主要资料：<code>python/sglang/srt/models/kimi_k3.py</code>、<code>python/sglang/srt/configs/kimi_linear.py</code>、<code>configs/kimi_k3.py</code>、<code>layers/attn_residual.py</code>、<code>layers/layer_boundary/residual/attn_bank.py</code>、cookbook 中的 <code>Kimi-K3.1-Pro.mdx</code> / <code>Kimi-K3.mdx</code>，以及 Maas 仓库里 <code>tools/kv_calculator/src/params.js</code> 记录的模型常量。仓库里没有真实的 <code>config.json</code>，有些数值是从代码注释或部署记录推断的，已在文中标注。</p>
+
+<nav>
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#s1">整体概览</a></li>
+    <li><a href="#s2">整体架构图</a></li>
+    <li><a href="#s3">各类结构的层数</a></li>
+    <li><a href="#s4">解码层内部结构</a></li>
+    <li><a href="#s5">KDA：Kimi Delta Attention（69 层）</a></li>
+    <li><a href="#s6">Gated Sparse-MLA + DSA indexer（24 层）</a></li>
+    <li><a href="#s7">FFN：Latent MoE（92 层）与 dense MLP（1 层）</a></li>
+    <li><a href="#s8">层与层怎么连接：Attention Residuals</a></li>
+    <li><a href="#s9">多模态输入：MoonViT3d 与 projector</a></li>
+    <li><a href="#s10">一个 token 的完整前向路径</a></li>
+    <li><a href="#s11">结构对推理缓存的影响</a></li>
+    <li><a href="#s12">K3 与 K3.1 的区别</a></li>
+    <li><a href="#s13">代码索引与未核实项</a></li>
+  </ol>
+</nav>
+
+<h2 id="s1">1. 整体概览</h2>
+<table>
+  <tr><th>项目</th><th>值</th><th>来源</th></tr>
+  <tr><td>类型</td><td>原生多模态、混合注意力的 MoE 大模型</td><td>cookbook</td></tr>
+  <tr><td>参数量</td><td>2.8T 总参数，104B 激活</td><td>cookbook</td></tr>
+  <tr><td>解码层数</td><td>93 层</td><td>cookbook；PP 划分 24+24+24+21=93</td></tr>
+  <tr><td>注意力</td><td>69 层 KDA（线性注意力）+ 24 层 Gated Sparse-MLA（带 DSA 稀疏 indexer）</td><td>cookbook；Maas <code>params.js</code></td></tr>
+  <tr><td>FFN</td><td>1 层 dense MLP + 92 层 MoE</td><td>cookbook "93 layers (1 dense)"</td></tr>
+  <tr><td>MoE</td><td>896 个路由专家，每个 token 选 16 个，另有 2 个共享专家。Latent MoE（Stable LatentMoE）</td><td>cookbook；<code>KimiK3MoE</code></td></tr>
+  <tr><td>激活函数</td><td>SiTU-GLU（beta=4.0，linear_beta=25.0）</td><td><code>layers/activation.py</code> 的 <code>SituAndMul</code>；<code>kimi_k3.py</code> 中 MegaMoE 的断言</td></tr>
+  <tr><td>残差连接</td><td><b>Attention Residuals</b>：对按块保存的残差快照做加权聚合，取代普通的逐层累加</td><td><code>attn_res_block_size</code>；<code>layers/attn_residual.py</code></td></tr>
+  <tr><td>hidden size</td><td>7168</td><td><code>attn_residual.py</code> 注释："H = 7168 = 7 x 1024"</td></tr>
+  <tr><td>词表</td><td>约 160K（默认值 163840）</td><td>cookbook；<code>KimiLinearConfig</code> 默认值</td></tr>
+  <tr><td>视觉编码器</td><td>MoonViT-V2（代码里是 MoonViT3d），401M 参数，支持图像和视频</td><td>cookbook；<code>KimiK3VisionTower</code></td></tr>
+  <tr><td>上下文长度</td><td>1,048,576 token</td><td>cookbook</td></tr>
+  <tr><td>精度</td><td>MXFP4 权重 + MXFP8 激活（量化感知训练）；推理强制 FP8 KV，page size 64</td><td>cookbook</td></tr>
+</table>
+
+<h2 id="s2">2. 整体架构图</h2>
+<div class="arch">
+  <div class="box v"><b>文本 token</b>，以及 <b>图像/视频</b>（预处理成 patch）</div>
+  <div class="arrow">↓ 图像/视频进入视觉分支</div>
+  <div class="box v"><b>KimiK3VisionTower（MoonViT3d）</b> → <b>KimiK3MultiModalProjector</b><br><span class="src">视觉特征映射到 hidden=7168，替换占位符 <code>&lt;|kimi_image_placeholder|&gt;</code>（id 163605）的位置</span></div>
+  <div class="arrow">↓</div>
+  <div class="box"><b>embed_tokens</b>（VocabParallelEmbedding，约 160K × 7168），和视觉特征合并</div>
+  <div class="arrow">↓ 打开 Attention-Residual bank：第 0 层把 embedding 存为第一个快照</div>
+  <div class="box r"><b>93 × KimiK3DecoderLayer</b><br>每层 = [bank 聚合 → RMSNorm → <span style="color:#00897b">KDA</span> 或 <span style="color:#3b6fd8">Gated Sparse-MLA</span>]<br>　　+ [bank 聚合 → RMSNorm → <span style="color:#e65100">Latent MoE</span> 或 dense MLP]</div>
+  <div class="arrow">↓</div>
+  <div class="box r"><b>AttnBankOutputRead</b>：最后一次 bank 聚合（<code>output_attn_res_norm</code> + <code>output_attn_res_proj</code>）→ 最终 RMSNorm</div>
+  <div class="arrow">↓</div>
+  <div class="box"><b>lm_head</b> → logits（约 160K 词表）</div>
+</div>
+<p class="src">对应代码：<code>KimiK31ForConditionalGeneration</code> → <code>KimiK3ForConditionalGeneration</code>（多模态外壳，<code>kimi_k3.py:4249</code>） → <code>KimiK3LinearForCausalLM</code>（<code>:3674</code>） → <code>KimiK3LinearModel</code>（<code>:3401</code>） → <code>KimiK3DecoderLayer</code>（<code>:3157</code>）。</p>
+
+<h2 id="s3">3. 各类结构的层数</h2>
+<p>每一层由一个注意力子层加一个 FFN 子层组成。两种子层各自有两种类型，按层号选择：</p>
+<table>
+  <tr><th>子层</th><th>类型</th><th>层数</th><th>怎么判断属于哪种</th></tr>
+  <tr><td rowspan="2">注意力</td><td><b>KDA</b>（<code>KimiK3DeltaAttention</code>）</td><td><b>69</b></td><td><code>config.is_kda_layer(i)</code>：<code>(i+1) in linear_attn_config["kda_layers"]</code></td></tr>
+  <tr><td><b>Gated Sparse-MLA + DSA</b>（<code>KimiK3MLAAttention</code>）</td><td><b>24</b></td><td>其余层，即 <code>full_attn_layers</code>。K3.1 要求 <code>dsa_layers == full_attn_layers</code>，也就是每个 MLA 层都带 DSA indexer（<code>kimi_linear.py:157-162</code>）</td></tr>
+  <tr><td rowspan="2">FFN</td><td><b>dense MLP</b>（<code>KimiK3MLP</code>）</td><td><b>1</b></td><td><code>layer_idx &lt; first_k_dense_replace</code>。推断是第 0 层：Maas 的权重统计里写的是 "layer0 MLP"</td></tr>
+  <tr><td><b>Latent MoE</b>（<code>KimiK3MoE</code>）</td><td><b>92</b></td><td><code>_is_moe_layer</code>：<code>i ≥ first_k_dense_replace</code> 且 <code>i % moe_layer_freq == 0</code>（<code>kimi_k3.py:3014</code>）</td></tr>
+  <tr><td>层间连接</td><td><b>Attention-Residual bank</b></td><td>最多 8 个快照</td><td><code>attn_res_block_size</code>：<code>layer_idx % block_size == 0</code> 的层写入一个快照（<code>kimi_k3.py:3237</code>）</td></tr>
+</table>
+<div class="note">
+  <b>KDA 层和 MLA 层是怎么排列的：</b> 69:24 接近 3:1。Kimi Linear 系列通常是"3 层 KDA 后接 1 层 MLA"交错排列，但 93 不是 4 的倍数，实际顺序要看 checkpoint config 里的 <code>linear_attn_config.kda_layers</code> 和 <code>full_attn_layers</code>（1-based 层号）。代码只依赖这两个列表，不假设任何固定规律。
+</div>
+<div class="note">
+  <b>Attention-Residual 的块大小：</b> bank 的快照数是 <code>ceil(93 / attn_res_block_size)</code>（<code>kimi_k3.py:3537</code>），代码注释写的是 "K3 has &lt;= 8 snapshots"（<code>attn_residual.py</code>）。要让 ceil(93/B) ≤ 8，块大小 B 至少是 12。所以推断 B=12：第 0、12、24、…、84 层各写一个快照，共 8 个。具体值以 config 为准。
+</div>
+
+<h2 id="s4">4. 解码层内部结构</h2>
+<pre><code>KimiK3DecoderLayer(layer_idx = i)
+├── self_attn  = KimiK3DeltaAttention     if is_kda_layer(i)       # 69 层
+│               KimiK3MLAAttention        otherwise                # 24 层（K3.1 都带 DSA）
+├── mlp        = KimiK3MoE                if _is_moe_layer(i)      # 92 层
+│               KimiK3MLP (dense)         otherwise                # 1 层
+├── input_layernorm           RMSNorm(7168)   # 注意力输入的输出 norm
+├── post_attention_layernorm  RMSNorm(7168)   # FFN 输入的输出 norm
+└── (Attention Residuals)
+    ├── self_attention_res_norm  RMSNorm(7168)    ┐ 注意力子层读 bank 时
+    ├── self_attention_res_proj  Linear(7168 → 1) ┘ 给每个快照打分
+    ├── mlp_res_norm             RMSNorm(7168)    ┐ FFN 子层读 bank 时
+    └── mlp_res_proj             Linear(7168 → 1) ┘ 给每个快照打分</code></pre>
+<p>层内的计算顺序（<code>KimiK3DecoderLayer.forward</code>，<code>kimi_k3.py:3355-3399</code>）：</p>
+<pre><code>x_attn_in = input_layernorm( Aggregate_attn(bank, running_residual) )   # attn_boundary.prepare
+a         = self_attn(x_attn_in)                                         # KDA 或 MLA
+running_residual += a                                                    # attn_boundary.finish（PLAIN_ADD）
+x_ffn_in  = post_attention_layernorm( Aggregate_ffn(bank, running_residual) )   # ffn_boundary.prepare
+f         = mlp(x_ffn_in)                                                # MoE 或 dense
+running_residual += f                                                    # ffn_boundary.finish</code></pre>
+<p>和普通 pre-norm Transformer 的区别在于：送进子层的输入不是"上一层的残差"，而是"bank 中所有历史快照加上当前块的累加值"按 softmax 加权混合的结果。详见第 8 节。</p>
+
+<h2 id="s5">5. KDA：Kimi Delta Attention（69 层）</h2>
+<p>KDA 是一种线性注意力，用带门控的 delta rule 维护一个固定大小的递归状态。它的推理成本不随上下文长度增长。</p>
+<table>
+  <tr><th>参数</th><th>值</th><th>来源</th></tr>
+  <tr><td>头数 <code>num_heads</code></td><td>96（Q/K/V 头数相同）</td><td>Maas <code>params.js</code>："12 heads/rank at attn TP8"</td></tr>
+  <tr><td>头维度 <code>head_dim</code></td><td>128</td><td>Maas <code>params.js</code></td></tr>
+  <tr><td>投影宽度</td><td>96 × 128 = 12288</td><td><code>projection_size = head_dim × num_heads</code></td></tr>
+  <tr><td>短卷积核 <code>short_conv_kernel_size</code></td><td>4</td><td>Maas <code>params.js</code></td></tr>
+</table>
+<h3>子模块（<code>KimiK3DeltaAttention.__init__</code>，<code>kimi_k3.py:2037-</code>）</h3>
+<table>
+  <tr><th>模块</th><th>形状</th><th>作用</th></tr>
+  <tr><td>q/k/v 投影（<code>qkv_proj</code>，或融合成 <code>fused_qkvbfg_a_proj</code>）</td><td>7168 → 3 × 12288</td><td>得到每个头的 q、k、v</td></tr>
+  <tr><td><code>qkv_conv1d</code></td><td>沿时间维的 depthwise 卷积，核大小 4</td><td>对 q/k/v 做局部混合，提供位置和局部信息。推理时要缓存最近 3 个 token 的卷积状态</td></tr>
+  <tr><td><code>b_proj</code></td><td>7168 → 96</td><td>每个头的写入强度 β（delta rule 的学习率）</td></tr>
+  <tr><td><code>f_a_proj</code> → <code>f_b_proj</code></td><td>7168 → 128 → 12288（低秩）</td><td><b>逐通道</b>的遗忘门 α，配合 <code>A_log</code>、<code>dt_bias</code> 决定每个通道的衰减</td></tr>
+  <tr><td><code>g_a_proj</code> → <code>g_b_proj</code>（或全秩门 <code>use_full_rank_gate</code>）</td><td>7168 → … → 12288</td><td>输出门</td></tr>
+  <tr><td><code>A_log</code>、<code>dt_bias</code></td><td>参数</td><td>衰减参数化</td></tr>
+  <tr><td><code>o_norm</code></td><td><code>FusedRMSNormGated(128, activation="sigmoid")</code></td><td>每个头的输出做 RMSNorm，再乘 sigmoid(输出门)</td></tr>
+  <tr><td><code>o_proj</code></td><td>12288 → 7168（RowParallel）</td><td>输出投影</td></tr>
+  <tr><td><code>attn = RadixLinearAttention</code></td><td>—</td><td>执行卷积和递归的 kernel 封装，管理 KDA 状态缓存</td></tr>
+</table>
+<h3>计算过程（概念）</h3>
+<pre><code>q, k, v = conv1d(qkv_proj(x))                # 短卷积，带因果
+β       = sigmoid(b_proj(x))                 # 每个头一个标量
+α       = decay(f_b(f_a(x)), A_log, dt_bias) # 每个头、每个通道一个衰减
+# 每个头的状态 S ∈ R^{128×128}：
+S_t = (I − β_t k_t k_tᵀ) · Diag(α_t) · S_{t−1} + β_t k_t v_tᵀ    # gated delta rule
+o_t = S_tᵀ q_t
+y   = o_proj( RMSNormGated(o, gate = g_b(g_a(x))) )</code></pre>
+<p class="src">上面的递归公式是 KDA（Kimi Linear 论文）的标准写法，用来说明各个门的作用。sglang 中的实际 kernel 在 <code>RadixLinearAttention</code> 及其后端里。</p>
+<p><b>和推理相关的特点：</b> KDA 不需要随长度增长的 KV cache，每个请求只需要一份固定大小的状态（每个头 128×128 的 S，加上卷积状态）。状态默认是 FP32，cookbook 给的数字是 TP8 时约 52 MB / 请求 / rank。prefill 时需要按顺序处理完整序列，这就是 PCP 下 KDA 层必须先 gather 完整序列的原因。</p>
+
+<h2 id="s6">6. Gated Sparse-MLA + DSA indexer（24 层）</h2>
+<p><code>KimiK3MLAAttention</code> 继承自 DeepSeek-V2 的 <code>DeepseekV2AttentionMLA</code>，在它的基础上有三处改动：</p>
+<div class="layer">
+  <div class="card"><h4>① 不用 RoPE（NoPE）</h4>
+    构造时传入 <code>skip_rope=True</code>（<code>kimi_k3.py:2788</code>），MLA 层不做旋转位置编码。位置信息来自 KDA 层的递归和短卷积。这是 Kimi Linear 系列的设计。</div>
+  <div class="card"><h4>② 输出门（Gated）</h4>
+    <code>mla_use_output_gate</code>：<code>g_proj = ColumnParallelLinear(7168 → num_heads × v_head_dim)</code>。在 o_proj 之前计算 <code>x · sigmoid(g_proj(hidden))</code>（<code>kimi_k3.py:2866-2906</code>）。</div>
+  <div class="card"><h4>③ DSA 稀疏 indexer（K3.1 新增）</h4>
+    每个 MLA 层都有自己的 indexer（<code>index_topk_freq == 1</code>）。indexer 用 <code>index_n_heads</code> 个头、<code>index_head_dim</code> 维的 NoPE key（<code>index_rope_dim == 0</code>，K 用 LayerNorm），对历史 token 打分，选出 <code>index_topk</code> 个。attention 只在这些 token 上计算。</div>
+  <div class="card"><h4>④ MLA 低秩 KV</h4>
+    <code>kv_lora_rank = 512</code>，<code>qk_rope_head_dim = 64</code>，每个 token 缓存 576 维 latent（Maas <code>params.js</code>）。用 FP8 FlashMLA 格式存储时约 656 B/token/层，加上 indexer K 约 132 B/token/层。</div>
+</div>
+<pre><code>c_q   = q_a_proj(x) → RMSNorm → q_b_proj           # q_lora_rank 低秩
+c_kv  = kv_a_proj_with_mqa(x)  → [latent 512 | k_rope 64]   # 写入 KV cache（FP8）
+idx_k = indexer_k(x) → LayerNorm                   # 写入 indexer K cache
+topk  = TopK( indexer_q(x) · idx_k_history ,  index_topk )  # DSA 选择
+o     = SparseMLA(q, c_kv[topk])                   # 只在选中的 token 上做 MLA
+y     = o_proj( o * sigmoid(g_proj(x)) )</code></pre>
+<p class="src">cookbook：24 个 DSA 层合计约 18.9 KB/token（24 × (656 + 132) B）。<code>index_topk</code>、<code>index_n_heads</code>、<code>index_head_dim</code> 的具体值需要看 config 的 <code>dsa_config</code>，仓库里没有。</p>
+
+<h2 id="s7">7. FFN：Latent MoE（92 层）与 dense MLP（1 层）</h2>
+<h3>7.1 Latent MoE（<code>KimiK3MoE</code>，<code>kimi_k3.py:565-</code>）</h3>
+<p>路由专家不在 7168 维的 hidden 空间里计算，而是先投影到一个更小的 latent 空间（<code>routed_expert_hidden_size</code>），在那里计算，再投影回 7168 维。共享专家仍然在原始 hidden 空间计算。</p>
+<pre><code>x (7168)
+├── router: MoEGate(x) → sigmoid 打分 + e_score_correction_bias
+│           → grouped top-k（DeepSeek-V3 风格，noaux_tc）→ 选 16 / 896 个专家
+├── 路由分支（Latent）:
+│     z = routed_expert_down_proj(x)            # ReplicatedLinear: 7168 → latent
+│     z = Σ_{e∈top16} w_e · Expert_e(z)        # 每个专家: SiTU-GLU，在 latent 空间里
+│     z = routed_expert_norm(z)                 # 可选（latent_moe_use_norm）
+│     r = routed_expert_up_proj(z)              # ReplicatedLinear: latent → 7168
+│     r = r × routed_scaling_factor
+├── 共享分支: s = SharedMLP(x)                  # 2 个共享专家合成一个 MLP，
+│                                               # intermediate = moe_intermediate_size × 2
+└── 输出 = r + s</code></pre>
+<p>这样设计的好处：专家的输入维度变小，dispatch/combine 的通信量和专家 GEMM 的计算量都随之下降。代码里会把 router、down 投影和共享专家的 gate_up 合并成一次 "fused front" GEMM（<code>_front_w</code>）。</p>
+<h3>7.2 dense MLP（<code>KimiK3MLP</code>，第 0 层）</h3>
+<pre><code>y = down_proj( SiTU(gate) ⊙ up ),   [gate, up] = gate_up_proj(x)</code></pre>
+<h3>7.3 SiTU 激活（<code>layers/activation.py</code> 的 <code>SituAndMul</code>）</h3>
+<pre><code>gate' = β · tanh(gate / β) · sigmoid(gate)        # β = 4.0
+up'   = β_lin · tanh(up / β_lin)                  # β_lin = 25.0，对 up 做软裁剪
+out   = gate' ⊙ up'</code></pre>
+<p>和 SiLU 相比，SiTU 对 gate 和 up 都做了有界的软裁剪，数值更稳定，适合 MXFP4/MXFP8 的量化训练。MegaMoE kernel 把 β=4.0、β_lin=25.0 写死了，加载 checkpoint 时会断言这两个值。</p>
+
+<h2 id="s8">8. 层与层怎么连接：Attention Residuals</h2>
+<p>这是 K3 系列最特别的地方。普通 Transformer 的残差是 <code>h_{l+1} = h_l + F(h_l)</code>，每一层只能看到前面所有输出的直接累加。K3 改成了"按块保存快照，再加权读取"。</p>
+<h3>8.1 机制（<code>layers/attn_residual.py</code> 的 <code>AttnResidual</code>，<code>layer_boundary/residual/attn_bank.py</code>）</h3>
+<ul>
+  <li><b>bank</b>：每次前向开一个形状为 <code>[T, NB, 7168]</code> 的快照缓冲区，NB ≤ 8。</li>
+  <li><b>running residual（块内累加值）</b>：当前块里各子层输出的累加和。</li>
+  <li><b>写快照</b>：<code>layer_idx % block_size == 0</code> 的层，在注意力的读取点把当前累加值存进 bank 的下一行，然后块内累加值清零重新开始。第 0 层存的是 embedding 本身（<code>attn_residual.py</code>："Layer 0 attention side: nothing banked yet"）。</li>
+  <li><b>读（聚合）</b>：每个子层的输入都这样计算：
+<pre><code>rows   = [bank[0], bank[1], …, bank[nvb−1], running_residual]     # nvb+1 行
+score  = res_proj( res_norm(rows) )          # 每行一个标量，res_proj: 7168 → 1
+p      = softmax(score)                      # 在这 nvb+1 行之间归一化，每个 token 独立
+mixed  = Σ p_r · rows_r
+input  = out_norm(mixed)                     # input_layernorm 或 post_attention_layernorm</code></pre>
+    参考实现见 <code>aggregate_stream_torch</code>（<code>attn_residual.py:324</code>）。注意力子层用 <code>self_attention_res_*</code>，FFN 子层用 <code>mlp_res_*</code>。</li>
+  <li><b>更新</b>：子层的输出直接加到 running residual 上（<code>PLAIN_ADD</code>）。</li>
+  <li><b>输出</b>：最后一层之后，<code>AttnBankOutputRead</code> 用 <code>output_attn_res_proj/norm</code> 再聚合一次，然后过最终 RMSNorm，送进 lm_head。</li>
+</ul>
+<h3>8.2 以 block_size = 12 为例（推断值）</h3>
+<pre><code>embedding ─► [快照0] ─────────────────────────────────────────────────────┐
+layer 0..11   每个子层: 输入 = Norm(Σ softmax·{快照0, 累加值})              │
+              输出累加到 running residual                                    │ 后面的层
+layer 12      注意力读取点: 把 running residual 存为 [快照1]，然后清零        │ 都能按
+layer 12..23  每个子层: 输入 = Norm(Σ softmax·{快照0, 快照1, 累加值})        │ 学到的权重
+…                                                                            │ 直接读取
+layer 84      存为 [快照7]                                                    │ 早期的
+layer 84..92  输入 = Norm(Σ softmax·{快照0..7, 累加值})                      │ 表示
+最终输出     Norm(Σ softmax·{快照0..7, 累加值}) → lm_head ◄──────────────────┘</code></pre>
+<p><b>作用：</b> 深层可以按学到的权重直接取用浅层的表示，包括 embedding 本身，不必让信息穿过几十次累加。93 层这样的深网络因此更容易训练和保持数值稳定。代价是每个子层多一次 softmax 聚合（有专门的 TMA / Triton kernel），而且 PP 切分时要把 bank 一起传给下一个 stage（<code>pp_proxy_tensors["attn_res_bank"]</code>，<code>kimi_k3.py:3540-3544</code>）。</p>
+
+<h2 id="s9">9. 多模态输入：MoonViT3d 与 projector</h2>
+<table>
+  <tr><th>组件</th><th>说明</th></tr>
+  <tr><td><code>KimiK3VisionTower</code>（MoonViT3d）</td><td>cookbook 写的是 MoonViT-V2，401M 参数。支持图像和视频（视频不含音轨）。<code>KimiK3VisionConfig</code> 的默认值是 patch 14、27 层、hidden 1024、12 个头，位置编码类型 <code>divided_fixed</code>，视频注意力类型 <code>spatial_temporal</code>，merge 核 2×2，<code>merge_type="sd2_tpool"</code>（空间 2×2 合并加时间池化）。<b>这些是 config 类的默认值，实际以 checkpoint 为准。</b></td></tr>
+  <tr><td><code>KimiK3MultiModalProjector</code></td><td><code>mm_projector_type="patchmergerv2"</code>，把视觉特征投影到文本的 hidden 维度（7168）</td></tr>
+  <tr><td>和文本合并</td><td>视觉特征替换 embedding 序列中 <code>media_placeholder_token_id = 163605</code> 的位置，之后和文本 token 一起进入 93 个解码层</td></tr>
+  <tr><td>部署相关</td><td>ViT 以数据并行方式运行（<code>use_data_parallel = True</code>）。本分支对 ViT 预处理做了按块流式处理和 CUDA Graph 优化（<code>multimodal/kimi_k3_vit_cuda_graph_runner.py</code>，以及 vit[1–5] 系列提交）</td></tr>
+</table>
+
+<h2 id="s10">10. 一个 token 的完整前向路径</h2>
+<pre><code>token_id ──► embed_tokens ──► h0 (7168)          （图像 token 换成 ViT → projector 的输出）
+           bank.open(); 第 0 层把 h0 存为快照0
+
+for i in 0..92:
+    # ---- 注意力子层 ----
+    x  = input_layernorm( AttnResAggregate(bank, R) )      # 第 i%B==0 层先把 R 存入 bank 再清零
+    if i+1 in kda_layers:   a = KDA(x)                      # 69 层：读写固定大小的递归状态
+    else:                   a = GatedSparseMLA_DSA(x)       # 24 层：读写 latent KV + indexer K
+    R += a
+    # ---- FFN 子层 ----
+    x  = post_attention_layernorm( AttnResAggregate(bank, R) )
+    if i == 0:              f = DenseMLP_SiTU(x)            # 1 层
+    else:                   f = LatentMoE(x)                # 92 层：top-16/896 + 2 个共享专家
+    R += f
+
+y = final_norm( OutputAttnResAggregate(bank, R) )
+logits = lm_head(y)</code></pre>
+
+<h2 id="s11">11. 结构对推理缓存的影响</h2>
+<table>
+  <tr><th>结构</th><th>需要缓存什么</th><th>大小</th><th>并行方式对它的影响</th></tr>
+  <tr><td>24 层 Sparse-MLA</td><td>latent KV（576 维，FP8）+ indexer K</td><td>约 18.9 KB/token，<b>随长度线性增长</b></td><td>TP 和 PCP 都是复制，只有 DCP 能按 token 切分</td></tr>
+  <tr><td>69 层 KDA</td><td>递归状态 S（96 头 × 128×128）+ 短卷积状态</td><td>每个请求固定大小（FP32，TP8 时约 52 MB/rank），乘以每个请求的状态槽数</td><td>可以按头在 TP 内切分，DCP/DP/EP 都不切分它。cookbook："The KDA state pool is the concurrency ceiling"</td></tr>
+  <tr><td>Attention-Residual bank</td><td>只在单次前向中存在，不跨请求缓存</td><td>[T, ≤8, 7168] 的激活</td><td>PP 时要随 hidden 一起传给下一个 stage</td></tr>
+</table>
+<p>所以 K3.1 的显存分成两个池：分页的 MLA KV 池和预先预留的 KDA 状态池，两者的比例由 <code>--mamba-full-memory-ratio</code> 控制。prefix cache、HiCache 和 PD 传输都要同时处理这两类数据。</p>
+
+<h2 id="s12">12. K3 与 K3.1 的区别</h2>
+<table>
+  <tr><th></th><th>Kimi-K3（<code>KimiK3ForConditionalGeneration</code>）</th><th>Kimi-K3.1（<code>KimiK31ForConditionalGeneration</code>）</th></tr>
+  <tr><td>MLA 层</td><td>dense MLA，没有 indexer（"K3 has no indexer"，<code>kimi_k3.py:2748</code>）</td><td>每个 MLA 层都有 DSA indexer，做稀疏 attention（<code>KimiK31Config</code> 文档："Kimi-K3 with DSA sparse attention on every MLA layer"）</td></tr>
+  <tr><td>其余结构</td><td colspan="2">相同：93 层，69 KDA + 24 MLA，Latent MoE 896/16+2，Attention Residuals，MoonViT</td></tr>
+  <tr><td>prefill CP</td><td>不支持</td><td>支持，走 CP-TP group sharing，策略是 interleave</td></tr>
+  <tr><td>后训练</td><td colspan="2">K3.1 Pro 从 K3 出发，做了大规模联合强化学习（cookbook）</td></tr>
+</table>
+<p>代码层面，<code>KimiK31ForConditionalGeneration</code> 是 <code>KimiK3ForConditionalGeneration</code> 的子类（<code>kimi_k3.py:4717</code>），只是通过 config 打开了 DSA。投机解码的草稿模型（DFLASH 的 <code>Kimi-K3.1-Dflash2-Preview</code>，或 DSPARK）是独立的小模型，不属于主干结构。<code>num_nextn_predict_layers</code> 的默认值是 0。</p>
+
+<h2 id="s13">13. 代码索引与未核实项</h2>
+<h3>代码索引（<code>python/sglang/srt/</code> 下）</h3>
+<ul>
+  <li><code>configs/kimi_linear.py</code>：<code>KimiLinearConfig</code>，包括 KDA/MLA 层表、DSA、MoE、attn_res 等字段</li>
+  <li><code>configs/kimi_k3.py</code>：<code>KimiK3Config</code>、<code>KimiK31Config</code>、<code>KimiK3VisionConfig</code></li>
+  <li><code>models/kimi_k3.py</code>：<code>KimiK3MLP</code> :407，<code>KimiK3MoE</code> :565，<code>KimiK3DeltaAttention</code> :2037，<code>KimiK3MLAAttention</code> :2745，<code>_is_moe_layer</code> :3014，<code>_stage_facts</code> :3084，<code>KimiK3DecoderLayer</code> :3157，<code>KimiK3LinearModel</code> :3401，<code>KimiK3LinearForCausalLM</code> :3674，<code>KimiK3ForConditionalGeneration</code> :4249，<code>KimiK31ForConditionalGeneration</code> :4717</li>
+  <li><code>layers/attn_residual.py</code>：Attention Residual 的快照和聚合 kernel</li>
+  <li><code>layers/layer_boundary/residual/attn_bank.py</code>：bank 在层边界上的读写</li>
+  <li><code>layers/activation.py</code>：<code>SituAndMul</code></li>
+</ul>
+<h3>未核实或推断的内容</h3>
+<ul>
+  <li>KDA 层和 MLA 层的具体排列顺序（<code>kda_layers</code> / <code>full_attn_layers</code>），仓库里没有真实 config。</li>
+  <li><code>attn_res_block_size = 12</code> 是根据"最多 8 个快照"和 93 层推出来的。</li>
+  <li>dense FFN 在第 0 层（<code>first_k_dense_replace = 1</code>）是根据 Maas 的权重统计 "layer0 MLP" 推断的。</li>
+  <li>MLA 的头数、<code>q_lora_rank</code>、<code>routed_expert_hidden_size</code>、<code>moe_intermediate_size</code>，以及 DSA 的 <code>index_topk</code> / <code>index_n_heads</code> / <code>index_head_dim</code>，这些具体数值都没有核实。</li>
+  <li>KDA 的头数 96、head_dim 128、卷积核 4 来自 Maas 部署记录（K3 部署推导），这里假设 K3.1 和 K3 相同。</li>
+  <li>视觉编码器的结构参数是 config 类的默认值，不一定等于 checkpoint 里的实际值。</li>
+  <li>KDA 的递归公式是按 Kimi Linear 的公开描述写的，用来说明原理，没有逐行对照 kernel。</li>
+</ul>
+
+</body>
+</html>
