@@ -23,6 +23,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
+    decode_attn_head_shards,
     get_buffer,
     get_exec,
     get_parallel,
@@ -750,12 +751,13 @@ class DeepseekSparseAttnBackend(
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
         # Under DCP, decode attention runs on q gathered from the DCP group
-        # (attn_mqa_for_dcp_decode) and sees attn_dcp_size x the heads; prefill
-        # attends with the local heads over the gathered KV.
-        self.local_num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
-        self.num_q_heads = self.local_num_q_heads * self.attn_dcp_size
+        # (attn_mqa_for_dcp_decode) and sees attn_dcp_size x the decode heads
+        # of a rank; prefill attends with the local heads over the gathered KV.
+        num_heads = model_runner.model_config.num_attention_heads
+        self.local_num_q_heads = num_heads // get_parallel().attn_tp_size
+        # Prefill CP with DCP slices decode heads per CP rank as well, so the
+        # gather restores the full count rather than attn_dcp_size times it.
+        self.num_q_heads = num_heads // decode_attn_head_shards() * self.attn_dcp_size
         if sharded_dcp or (
             model_runner.is_draft_worker
             and not dsa_draft_shards_under_dcp(

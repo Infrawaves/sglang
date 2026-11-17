@@ -218,6 +218,7 @@ from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
+    decode_attn_head_shards,
     get_device,
     get_exec,
     get_forward,
@@ -2258,10 +2259,12 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
+        # q_nope and q_rope are gathered from the DCP ranks, so decode sees a
+        # rank's decode heads times dcp_size. Prefill CP with DCP slices decode
+        # heads per CP rank, so that is num_heads rather than dcp_size x local.
         if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * self.dcp_size,
+                num_heads // decode_attn_head_shards() * self.dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,

@@ -257,3 +257,41 @@ if cfg.enable_prefill_cp:
 
 **应当自动处理：**
 - 没有显式指定 prefill graph 时，自动关闭 breakable graph。
+
+## 10. 已实现的测试和运行方式
+
+上面的测试都写在新文件 `test/registered/unit/server_args/test_prefill_cp_with_dcp_args.py` 里，注册在 `base-a-test-cpu`。一共 6 个测试类，每个对应一个 hook：
+
+| 测试类 | 对应的 hook | 覆盖内容 |
+|---|---|---|
+| `TestDecodeContextParallelismGate` | `parallel_hook.py` | K3.1 三个宽度相等时放行，`cp_strategy` 尚未设置时也放行；其他架构（DeepSeek-V3.2、GLM5-Next、Kimi-K3）拒绝；宽度不相等拒绝；zigzag 拒绝；page 布局拒绝 |
+| `TestCpTpGroupSharingWithDcp` | `cp_tp_group_sharing_hook.py` | K3.1 开启 DCP 后仍然启用 CP-TP sharing；K3.1 的 dcp < attn_cp 拒绝；GLM5-Next 仍然拒绝 DCP |
+| `TestKimiK31PrefillCpWithDcpOverrides` | `model_overrides/kimi_k3.py` | 三个宽度相等时放行；其他 prefill CP 布局拒绝；投机解码、PD 分离、trtllm/prims_ts 后端拒绝；不开 prefill CP 的普通 DCP 不受影响 |
+| `TestHiCacheWithPrefillCpAndDcp` | `hicache_hook.py` | 同时开启 prefill CP 和 DCP 时，HiCache 拒绝；只开 DCP 时 HiCache 放行 |
+| `TestPrefillCudaGraphWithPrefillCpAndDcp` | `cuda_graph_hook.py` | 显式指定 breakable/full 时拒绝；显式指定 disabled 时放行；不开 prefill CP 时，显式指定的 graph 不受影响 |
+| `TestMegaMoeBudgetWithPrefillCpAndDcp` | `mega_moe_hook.py` | 16384 个 token、8 卡、64 个请求时，每卡预算是 2112：2112 通过，2111 报错；不开 DCP 时仍按均分计算，2048 通过 |
+
+第 9 节建议的测试里有两项没写：Qwen4-Exp 继续拒绝 DCP（只测了 GLM5-Next），以及没有显式指定 prefill graph 时自动关闭 breakable graph。
+
+在装好 sglang 的环境里，从仓库根目录运行：
+
+```bash
+python -m pytest test/registered/unit/server_args/test_prefill_cp_with_dcp_args.py
+```
+
+只跑某一个 hook 的测试，例如 `parallel_hook.py`：
+
+```bash
+python -m pytest test/registered/unit/server_args/test_prefill_cp_with_dcp_args.py -k TestDecodeContextParallelismGate
+```
+
+参数校验的修改可能影响已有测试，回归时可以一起跑同目录下的相关文件：
+
+```bash
+python -m pytest test/registered/unit/server_args/test_prefill_cp_with_dcp_args.py \
+  test/registered/unit/server_args/test_server_args.py \
+  test/registered/unit/server_args/test_dcp_kv_layout.py \
+  test/registered/unit/test_model_overrides.py
+```
+
+这些测试还没有实际运行过。开发机上只有 Python 3.9，没有 torch，只做过语法解析检查。

@@ -366,7 +366,8 @@ class Parallel(msgspec.Struct):
     )
     attn_dcp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dcp_size_of",
-        doc="Decode context-parallel width inside the attention TP group.",
+        doc="Decode context-parallel width: inside the attention TP group, or "
+        "the attention-CP group itself when prefill CP runs with DCP.",
     )
     moe_ep_size = Derived(
         fn="sglang.srt.runtime_context.moe_ep_size_of",
@@ -402,8 +403,9 @@ class Parallel(msgspec.Struct):
     )
     attn_dcp_rank = Derived(
         doc=(
-            "Decode context-parallel rank inside the attention TP group, "
-            "zero where decode context parallelism is off."
+            "Decode context-parallel rank inside the attention TP group, or "
+            "the attention-CP rank when prefill CP runs with DCP; zero where "
+            "decode context parallelism is off."
         )
     )
     attn_dp_rank = Derived(
