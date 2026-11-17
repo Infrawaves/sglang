@@ -949,6 +949,11 @@ class Envs:
     # Override --hicache-ratio for Mamba states in ratio mode: a cached KV prefix
     # cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
+    # Log each L3 Mamba/KDA state write with its class (head/middle/tail/branch)
+    # and each L3 hit query with the state it used (attention TP rank 0 only).
+    SGLANG_KDA_L3_STATS = EnvBool(False)
+    # A non-final state at or below this absolute prompt position is "head".
+    SGLANG_KDA_L3_STATS_HEAD_TOKENS = EnvInt(16384)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

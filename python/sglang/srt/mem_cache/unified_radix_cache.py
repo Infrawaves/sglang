@@ -25,6 +25,8 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.mem_cache import kda_l3_stats
+from sglang.srt.mem_cache.kda_l3_stats import KdaL3StatsTracker
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -235,6 +237,8 @@ def _format_age(age: Optional[float]) -> str:
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
+    # SGLANG_KDA_L3_STATS: class of each Mamba state from insert to L3 write.
+    kda_l3_stats: Optional[KdaL3StatsTracker] = None
 
     def __init__(
         self,
@@ -538,6 +542,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if kda_l3_stats.enabled() and ComponentType.MAMBA in self.components:
+            self.kda_l3_stats = KdaL3StatsTracker()
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {
@@ -1649,6 +1655,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
         req.kv.record_insert(page_aligned_len)
+        if (
+            self.kda_l3_stats is not None
+            and insert_params.mamba_value is not None
+            and not result.mamba_exist
+        ):
+            # The new state sits at the end of the inserted key, on the node
+            # the insert ended on.
+            self.kda_l3_stats.on_insert(
+                result.last_device_node,
+                rid=req.rid,
+                position=page_aligned_len,
+                prompt_len=len(req.origin_input_ids),
+                is_request_end=insert_params.is_request_end,
+                branching_seqlen=req.mamba_branching_seqlen,
+            )
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -2433,6 +2454,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return
+        if self.kda_l3_stats is not None:
+            self._record_kda_l3_write(node_id, spec)
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2457,6 +2480,20 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+
+    def _record_kda_l3_write(self, node_id: NodeId, spec) -> None:
+        try:
+            mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
+            if not mamba_xfers or not mamba_xfers[0].keys:
+                return
+            node_end = (
+                len(self.get_prefix_hash_values(node_id)) + len(spec.hash_value)
+            ) * self.page_size
+            self.kda_l3_stats.on_storage_write(
+                node_id, mamba_xfers[0].keys[-1], node_end
+            )
+        except Exception:
+            logger.debug("KDA_L3_WRITE logging failed", exc_info=True)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
