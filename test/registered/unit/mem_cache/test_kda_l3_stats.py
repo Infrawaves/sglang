@@ -129,28 +129,77 @@ class TestWriteGate(unittest.TestCase):
 
 
 class TestReadLog(unittest.TestCase):
-    def _op(self, kv_pages):
+    """start_page=4, page=512: positions are 2048 + pages * 512."""
+
+    def _op(self, kv_pages, mamba=None, indexer=None, pools=("mamba", "indexer")):
+        hits = {PoolName.KV: kv_pages}
+        if mamba:
+            hits[PoolName.MAMBA] = mamba
+        if indexer:
+            hits[PoolName.INDEXER] = indexer
+        names = {"mamba": PoolName.MAMBA, "indexer": PoolName.INDEXER}
         return SimpleNamespace(
-            query_pool_hit_pages={PoolName.KV: kv_pages},
+            query_pool_hit_pages=hits,
+            pool_transfers=[SimpleNamespace(name=names[p]) for p in pools],
             all_hash_values=[f"h{i}" for i in range(1, 11)],
             start_page=4,
             assume_stored=False,
             request_id="rid-x",
         )
 
-    def test_limited_hit(self):
+    def _line(self, op, final_tokens):
         with mock.patch.object(kda_l3_stats, "_is_logging_rank", return_value=True):
             with self.assertLogs(kda_l3_stats.logger, level=logging.INFO) as cm:
-                kda_l3_stats.log_hit_query(self._op(8), 3 * 512, 512)
-        line = cm.output[0]
-        self.assertIn("key=h3 start=2048 hit_end=3584 kv_end=6144 limited=1", line)
+                kda_l3_stats.log_hit_query(op, final_tokens, 512)
+        return cm.output[0]
+
+    def test_full_hit(self):
+        line = self._line(self._op(8, mamba=8, indexer=8), 8 * 512)
+        self.assertIn(
+            "key=h8 start=2048 hit_end=6144 kv_end=6144 mamba_end=6144 "
+            "indexer_end=6144 limited=0 limited_by=-",
+            line,
+        )
         self.assertIn("rid=rid-x", line)
 
-    def test_cut_to_zero_still_logged(self):
-        with mock.patch.object(kda_l3_stats, "_is_logging_rank", return_value=True):
-            with self.assertLogs(kda_l3_stats.logger, level=logging.INFO) as cm:
-                kda_l3_stats.log_hit_query(self._op(8), 0, 512)
-        self.assertIn("key=- start=2048 hit_end=2048 kv_end=6144 limited=1", cm.output[0])
+    def test_cut_by_mamba(self):
+        line = self._line(self._op(8, mamba=3, indexer=8), 3 * 512)
+        self.assertIn("hit_end=3584 kv_end=6144 mamba_end=3584 indexer_end=6144", line)
+        self.assertIn("limited=1 limited_by=mamba", line)
+
+    def test_cut_by_indexer(self):
+        # Indexer page 6 is missing; the state before it sits at page 5.
+        line = self._line(self._op(8, mamba=8, indexer=5), 5 * 512)
+        self.assertIn("mamba_end=6144 indexer_end=4608 limited=1 limited_by=indexer", line)
+
+    def test_cut_by_both(self):
+        line = self._line(self._op(8, mamba=3, indexer=5), 3 * 512)
+        self.assertIn("limited_by=mamba+indexer", line)
+
+    def test_pool_without_stop_point_ends_at_start(self):
+        # A queried pool with boundary 0 is absent from the verdict dict.
+        line = self._line(self._op(8, indexer=8), 0)
+        self.assertIn("key=- start=2048 hit_end=2048 kv_end=6144 mamba_end=2048", line)
+        self.assertIn("limited_by=mamba", line)
+
+    def test_unqueried_pool_is_na(self):
+        line = self._line(self._op(8, mamba=3, pools=("mamba",)), 3 * 512)
+        self.assertIn("mamba_end=3584 indexer_end=na limited=1 limited_by=mamba", line)
+
+    def test_cut_by_other_pool(self):
+        line = self._line(self._op(8, mamba=8, indexer=8), 5 * 512)
+        self.assertIn("limited=1 limited_by=other", line)
+
+    def test_assume_stored_has_no_verdicts(self):
+        op = self._op(0)
+        op.assume_stored = True
+        op.query_pool_hit_pages = {}
+        line = self._line(op, 6 * 512)
+        self.assertIn(
+            "hit_end=5120 kv_end=5120 mamba_end=na indexer_end=na limited=0 "
+            "limited_by=- assume_stored=1",
+            line,
+        )
 
     def test_miss_not_logged(self):
         with mock.patch.object(kda_l3_stats, "_is_logging_rank", return_value=True):

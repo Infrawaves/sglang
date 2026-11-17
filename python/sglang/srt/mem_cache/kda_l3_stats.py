@@ -116,29 +116,63 @@ class KdaL3StatsTracker:
 
 
 def log_hit_query(operation: Any, final_hit_tokens: int, page_size: int) -> None:
-    """Log one rank-agreed L3 hit query (attention TP rank 0 only)."""
+    """Log one rank-agreed L3 hit query (attention TP rank 0 only).
+
+    Besides the final hit and the contiguous KV prefix, logs where the Mamba
+    (KDA) pool and the DSA indexer pool could each stop on their own, so a
+    truncated hit (``limited=1``) names the pool that cut it. A pool absent from
+    the query prints ``na``; a queried pool with no stop point ends at ``start``.
+    """
     if not _is_logging_rank():
         return
     try:
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
+        assume_stored = bool(getattr(operation, "assume_stored", False))
         pool_hits = getattr(operation, "query_pool_hit_pages", None) or {}
-        kv_pages = int(pool_hits.get(PoolName.KV, 0) or 0)
         final_pages = final_hit_tokens // page_size
+        # assume_stored skips the existence query, so no pool has a verdict.
+        kv_pages = (
+            final_pages if assume_stored else int(pool_hits.get(PoolName.KV, 0) or 0)
+        )
         if kv_pages <= 0 and final_pages <= 0:
             return
         hashes = getattr(operation, "all_hash_values", None) or []
         key = hashes[final_pages - 1] if 0 < final_pages <= len(hashes) else "-"
         start = int(getattr(operation, "start_page", 0) or 0) * page_size
+        kv_end = start + kv_pages * page_size
+        queried = {t.name for t in getattr(operation, "pool_transfers", None) or []}
+
+        def pool_end(pool) -> Optional[int]:
+            if assume_stored or pool not in queried:
+                return None
+            # The backend reports a pool only when it has a stop point.
+            return start + int(pool_hits.get(pool, 0) or 0) * page_size
+
+        mamba_end = pool_end(PoolName.MAMBA)
+        indexer_end = pool_end(PoolName.INDEXER)
+        limited = final_pages < kv_pages
+        if limited:
+            cut = [
+                name
+                for name, end in (("mamba", mamba_end), ("indexer", indexer_end))
+                if end is not None and end < kv_end
+            ]
+            limited_by = "+".join(cut) or "other"
+        else:
+            limited_by = "-"
         logger.info(
-            "KDA_L3_READ key=%s start=%d hit_end=%d kv_end=%d limited=%d "
-            "assume_stored=%d rid=%s",
+            "KDA_L3_READ key=%s start=%d hit_end=%d kv_end=%d mamba_end=%s "
+            "indexer_end=%s limited=%d limited_by=%s assume_stored=%d rid=%s",
             key,
             start,
             start + final_pages * page_size,
-            start + kv_pages * page_size,
-            int(final_pages < kv_pages),
-            int(bool(getattr(operation, "assume_stored", False))),
+            kv_end,
+            "na" if mamba_end is None else mamba_end,
+            "na" if indexer_end is None else indexer_end,
+            int(limited),
+            limited_by,
+            int(assume_stored),
             getattr(operation, "request_id", None),
         )
     except Exception:
