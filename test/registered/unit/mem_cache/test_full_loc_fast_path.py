@@ -388,5 +388,51 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.assertTrue(bool((pool.kv_buffer[0][4] == 0).all()))
 
 
+class TestDcpWriteOwnership(CustomTestCase):
+    """Prefill CP with DCP gathers the batch's new KV onto every rank and has
+    each rank write it through `translate_write` with the same widened slots.
+    The owner filter must store every slot on exactly one rank, slot % dcp,
+    or the KV is lost or written twice without any error."""
+
+    DCP = 4
+    PAGE = 4  # physical rows per page on each rank
+
+    def _unit_ids(self):
+        from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
+
+        ids = UnitIds(
+            num_virtual_ids=4,
+            num_physical_units=4,
+            unit_tokens=self.PAGE,
+            shards_under_dcp=True,
+            device="cpu",
+        )
+        ids.reset()
+        # Virtual page 1 sits at physical page 3 on every rank.
+        ids.bind(torch.tensor([1]), torch.tensor([3]))
+        return ids
+
+    def test_each_slot_is_stored_by_its_owner_alone(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        ids = self._unit_ids()
+        # Widened page 1 spans slots [16, 32): rows 12..15 on each of 4 ranks.
+        slots = torch.arange(16, 32, dtype=torch.int64)
+        loc = torch.cat([slots, torch.tensor([-1])])
+        written = []
+        for rank in range(self.DCP):
+            with get_parallel().override(attn_dcp_size=self.DCP, attn_dcp_rank=rank):
+                written.append(ids.translate_write(loc))
+        written = torch.stack(written)  # [rank, slot]
+
+        for col, slot in enumerate(slots.tolist()):
+            owners = (written[:, col] != 0).nonzero().flatten().tolist()
+            self.assertEqual(owners, [slot % self.DCP], msg=f"slot {slot}")
+            row = 3 * self.PAGE + (slot - 16) // self.DCP
+            self.assertEqual(int(written[slot % self.DCP, col]), row)
+        # A padded write lane lands on the sink on every rank.
+        self.assertTrue(bool((written[:, -1] == 0).all()))
+
+
 if __name__ == "__main__":
     unittest.main()

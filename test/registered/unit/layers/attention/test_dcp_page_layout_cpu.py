@@ -795,5 +795,32 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                         )
 
 
+class TestPrefillCpWithDcpAlignment(CustomTestCase):
+    """Prefill CP with DCP stores KV through the widened-slot owner filter,
+    which matches the position rule only when pages and prefixes are
+    dcp_size-aligned; a misaligned batch must fail loudly, not store KV on
+    the wrong rank."""
+
+    @staticmethod
+    def _check(prefix_lens, *, dcp_size=8, page_size=64):
+        from sglang.srt.layers.dcp import planner
+
+        with patch.object(
+            planner, "get_schedule", return_value=SimpleNamespace(page_size=page_size)
+        ):
+            planner._check_prefill_cp_with_dcp_alignment(prefix_lens, dcp_size)
+
+    def test_aligned_prefixes_pass(self):
+        self._check([0, 64, 128])
+
+    def test_a_misaligned_prefix_is_refused(self):
+        with self.assertRaisesRegex(AssertionError, r"\[60\]"):
+            self._check([64, 60])
+
+    def test_a_page_size_off_the_dcp_grid_is_refused(self):
+        with self.assertRaisesRegex(AssertionError, "page_size"):
+            self._check([0], dcp_size=8, page_size=4)
+
+
 if __name__ == "__main__":
     unittest.main()
