@@ -141,6 +141,18 @@ def apply_cuda_graph_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        # Neither capture holds the prefill-CP-with-DCP metadata, and an
+        # explicit backend would skip the rules below that disable it.
+        if (
+            cfg.enable_prefill_cp
+            and cfg.dcp_size > 1
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "--dcp-size > 1 with --enable-prefill-cp does not support a "
+                "prefill CUDA graph yet; use --cuda-graph-backend-prefill "
+                "disabled."
+            )
         return
 
     # PP prefill graph replay is opt-in. It is most useful for small

@@ -107,6 +107,11 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     elif arch == "KimiK31ForConditionalGeneration":
         # Prefill only: the decode node serves TP (+ DCP).
         unsupported["disaggregation-mode decode"] = cfg.disaggregation_mode == "decode"
+        # DCP runs on the CP group itself, which here is the whole TP group.
+        del unsupported["dcp-size > 1"]
+        unsupported["dcp-size != attn-cp-size"] = (
+            cfg.dcp_size > 1 and cfg.dcp_size != view.attn_cp_size
+        )
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

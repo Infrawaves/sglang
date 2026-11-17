@@ -243,6 +243,14 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         local_chunked_prefill_size = (
             prefill_tokens + token_partition_size - 1
         ) // token_partition_size
+        if cfg.dcp_size > 1:
+            # Prefill CP with DCP splits each request by position on its own,
+            # so a rank can hold one extra row per request in the batch.
+            max_requests = min(
+                cfg.max_running_requests or prefill_tokens, prefill_tokens
+            )
+            local_chunked_prefill_size += max_requests
+            token_partition_name = "attn_cp_size (per-request split)"
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
         token_partition_name = "attn_dp_size (already applied)"
