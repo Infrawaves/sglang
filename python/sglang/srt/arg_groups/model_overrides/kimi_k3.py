@@ -221,6 +221,9 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
+    # Prefill CP with DCP on one group (tp == attn_cp == dcp). Its first stage
+    # serves only aggregated, non-speculative flashmla_kv.
+    prefill_cp_dcp = cfg.enable_prefill_cp and dcp == cfg.attn_cp_size == cfg.tp_size
     unsupported = {
         "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
         not in (None, "DSPARK", "DFLASH"),
@@ -237,8 +240,20 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             and cfg.disaggregation_transfer_backend != "mooncake"
         ),
         "HiSparse": cfg.enable_hisparse,
-        "prefill context parallel": cfg.enable_prefill_cp
-        or (cfg.attn_cp_size or 1) > 1,
+        "prefill context parallel other than --tp-size == --attn-cp-size == "
+        "--dcp-size": (cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1)
+        and not prefill_cp_dcp,
+        "speculative decoding with prefill context parallel": prefill_cp_dcp
+        and cfg.speculative_algorithm is not None,
+        "PD disaggregation with prefill context parallel": prefill_cp_dcp
+        and cfg.disaggregation_mode != "null",
+        "a DSA backend other than flashmla_kv with prefill context parallel": (
+            prefill_cp_dcp
+            and any(
+                backend not in (None, "flashmla_kv")
+                for backend in (cfg.dsa_prefill_backend, cfg.dsa_decode_backend)
+            )
+        ),
     }
     rejected = [name for name, on in unsupported.items() if on]
     if rejected:

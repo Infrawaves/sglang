@@ -260,6 +260,13 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
+    # Runs before handle_context_parallelism declares CP-TP group sharing, so
+    # only the configured CP flags tell the prefill-CP-with-DCP layout apart.
+    if cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
+        raise NotImplementedError(
+            "HiCache with --dcp-size > 1 and --enable-prefill-cp is not "
+            "supported yet."
+        )
     if (
         cfg.hicache_storage_backend is not None
         and cfg.hicache_host_memory_mode == "buffer_only"
