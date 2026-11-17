@@ -1435,6 +1435,41 @@ async fn kimi_k3_sampling_defaults_reach_the_encoder() {
     );
 }
 
+/// Load totals count every sample, as for `/generate`, so a worker serving
+/// `n` samples is not routed as if it served one.
+#[tokio::test]
+async fn kimi_k3_load_counts_every_sample() {
+    async fn inflight_prefill_tokens(n: u64) -> u64 {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+        let decode = MockWorker::start_hanging(Duration::from_secs(2)).await;
+        // Only the load-based policy weighs dispatches by tokens.
+        let mut cfg = tokenizer.config();
+        cfg.model.policy = PolicyKind::LoadBased;
+        let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
+        let mut request = text_request();
+        request["n"] = json!(n);
+        let sent = Arc::clone(&ctx);
+        let pending = tokio::spawn(async move { send(sent, &request).await });
+        let worker = ctx.registry.get(&WorkerId(prefill.url.clone())).unwrap();
+        let tokens = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let tokens = worker.router_inflight_prefill_tokens();
+                if tokens > 0 {
+                    return tokens;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the prefill dispatch must claim its tokens");
+        pending.abort();
+        tokens
+    }
+    let one = inflight_prefill_tokens(1).await;
+    assert_eq!(inflight_prefill_tokens(4).await, one * 4);
+}
+
 /// dynamo-tokenizers has no tiktoken pattern for `kimi_k31`, which uses K3's
 /// tokenizer; the router still loads it and encodes as K3, on both backends,
 /// and removes the copy it staged to do so.

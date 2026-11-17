@@ -254,18 +254,21 @@ impl PreparedRequest {
                 .as_ref()
                 .map(|tokens| tokens.ids.len())
                 .or_else(|| policy_needs_token_count.then(|| estimate_text_tokens(&value)));
-            let prefill_token_override = Some(estimate_prefill_work(
+            let prefill_work = estimate_prefill_work(
                 Some(&value),
                 text_tokens,
                 body.len(),
                 text_tokens.map_or(input_tokens, |count| count.max(1)),
-            ));
+            );
+            // Totals cover every sample, as `/generate` counts them; the
+            // per-sequence lengths stay one sample's.
+            let samples = sample_count(&fields, &sampling_defaults);
             Ok(Self {
                 path: CHAT_PATH,
                 model,
                 streaming: fields.stream.unwrap_or(false),
-                output_tokens,
-                input_token_count: input_tokens,
+                output_tokens: output_tokens.map(|output| output.saturating_mul(samples)),
+                input_token_count: input_tokens.saturating_mul(samples as usize),
                 sequence_token_count: input_tokens,
                 expected_peak_sequence_tokens: output_tokens
                     .map(|output| (input_tokens as u64).saturating_add(output)),
@@ -276,7 +279,7 @@ impl PreparedRequest {
                 fans_out: requests_multiple_samples(&fields, &sampling_defaults),
                 parsed_body: Some(value),
                 sampling_defaults,
-                prefill_token_override,
+                prefill_token_override: Some(prefill_work.saturating_mul(samples as usize)),
                 input_ids_forwarding: Some(InputIdsForwarding::Forwarded),
                 forwarding_booked: false,
                 responder: None,
