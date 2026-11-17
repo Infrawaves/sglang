@@ -1711,9 +1711,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         if dsa_shards_index_k():
-            k_fp8, k_scale = self._dcp_gather_index_k(
-                layer_id, metadata, block_tables, indexer_seq_lens_cpu
-            )
+            whole_batch = metadata.get_dcp_whole_batch()
+            if whole_batch is None:
+                whole_batch = (
+                    block_tables,
+                    metadata.get_indexer_seq_len(),
+                    indexer_seq_lens_cpu,
+                )
+            k_fp8, k_scale = self._dcp_gather_index_k(layer_id, *whole_batch)
         else:
             k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
@@ -1924,19 +1929,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     @staticmethod
     def _dcp_gather_index_k(
         layer_id: int,
-        metadata: BaseIndexerMetadata,
         block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Prefill under DCP: every request's index-K from all ranks, in DCP1's
         # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
+        # The gather is collective: every rank passes the same request list.
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
         # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
-            get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
+            get_dcp_lens(seq_lens, dcp_size, dcp_rank),
             block_tables,
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
