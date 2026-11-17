@@ -52,7 +52,7 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import enter_scope, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -103,6 +103,7 @@ class _FakeReq:
         self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.prefill_cached_tokens = None
         self.cached_tokens_device = 0
         self.cached_tokens_host = 0
         self.cached_tokens_storage = 0
@@ -643,7 +644,7 @@ def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True)
     )
 
 
-class TestOutputStreamerRequestStats(unittest.TestCase):
+class TestOutputStreamerRequestStats(CustomTestCase):
     def setUp(self):
         _enter_streamer_scope(self)
 
@@ -680,6 +681,7 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         streamer = _streamer(outputs)
         req = _metered_req()
         req.cached_tokens = 2
+        req.prefill_cached_tokens = 1
 
         def output(finished=False):
             req.output_ids.append(7)
@@ -689,6 +691,7 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
             return outputs[-1].request_stats
 
         [first] = output()
+        self.assertEqual(first.prefill_cached_tokens, 1)
         self.assertEqual(
             (first.prompt_tokens, first.cached_tokens, first.retraction_count),
             (3, 2, 0),
@@ -696,15 +699,20 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         self.assertIsNone(output())
 
         req.reset_for_retract()
+        req.cached_tokens = 3
         # The overlap schedule outputs the retracted request's last decode step.
         [retracted] = output()
         self.assertEqual(retracted.retraction_count, 1)
+        self.assertEqual(
+            (retracted.cached_tokens, retracted.prefill_cached_tokens), (3, 1)
+        )
         # Re-admission adds the second wait to the queue time.
         req.time_stats.queue_duration_s += 0.5
         req.is_retracted = False
         self.assertIsNone(output())
 
         [finished] = output(finished=True)
+        self.assertEqual(finished.prefill_cached_tokens, 1)
         self.assertEqual(finished.retraction_count, 1)
         self.assertEqual(finished.time_stats.queue_time, 0.5)
 

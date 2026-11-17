@@ -2842,10 +2842,30 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
+    @staticmethod
+    def _physical_cache_headers(meta_info: Dict[str, Any]) -> Dict[str, str]:
+        """Expose prefill reuse, excluding decode-local radix reuse in PD."""
+        finish_reason = meta_info.get("finish_reason")
+        reason = (
+            finish_reason.get("type")
+            if isinstance(finish_reason, dict)
+            else finish_reason
+        )
+        if reason in ("abort", "error"):
+            return {}
+        if get_disagg().disaggregation_mode == "decode":
+            # Missing is unknown, not zero; never substitute max(P, D).
+            cached_tokens = meta_info.get("prefill_cached_tokens")
+        else:
+            cached_tokens = meta_info.get("cached_tokens", 0) or 0
+        if cached_tokens is None:
+            return {}
+        return {"X-Sgl-Cached-Tokens": str(cached_tokens)}
+
     def _usage_headers(
         self, meta_info: Dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> Dict[str, str]:
-        """Return physical cache hits, cache-write and optional K3 usage headers.
+        """Return prefill cache hits, cache-write and optional K3 usage headers.
 
         Streaming uses the first engine event so prompt-side accounting is
         available even if the stream ends before the final usage frame.
@@ -2870,18 +2890,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     f"{prefix}-Cached-Tokens": str(cached),
                 }
             )
-        # Preserve the engine/logging count, including when the configurable
-        # usage prefix is X-Sgl and would otherwise expose the Redis read count.
+        # This name is reserved for prefill reuse, including when the
+        # configurable prefix would otherwise expose the Redis read count.
         if prefix.lower() == "x-sgl":
             headers.pop(f"{prefix}-Cached-Tokens", None)
-        finish_reason = meta_info.get("finish_reason")
-        reason = (
-            finish_reason.get("type")
-            if isinstance(finish_reason, dict)
-            else finish_reason
-        )
-        if reason not in ("abort", "error"):
-            headers["X-Sgl-Cached-Tokens"] = str(meta_info.get("cached_tokens", 0) or 0)
+        headers.update(self._physical_cache_headers(meta_info))
         return headers
 
     async def _handle_streaming_request(

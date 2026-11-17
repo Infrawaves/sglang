@@ -53,6 +53,7 @@ from sglang.srt.function_call.kimik3_format import THINK_CLOSE
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import (
     get_context,
+    get_disagg,
     get_serving,
     publish,
     reset_context,
@@ -3015,6 +3016,63 @@ class PhysicalCacheHeadersTestCase(CustomTestCase):
 
                     asyncio.run(run())
 
+    def test_cache_header_uses_prefill_measurement_only_on_decode(self):
+        """Decode's cache reuse must not stand in for absent or cold Prefill data."""
+        for mode, prefill_meta, expected in (
+            ("decode", {"prefill_cached_tokens": 0}, "0"),
+            ("decode", {"prefill_cached_tokens": 512}, "512"),
+            ("decode", {"prefill_cached_tokens": 1920}, "1920"),
+            ("decode", {}, None),
+            ("decode", {"prefill_cached_tokens": None}, None),
+            ("null", {"prefill_cached_tokens": 0}, "1920"),
+            ("prefill", {"prefill_cached_tokens": 0}, "1920"),
+        ):
+            for streaming in (False, True):
+                with self.subTest(mode=mode, prefill=prefill_meta, stream=streaming):
+
+                    async def generate(*args, **kwargs):
+                        first = engine_chunk("ok", finish=not streaming)
+                        first["meta_info"].update(
+                            prompt_tokens=2051, cached_tokens=1920, **prefill_meta
+                        )
+                        yield first
+                        if streaming:
+                            final = engine_chunk("ok", finish=True)
+                            final["meta_info"].update(
+                                prompt_tokens=2051,
+                                cached_tokens=2048,
+                                prefill_cached_tokens=2048,
+                            )
+                            yield final
+
+                    self.serving.tokenizer_manager.generate_request = generate
+
+                    async def run():
+                        result = await self.serving.create_responses(
+                            ResponsesRequest(
+                                model="x", input="hi", stream=streaming, store=False
+                            )
+                        )
+                        if streaming:
+                            self.assertIsInstance(result, StreamingResponse)
+                            headers = dict(result.headers)
+                            events = event_payloads(
+                                await collect_stream_events(result.body_iterator)
+                            )
+                            self.assertEqual(events[-1]["type"], "response.completed")
+                            self.assertEqual(dict(result.headers), headers)
+                            return headers
+                        self.assertIsInstance(result, ResponsesResponse)
+                        return result._response_headers
+
+                    with get_disagg().override(disaggregation_mode=mode):
+                        headers = asyncio.run(run())
+                    headers = {key.lower(): value for key, value in headers.items()}
+                    if expected is None:
+                        self.assertNotIn("x-sgl-cached-tokens", headers)
+                    else:
+                        self.assertEqual(headers["x-sgl-cached-tokens"], expected)
+
     def test_stream_waits_for_engine_before_committing_headers(self):
         """A no-accounting stream cannot send headers before physical usage exists."""
 
@@ -3080,6 +3138,7 @@ class PhysicalCacheHeadersTestCase(CustomTestCase):
             failed = engine_chunk("", finish=True)
             failed["meta_info"].update(
                 cached_tokens=256,
+                prefill_cached_tokens=128,
                 finish_reason={
                     "type": "abort",
                     "message": "failed",
@@ -3088,7 +3147,9 @@ class PhysicalCacheHeadersTestCase(CustomTestCase):
             )
             yield failed
             subsequent = engine_chunk("ok", finish=True)
-            subsequent["meta_info"]["cached_tokens"] = 1024
+            subsequent["meta_info"].update(
+                cached_tokens=1024, prefill_cached_tokens=512
+            )
             yield subsequent
 
         self.serving.tokenizer_manager.generate_request = generate
@@ -3107,7 +3168,8 @@ class PhysicalCacheHeadersTestCase(CustomTestCase):
             self.assertEqual(len(outputs), 2)
             self.assertEqual(headers, {})
 
-        asyncio.run(run())
+        with get_disagg().override(disaggregation_mode="decode"):
+            asyncio.run(run())
 
 
 STORE_DISABLED_MESSAGE = (

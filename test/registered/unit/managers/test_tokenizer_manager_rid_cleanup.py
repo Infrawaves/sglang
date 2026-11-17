@@ -545,6 +545,42 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
 
 class TestStoredRequestStats(CustomTestCase):
+    def test_prefill_hits_survive_sparse_stats_without_fabricating_zero(self):
+        """Original P remains distinct from D across first/intermediate/final
+        outputs, including a measured zero and requests with no P measurement."""
+        for prefill_hits in (None, 0, 2):
+            with self.subTest(prefill_hits=prefill_hits):
+                tm = _make_tokenizer_manager(self)
+                rid = "prefill_cache_stats"
+                state = _make_req_state(rid)
+                state.obj.stream = True
+                tm.rid_to_state[rid] = state
+                first = _request_stats(
+                    prompt_tokens=5,
+                    cached_tokens=3,
+                    prefill_cached_tokens=prefill_hits,
+                )
+                final = _request_stats(
+                    prompt_tokens=5,
+                    cached_tokens=4,
+                    prefill_cached_tokens=prefill_hits,
+                )
+                for stats, reason in (
+                    ([first], _NOT_FINISHED),
+                    (None, _NOT_FINISHED),
+                    ([final], None),
+                ):
+                    output = _make_batch_str_output(rid, reason)
+                    output.request_stats = stats
+                    asyncio.run(tm._handle_batch_output(output))
+                metadata = [out["meta_info"] for out in state.out_list]
+                self.assertEqual([m["cached_tokens"] for m in metadata], [3, 3, 4])
+                for meta in metadata:
+                    if prefill_hits is None:
+                        self.assertNotIn("prefill_cached_tokens", meta)
+                    else:
+                        self.assertEqual(meta["prefill_cached_tokens"], prefill_hits)
+
     def test_rows_without_request_stats_read_the_latest_request_stats(self):
         """A row without request stats reports the latest received, and a row
         before any is dropped."""

@@ -3468,6 +3468,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": request_stats.cached_tokens,
                     }
                 )
+                if request_stats.prefill_cached_tokens is not None:
+                    meta_info["prefill_cached_tokens"] = (
+                        request_stats.prefill_cached_tokens
+                    )
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None

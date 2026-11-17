@@ -70,7 +70,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateToolDetector,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import get_context, get_disagg, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
@@ -571,17 +571,95 @@ class ServingChatTestCase(CustomTestCase):
                     "512" if ttl == 3600 else "0",
                 )
 
+    def test_cache_header_uses_prefill_measurement_only_on_decode(self):
+        """A warm decode cache cannot conceal a cold or unmeasured prefill."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        for mode, prefill_meta, expected in (
+            ("decode", {"prefill_cached_tokens": 0}, "0"),
+            ("decode", {"prefill_cached_tokens": 512}, "512"),
+            ("decode", {"prefill_cached_tokens": 1920}, "1920"),
+            ("decode", {}, None),
+            ("decode", {"prefill_cached_tokens": None}, None),
+            ("null", {"prefill_cached_tokens": 0}, "1920"),
+            ("prefill", {"prefill_cached_tokens": 0}, "1920"),
+        ):
+            for streaming in (False, True):
+                with self.subTest(mode=mode, prefill=prefill_meta, stream=streaming):
+                    first = _spec_result(0)
+                    first["meta_info"].update(
+                        prompt_tokens=2051,
+                        cached_tokens=1920,
+                        cache_usage={
+                            "ttl_seconds": 300,
+                            "read_tokens": 256,
+                            "write_tokens": 512,
+                        },
+                        **prefill_meta,
+                    )
+                    final = copy.deepcopy(first)
+                    final["meta_info"].update(
+                        cached_tokens=2048, prefill_cached_tokens=2048
+                    )
+                    if streaming:
+                        first["meta_info"]["finish_reason"] = None
+
+                    async def generate(*_args, **_kwargs):
+                        yield first
+                        if streaming:
+                            yield final
+
+                    self.tm.generate_request = generate
+
+                    async def run():
+                        if streaming:
+                            response = await self.chat._handle_streaming_request(
+                                Mock(), self.stream_req, self.fastapi_request
+                            )
+                            headers = dict(response.headers)
+                            chunks = [chunk async for chunk in response.body_iterator]
+                            self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                            self.assertEqual(dict(response.headers), headers)
+                            return headers
+                        response = await self.chat._handle_non_streaming_request(
+                            Mock(), self.basic_req, self.fastapi_request
+                        )
+                        self.assertEqual(
+                            response.usage.prompt_tokens_details.cached_tokens, 256
+                        )
+                        return response._response_headers
+
+                    # Configurable usage headers also expose Redis reads; they
+                    # must not substitute for an absent Prefill measurement.
+                    with get_disagg().override(disaggregation_mode=mode):
+                        with envs.SGLANG_USAGE_HEADER_PREFIX.override("X-Sgl"):
+                            headers = asyncio.run(run())
+                    headers = {key.lower(): value for key, value in headers.items()}
+                    if expected is None:
+                        self.assertNotIn("x-sgl-cached-tokens", headers)
+                    else:
+                        self.assertEqual(headers["x-sgl-cached-tokens"], expected)
+                    self.assertEqual(headers["msh-usage-cache-write-tokens-5m"], "512")
+                    self.assertEqual(headers["msh-usage-cache-write-tokens-1h"], "0")
+
     def test_failed_initial_result_has_no_physical_cache_header(self):
         """A failed first result must not look like a measured successful request."""
         self.chat.chat_encoding_spec = "kimi_k3"
         for finish_reason in ("abort", "error", {"type": "abort"}, {"type": "error"}):
-            for prefix in ("", "X-Sgl", "x-SGL"):
-                with self.subTest(finish_reason=finish_reason, prefix=prefix):
-                    with envs.SGLANG_USAGE_HEADER_PREFIX.override(prefix):
+            for mode, prefix in (
+                ("null", ""),
+                ("decode", "X-Sgl"),
+                ("decode", "x-SGL"),
+            ):
+                with self.subTest(finish_reason=finish_reason, prefix=prefix, mode=mode):
+                    with (
+                        get_disagg().override(disaggregation_mode=mode),
+                        envs.SGLANG_USAGE_HEADER_PREFIX.override(prefix),
+                    ):
                         headers = self.chat._usage_headers(
                             {
                                 "prompt_tokens": 1922,
                                 "cached_tokens": 1920,
+                                "prefill_cached_tokens": 512,
                                 "finish_reason": finish_reason,
                             }
                         )

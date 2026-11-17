@@ -3396,17 +3396,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         meta_info = (
                             res.get("meta_info") if isinstance(res, dict) else None
                         )
-                        if (
-                            isinstance(meta_info, dict)
-                            and self._status_from_finish_reason(
-                                meta_info.get("finish_reason")
-                            )
-                            != "failed"
-                        ):
+                        if isinstance(meta_info, dict):
                             # HTTP headers describe the initial engine turn;
                             # built-in tool continuations cannot replace them.
-                            physical_usage_headers["X-Sgl-Cached-Tokens"] = str(
-                                meta_info.get("cached_tokens") or 0
+                            physical_usage_headers.update(
+                                self._physical_cache_headers(meta_info)
                             )
                     if cache_context is not None and isinstance(res, dict):
                         meta = res.get("meta_info") or {}
