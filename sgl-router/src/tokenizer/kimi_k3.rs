@@ -51,12 +51,16 @@ impl EncodeError {
 struct Reply {
     #[serde(default)]
     ready: bool,
+    /// The encoder's rendering digest, in its ready reply.
+    fingerprint: Option<String>,
     input_ids: Option<Vec<u32>>,
     error: Option<String>,
     error_type: Option<String>,
 }
 
 struct Process {
+    /// The rendering digest workers must report to take this pool's IDs.
+    fingerprint: String,
     child: Child,
     requests: Option<mpsc::Sender<Value>>,
     replies: mpsc::Receiver<Result<Reply>>,
@@ -104,6 +108,7 @@ impl Process {
         let (requests, request_rx) = mpsc::channel::<Value>();
         let (reply_tx, replies) = mpsc::sync_channel(1);
         let mut process = Self {
+            fingerprint: String::new(),
             child,
             requests: Some(requests),
             replies,
@@ -159,6 +164,10 @@ impl Process {
             bail!("tokenizer startup failed: {error}");
         }
         ensure!(reply.ready, "tokenizer did not report ready");
+        process.fingerprint = reply
+            .fingerprint
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .context("Kimi-K3 encoder reported no rendering fingerprint")?;
         Ok(process)
     }
 
@@ -257,6 +266,8 @@ struct PoolShared {
 
 pub struct KimiK3Pool {
     source: String,
+    /// Every process's rendering digest; a replacement must report the same.
+    fingerprint: String,
     options: ChatEncodingOptions,
     /// Worker `--default-chat-template-kwargs`, sent to every process at startup.
     defaults: Value,
@@ -283,8 +294,16 @@ impl KimiK3Pool {
                 Process::start(source, options, &defaults, deadline)
             })
             .collect::<Result<Vec<_>>>()?;
+        let fingerprint = processes[0].fingerprint.clone();
+        ensure!(
+            processes
+                .iter()
+                .all(|process| process.fingerprint == fingerprint),
+            "Kimi-K3 encoder processes rendered differently at startup"
+        );
         Ok(Self {
             source: source.into(),
+            fingerprint,
             options: options.clone(),
             defaults,
             metrics,
@@ -301,6 +320,10 @@ impl KimiK3Pool {
                 returned: Condvar::new(),
             }),
         })
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     pub(crate) fn metrics(&self) -> Arc<EncoderMetrics> {
@@ -474,6 +497,7 @@ impl KimiK3Pool {
         let options = self.options.clone();
         let defaults = self.defaults.clone();
         let metrics = Arc::clone(&self.metrics);
+        let fingerprint = self.fingerprint.clone();
         let startup_timeout = Duration::from_secs(options.tokenizer_startup_timeout_secs);
         let worker = std::thread::Builder::new()
             .name("kimi-tokenizer-restart".into())
@@ -482,7 +506,13 @@ impl KimiK3Pool {
                     let deadline = Instant::now()
                         .checked_add(startup_timeout)
                         .context("Kimi-K3 tokenizer startup timeout is too large")?;
-                    Process::start(&source, &options, &defaults, deadline)
+                    let process = Process::start(&source, &options, &defaults, deadline)?;
+                    // Workers were matched against the pool's digest.
+                    ensure!(
+                        process.fingerprint == fingerprint,
+                        "the restarted Kimi-K3 encoder renders differently"
+                    );
+                    Ok(process)
                 })();
                 metrics.restart(result.is_ok());
                 let new_slot = match result {
@@ -522,6 +552,8 @@ impl KimiK3Pool {
 pub fn encoder_source(tokenizer_path: &str) -> String {
     let path = std::path::Path::new(tokenizer_path);
     match path.parent() {
+        // A bare file name's parent is empty, which is the working directory.
+        Some(dir) if path.is_file() && dir.as_os_str().is_empty() => ".".to_owned(),
         Some(dir) if path.is_file() => dir.to_string_lossy().into_owned(),
         _ => tokenizer_path.to_owned(),
     }

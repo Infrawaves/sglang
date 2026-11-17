@@ -458,6 +458,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
         self._encoding_adapter = self._build_chat_encoding_adapter()
+        # Computed on the first /server_info, once the tokenizer is loaded;
+        # "" after a failure.
+        self._kimi_k3_input_ids_fingerprint: str | None = None
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: ResponseParserProtocol | None = None
@@ -1927,7 +1930,25 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.default_chat_template_kwargs.get("chat_template") is None
         )
 
-    def _expands_kimi_k3_media_placeholders(self, is_multimodal: bool) -> bool:
+    def kimi_k3_input_ids_fingerprint(self) -> str | None:
+        """This server's rendering digest, for `/server_info`; the sgl-router
+        forwards its IDs only when its encoder's digest is the same."""
+        if not self.supports_kimi_k3_input_ids():
+            return None
+        if self._kimi_k3_input_ids_fingerprint is None:
+            try:
+                self._kimi_k3_input_ids_fingerprint = kimi_k3_tokenization.input_ids_fingerprint(
+                    self.tokenizer_manager.tokenizer,
+                    model_type=self.tokenizer_manager.model_config.hf_config.model_type,
+                )
+            except Exception:
+                # "" records the failure, so later /server_info calls neither
+                # retry nor log again; the router then sends no IDs here.
+                logger.exception("Kimi-K3 rendering fingerprint failed")
+                self._kimi_k3_input_ids_fingerprint = ""
+        return self._kimi_k3_input_ids_fingerprint or None
+
+    def expands_kimi_k3_media_placeholders(self, is_multimodal: bool) -> bool:
         """Router IDs hold one placeholder per image, which only a K3
         processor expands; without one, image chats render locally."""
         processor = self.tokenizer_manager.mm_processor
@@ -2110,9 +2131,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Router IDs have their own fields: keeping caller input_ids unset
         # preserves chat-template generation-stub budget and usage accounting.
-        input_ids = request.input_ids
-        if (
-            input_ids is None
+        router_ids = (
+            request.input_ids is None
             and request.kimi_k3_input_ids is not None
             and (request.chat_template_kwargs or {}).get("chat_template") is None
             and self.supports_kimi_k3_input_ids()
@@ -2123,13 +2143,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     if isinstance(message.content, list)
                     for part in message.content
                 )
-                or self._expands_kimi_k3_media_placeholders(is_multimodal)
+                or self.expands_kimi_k3_media_placeholders(is_multimodal)
             )
-        ):
-            input_ids = request.kimi_k3_input_ids
+        )
+        input_ids = request.kimi_k3_input_ids if router_ids else request.input_ids
         if input_ids is not None:
             image_data, video_data, audio_data, modalities = [], [], [], []
-            if self.chat_encoding_spec == "kimi_k3" and is_multimodal:
+            # Router IDs hold one placeholder per image for the MM processor to
+            # expand; caller IDs are used as sent, without the messages' media.
+            if router_ids:
                 messages = [msg.model_dump() for msg in request.messages]
                 kimi_k3_tokenization.truncate_kimi_k3_videos(messages)
                 image_data, video_data, audio_data, modalities = (

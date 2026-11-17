@@ -33,6 +33,7 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.entrypoints.openai import kimi_k3_tokenization
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
@@ -2107,6 +2108,41 @@ class ServingChatTestCase(CustomTestCase):
         fallback = self.chat._process_messages(ChatCompletionRequest(**body), True)
         self.assertEqual(fallback.prompt_ids, [71, 72])
         self.assertEqual(fallback.image_data, result.image_data)
+        # Caller IDs are used as sent, without the messages' media, as before
+        # the router IDs existed.
+        self.tm.mm_processor.kimi_k3_input_ids_version = 1
+        caller = dict(body, input_ids=[91, 92])
+        del caller["kimi_k3_input_ids"]
+        result = self.chat._process_messages(ChatCompletionRequest(**caller), True)
+        self.assertEqual(result.prompt_ids, [91, 92])
+        self.assertIsNone(result.image_data)
+
+    def test_kimi_k3_fingerprint_matches_the_router_encoders(self):
+        """The worker's digest is the router encoder's for the same checkpoint,
+        computed once; a server that does not take router IDs reports none."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.hf_config.model_type = "kimi_k31"
+        self.chat._kimi_k3_input_ids_fingerprint = None
+        self.tm.tokenizer.apply_chat_template.return_value = [5, 6, 7]
+        self.tm.tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
+        expected = kimi_k3_tokenization.input_ids_fingerprint(
+            self.tm.tokenizer, model_type="kimi_k31"
+        )
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        self.assertEqual(self.chat.kimi_k3_input_ids_fingerprint(), expected)
+        self.assertEqual(self.chat.kimi_k3_input_ids_fingerprint(), expected)
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+        self.chat.chat_encoding_spec = None
+        self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
+        # A failure is recorded too: later calls neither retry nor log again.
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat._kimi_k3_input_ids_fingerprint = None
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        self.tm.tokenizer.apply_chat_template.return_value = []
+        self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
+        self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
     def test_kimi_k3_router_capability_follows_effective_config(self):
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -2118,7 +2154,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertFalse(self.chat.supports_kimi_k3_input_ids())
         with get_context().override_server_args(enable_multimodal=False):
             self.assertTrue(self.chat.supports_kimi_k3_input_ids())
-            self.assertFalse(self.chat._expands_kimi_k3_media_placeholders(True))
+            self.assertFalse(self.chat.expands_kimi_k3_media_placeholders(True))
         self.chat.default_chat_template_kwargs = {"chat_template": "custom"}
         self.assertFalse(self.chat.supports_kimi_k3_input_ids())
         self.chat.default_chat_template_kwargs = {}

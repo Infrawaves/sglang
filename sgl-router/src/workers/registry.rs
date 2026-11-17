@@ -341,6 +341,7 @@ mod tests {
             EngineProfile {
                 capabilities: crate::workers::WorkerCapabilities {
                     kimi_k3_input_ids_version: Some(1),
+                    ..Default::default()
                 },
                 ..WireProtocol::Http1.into()
             },
@@ -373,6 +374,7 @@ mod tests {
                     EngineProfile {
                         capabilities: crate::workers::WorkerCapabilities {
                             kimi_k3_input_ids_version: version,
+                            ..Default::default()
                         },
                         ..WireProtocol::Http1.into()
                     },

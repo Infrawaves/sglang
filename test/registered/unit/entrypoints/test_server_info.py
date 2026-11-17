@@ -180,13 +180,21 @@ class TestServerInfoKimiK3RouterCapabilities(CustomTestCase):
         )
         chat.template_manager = SimpleNamespace(chat_template_name=None)
         chat.default_chat_template_kwargs = {}
+        chat._kimi_k3_input_ids_fingerprint = "digest"
         args = ServerArgs(model_path="dummy")
         with get_context().override_server_args(enable_multimodal=True):
             payload = _call_server_info_with(args, serving_chat=chat)
             self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
+            self.assertEqual(payload["kimi_k3_input_ids_fingerprint"], "digest")
+            self.assertTrue(payload["kimi_k3_input_ids_media"])
+            chat.tokenizer_manager.mm_processor.kimi_k3_input_ids_version = None
+            payload = _call_server_info_with(args, serving_chat=chat)
+            self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
+            self.assertFalse(payload["kimi_k3_input_ids_media"])
             chat.default_chat_template_kwargs = {"chat_template": "custom"}
             payload = _call_server_info_with(args, serving_chat=chat)
             self.assertIsNone(payload["kimi_k3_input_ids_version"])
+            self.assertNotIn("kimi_k3_input_ids_fingerprint", payload)
             payload = _call_server_info_with(args)
             self.assertIsNone(payload["kimi_k3_input_ids_version"])
 

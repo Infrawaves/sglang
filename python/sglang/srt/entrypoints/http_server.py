@@ -939,12 +939,18 @@ async def server_info(raw_request: Request = None):
     server_args = _global_state.tokenizer_manager.server_args
 
     # Read by the sgl-router before it forwards router-rendered K3 prompt IDs.
-    kimi_k3_input_ids_version = (
-        1
-        if raw_request is not None
-        and raw_request.app.state.openai_serving_chat.supports_kimi_k3_input_ids()
-        else None
-    )
+    kimi_k3 = {}
+    if raw_request is not None:
+        chat = raw_request.app.state.openai_serving_chat
+        fingerprint = chat.kimi_k3_input_ids_fingerprint()
+        if fingerprint is not None:
+            kimi_k3 = {
+                "kimi_k3_input_ids_version": 1,
+                "kimi_k3_input_ids_fingerprint": fingerprint,
+                "kimi_k3_input_ids_media": chat.expands_kimi_k3_media_placeholders(
+                    chat.tokenizer_manager.model_config.is_multimodal
+                ),
+            }
 
     return msgspec_to_builtins(
         redact_watermark_secrets(
@@ -954,7 +960,8 @@ async def server_info(raw_request: Request = None):
                 "internal_states": internal_states,
                 "version": __version__,
                 "frontend": "python",
-                "kimi_k3_input_ids_version": kimi_k3_input_ids_version,
+                "kimi_k3_input_ids_version": None,
+                **kimi_k3,
             }
         )
     )

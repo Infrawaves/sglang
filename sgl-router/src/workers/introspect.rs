@@ -534,7 +534,25 @@ mod tests {
             let info = fast_introspector().fetch(&url).await;
             assert_eq!(info.served_model_name.as_deref(), Some("kimi-k31"));
             assert_eq!(info.capabilities.kimi_k3_input_ids_version, version);
+            assert_eq!(info.capabilities.kimi_k3_input_ids_fingerprint, None);
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_reads_the_kimi_rendering_fingerprint_and_image_support() {
+        let body = json!({
+            "served_model_name": "kimi-k31",
+            "kimi_k3_input_ids_version": 1,
+            "kimi_k3_input_ids_fingerprint": "abc",
+            "kimi_k3_input_ids_media": true,
+        });
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let capabilities = fast_introspector().fetch(&url).await.capabilities;
+        assert_eq!(
+            capabilities.kimi_k3_input_ids_fingerprint.as_deref(),
+            Some("abc")
+        );
+        assert!(capabilities.kimi_k3_input_ids_media);
     }
 
     /// An engine started with `--api-key` answers `/server_info` only to the key.

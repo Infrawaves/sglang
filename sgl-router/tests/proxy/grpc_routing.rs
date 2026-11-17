@@ -594,6 +594,323 @@ async fn text_rpcs_reach_the_engine_as_router_tokens() {
     );
 }
 
+/// The same prepared RPC can retry on a worker that needs the original text,
+/// then use router IDs again without losing per-attempt fields or reply shape.
+#[tokio::test]
+async fn tokenized_text_rpcs_recheck_compatibility_on_every_call() {
+    use sgl_router::proxy::grpc::{
+        Additions, EngineRpc, TokenizedClassify, TokenizedTextEmbed, TokenizedTextGenerate,
+    };
+
+    let (generates, texts, embeds, text_embeds, classifies) = (
+        Seen::new(),
+        Seen::new(),
+        Seen::new(),
+        Seen::new(),
+        Seen::new(),
+    );
+    let (record_generate, record_text, record_embed, record_text_embed, record_classify) = (
+        generates.record(),
+        texts.record(),
+        embeds.record(),
+        text_embeds.record(),
+        classifies.record(),
+    );
+    let port = MockEngine::default()
+        .stream("Generate", move |request: proto::GenerateRequest| {
+            record_generate(request);
+            stream::iter([Ok(proto::GenerateResponse {
+                text: Some("ids".into()),
+                finished: true,
+                ..Default::default()
+            })])
+            .boxed()
+        })
+        .stream(
+            "TextGenerate",
+            move |request: proto::TextGenerateRequest| {
+                record_text(request);
+                stream::iter([Ok(proto::TextGenerateResponse {
+                    text: "text".into(),
+                    finished: true,
+                    ..Default::default()
+                })])
+                .boxed()
+            },
+        )
+        .unary("Embed", move |request: proto::EmbedRequest| {
+            record_embed(request);
+            proto::EmbedResponse {
+                embedding: vec![1.0],
+                ..Default::default()
+            }
+        })
+        .unary("TextEmbed", move |request: proto::TextEmbedRequest| {
+            record_text_embed(request);
+            proto::TextEmbedResponse {
+                embedding: vec![2.0],
+                ..Default::default()
+            }
+        })
+        .unary("Classify", move |request: proto::ClassifyRequest| {
+            record_classify(request);
+            proto::ClassifyResponse {
+                embedding: vec![3.0],
+                ..Default::default()
+            }
+        })
+        .start()
+        .await;
+    let client = SglangServiceClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let generate = TokenizedTextGenerate::new(
+        proto::TextGenerateRequest {
+            text: "hello".into(),
+            ..Default::default()
+        },
+        vec![7, 8],
+    );
+    let embed = TokenizedTextEmbed::new(
+        proto::TextEmbedRequest {
+            text: "hello".into(),
+            ..Default::default()
+        },
+        vec![7, 8],
+    );
+    let classify = TokenizedClassify::new(
+        proto::ClassifyRequest {
+            text: "hello".into(),
+            ..Default::default()
+        },
+        vec![7, 8],
+    );
+    for (attempt, allow_router_input_ids) in [false, true, false, true].into_iter().enumerate() {
+        let rid = format!("attempt-{attempt}");
+        let additions = Additions {
+            allow_router_input_ids,
+            rid: Some(rid.clone()),
+            routed_dp_rank: Some(Some(3)),
+            bootstrap: Some(proto::DisaggregatedParams {
+                bootstrap_host: "prefill".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: attempt as i64,
+            }),
+            ..Default::default()
+        };
+        let headers = HashMap::from([("traceparent".into(), rid.clone())]);
+        let mut replies = generate
+            .call(
+                client.clone(),
+                Default::default(),
+                &additions,
+                headers.clone(),
+            )
+            .await
+            .unwrap();
+        let reply = replies.next().await.unwrap().unwrap();
+        assert_eq!(
+            reply.text,
+            if allow_router_input_ids {
+                "ids"
+            } else {
+                "text"
+            }
+        );
+        assert!(reply.finished);
+        let (actual_rid, rank, bootstrap, trace) = if allow_router_input_ids {
+            let sent = generates.last().await;
+            assert_eq!(sent.input_ids, [7, 8]);
+            assert_eq!(sent.return_text, Some(true));
+            (
+                sent.rid,
+                sent.routed_dp_rank,
+                sent.disaggregated_params,
+                sent.trace_headers,
+            )
+        } else {
+            let sent = texts.last().await;
+            assert_eq!(sent.text, "hello");
+            (
+                sent.rid,
+                sent.routed_dp_rank,
+                sent.disaggregated_params,
+                sent.trace_headers,
+            )
+        };
+        assert_eq!(actual_rid.as_deref(), Some(rid.as_str()));
+        assert_eq!(rank, Some(3));
+        assert_eq!(bootstrap.unwrap().bootstrap_room, attempt as i64);
+        assert_eq!(trace["traceparent"], rid);
+
+        let mut replies = embed
+            .call(
+                client.clone(),
+                Default::default(),
+                &additions,
+                headers.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies.next().await.unwrap().unwrap().embedding,
+            if allow_router_input_ids {
+                vec![1.0]
+            } else {
+                vec![2.0]
+            }
+        );
+        let (actual_rid, trace) = if allow_router_input_ids {
+            let sent = embeds.last().await;
+            assert_eq!(sent.input_ids, [7, 8]);
+            (sent.rid, sent.trace_headers)
+        } else {
+            let sent = text_embeds.last().await;
+            assert_eq!(sent.text, "hello");
+            (sent.rid, sent.trace_headers)
+        };
+        assert_eq!(actual_rid.as_deref(), Some(rid.as_str()));
+        assert_eq!(trace["traceparent"], rid);
+
+        let mut replies = classify
+            .call(client.clone(), Default::default(), &additions, headers)
+            .await
+            .unwrap();
+        assert_eq!(replies.next().await.unwrap().unwrap().embedding, [3.0]);
+        let sent = classifies.last().await;
+        if allow_router_input_ids {
+            assert_eq!(sent.input_ids, [7, 8]);
+            assert!(sent.text.is_empty());
+        } else {
+            assert!(sent.input_ids.is_empty());
+            assert_eq!(sent.text, "hello");
+        }
+        assert_eq!(sent.rid.as_deref(), Some(rid.as_str()));
+        assert_eq!(sent.trace_headers["traceparent"], rid);
+    }
+}
+
+/// A worker added after the first dispatch must receive the original text on
+/// retry when its tokenizer differs, even though TextGenerate prepared IDs.
+#[tokio::test]
+async fn text_generate_retry_rechecks_a_new_workers_tokenizer() {
+    use sgl_router::tokenizer::options::{ChatEncoderKind, ChatEncodingOptions};
+    use sgl_router::workers::WorkerCapabilities;
+
+    let texts = Seen::new();
+    let record_text = texts.record();
+    let replacement_port = MockEngine::default()
+        .stream(
+            "TextGenerate",
+            move |request: proto::TextGenerateRequest| {
+                record_text(request);
+                stream::iter([Ok(proto::TextGenerateResponse {
+                    text: "restored".into(),
+                    finished: true,
+                    ..Default::default()
+                })])
+                .boxed()
+            },
+        )
+        .stream("Generate", |_: proto::GenerateRequest| {
+            stream::iter([Ok(proto::GenerateResponse {
+                text: Some("unsafe IDs".into()),
+                finished: true,
+                ..Default::default()
+            })])
+            .boxed()
+        })
+        .start()
+        .await;
+    let registry = Arc::new(Mutex::new(None::<Arc<WorkerRegistry>>));
+    let replace = Arc::clone(&registry);
+    let generates = Seen::new();
+    let record_generate = generates.record();
+    let first_port = MockEngine::default()
+        .stream("Generate", move |request: proto::GenerateRequest| {
+            record_generate(request);
+            let registry = replace.lock().unwrap().clone().unwrap();
+            registry.remove(&WorkerId("http://127.0.0.1:1".into()));
+            registry
+                .add_with_cb(
+                    WorkerSpec {
+                        id: WorkerId("http://127.0.0.1:2".into()),
+                        url: "http://127.0.0.1:2".into(),
+                        mode: WorkerMode::Plain,
+                        model_ids: vec![ModelId("tiny".into())],
+                        ..Default::default()
+                    },
+                    None,
+                    EngineProfile {
+                        grpc_port: Some(replacement_port),
+                        capabilities: WorkerCapabilities {
+                            kimi_k3_input_ids_fingerprint: Some("another-tokenizer".into()),
+                            ..Default::default()
+                        },
+                        ..WireProtocol::default().into()
+                    },
+                )
+                .unwrap();
+            stream::iter([Err::<proto::GenerateResponse, _>(Status::unavailable(
+                "retry on the replacement",
+            ))])
+            .boxed()
+        })
+        .start()
+        .await;
+    let mut ctx = Arc::try_unwrap(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(first_port),
+    )]))
+    .ok()
+    .unwrap();
+    ctx.config.proxy.max_attempts = 2.try_into().unwrap();
+    ctx.config.proxy.initial_backoff_ms = 0;
+    let model = crate::kimi_fixture::tokenizer();
+    ctx.config.model.tokenizer_path =
+        Some(model.path().join("tiktoken.model").display().to_string());
+    let encoder_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        encoder_dir.path().join("fixture.json"),
+        json!({"replies": ["{\"input_ids\":[7,8]}"], "restart_delay_millis": 0}).to_string(),
+    )
+    .unwrap();
+    let executable = encoder_dir.path().join("python");
+    std::os::unix::fs::symlink(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kimi_k3/fake_tokenizer.py"),
+        &executable,
+    )
+    .unwrap();
+    ctx.tokenizers = Arc::new(
+        TokenizerRegistry::load_with_options(
+            &ctx.config,
+            ChatEncodingOptions {
+                chat_encoder: ChatEncoderKind::KimiK3,
+                tokenizer_python: executable.display().to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    *registry.lock().unwrap() = Some(Arc::clone(&ctx.registry));
+    let mut client = serve_grpc(Arc::new(ctx)).await;
+    let replies = collect(
+        client
+            .text_generate(proto::TextGenerateRequest {
+                text: "hello".into(),
+                ..Default::default()
+            })
+            .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replies[0].text, "restored");
+    assert!(!generates.last().await.input_ids.is_empty());
+    assert_eq!(texts.last().await.text, "hello");
+}
+
 #[tokio::test]
 async fn client_cancel_aborts_the_engine_request() {
     let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();

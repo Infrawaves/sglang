@@ -39,6 +39,8 @@ use crate::common::mock_worker::MockWorker;
 
 const MODEL: &str = "kimi-k3-test";
 const GENERATED_IDS: &[u32] = &[100279, 781, 321, 100282];
+/// The fake encoder's rendering digest (`tests/fixtures/kimi_k3/fake_tokenizer.py`).
+const FINGERPRINT: &str = "fake-fingerprint";
 
 struct FakeTokenizer {
     directory: TempDir,
@@ -569,6 +571,15 @@ fn register_capabilities(
     );
 }
 
+/// What a worker running the fake encoder's checkpoint advertises at `version`.
+fn capabilities(version: Option<u32>) -> WorkerCapabilities {
+    WorkerCapabilities {
+        kimi_k3_input_ids_version: version,
+        kimi_k3_input_ids_fingerprint: Some(FINGERPRINT.into()),
+        kimi_k3_input_ids_media: true,
+    }
+}
+
 /// A worker whose `/server_info` reported `settings`, which carry its
 /// `--default-chat-template-kwargs`.
 fn register_worker(
@@ -591,9 +602,7 @@ fn register_worker(
             },
             None,
             EngineProfile {
-                capabilities: WorkerCapabilities {
-                    kimi_k3_input_ids_version: version,
-                },
+                capabilities: capabilities(version),
                 openai: Some(Arc::new(settings)),
                 ..WireProtocol::default().into()
             },
@@ -1335,6 +1344,7 @@ async fn kimi_k3_ids_need_the_workers_default_chat_template_kwargs() {
     };
     // `None`: the worker's /server_info carried no OpenAI settings to compare.
     for settings in [Some(other_defaults), None] {
+        let reports_other_defaults = settings.is_some();
         let tokenizer = FakeTokenizer::successful();
         let prefill = MockWorker::start(vec![]).await;
         let decode = MockWorker::start(vec![]).await;
@@ -1347,9 +1357,7 @@ async fn kimi_k3_ids_need_the_workers_default_chat_template_kwargs() {
             ..Default::default()
         };
         let profile = EngineProfile {
-            capabilities: WorkerCapabilities {
-                kimi_k3_input_ids_version: Some(1),
-            },
+            capabilities: capabilities(Some(1)),
             openai: settings.map(Arc::new),
             ..WireProtocol::default().into()
         };
@@ -1358,6 +1366,11 @@ async fn kimi_k3_ids_need_the_workers_default_chat_template_kwargs() {
         assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
         for body in [captured_body(&prefill).await, captured_body(&decode).await] {
             assert_not_router_encoded(&body);
+            // The Rust path renders with the router's defaults too.
+            if reports_other_defaults {
+                assert!(body.get("input_ids").is_none(), "{body}");
+                assert_eq!(body["messages"], request["messages"]);
+            }
         }
         assert!(tokenizer.captured_requests().is_empty());
     }
@@ -1420,4 +1433,660 @@ async fn kimi_k3_sampling_defaults_reach_the_encoder() {
         captured_body(&decode).await["kimi_k3_input_ids"],
         json!(GENERATED_IDS)
     );
+}
+
+/// dynamo-tokenizers has no tiktoken pattern for `kimi_k31`, which uses K3's
+/// tokenizer; the router still loads it and encodes as K3, on both backends,
+/// and removes the copy it staged to do so.
+#[test]
+fn kimi_k31_tiktoken_loads_as_kimi_k3() {
+    use sgl_router::config::{TokenizerBackend, TokenizerConfig};
+    use sgl_router::tokenizer::adapter;
+    let k3 = crate::kimi_fixture::tokenizer();
+    let k31 = crate::kimi_fixture::tokenizer();
+    fs::write(
+        k31.path().join("config.json"),
+        r#"{"model_type":"kimi_k31"}"#,
+    )
+    .unwrap();
+    let path = |dir: &TempDir| dir.path().join("tiktoken.model").display().to_string();
+    let staged = || -> std::collections::HashSet<_> {
+        fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|name| name.to_string_lossy().starts_with("sgl-router-kimi-k31-"))
+            .collect()
+    };
+    let before = staged();
+    for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+        let cfg = TokenizerConfig {
+            backend,
+            ..Default::default()
+        };
+        let (k3, _) = adapter::load_with(&path(&k3), cfg).unwrap();
+        let (k31, _) = adapter::load_with(&path(&k31), cfg).unwrap();
+        let text = "hello <|open|>message world";
+        assert_eq!(
+            adapter::encode(&k31, text).unwrap(),
+            adapter::encode(&k3, text).unwrap(),
+            "{backend:?}"
+        );
+    }
+    // Only this test stages here; other processes' stages are left alone.
+    assert!(staged().is_subset(&before));
+}
+
+/// A worker whose rendering digest differs from the encoder's (another
+/// checkpoint, such as K3 beside K3.1, or tokenizer snapshot) gets no router
+/// IDs; one without a K3 image processor gets text IDs but not image IDs.
+#[tokio::test]
+async fn kimi_k3_ids_need_the_encoders_rendering_and_image_support() {
+    let other_rendering = WorkerCapabilities {
+        kimi_k3_input_ids_fingerprint: Some("other-checkpoint".into()),
+        ..capabilities(Some(1))
+    };
+    let no_images = WorkerCapabilities {
+        kimi_k3_input_ids_media: false,
+        ..capabilities(Some(1))
+    };
+    for (capabilities, media, encoded) in [
+        (other_rendering.clone(), false, false),
+        (other_rendering, true, false),
+        (no_images.clone(), false, true),
+        (no_images, true, false),
+    ] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = tokenizer.context(&prefill, &decode);
+        let spec = WorkerSpec {
+            id: WorkerId(decode.url.clone()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId(MODEL.into())],
+            ..Default::default()
+        };
+        let profile = EngineProfile {
+            capabilities,
+            openai: Some(Arc::new(OpenAiSettings::default())),
+            ..WireProtocol::default().into()
+        };
+        ctx.registry.add_with_cb(spec, None, profile).unwrap();
+        let request = request_with_image(media);
+        assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+        let renders_alike = capabilities_renders_alike(&ctx, &decode);
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            if encoded {
+                assert_eq!(body["kimi_k3_input_ids"], json!(GENERATED_IDS));
+            } else {
+                assert_not_router_encoded(&body);
+            }
+            // Neither does the Rust path forward IDs to another checkpoint.
+            if !renders_alike {
+                assert!(body.get("input_ids").is_none(), "{body}");
+            }
+        }
+        assert_eq!(tokenizer.captured_requests().len(), usize::from(encoded));
+        if !renders_alike {
+            let generate = Request::post("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"text": "hi"}).to_string()))
+                .unwrap();
+            let response = build_router(Arc::clone(&ctx))
+                .oneshot(generate)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = captured_body(&decode).await;
+            assert_eq!(body["text"], "hi");
+            assert!(body.get("input_ids").is_none(), "{body}");
+        }
+    }
+}
+
+fn capabilities_renders_alike(ctx: &AppContext, worker: &MockWorker) -> bool {
+    ctx.registry
+        .get(&WorkerId(worker.url.clone()))
+        .and_then(|w| w.kimi_k3_input_ids_fingerprint().map(str::to_owned))
+        .as_deref()
+        == Some(FINGERPRINT)
+}
+
+/// The pool takes the encoder's digest from its ready reply, and a restart
+/// that renders differently is not accepted.
+#[test]
+fn kimi_k3_pool_requires_an_encoder_fingerprint() {
+    let tokenizer = FakeTokenizer::successful();
+    let mut scenario: Value = serde_json::from_str(
+        &fs::read_to_string(tokenizer.directory.path().join("fixture.json")).unwrap(),
+    )
+    .unwrap();
+    scenario["fingerprint"] = json!("");
+    fs::write(
+        tokenizer.directory.path().join("fixture.json"),
+        scenario.to_string(),
+    )
+    .unwrap();
+    let options = ChatEncodingOptions {
+        chat_encoder: ChatEncoderKind::KimiK3,
+        tokenizer_python: tokenizer.executable.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let error = TokenizerRegistry::load_with_options(&tokenizer.config(), options).unwrap_err();
+    assert!(format!("{error:#}").contains("fingerprint"), "{error:#}");
+}
+
+/// K3.1 has no Rust chat formatter, so the Anthropic token count uses the
+/// Python encoder, as the chat route does.
+#[tokio::test]
+async fn kimi_k31_messages_count_tokens_uses_the_encoder() {
+    let tokenizer = FakeTokenizer::successful();
+    fs::write(
+        tokenizer.model.path().join("config.json"),
+        r#"{"model_type":"kimi_k31"}"#,
+    )
+    .unwrap();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context(&prefill, &decode);
+    assert!(!ctx.tokenizers.has_chat_formatter(MODEL));
+    let request = Request::post("/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+        ))
+        .unwrap();
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body, json!({"input_tokens": GENERATED_IDS.len()}));
+    assert_eq!(tokenizer.captured_requests().len(), 1);
+}
+
+/// The IDs are fixed before selection, and a retry can pick a worker whose
+/// breaker is open once every breaker is (the pool fails open). So a worker
+/// that renders differently stops router IDs even while it is unhealthy.
+#[tokio::test]
+async fn kimi_k3_an_unhealthy_worker_that_renders_differently_stops_router_ids() {
+    let tokenizer = FakeTokenizer::successful();
+    let matching = MockWorker::start(vec![]).await;
+    let other = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context(&matching, &other);
+    for worker in [&matching, &other] {
+        ctx.registry.remove(&WorkerId(worker.url.clone()));
+    }
+    register_capabilities(&ctx.registry, &matching, WorkerMode::Plain, Some(1), None);
+    let spec = WorkerSpec {
+        id: WorkerId(other.url.clone()),
+        url: other.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId(MODEL.into())],
+        ..Default::default()
+    };
+    let profile = EngineProfile {
+        capabilities: WorkerCapabilities {
+            kimi_k3_input_ids_fingerprint: Some("other-checkpoint".into()),
+            ..capabilities(Some(1))
+        },
+        openai: Some(Arc::new(OpenAiSettings::default())),
+        ..WireProtocol::default().into()
+    };
+    ctx.registry
+        .add_with_cb(spec, Some(Default::default()), profile)
+        .unwrap();
+    let unhealthy = ctx.registry.get(&WorkerId(other.url.clone())).unwrap();
+    while unhealthy.breaker.would_allow() {
+        unhealthy.breaker.record_failure();
+    }
+
+    let generate = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"text": "hi"}).to_string()))
+        .unwrap();
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(generate)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = captured_body(&matching).await;
+    assert_eq!(body["text"], "hi");
+    assert!(body.get("input_ids").is_none(), "{body}");
+
+    let request = text_request();
+    assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+    let body = captured_body(&matching).await;
+    assert!(body.get("input_ids").is_none(), "{body}");
+    assert!(body.get("kimi_k3_input_ids").is_some(), "{body}");
+}
+
+/// Pause a real upstream request so discovery can add a worker between its
+/// first dispatch and retry, without relying on sleeps or reconcile timing.
+struct PausedRetryWorker {
+    url: String,
+    requests: tokio::sync::mpsc::Receiver<(String, Value)>,
+    release: Arc<tokio::sync::Notify>,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl PausedRetryWorker {
+    async fn start() -> Self {
+        use axum::response::IntoResponse;
+
+        let (requests, received) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler_release = Arc::clone(&release);
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+                let requests = requests.clone();
+                let release = Arc::clone(&handler_release);
+                async move {
+                    if uri.path() == "/abort_request" {
+                        return StatusCode::OK.into_response();
+                    }
+                    requests.send((uri.path().to_owned(), body)).await.unwrap();
+                    release.notified().await;
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        axum::Json(json!({"error": "retry after worker discovery"})),
+                    )
+                        .into_response()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            requests: received,
+            release,
+            _shutdown: shutdown,
+        }
+    }
+
+    async fn received(&mut self) -> (String, Value) {
+        tokio::time::timeout(Duration::from_secs(2), self.requests.recv())
+            .await
+            .expect("first worker did not receive the request")
+            .expect("first worker stopped")
+    }
+}
+
+fn register_retry_profile(
+    registry: &WorkerRegistry,
+    url: &str,
+    mode: WorkerMode,
+    fingerprint: &str,
+    defaults: Option<serde_json::Map<String, Value>>,
+) {
+    registry
+        .add_with_cb(
+            WorkerSpec {
+                id: WorkerId(url.into()),
+                url: url.into(),
+                mode,
+                model_ids: vec![ModelId(MODEL.into())],
+                bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+                ..Default::default()
+            },
+            None,
+            EngineProfile {
+                // An older worker takes native router IDs but not Python encoder IDs.
+                capabilities: WorkerCapabilities {
+                    kimi_k3_input_ids_fingerprint: Some(fingerprint.into()),
+                    ..capabilities(None)
+                },
+                openai: Some(Arc::new(OpenAiSettings {
+                    default_chat_template_kwargs: defaults,
+                    ..Default::default()
+                })),
+                ..WireProtocol::default().into()
+            },
+        )
+        .unwrap();
+}
+
+/// A worker discovered while inference is in flight was absent from the
+/// preparation guard. Retrying on it must restore the client's text/messages,
+/// including a lowered OpenAI route, while retaining caller-provided IDs.
+#[tokio::test]
+async fn kimi_k3_native_retries_restore_inputs_for_a_new_incompatible_worker() {
+    use sgl_router::config::{ParamSpec, SamplingField};
+
+    for (name, path, request, first_path, defaults_only) in [
+        (
+            "generate",
+            "/generate",
+            json!({"text": "hello", "sampling_params": {"max_new_tokens": 8, "frequency_penalty": null}}),
+            "/generate",
+            false,
+        ),
+        (
+            "generate batch",
+            "/generate",
+            json!({"text": ["hello", "world"], "sampling_params": [{"max_new_tokens": 8}, {"max_new_tokens": 9}]}),
+            "/generate",
+            false,
+        ),
+        (
+            "completion",
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "hello", "max_tokens": 8}),
+            "/generate",
+            false,
+        ),
+        (
+            "native chat",
+            "/v1/chat/completions",
+            json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}], "return_input_ids_in_sglext": true}),
+            "/v1/chat/completions",
+            false,
+        ),
+        (
+            "lowered chat",
+            "/v1/chat/completions",
+            text_request(),
+            "/generate",
+            false,
+        ),
+        (
+            "chat defaults",
+            "/v1/chat/completions",
+            json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}], "return_input_ids_in_sglext": true}),
+            "/v1/chat/completions",
+            true,
+        ),
+        (
+            "lowered chat defaults",
+            "/v1/chat/completions",
+            text_request(),
+            "/generate",
+            true,
+        ),
+        (
+            "embeddings",
+            "/v1/embeddings",
+            json!({"model": MODEL, "input": ["hello", "world"]}),
+            "/v1/embeddings",
+            false,
+        ),
+        (
+            "classify",
+            "/v1/classify",
+            json!({"model": MODEL, "input": "hello"}),
+            "/v1/classify",
+            false,
+        ),
+        (
+            "caller generate IDs",
+            "/generate",
+            json!({"input_ids": [7, 8]}),
+            "/generate",
+            false,
+        ),
+        (
+            "caller chat IDs",
+            "/v1/chat/completions",
+            json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}], "input_ids": [7, 8]}),
+            "/v1/chat/completions",
+            false,
+        ),
+        (
+            "caller completion IDs",
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": [7, 8], "max_tokens": 8}),
+            "/generate",
+            false,
+        ),
+        (
+            "caller embedding IDs",
+            "/v1/embeddings",
+            json!({"model": MODEL, "input": [7, 8]}),
+            "/v1/embeddings",
+            false,
+        ),
+    ] {
+        let tokenizer = FakeTokenizer::successful();
+        let placeholder = MockWorker::start(vec![]).await;
+        let next = MockWorker::start(vec![]).await;
+        let mut first = PausedRetryWorker::start().await;
+        let mut cfg = tokenizer.config();
+        cfg.proxy.max_attempts = NonZeroU32::new(2).unwrap();
+        cfg.proxy.initial_backoff_ms = 0;
+        cfg.proxy.max_backoff_ms = 0;
+        cfg.model.sampling_overrides.params.insert(
+            SamplingField::FrequencyPenalty,
+            ParamSpec::Exact(serde_json::Number::from_f64(0.5).unwrap()),
+        );
+        let ctx = tokenizer.context_with_config(&placeholder, &next, cfg, 5, 300);
+        for worker in ctx.registry.all() {
+            ctx.registry.remove(&worker.id);
+        }
+        register_retry_profile(
+            &ctx.registry,
+            &first.url,
+            WorkerMode::Plain,
+            FINGERPRINT,
+            None,
+        );
+        let sending = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            let body = request.to_string();
+            async move {
+                build_router(ctx)
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let (actual_path, encoded) = first.received().await;
+        assert_eq!(actual_path, first_path, "{name}");
+        let ids = if request.get("input").is_some() {
+            &encoded["input"]
+        } else {
+            &encoded["input_ids"]
+        };
+        assert!(
+            ids.is_array(),
+            "first dispatch did not forward IDs for {name}: {encoded}"
+        );
+        register_retry_profile(
+            &ctx.registry,
+            &next.url,
+            WorkerMode::Plain,
+            if defaults_only {
+                FINGERPRINT
+            } else {
+                "other-checkpoint"
+            },
+            defaults_only.then(|| json!({"thinking": false}).as_object().unwrap().clone()),
+        );
+        first.release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(3), sending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let restored = captured_body(&next).await;
+        for key in [
+            "text",
+            "prompt",
+            "messages",
+            "input",
+            "input_ids",
+            "max_tokens",
+            "return_input_ids_in_sglext",
+        ] {
+            if let Some(value) = request.get(key) {
+                assert_eq!(&restored[key], value, "{name}: {restored}");
+            }
+        }
+        if request.get("input_ids").is_none() {
+            assert!(restored.get("input_ids").is_none(), "{name}: {restored}");
+        }
+        assert!(
+            restored.get("kimi_k3_input_ids").is_none(),
+            "{name}: {restored}"
+        );
+        if path == "/generate" {
+            let sampling = &restored["sampling_params"];
+            let rows = sampling
+                .as_array()
+                .map_or_else(|| vec![sampling], |rows| rows.iter().collect());
+            for params in rows {
+                assert_eq!(
+                    params["frequency_penalty"],
+                    json!(0.5),
+                    "{name}: {restored}"
+                );
+            }
+            if let Some(original) = request.get("sampling_params") {
+                if let Some(originals) = original.as_array() {
+                    for (index, original) in originals.iter().enumerate() {
+                        assert_eq!(
+                            sampling[index]["max_new_tokens"], original["max_new_tokens"],
+                            "{name}: {restored}"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        sampling["max_new_tokens"], original["max_new_tokens"],
+                        "{name}: {restored}"
+                    );
+                }
+            }
+        }
+        if path == "/v1/chat/completions" || path == "/v1/completions" {
+            assert_eq!(
+                restored["frequency_penalty"],
+                json!(0.5),
+                "{name}: {restored}"
+            );
+            // The mock's original OpenAI response must pass through, without
+            // the responder for the first attempt's /generate body.
+            assert_eq!(response["object"], "chat.completion", "{name}: {response}");
+            assert_eq!(
+                response["choices"][0]["message"]["content"], "ok",
+                "{name}: {response}"
+            );
+        }
+        assert!(tokenizer.captured_requests().is_empty(), "{name}");
+    }
+}
+
+/// Either newly selected PD leg can invalidate native IDs. Both workers must
+/// receive the restored prompt and the same new bootstrap fields on retry.
+#[tokio::test]
+async fn kimi_k3_native_pd_retry_restores_both_legs_after_discovery() {
+    for changed_leg in [WorkerMode::Prefill, WorkerMode::Decode] {
+        let tokenizer = FakeTokenizer::successful();
+        let next = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let mut first = PausedRetryWorker::start().await;
+        let mut cfg = tokenizer.config();
+        cfg.proxy.max_attempts = NonZeroU32::new(2).unwrap();
+        cfg.proxy.initial_backoff_ms = 0;
+        cfg.proxy.max_backoff_ms = 0;
+        cfg.proxy.stream_after_prefill = true;
+        let ctx = tokenizer.context_with_config(&next, &decode, cfg, 5, 300);
+        ctx.registry.remove(&WorkerId(next.url.clone()));
+        register_retry_profile(
+            &ctx.registry,
+            &first.url,
+            WorkerMode::Prefill,
+            FINGERPRINT,
+            None,
+        );
+        register_retry_profile(
+            &ctx.registry,
+            &decode.url,
+            WorkerMode::Decode,
+            FINGERPRINT,
+            None,
+        );
+        let sending = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move {
+                build_router(ctx)
+                    .oneshot(
+                        Request::post("/generate")
+                            .header("content-type", "application/json")
+                            .body(Body::from(json!({"text": "hello"}).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let (_, encoded) = first.received().await;
+        assert!(encoded["input_ids"].is_array(), "{encoded}");
+        let first_decode = captured_body(&decode).await;
+        assert_eq!(first_decode["input_ids"], encoded["input_ids"]);
+        register_retry_profile(
+            &ctx.registry,
+            &next.url,
+            WorkerMode::Prefill,
+            if changed_leg == WorkerMode::Prefill {
+                "other-checkpoint"
+            } else {
+                FINGERPRINT
+            },
+            None,
+        );
+        if changed_leg == WorkerMode::Decode {
+            register_retry_profile(
+                &ctx.registry,
+                &decode.url,
+                WorkerMode::Decode,
+                "other-checkpoint",
+                None,
+            );
+        }
+        first.release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(3), sending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{changed_leg:?}");
+        let prefill_body = captured_body(&next).await;
+        let decode_body = captured_body(&decode).await;
+        for body in [&prefill_body, &decode_body] {
+            assert_eq!(body["text"], "hello", "{changed_leg:?}: {body}");
+            assert!(body.get("input_ids").is_none(), "{changed_leg:?}: {body}");
+        }
+        for key in ["bootstrap_host", "bootstrap_port", "bootstrap_room", "rid"] {
+            assert_eq!(
+                prefill_body[key], decode_body[key],
+                "{changed_leg:?}: {key}"
+            );
+        }
+        assert_ne!(prefill_body["bootstrap_room"], encoded["bootstrap_room"]);
+        assert!(tokenizer.captured_requests().is_empty());
+    }
 }

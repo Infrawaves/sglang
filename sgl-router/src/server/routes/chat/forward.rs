@@ -5,8 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    accepts_router_kimi_ids, append_fields, generate_room_id, generate_room_id_for_rank,
-    pd_prefill_body, BootstrapFields, PreparedRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, pd_prefill_body, BootstrapFields,
+    PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -178,13 +178,8 @@ async fn dispatch<T: Transport>(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
-    request.set_kimi_dispatch_supported(
-        accepts_router_kimi_ids(ctx, &workers.prefill)
-            && workers
-                .decode
-                .as_ref()
-                .is_none_or(|worker| accepts_router_kimi_ids(ctx, worker)),
-    );
+    let allow_router_input_ids =
+        request.prepare_dispatch(ctx, &workers.prefill, workers.decode.as_deref());
     let SelectedWorkers {
         prefill,
         decode,
@@ -245,6 +240,7 @@ async fn dispatch<T: Transport>(
     // Read before `outgoing_body`, which consumes the cached parse.
     let caller_rid = pd.as_ref().and_then(|_| request.caller_rid());
     let additions = Additions {
+        allow_router_input_ids,
         rid: engine_rid.clone(),
         bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
             bootstrap_host: bootstrap.host.clone(),

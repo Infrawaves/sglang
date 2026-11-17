@@ -6,8 +6,8 @@
 //! RPC is routed like its HTTP route and forwarded to the same RPC on an engine.
 
 use crate::proxy::grpc::{
-    embed_to_text, generate_to_text, text_to_embed, text_to_generate, GrpcResponse, OpenAiRpc,
-    OpenAiUnaryRpc, Replies,
+    GrpcResponse, OpenAiRpc, OpenAiUnaryRpc, Replies, TokenizedClassify, TokenizedTextEmbed,
+    TokenizedTextGenerate,
 };
 use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
@@ -185,10 +185,9 @@ impl RouterGrpc {
             let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
             return self.finish("TextGenerate", headers, call).await;
         };
-        let request = text_to_generate(request, ids);
+        let request = TokenizedTextGenerate::new(request, ids);
         let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
-        let replies = self.finish("TextGenerate", headers, call).await?;
-        Ok(replies.map(|reply| reply.map(generate_to_text)).boxed())
+        self.finish("TextGenerate", headers, call).await
     }
 
     /// Tokenized here, as `/v1/embeddings` tokenizes text, then sent as `Embed`.
@@ -204,11 +203,10 @@ impl RouterGrpc {
         let call = route_typed(
             &self.ctx,
             Endpoint::Embeddings,
-            text_to_embed(request, ids),
+            TokenizedTextEmbed::new(request, ids),
             headers.clone(),
         );
-        let reply = self.finish_unary("TextEmbed", headers, call).await?;
-        Ok(reply.map(embed_to_text))
+        self.finish_unary("TextEmbed", headers, call).await
     }
 
     async fn openai_unary(
@@ -289,15 +287,17 @@ sglang_service! {
             self.text_embed(request).await
         }
 
-        async fn classify(&self, mut request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
-            // A text prompt is sent as ids, as `/v1/classify` forwards it.
-            let classify = request.get_mut();
-            if classify.input_ids.is_empty() {
-                if let Some(ids) = prompt_ids(&self.ctx, Endpoint::Classify, &classify.text) {
-                    (classify.input_ids, classify.text) = (ids, String::new());
+        async fn classify(&self, request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
+            let (headers, request) = request_headers(request, |r| &r.trace_headers);
+            if request.input_ids.is_empty() {
+                if let Some(ids) = prompt_ids(&self.ctx, Endpoint::Classify, &request.text) {
+                    let request = TokenizedClassify::new(request, ids);
+                    let call = route_typed(&self.ctx, Endpoint::Classify, request, headers.clone());
+                    return self.finish_unary("Classify", headers, call).await;
                 }
             }
-            typed!(self, request, Classify, "Classify", finish_unary)
+            let call = route_typed(&self.ctx, Endpoint::Classify, request, headers.clone());
+            self.finish_unary("Classify", headers, call).await
         }
 
         async fn open_ai_embed(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<proto::OpenAiResponse> {

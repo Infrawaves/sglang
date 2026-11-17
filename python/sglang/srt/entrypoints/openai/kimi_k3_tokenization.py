@@ -9,6 +9,8 @@ No model, scheduler, or TokenizerManager is constructed by this worker.
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -451,6 +453,71 @@ def encode_request(
     return encode_kimi_k3_messages(tokenizer, messages, request, model_type=model_type)
 
 
+# Exercises what differs across K3 checkpoints and tokenizer snapshots: the
+# effort tiers (K3.1 adds "medium"), tool and system rendering, and BPE merges.
+_FINGERPRINT_PROBE = {
+    "messages": [
+        {"role": "system", "content": "Probe."},
+        {"role": "user", "content": "Hello, 你好 <|kimi_image_placeholder|> 12345"},
+    ],
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "probe",
+                "parameters": {"type": "object", "properties": {"x": {"type": "int"}}},
+            },
+        }
+    ],
+    "reasoning_effort": "medium",
+}
+
+
+def input_ids_fingerprint(tokenizer: Any, *, model_type: str | None) -> str:
+    """A digest of what makes this server's K3 IDs: the tokenizer's vocabulary
+    and special tokens, its implementation, the SGLang code that renders, and
+    the checkpoint's rendering of a fixed probe, without server defaults.
+    Router and worker IDs agree only when their digests do."""
+    ids = _validate_token_ids(
+        encode_request(
+            tokenizer, copy.deepcopy(_FINGERPRINT_PROBE), model_type=model_type
+        )
+    )
+    return _fingerprint_digest(ids, _tokenizer_digest(tokenizer))
+
+
+def _tokenizer_digest(tokenizer: Any) -> str:
+    # Ranks determine tiktoken's merges, so the id-ordered vocabulary, special
+    # tokens included, identifies the snapshot where the probe cannot; the
+    # class source covers the pattern and chunking the implementation applies.
+    digest = hashlib.sha256()
+    vocab = sorted(tokenizer.get_vocab().items(), key=lambda item: item[1])
+    digest.update(repr(vocab).encode())
+    source = inspect.getsourcefile(type(tokenizer))
+    if source is not None:
+        with open(source, "rb") as code:
+            digest.update(code.read())
+    return digest.hexdigest()
+
+
+def _fingerprint_digest(ids: list[int], tokenizer_digest: str) -> str:
+    # The probe covers only some request paths, so the code that renders the
+    # rest (this module, and SGLang's request schema by version) is part of it.
+    try:
+        from sglang.version import __version__ as version
+    except ImportError:
+        version = None
+    with open(__file__, "rb") as source:
+        source_digest = hashlib.sha256(source.read()).hexdigest()
+    key = {
+        "ids": ids,
+        "sglang": version,
+        "source": source_digest,
+        "tokenizer": tokenizer_digest,
+    }
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+
+
 def _validate_token_ids(token_ids: Any) -> list[int]:
     if (
         not isinstance(token_ids, list)
@@ -512,7 +579,8 @@ def _load_tokenizer(config: dict):
             model_type=hf_config.model_type,
         )
     )
-    return tokenizer, defaults, hf_config.model_type
+    fingerprint = input_ids_fingerprint(tokenizer, model_type=hf_config.model_type)
+    return tokenizer, defaults, hf_config.model_type, fingerprint
 
 
 def run_worker(
@@ -533,12 +601,12 @@ def run_worker(
             config = json.loads(input_stream.readline())
             if not isinstance(config, dict):
                 raise TypeError("Initialization must be a JSON object")
-            tokenizer, defaults, model_type = load_tokenizer(config)
+            tokenizer, defaults, model_type, fingerprint = load_tokenizer(config)
     except Exception as exc:
         logger.exception("Kimi-K3 router tokenizer initialization failed")
         send({"error": str(exc), "error_type": "internal"})
         return 1
-    send({"ready": True})
+    send({"ready": True, "fingerprint": fingerprint})
     for line in input_stream:
         try:
             with redirect_stdout(sys.stderr):

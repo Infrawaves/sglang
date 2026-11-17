@@ -24,7 +24,8 @@ json.loads(init)
 (directory / "init.json").write_text(init)
 if started_count:
     time.sleep(scenario["restart_delay_millis"] / 1000)
-print(json.dumps({"ready": True}), flush=True)
+fingerprint = scenario.get("fingerprint", "fake-fingerprint")
+print(json.dumps({"ready": True, "fingerprint": fingerprint}), flush=True)
 replies = scenario["replies"]
 counter = directory / "reply-count"
 for line in sys.stdin:

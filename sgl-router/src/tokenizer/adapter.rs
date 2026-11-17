@@ -30,9 +30,14 @@ pub fn load_with(
     build(&path, cfg).with_context(|| format!("load tokenizer for {source}"))
 }
 
+/// Whether `source` names a local file rather than an HF repo id.
+pub(crate) fn is_local(source: &str) -> bool {
+    Path::new(source).is_file() || looks_like_path(source)
+}
+
 /// Local tokenizer file for a path or an HF repo id.
 fn resolve(source: &str) -> Result<String> {
-    if Path::new(source).is_file() || looks_like_path(source) {
+    if is_local(source) {
         return Ok(source.to_owned());
     }
     download_tokenizer(source)?
@@ -285,6 +290,9 @@ fn encoder(
     backend: TokenizerBackend,
 ) -> Result<(Arc<dyn traits::Tokenizer>, EncodeBackend)> {
     if !path.ends_with(".json") {
+        if let Some(staged) = KimiK31Stage::new(path)? {
+            return encoder(staged.tiktoken(), backend);
+        }
         let reference = create_tokenizer_from_file(path)?;
         if backend != TokenizerBackend::Fast {
             return Ok((reference, EncodeBackend::Tiktoken));
@@ -313,6 +321,63 @@ fn encoder(
         ));
     }
     Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// Workaround: dynamo-tokenizers 3.1.0 picks a tiktoken BPE pattern by
+/// `config.json`'s `model_type` and has none for `kimi_k31`, which uses K3's
+/// tokenizer. Load it from a directory whose `config.json` says `kimi_k3`;
+/// drop this once dynamo-tokenizers recognizes `kimi_k31`.
+struct KimiK31Stage {
+    /// A fresh, private (0700) directory under a random name, removed on drop.
+    dir: tempfile::TempDir,
+    tiktoken: String,
+}
+
+impl KimiK31Stage {
+    fn new(tiktoken: &str) -> Result<Option<Self>> {
+        let dir = Path::new(tiktoken).parent().unwrap_or(Path::new("."));
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let model_type = std::fs::read_to_string(dir.join("config.json"))
+            .ok()
+            .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())
+            .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+        if model_type.as_deref() != Some("kimi_k31") {
+            return Ok(None);
+        }
+        let stage = tempfile::Builder::new()
+            .prefix("sgl-router-kimi-k31-")
+            .tempdir()
+            .context("stage the Kimi-K3.1 tokenizer")?;
+        let staged = Self {
+            tiktoken: stage
+                .path()
+                .join("tiktoken.model")
+                .to_string_lossy()
+                .into_owned(),
+            dir: stage,
+        };
+        std::fs::copy(tiktoken, &staged.tiktoken).context("stage the Kimi-K3.1 tiktoken.model")?;
+        std::fs::copy(
+            dir.join("tokenizer_config.json"),
+            staged.dir.path().join("tokenizer_config.json"),
+        )
+        .context("stage the Kimi-K3.1 tokenizer_config.json")?;
+        std::fs::write(
+            staged.dir.path().join("config.json"),
+            r#"{"model_type":"kimi_k3"}"#,
+        )
+        .context("stage the Kimi-K3.1 config.json")?;
+        Ok(Some(staged))
+    }
+
+    /// The staged copy; files are read only while the encoder loads.
+    fn tiktoken(&self) -> &str {
+        &self.tiktoken
+    }
 }
 
 /// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
@@ -422,6 +487,40 @@ fn download_tokenizer(repo_id: &str) -> Result<std::path::PathBuf> {
         download_repo_file(repo_id, sibling)?;
     }
     Ok(path)
+}
+
+/// The tokenizer file of HF repo `repo_id` at `revision`, with the files the
+/// router reads beside it, in one snapshot directory; `--tokenizer-revision`
+/// pins the Rust tokenizer to the Kimi-K3 encoder's snapshot this way.
+pub(crate) fn snapshot_tokenizer(repo_id: &str, revision: &str) -> Result<String> {
+    use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::{Repo, RepoType};
+    if cfg!(feature = "fips") {
+        anyhow::bail!("{FIPS_NO_HUB}");
+    }
+    let api = ApiBuilder::from_env()
+        .build()
+        .context("initialize HuggingFace Hub client")?;
+    let repo = api.repo(Repo::with_revision(
+        repo_id.to_owned(),
+        RepoType::Model,
+        revision.to_owned(),
+    ));
+    let get = |file: &str| {
+        repo.get(file)
+            .with_context(|| format!("download {file} for {repo_id:?} at revision {revision:?}"))
+    };
+    let tokenizer = get("tokenizer.json").or_else(|_| get("tiktoken.model"))?;
+    for required in ["config.json", "tokenizer_config.json"] {
+        get(required)?;
+    }
+    for optional in ["generation_config.json", "chat_template.jinja"] {
+        let _ = get(optional);
+    }
+    tokenizer
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("downloaded tokenizer path is not valid UTF-8"))
 }
 
 /// FIPS builds never contact HuggingFace Hub: hf-hub's HTTP client (ureq)

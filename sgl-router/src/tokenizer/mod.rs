@@ -177,7 +177,15 @@ impl TokenizerRegistry {
             }
         }
         let mut me = Self::with_options(&options);
-        me.load_rust(cfg)?;
+        match (&options.tokenizer_revision, m.tokenizer_path.as_deref()) {
+            // An HF repo id at the encoder's revision; local paths have none.
+            (Some(revision), Some(repo)) if options.is_kimi_k3() && !adapter::is_local(repo) => {
+                let mut pinned = cfg.clone();
+                pinned.model.tokenizer_path = Some(adapter::snapshot_tokenizer(repo, revision)?);
+                me.load_rust(&pinned)?;
+            }
+            _ => me.load_rust(cfg)?,
+        }
         if options.is_kimi_k3() {
             let tokenizer_path = m.tokenizer_path.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--chat-encoder kimi-k3 cannot be combined with --no-tokenizer")
@@ -339,6 +347,13 @@ impl TokenizerRegistry {
 
     pub fn has_kimi_encoder(&self, model_id: &str) -> bool {
         self.kimi_encoders.contains_key(model_id)
+    }
+
+    /// Whether `fingerprint` is the Kimi-K3 encoder's rendering digest.
+    pub(crate) fn kimi_fingerprint_is(&self, model_id: &str, fingerprint: &str) -> bool {
+        self.kimi_encoders
+            .get(model_id)
+            .is_some_and(|pool| pool.fingerprint() == fingerprint)
     }
 
     pub(crate) fn kimi_metrics(&self, model_id: &str) -> Option<Arc<EncoderMetrics>> {

@@ -466,7 +466,9 @@ how much tokenization work the cache reuses.
 `/v1/chat/completions`. It uses the same prompt preparation as the Python serving
 worker, including K3.1's `medium` thinking tier. The router still loads its Rust
 tokenizer as without this flag; the pool takes only the chats whose IDs it can
-forward, and every other request is handled as without the flag.
+forward, and every other request is handled as without the flag. The Rust
+tokenizer loads K3.1 (`model_type: kimi_k31`) on K3's tiktoken pattern, which
+dynamo-tokenizers does not yet map.
 
 Add these flags to the existing router command, keeping its worker discovery and
 P/D settings:
@@ -481,8 +483,9 @@ P/D settings:
 
 Here `--tokenizer-path` is the checkpoint's `tiktoken.model` or a Hugging Face
 repository, as without the flag; the Rust tokenizer loads it, and the encoder
-loads the file's directory, which must hold the checkpoint's `config.json`, or the
-same repository. A directory is rejected. Startup checks that the configuration
+loads the file's directory (`.` for a bare file name), which must hold the
+checkpoint's `config.json`, or the same repository. A directory is rejected.
+With a repository, `--tokenizer-revision` pins both tokenizers to that snapshot. Startup checks that the configuration
 resolves to Kimi-K3/K3.1 before warming the tokenizer.
 
 The Python executable must import this SGLang checkout and the checkpoint's
@@ -501,27 +504,44 @@ load and preprocess the images and expand their placeholders. Placeholder IDs
 are not final KV tokens, so image requests do not use them for prefix matching
 or exact sequence lengths; the router retains its media workload estimate.
 
-Workers advertise `kimi_k3_input_ids_version: 1` in `/server_info`, which also
-reports their `--default-chat-template-kwargs`. A worker receives IDs only when
-it advertises the version and its defaults equal the router's, since the encoder
-applied the router's; the first mismatch is logged. The router checks this
-before encoding and again for the selected workers on every dispatch, including
-retries; otherwise both P/D workers receive the original messages and encode
-locally. Workers trust `kimi_k3_input_ids` as the router's own rendering, so the
-router rejects a chat that sets it with 400; clients that reach workers
-directly bypass this check. A worker without a K3 image processor (for example one
-serving the language model only) renders image chats locally even when it
-advertises the version. Deploy compatible workers before enabling router
-encoding to realize the offload benefit.
+Workers advertise `kimi_k3_input_ids_version: 1` in `/server_info`, with
+`kimi_k3_input_ids_fingerprint`, a digest of their tokenizer's vocabulary and
+implementation, their SGLang version and encoder source, and their rendering of a
+fixed probe,
+and `kimi_k3_input_ids_media` when their K3 image processor expands image
+placeholders; `/server_info` also reports their `--default-chat-template-kwargs`.
+A worker receives IDs only when it advertises the version, its digest equals the
+encoder's (the same checkpoint, such as K3 or K3.1, and tokenizer snapshot), its
+defaults equal the router's, since the encoder applied the
+router's, and, for an image chat, it expands image placeholders; the first
+mismatch is logged. The router checks this before encoding and again for the
+selected workers on every dispatch, including retries; otherwise the chat takes
+the Rust path below. Deploy compatible workers before enabling router encoding to
+realize the offload benefit.
+
+Workers trust `kimi_k3_input_ids` as the router's own rendering, so the router
+rejects a chat that sets it with 400. A client that reaches a worker directly is
+not checked, so do not expose workers to clients, or put them behind
+`--api-key`.
 
 Audio, video, request chat templates (including
 `chat_template_kwargs.chat_template`), caller-provided IDs,
 `--disable-input-ids-forwarding`, and fleets with no worker that accepts the IDs
 bypass the Python encoder: those chats take the Rust path, with its routing
-tokens and forwarding, as without the flag. Request templates remain subject to
+tokens and forwarding, as without the flag. Neither path forwards chat IDs to a
+worker that reports `--default-chat-template-kwargs` other than the router's,
+and while any registered worker, healthy or not, reports a digest other than the
+encoder's, native chat, `/generate`, embeddings and classify keep their original
+text. Every dispatch checks the actual selected workers again, including retries
+and newly registered workers. An incompatible worker restores the original
+request; P/D restores it on both legs, and lowered OpenAI requests return to their
+original endpoint. Native gRPC text calls also retain their original text for this
+fallback. Python IDs may still go to compatible selected workers. Request templates remain subject to
 the worker's `--trust-request-chat-template` setting. Responses, completions,
 `/generate`, native gRPC, `/v1/messages/count_tokens`, `/v1/tokenize` and
-`/v1/detokenize` also use the Rust tokenizer as without the flag. `--no-tokenizer`
+`/v1/detokenize` also use the Rust tokenizer as without the flag; K3.1, which has
+no Rust chat formatter, counts `/v1/messages/count_tokens` with the pool, each
+image as its one placeholder. `--no-tokenizer`
 cannot be combined with this encoder.
 
 | Option | Default | Meaning |

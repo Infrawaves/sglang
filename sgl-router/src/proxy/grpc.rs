@@ -175,6 +175,9 @@ pub struct RoutingView<'a> {
 /// What the router adds to a typed request, as it adds it to an HTTP body.
 #[derive(Clone, Default)]
 pub struct Additions {
+    /// The selected workers accept IDs produced by the router's tokenizer.
+    /// Rechecked for every dispatch; text RPCs keep their original request otherwise.
+    pub allow_router_input_ids: bool,
     pub rid: Option<String>,
     pub bootstrap: Option<proto::DisaggregatedParams>,
     pub sampling_defaults: Vec<(SamplingField, f64)>,
@@ -402,6 +405,63 @@ pub fn generate_to_text(reply: proto::GenerateResponse) -> proto::TextGenerateRe
     }
 }
 
+/// Keep both wire requests so a retry can return to the engine's text tokenizer.
+#[derive(Clone)]
+pub struct TokenizedTextGenerate {
+    original: proto::TextGenerateRequest,
+    tokenized: proto::GenerateRequest,
+    use_input_ids: bool,
+}
+
+impl TokenizedTextGenerate {
+    pub fn new(original: proto::TextGenerateRequest, input_ids: Vec<i32>) -> Self {
+        Self {
+            tokenized: text_to_generate(original.clone(), input_ids),
+            original,
+            use_input_ids: false,
+        }
+    }
+}
+
+impl TypedRpc for TokenizedTextGenerate {
+    type Reply = proto::TextGenerateResponse;
+
+    fn view(&self) -> RoutingView<'_> {
+        self.tokenized.view()
+    }
+
+    fn apply(&mut self, additions: &Additions) {
+        self.use_input_ids = additions.allow_router_input_ids;
+        if self.use_input_ids {
+            self.tokenized.apply(additions);
+        } else {
+            self.original.apply(additions);
+        }
+    }
+
+    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+        if self.use_input_ids {
+            self.tokenized.trace_headers()
+        } else {
+            self.original.trace_headers()
+        }
+    }
+
+    fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
+        if !self.use_input_ids {
+            return self.original.send(client);
+        }
+        Box::pin(async move {
+            Ok(self
+                .tokenized
+                .send(client)
+                .await?
+                .map_ok(generate_to_text)
+                .boxed())
+        })
+    }
+}
+
 /// Unary typed RPCs routed like embeddings: only the rid is added.
 macro_rules! embedding_rpc {
     ($request:ident -> $reply:ident, $method:ident, |$this:ident| $input_ids:expr, $text:expr) => {
@@ -458,6 +518,117 @@ pub fn embed_to_text(reply: proto::EmbedResponse) -> proto::TextEmbedResponse {
     proto::TextEmbedResponse {
         embedding: reply.embedding,
         meta_info: reply.meta_info,
+    }
+}
+
+/// `TextEmbed` may use router IDs only for the workers selected for this attempt.
+#[derive(Clone)]
+pub struct TokenizedTextEmbed {
+    original: proto::TextEmbedRequest,
+    tokenized: proto::EmbedRequest,
+    use_input_ids: bool,
+}
+
+impl TokenizedTextEmbed {
+    pub fn new(original: proto::TextEmbedRequest, input_ids: Vec<i32>) -> Self {
+        Self {
+            tokenized: text_to_embed(original.clone(), input_ids),
+            original,
+            use_input_ids: false,
+        }
+    }
+}
+
+impl TypedRpc for TokenizedTextEmbed {
+    type Reply = proto::TextEmbedResponse;
+
+    fn view(&self) -> RoutingView<'_> {
+        self.tokenized.view()
+    }
+
+    fn apply(&mut self, additions: &Additions) {
+        self.use_input_ids = additions.allow_router_input_ids;
+        if self.use_input_ids {
+            self.tokenized.apply(additions);
+        } else {
+            self.original.apply(additions);
+        }
+    }
+
+    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+        if self.use_input_ids {
+            self.tokenized.trace_headers()
+        } else {
+            self.original.trace_headers()
+        }
+    }
+
+    fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
+        if !self.use_input_ids {
+            return self.original.send(client);
+        }
+        Box::pin(async move {
+            Ok(self
+                .tokenized
+                .send(client)
+                .await?
+                .map_ok(embed_to_text)
+                .boxed())
+        })
+    }
+}
+
+/// Classify uses one RPC for both representations; retain the caller's text.
+#[derive(Clone)]
+pub struct TokenizedClassify {
+    original: proto::ClassifyRequest,
+    tokenized: proto::ClassifyRequest,
+    use_input_ids: bool,
+}
+
+impl TokenizedClassify {
+    pub fn new(original: proto::ClassifyRequest, input_ids: Vec<i32>) -> Self {
+        let mut tokenized = original.clone();
+        tokenized.input_ids = input_ids;
+        tokenized.text.clear();
+        Self {
+            original,
+            tokenized,
+            use_input_ids: false,
+        }
+    }
+}
+
+impl TypedRpc for TokenizedClassify {
+    type Reply = proto::ClassifyResponse;
+
+    fn view(&self) -> RoutingView<'_> {
+        self.tokenized.view()
+    }
+
+    fn apply(&mut self, additions: &Additions) {
+        self.use_input_ids = additions.allow_router_input_ids;
+        if self.use_input_ids {
+            self.tokenized.apply(additions);
+        } else {
+            self.original.apply(additions);
+        }
+    }
+
+    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+        if self.use_input_ids {
+            self.tokenized.trace_headers()
+        } else {
+            self.original.trace_headers()
+        }
+    }
+
+    fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
+        if self.use_input_ids {
+            self.tokenized.send(client)
+        } else {
+            self.original.send(client)
+        }
     }
 }
 
@@ -705,6 +876,7 @@ mod tests {
             bootstrap_room: 42,
         };
         request.apply(&Additions {
+            allow_router_input_ids: true,
             rid: Some("router".into()),
             bootstrap: Some(room.clone()),
             sampling_defaults: vec![

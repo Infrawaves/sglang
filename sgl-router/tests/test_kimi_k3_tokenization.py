@@ -52,9 +52,13 @@ def request(messages, **kwargs):
 class RecordingTokenizer:
     bos_token_id = 1
 
-    def __init__(self):
+    def __init__(self, vocab=None):
+        self.vocab = {"a": 0, "b": 1} if vocab is None else vocab
         self.calls = []
         self.prefixes = []
+
+    def get_vocab(self):
+        return dict(self.vocab)
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((copy.deepcopy(messages), copy.deepcopy(kwargs)))
@@ -346,7 +350,7 @@ class RequestPreparationTests(unittest.TestCase):
             ),
             patch.object(k3, "encode_request", warmup),
         ):
-            actual_tokenizer, actual_defaults, actual_model_type = k3._load_tokenizer(
+            loaded = k3._load_tokenizer(
                 {
                     "tokenizer_path": "/models/k3",
                     "revision": "abc123",
@@ -366,15 +370,33 @@ class RequestPreparationTests(unittest.TestCase):
             revision="abc123",
             tokenizer_revision="abc123",
         )
+        actual_tokenizer, actual_defaults, actual_model_type, fingerprint = loaded
         self.assertIs(actual_tokenizer, tokenizer)
         self.assertEqual(actual_defaults, defaults)
         self.assertEqual(actual_model_type, "kimi_k31")
-        warmup.assert_called_once_with(
-            tokenizer,
-            {"messages": [{"role": "user", "content": "Hello"}]},
-            defaults,
-            model_type="kimi_k31",
+        # The warmup renders with the server defaults; the fingerprint without.
+        warmup_call, probe_call = warmup.call_args_list
+        self.assertEqual(
+            warmup_call.args,
+            (tokenizer, {"messages": [{"role": "user", "content": "Hello"}]}, defaults),
         )
+        self.assertEqual(warmup_call.kwargs, {"model_type": "kimi_k31"})
+        self.assertEqual(len(probe_call.args), 2)
+        self.assertEqual(probe_call.args[1]["reasoning_effort"], "medium")
+        self.assertEqual(probe_call.kwargs, {"model_type": "kimi_k31"})
+        expected = k3._fingerprint_digest([10, 20], k3._tokenizer_digest(tokenizer))
+        self.assertEqual(fingerprint, expected)
+
+    def test_fingerprint_tells_vocabularies_apart_that_render_the_probe_alike(self):
+        """A merge the probe never uses still changes other prompts' IDs."""
+        same = RecordingTokenizer({"a": 0, "zq": 1})
+        other = RecordingTokenizer({"a": 0, "z": 1})
+        with patch.object(k3, "encode_request", return_value=[10, 20]):
+            digests = {
+                k3.input_ids_fingerprint(tokenizer, model_type="kimi_k31")
+                for tokenizer in (same, RecordingTokenizer({"a": 0, "zq": 1}), other)
+            }
+        self.assertEqual(len(digests), 2)
 
     def test_loader_rejects_other_encoders_before_tokenizer_or_warmup(self):
         for spec in (None, "dsv4"):
@@ -649,7 +671,8 @@ class ProtocolTests(unittest.TestCase):
                 + "\n"
             ),
             output,
-            load_tokenizer=loader or (lambda _: (RecordingTokenizer(), {}, "kimi_k31")),
+            load_tokenizer=loader
+            or (lambda _: (RecordingTokenizer(), {}, "kimi_k31", "fingerprint")),
             encode=encoder or (lambda *args, **kwargs: [42]),
         )
         return result, [json.loads(line) for line in output.getvalue().splitlines()]
@@ -657,7 +680,7 @@ class ProtocolTests(unittest.TestCase):
     def test_protocol_recovers_after_invalid_request(self):
         result, replies = self.run_protocol([{}, "{bad", {}])
         self.assertEqual(result, 0)
-        self.assertEqual(replies[0], {"ready": True})
+        self.assertEqual(replies[0], {"ready": True, "fingerprint": "fingerprint"})
         self.assertEqual(replies[1]["error_type"], "request")
         self.assertEqual(replies[2], {"input_ids": [42]})
 
@@ -683,7 +706,7 @@ class ProtocolTests(unittest.TestCase):
     def test_stdout_from_loader_and_encoder_is_not_protocol(self):
         def loader(config):
             print("remote tokenizer loading")
-            return object(), {}, "kimi_k31"
+            return object(), {}, "kimi_k31", "fingerprint"
 
         def encoder(*args, **kwargs):
             print("remote tokenizer rendering")
@@ -692,7 +715,13 @@ class ProtocolTests(unittest.TestCase):
         errors = io.StringIO()
         with patch.object(sys, "stderr", errors):
             _, replies = self.run_protocol([{}, {}], loader=loader, encoder=encoder)
-        self.assertEqual(replies, [{"ready": True}, {"input_ids": [0, 0xFFFFFFFF]}])
+        self.assertEqual(
+            replies,
+            [
+                {"ready": True, "fingerprint": "fingerprint"},
+                {"input_ids": [0, 0xFFFFFFFF]},
+            ],
+        )
         self.assertIn("remote tokenizer loading", errors.getvalue())
         self.assertIn("remote tokenizer rendering", errors.getvalue())
 
