@@ -2135,14 +2135,15 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
         self.chat.chat_encoding_spec = None
         self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
-        # A failure is recorded too: later calls neither retry nor log again.
+        # A failure is not cached, so a transient one recovers on the next call.
         self.chat.chat_encoding_spec = "kimi_k3"
         self.chat._kimi_k3_input_ids_fingerprint = None
         self.tm.tokenizer.apply_chat_template.reset_mock()
         self.tm.tokenizer.apply_chat_template.return_value = []
         self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
-        self.assertIsNone(self.chat.kimi_k3_input_ids_fingerprint())
-        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+        self.tm.tokenizer.apply_chat_template.return_value = [5, 6, 7]
+        self.assertEqual(self.chat.kimi_k3_input_ids_fingerprint(), expected)
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 2)
 
     def test_kimi_k3_router_capability_follows_effective_config(self):
         self.chat.chat_encoding_spec = "kimi_k3"

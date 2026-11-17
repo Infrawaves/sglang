@@ -351,6 +351,11 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager, _global_state.template_manager
         )
     )
+    # Before serving: the sgl-router reads /server_info only when it registers
+    # the worker, so a digest missing then stays missing until it re-registers.
+    await asyncio.to_thread(
+        fast_api_app.state.openai_serving_chat.kimi_k3_input_ids_fingerprint
+    )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -942,7 +947,7 @@ async def server_info(raw_request: Request = None):
     kimi_k3 = {}
     if raw_request is not None:
         chat = raw_request.app.state.openai_serving_chat
-        fingerprint = chat.kimi_k3_input_ids_fingerprint()
+        fingerprint = await asyncio.to_thread(chat.kimi_k3_input_ids_fingerprint)
         if fingerprint is not None:
             kimi_k3 = {
                 "kimi_k3_input_ids_version": 1,

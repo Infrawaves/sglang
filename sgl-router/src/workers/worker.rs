@@ -297,6 +297,7 @@ pub struct Worker {
     /// Shared across re-registration so in-flight selectors keep the same estimator.
     cold_ratio: Arc<Mutex<ColdRatioEstimator>>,
     warned_no_input_tokens: AtomicBool,
+    warned_kimi_k3_rendering: AtomicBool,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -364,6 +365,7 @@ impl Worker {
             slots,
             cold_ratio: Arc::new(Mutex::new(ColdRatioEstimator::new())),
             warned_no_input_tokens: AtomicBool::new(false),
+            warned_kimi_k3_rendering: AtomicBool::new(false),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
@@ -402,6 +404,12 @@ impl Worker {
                         .all(|(key, value)| router.get(key) == Some(value))
             })
         })
+    }
+
+    /// True on the first call only, so a worker excluded from router K3 IDs is
+    /// logged once per registration.
+    pub(crate) fn first_kimi_k3_rendering_warning(&self) -> bool {
+        !self.warned_kimi_k3_rendering.swap(true, Ordering::Relaxed)
     }
 
     /// Whether the worker expands the image placeholders in router K3 IDs.

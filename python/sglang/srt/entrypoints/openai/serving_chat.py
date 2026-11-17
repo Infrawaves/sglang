@@ -458,8 +458,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
         self._encoding_adapter = self._build_chat_encoding_adapter()
-        # Computed on the first /server_info, once the tokenizer is loaded;
-        # "" after a failure.
+        # Computed at server startup, before /server_info is served; None
+        # until then or after a failure.
         self._kimi_k3_input_ids_fingerprint: str | None = None
 
         # Per-request response parser for custom decoding (set by _encode_messages)
@@ -530,52 +530,13 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        """
-        Handle continue_final_message feature: separate final assistant message.
-
-        If continue_final_message is enabled and the last message is from assistant,
-        extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
-
-        Only processes text-based content (strings), ignoring multimodal content (lists).
-
-        Args:
-            messages: List of message dictionaries
-            request: ChatCompletionRequest with continue_final_message flag
-
-        Returns:
-            Tuple of (processed_messages, assistant_prefix)
-            - processed_messages: Messages with last assistant message handled appropriately
-            - assistant_prefix: Content of the last assistant message (string only), or None
-        """
-        assistant_prefix = None
-        if messages and messages[-1].get("role") == "assistant":
-            last_content = messages[-1].get("content")
-            # Only process string content, ignore multimodal content (lists)
-            if isinstance(last_content, str):
-                if request.continue_final_message:
-                    # Extract content and remove the assistant message
-                    assistant_prefix = last_content
-                    messages = messages[:-1]
-                else:
-                    # Convert the last assistant message to user message
-                    messages[-1] = {"role": "user", "content": last_content}
-        return messages, assistant_prefix
+        """Split off a final string assistant turn as the continuation prefix
+        (``continue_final_message``), else make it a user turn."""
+        return kimi_k3_tokenization.handle_last_assistant_message(messages, request)
 
     def _append_assistant_prefix_to_prompt_ids(
         self, prompt_ids: list[int], assistant_prefix: str
     ) -> list[int]:
-        """
-        Append assistant prefix to prompt_ids.
-
-        Args:
-            prompt_ids: Current prompt token IDs
-            assistant_prefix: Assistant message content to append
-
-        Returns:
-            Updated prompt_ids with assistant prefix appended
-        """
         detector = self._reasoning_detector
         if isinstance(detector, ResponseTemplateReasoningDetector):
             prompt = self.tokenizer_manager.tokenizer.decode(
@@ -584,10 +545,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 spaces_between_special_tokens=False,
             )
             assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
-        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-            encoded = encoded[1:]
-        return prompt_ids + encoded
+        return kimi_k3_tokenization.append_assistant_prefix(
+            self.tokenizer_manager.tokenizer, prompt_ids, assistant_prefix
+        )
 
     def _resolve_inline_system_support(self) -> bool:
         if self.chat_encoding_spec is not None:
@@ -1932,7 +1892,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def kimi_k3_input_ids_fingerprint(self) -> str | None:
         """This server's rendering digest, for `/server_info`; the sgl-router
-        forwards its IDs only when its encoder's digest is the same."""
+        forwards its IDs only when its encoder's digest is the same. The first
+        call hashes the vocabulary and renders a probe, so call it off the loop."""
         if not self.supports_kimi_k3_input_ids():
             return None
         if self._kimi_k3_input_ids_fingerprint is None:
@@ -1942,11 +1903,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model_type=self.tokenizer_manager.model_config.hf_config.model_type,
                 )
             except Exception:
-                # "" records the failure, so later /server_info calls neither
-                # retry nor log again; the router then sends no IDs here.
+                # Not cached, so a later call can succeed; a router that already
+                # registered this worker keeps sending it no IDs until it re-registers.
                 logger.exception("Kimi-K3 rendering fingerprint failed")
-                self._kimi_k3_input_ids_fingerprint = ""
-        return self._kimi_k3_input_ids_fingerprint or None
+        return self._kimi_k3_input_ids_fingerprint
 
     def expands_kimi_k3_media_placeholders(self, is_multimodal: bool) -> bool:
         """Router IDs hold one placeholder per image, which only a K3
@@ -2295,17 +2255,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 else self.chat_encoding_spec == "kimi_k3"
             )
             if collects_openai_media:
-                for msg_dict in messages:
-                    if msg_dict.get("content") is None:
-                        msg_dict["content"] = ""
-                    process_content_for_template_format(
-                        msg_dict,
-                        "openai",
-                        image_data,
-                        video_data,
-                        audio_data,
-                        modalities,
-                    )
+                # Appended, as `_encode_messages` may have filled `image_data`.
+                media = self._extract_media_from_messages(messages)
+                for collected, found in zip(
+                    (image_data, video_data, audio_data, modalities), media
+                ):
+                    collected.extend(found)
         elif self.chat_encoding_spec is not None:
             # dsv32 encoding path
             messages = copy.deepcopy(messages)

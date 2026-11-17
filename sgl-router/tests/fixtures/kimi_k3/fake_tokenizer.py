@@ -14,16 +14,20 @@ from pathlib import Path
 # itself is never rewritten while another test could fork with an open writer.
 directory = Path(sys.argv[0]).parent
 scenario = json.loads((directory / "fixture.json").read_text())
-process_count = directory / "process-count"
-started_count = int(process_count.read_text()) if process_count.exists() else 0
-process_count.write_text(str(started_count + 1))
-with (directory / "processes.txt").open("a", encoding="utf-8") as started:
-    started.write(str(os.getpid()) + "\n")
+# Appends are atomic, so processes starting together each count every start.
+started = directory / "processes.txt"
+with started.open("a", encoding="utf-8") as processes:
+    processes.write(str(os.getpid()) + "\n")
+started_count = len(started.read_text().split()) - 1
 init = sys.stdin.readline()
 json.loads(init)
 (directory / "init.json").write_text(init)
 if started_count:
     time.sleep(scenario["restart_delay_millis"] / 1000)
+# Ready only once this many processes have started, which a serial startup
+# never reaches.
+while len(started.read_text().split()) < scenario.get("startup_barrier", 0):
+    time.sleep(0.005)
 fingerprint = scenario.get("fingerprint", "fake-fingerprint")
 print(json.dumps({"ready": True, "fingerprint": fingerprint}), flush=True)
 replies = scenario["replies"]

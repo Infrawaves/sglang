@@ -146,7 +146,8 @@ def validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | None
 
 
 def handle_last_assistant_message(messages: list[dict], request: Any):
-    """Preserve serving's string-only assistant continuation behavior."""
+    """The one implementation of serving's string-only assistant continuation;
+    `OpenAIServingChat` calls it for every chat encoding."""
     assistant_prefix = None
     if messages and messages[-1].get("role") == "assistant":
         last_content = messages[-1].get("content")
@@ -160,6 +161,7 @@ def handle_last_assistant_message(messages: list[dict], request: Any):
 
 
 def append_assistant_prefix(tokenizer: Any, prompt_ids: list[int], prefix: str):
+    # Encoded alone, so a leading BOS is dropped; serving calls this too.
     encoded = tokenizer.encode(prefix)
     if encoded and encoded[0] == tokenizer.bos_token_id:
         encoded = encoded[1:]
@@ -167,11 +169,11 @@ def append_assistant_prefix(tokenizer: Any, prompt_ids: list[int], prefix: str):
 
 
 def _message_tools(message: Any) -> list:
-    # Only generic system/developer messages carry tools; the user-only
-    # message model has no `tools` field.
+    # Only system/developer messages carry tools here; the user-only message
+    # model has no `tools` field.
     if message.role not in ("system", "developer"):
         return []
-    return getattr(message, "tools", None) or []
+    return message.tools or []
 
 
 def effective_tools(request: Any) -> list:
@@ -179,7 +181,7 @@ def effective_tools(request: Any) -> list:
     tools = list(request.tools or [])
     for message in request.messages:
         if message.role == "root":
-            tools.extend(getattr(message, "tools", None) or [])
+            tools.extend(message.tools or [])
         else:
             tools.extend(_message_tools(message))
     return tools
@@ -300,13 +302,18 @@ def encode_kimi_k3_messages(
             template_kwargs["thinking_effort"] = effort
 
     declared_tools = effective_tools(request)
-    allowed_tools = getattr(request.tool_choice, "allowed_tools", None)
+    allowed_tools = (
+        request.tool_choice.allowed_tools
+        if not isinstance(request.tool_choice, str)
+        and request.tool_choice.type == "allowed_tools"
+        else None
+    )
     # The encoder renders tool_choice="none" with or without tools, so a
     # client's explicit "none" reaches it either way; the default "none"
     # of a request without tools does not.
     passes_tool_choice = (request.tool_choice == "required" and declared_tools) or (
         request.tool_choice == "none"
-        and (declared_tools or getattr(request, "_tool_choice_explicit", False))
+        and (declared_tools or request._tool_choice_explicit)
     )
     if passes_tool_choice:
         template_kwargs.setdefault("tool_choice", request.tool_choice)
@@ -381,6 +388,9 @@ def validate_request(body: Any) -> None:
                 continue
             if part.get("type") == "image_url":
                 image = part.get("image_url")
+                # The protocol's `_accept_bare_url` takes a bare URL string too.
+                if isinstance(image, str):
+                    image = {"url": image}
                 if (
                     not isinstance(image, dict)
                     or not isinstance(image.get("url"), str)
@@ -419,7 +429,7 @@ def encode_request(
     kimi_k3_thinking_effort(request.reasoning_effort, kimi_k3_effort_tiers(model_type))
     for message_index, message in enumerate(request.messages):
         for tool_index, tool_call in enumerate(
-            getattr(message, "tool_calls", None) or []
+            (message.tool_calls if message.role != "user" else None) or []
         ):
             if tool_call.function.name is None or not tool_call.function.name.strip():
                 raise ValueError(

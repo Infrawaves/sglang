@@ -130,7 +130,8 @@ class EncodingTests(unittest.TestCase):
         ]:
             with self.subTest(expected=expected):
                 choice = types.SimpleNamespace(
-                    allowed_tools=types.SimpleNamespace(tools=tools, mode=mode)
+                    type="allowed_tools",
+                    allowed_tools=types.SimpleNamespace(tools=tools, mode=mode),
                 )
                 _, _, options = self.encode(
                     [{"role": "user", "content": "Hello"}], tool_choice=choice
@@ -252,6 +253,10 @@ class EncodingTests(unittest.TestCase):
         ):
             k3.validate_request({"messages": messages, **extra})
 
+    def test_image_encoder_accepts_a_bare_url_string(self):
+        part = {"type": "image_url", "image_url": "https://example.com/image.png"}
+        k3.validate_request({"messages": [{"role": "user", "content": [part]}]})
+
     def test_image_encoder_rejects_audio_video_unknown_and_invalid_image_parts(self):
         invalid_parts = [
             {"type": "video_url", "video_url": {"url": "video"}},
@@ -261,7 +266,7 @@ class EncodingTests(unittest.TestCase):
             {"type": "file", "file": {"file_data": "data"}},
             {"type": "image_url"},
             {"type": "image_url", "image_url": None},
-            {"type": "image_url", "image_url": "https://example.com/image.png"},
+            {"type": "image_url", "image_url": " "},
             {"type": "image_url", "image_url": {}},
             {"type": "image_url", "image_url": {"url": 123}},
             {"type": "image_url", "image_url": {"url": " \t"}},

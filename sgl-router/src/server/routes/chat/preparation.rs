@@ -292,6 +292,8 @@ impl PreparedRequest {
         }
         .await;
         request_metrics.finish(match &result {
+            // The encoder never ran; the OpenAI path's own errors are not its.
+            _ if matches!(outcome, EncoderOutcome::Bypassed) => outcome,
             Err(ApiError::BadRequest(_) | ApiError::SamplingContract { .. }) => {
                 EncoderOutcome::RequestError
             }
@@ -1038,9 +1040,9 @@ pub(super) fn accepts_router_kimi_ids(
         .default_chat_template_kwargs_match(&ctx.config.model.default_chat_template_kwargs)
         == Some(true);
     let accepted = same_rendering && same_defaults;
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !accepted && !WARNED.swap(true, Ordering::Relaxed) {
+    if !accepted && worker.first_kimi_k3_rendering_warning() {
         tracing::warn!(worker = %worker.url, same_rendering, same_defaults,
+            worker_fingerprint = worker.kimi_k3_input_ids_fingerprint(),
             "worker renders Kimi-K3 chats unlike the router's encoder (another checkpoint, \
              tokenizer revision, or --default-chat-template-kwargs); router IDs are not \
              forwarded to it");
@@ -1077,10 +1079,18 @@ fn forwards_router_ids(ctx: &AppContext, model: &ModelId) -> bool {
 /// Legacy workers without a digest retain native forwarding. Unlike Python
 /// IDs, native IDs do not require the K3 protocol version or media capability.
 fn accepts_native_input_ids(ctx: &AppContext, model: &ModelId, worker: &Worker) -> bool {
-    !ctx.tokenizers.has_kimi_encoder(&model.0)
+    let accepted = !ctx.tokenizers.has_kimi_encoder(&model.0)
         || worker
             .kimi_k3_input_ids_fingerprint()
-            .is_none_or(|fingerprint| ctx.tokenizers.kimi_fingerprint_is(&model.0, fingerprint))
+            .is_none_or(|fingerprint| ctx.tokenizers.kimi_fingerprint_is(&model.0, fingerprint));
+    if !accepted && worker.first_kimi_k3_rendering_warning() {
+        tracing::warn!(worker = %worker.url,
+            worker_fingerprint = worker.kimi_k3_input_ids_fingerprint(),
+            "worker renders Kimi-K3 chats unlike the router's encoder (another checkpoint or \
+             tokenizer revision); while it is registered, no router IDs are forwarded for \
+             this model");
+    }
+    accepted
 }
 
 fn forwarding_scope(ctx: &AppContext, model: &ModelId) -> ForwardingScope {

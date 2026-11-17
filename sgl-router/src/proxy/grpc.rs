@@ -405,26 +405,41 @@ pub fn generate_to_text(reply: proto::GenerateResponse) -> proto::TextGenerateRe
     }
 }
 
-/// Keep both wire requests so a retry can return to the engine's text tokenizer.
-#[derive(Clone)]
-pub struct TokenizedTextGenerate {
-    original: proto::TextGenerateRequest,
-    tokenized: proto::GenerateRequest,
+/// A text RPC and its form with the router's tokens. Each attempt sends the
+/// tokens only when its selected workers allow them, so a retry can return to
+/// the engine's own tokenizer.
+pub struct TokenizedRpc<O: TypedRpc, T: TypedRpc> {
+    original: O,
+    tokenized: T,
+    to_reply: fn(T::Reply) -> O::Reply,
     use_input_ids: bool,
 }
 
-impl TokenizedTextGenerate {
-    pub fn new(original: proto::TextGenerateRequest, input_ids: Vec<i32>) -> Self {
+// Not derived: the derive would also require the replies to be `Clone`.
+impl<O: TypedRpc, T: TypedRpc> Clone for TokenizedRpc<O, T> {
+    fn clone(&self) -> Self {
         Self {
-            tokenized: text_to_generate(original.clone(), input_ids),
+            original: self.original.clone(),
+            tokenized: self.tokenized.clone(),
+            to_reply: self.to_reply,
+            use_input_ids: self.use_input_ids,
+        }
+    }
+}
+
+impl<O: TypedRpc, T: TypedRpc> TokenizedRpc<O, T> {
+    fn with(original: O, tokenized: T, to_reply: fn(T::Reply) -> O::Reply) -> Self {
+        Self {
             original,
+            tokenized,
+            to_reply,
             use_input_ids: false,
         }
     }
 }
 
-impl TypedRpc for TokenizedTextGenerate {
-    type Reply = proto::TextGenerateResponse;
+impl<O: TypedRpc, T: TypedRpc> TypedRpc for TokenizedRpc<O, T> {
+    type Reply = O::Reply;
 
     fn view(&self) -> RoutingView<'_> {
         self.tokenized.view()
@@ -451,14 +466,17 @@ impl TypedRpc for TokenizedTextGenerate {
         if !self.use_input_ids {
             return self.original.send(client);
         }
-        Box::pin(async move {
-            Ok(self
-                .tokenized
-                .send(client)
-                .await?
-                .map_ok(generate_to_text)
-                .boxed())
-        })
+        let to_reply = self.to_reply;
+        Box::pin(async move { Ok(self.tokenized.send(client).await?.map_ok(to_reply).boxed()) })
+    }
+}
+
+pub type TokenizedTextGenerate = TokenizedRpc<proto::TextGenerateRequest, proto::GenerateRequest>;
+
+impl TokenizedTextGenerate {
+    pub fn new(original: proto::TextGenerateRequest, input_ids: Vec<i32>) -> Self {
+        let tokenized = text_to_generate(original.clone(), input_ids);
+        Self::with(original, tokenized, generate_to_text)
     }
 }
 
@@ -521,114 +539,24 @@ pub fn embed_to_text(reply: proto::EmbedResponse) -> proto::TextEmbedResponse {
     }
 }
 
-/// `TextEmbed` may use router IDs only for the workers selected for this attempt.
-#[derive(Clone)]
-pub struct TokenizedTextEmbed {
-    original: proto::TextEmbedRequest,
-    tokenized: proto::EmbedRequest,
-    use_input_ids: bool,
-}
+pub type TokenizedTextEmbed = TokenizedRpc<proto::TextEmbedRequest, proto::EmbedRequest>;
 
 impl TokenizedTextEmbed {
     pub fn new(original: proto::TextEmbedRequest, input_ids: Vec<i32>) -> Self {
-        Self {
-            tokenized: text_to_embed(original.clone(), input_ids),
-            original,
-            use_input_ids: false,
-        }
-    }
-}
-
-impl TypedRpc for TokenizedTextEmbed {
-    type Reply = proto::TextEmbedResponse;
-
-    fn view(&self) -> RoutingView<'_> {
-        self.tokenized.view()
-    }
-
-    fn apply(&mut self, additions: &Additions) {
-        self.use_input_ids = additions.allow_router_input_ids;
-        if self.use_input_ids {
-            self.tokenized.apply(additions);
-        } else {
-            self.original.apply(additions);
-        }
-    }
-
-    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
-        if self.use_input_ids {
-            self.tokenized.trace_headers()
-        } else {
-            self.original.trace_headers()
-        }
-    }
-
-    fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
-        if !self.use_input_ids {
-            return self.original.send(client);
-        }
-        Box::pin(async move {
-            Ok(self
-                .tokenized
-                .send(client)
-                .await?
-                .map_ok(embed_to_text)
-                .boxed())
-        })
+        let tokenized = text_to_embed(original.clone(), input_ids);
+        Self::with(original, tokenized, embed_to_text)
     }
 }
 
 /// Classify uses one RPC for both representations; retain the caller's text.
-#[derive(Clone)]
-pub struct TokenizedClassify {
-    original: proto::ClassifyRequest,
-    tokenized: proto::ClassifyRequest,
-    use_input_ids: bool,
-}
+pub type TokenizedClassify = TokenizedRpc<proto::ClassifyRequest, proto::ClassifyRequest>;
 
 impl TokenizedClassify {
     pub fn new(original: proto::ClassifyRequest, input_ids: Vec<i32>) -> Self {
         let mut tokenized = original.clone();
         tokenized.input_ids = input_ids;
         tokenized.text.clear();
-        Self {
-            original,
-            tokenized,
-            use_input_ids: false,
-        }
-    }
-}
-
-impl TypedRpc for TokenizedClassify {
-    type Reply = proto::ClassifyResponse;
-
-    fn view(&self) -> RoutingView<'_> {
-        self.tokenized.view()
-    }
-
-    fn apply(&mut self, additions: &Additions) {
-        self.use_input_ids = additions.allow_router_input_ids;
-        if self.use_input_ids {
-            self.tokenized.apply(additions);
-        } else {
-            self.original.apply(additions);
-        }
-    }
-
-    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
-        if self.use_input_ids {
-            self.tokenized.trace_headers()
-        } else {
-            self.original.trace_headers()
-        }
-    }
-
-    fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
-        if self.use_input_ids {
-            self.tokenized.send(client)
-        } else {
-            self.original.send(client)
-        }
+        Self::with(original, tokenized, std::convert::identity)
     }
 }
 

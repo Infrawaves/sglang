@@ -637,6 +637,49 @@ async fn kimi_k3_audio_and_video_requests_bypass_encoder() {
     }
 }
 
+/// A bypassed request the OpenAI path rejects is still counted as bypassed,
+/// so its error does not read as an encoder failure.
+#[tokio::test]
+async fn kimi_k3_bypassed_request_errors_are_not_encoder_errors() {
+    let tokenizer = FakeTokenizer::successful();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let mut cfg = tokenizer.config();
+    let argv = [
+        "sgl-router",
+        "--model-id",
+        MODEL,
+        "--worker-urls",
+        "http://placeholder:0",
+        "--override-sampling-params",
+        r#"{"temperature": 0.5}"#,
+    ];
+    cfg.model.sampling_overrides = <sgl_router::config::Cli as clap::Parser>::parse_from(argv)
+        .into_config()
+        .unwrap()
+        .model
+        .sampling_overrides;
+    let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
+    let audio =
+        json!({"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}});
+    let request = json!({
+        "model": MODEL,
+        "temperature": 1.0,
+        "messages": [{"role": "user", "content": [audio]}],
+    });
+    assert_eq!(
+        send(Arc::clone(&ctx), &request).await,
+        StatusCode::BAD_REQUEST
+    );
+    let exposed = metrics(&ctx).await;
+    assert_encoder_outcome(&exposed, "bypassed", 1);
+    let request_errors = exposed
+        .lines()
+        .filter(|line| line.contains("outcome=\"request_error\""))
+        .any(|line| !line.ends_with(" 0"));
+    assert!(!request_errors, "{exposed}");
+}
+
 /// A request template replaces the checkpoint's encoder, so neither the Python
 /// encoder nor the Rust renderer renders the chat; the worker renders it, or
 /// rejects it without `--trust-request-chat-template`.
@@ -1610,6 +1653,27 @@ fn kimi_k3_pool_requires_an_encoder_fingerprint() {
     };
     let error = TokenizerRegistry::load_with_options(&tokenizer.config(), options).unwrap_err();
     assert!(format!("{error:#}").contains("fingerprint"), "{error:#}");
+}
+
+/// The pool's processes start together: each reports ready only after all
+/// have started, so a startup that waits for one before the next times out.
+#[test]
+fn kimi_k3_pool_processes_start_together() {
+    let tokenizer = FakeTokenizer::successful();
+    let path = tokenizer.directory.path().join("fixture.json");
+    let mut scenario: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    scenario["startup_barrier"] = json!(3);
+    fs::write(&path, scenario.to_string()).unwrap();
+    let options = ChatEncodingOptions {
+        chat_encoder: ChatEncoderKind::KimiK3,
+        tokenizer_python: tokenizer.executable.to_str().unwrap().into(),
+        tokenizer_workers: NonZeroUsize::new(3),
+        tokenizer_startup_timeout_secs: 10,
+        ..Default::default()
+    };
+    let registry = TokenizerRegistry::load_with_options(&tokenizer.config(), options).unwrap();
+    assert!(registry.has_kimi_encoder(MODEL));
+    assert_eq!(tokenizer.started_processes().len(), 3);
 }
 
 /// K3.1 has no Rust chat formatter, so the Anthropic token count uses the

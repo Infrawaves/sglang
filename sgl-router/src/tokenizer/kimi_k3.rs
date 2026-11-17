@@ -285,15 +285,24 @@ impl KimiK3Pool {
         let count = options
             .tokenizer_workers
             .map_or(1, std::num::NonZeroUsize::get);
-        let startup_timeout = Duration::from_secs(options.tokenizer_startup_timeout_secs);
-        let processes = (0..count)
-            .map(|_| {
-                let deadline = Instant::now()
-                    .checked_add(startup_timeout)
-                    .context("Kimi-K3 tokenizer startup timeout is too large")?;
-                Process::start(source, options, &defaults, deadline)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(options.tokenizer_startup_timeout_secs))
+            .context("Kimi-K3 tokenizer startup timeout is too large")?;
+        // Each process loads the tokenizer, so they start together under one
+        // deadline; on an error the others are dropped, which stops them.
+        let processes = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..count)
+                .map(|_| scope.spawn(|| Process::start(source, options, &defaults, deadline)))
+                .collect();
+            starts
+                .into_iter()
+                .map(|start| {
+                    start
+                        .join()
+                        .expect("Kimi-K3 tokenizer startup thread panicked")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
         let fingerprint = processes[0].fingerprint.clone();
         ensure!(
             processes
