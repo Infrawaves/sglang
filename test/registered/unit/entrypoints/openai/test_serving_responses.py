@@ -3,7 +3,6 @@ import asyncio
 import functools
 import sys
 import unittest
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from copy import deepcopy
@@ -11,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
 import pytest
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -622,8 +621,10 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
         async def complete():
             self.serving.tokenizer_manager.generate_request = generate
             response = await self.serving.create_responses(request)
-            if isinstance(response, AsyncIterator):
-                return event_payloads(await collect_stream_events(response))
+            if isinstance(response, StreamingResponse):
+                return event_payloads(
+                    await collect_stream_events(response.body_iterator)
+                )
             return response
 
         return asyncio.run(complete())
@@ -1307,8 +1308,10 @@ class KimiK3AdditionalToolsTestCase(CustomTestCase):
         async def respond():
             self.serving.tokenizer_manager.generate_request = generate
             response = await self.serving.create_responses(request)
-            if isinstance(response, AsyncIterator):
-                events = event_payloads(await collect_stream_events(response))
+            if isinstance(response, StreamingResponse):
+                events = event_payloads(
+                    await collect_stream_events(response.body_iterator)
+                )
                 self.assertEqual(events[-1]["type"], "response.completed")
                 return ResponsesResponse.model_validate(events[-1]["response"])
             return response
@@ -1710,7 +1713,8 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             if isinstance(response, ORJSONResponse):
                 return response
             if stream:
-                events = [event async for event in response]
+                self.assertIsInstance(response, StreamingResponse)
+                events = [event async for event in response.body_iterator]
                 return event_payloads(events)[-1]["response"]
             return response.model_dump()
 
@@ -2942,6 +2946,170 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
         self.assertIn("streaming mode", body["error"]["message"])
 
 
+class PhysicalCacheHeadersTestCase(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.serving = make_serving()
+        self.serving.use_harmony = False
+        self.serving.default_chat_template_kwargs = {}
+        self.serving.template_manager.chat_template_name = None
+        self.serving.template_manager.jinja_template_content_format = "string"
+        self.serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [
+            1,
+            2,
+            3,
+        ]
+        self.serving.reasoning_parser = None
+        self.serving.tool_call_parser = None
+
+    def tearDown(self):
+        reset_context()
+
+    def test_physical_usage_preserves_models_and_is_independent_of_accounting(self):
+        """HTTP metadata must not turn the internal response into serialized JSON."""
+        for streaming in (False, True):
+            for cached in (0, 2048):
+                with self.subTest(streaming=streaming, cached=cached):
+
+                    async def generate(*args, **kwargs):
+                        chunk = engine_chunk("ok", finish=True)
+                        chunk["meta_info"].update(
+                            prompt_tokens=2051, cached_tokens=cached
+                        )
+                        yield chunk
+
+                    self.serving.tokenizer_manager.generate_request = generate
+
+                    async def run():
+                        request = ResponsesRequest(
+                            model="x", input="hi", stream=streaming, store=False
+                        )
+                        result = await self.serving.create_responses(request)
+                        if streaming:
+                            self.assertIsInstance(result, StreamingResponse)
+                            self.assertEqual(
+                                result.headers["X-Sgl-Cached-Tokens"], str(cached)
+                            )
+                            events = event_payloads(
+                                await collect_stream_events(result.body_iterator)
+                            )
+                            self.assertEqual(events[0]["type"], "response.created")
+                            self.assertEqual(events[-1]["type"], "response.completed")
+                            self.assertEqual(
+                                events[-1]["response"]["output"][0]["content"][0][
+                                    "text"
+                                ],
+                                "ok",
+                            )
+                        else:
+                            self.assertIsInstance(result, ResponsesResponse)
+                            self.assertEqual(
+                                result._response_headers,
+                                {"X-Sgl-Cached-Tokens": str(cached)},
+                            )
+                            self.assertNotIn("_response_headers", result.model_dump())
+                            self.assertNotIn(
+                                "X-Sgl-Cached-Tokens", result.model_dump_json()
+                            )
+                            self.assertEqual(result.output[0].content[0].text, "ok")
+
+                    asyncio.run(run())
+
+    def test_stream_waits_for_engine_before_committing_headers(self):
+        """A no-accounting stream cannot send headers before physical usage exists."""
+
+        async def run():
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def generate(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                chunk = engine_chunk("ok", finish=True)
+                chunk["meta_info"]["cached_tokens"] = 256
+                yield chunk
+
+            self.serving.tokenizer_manager.generate_request = generate
+            task = asyncio.create_task(
+                self.serving.create_responses(
+                    ResponsesRequest(model="x", input="hi", stream=True, store=False)
+                )
+            )
+            await entered.wait()
+            self.assertFalse(task.done())
+            release.set()
+            result = await task
+            self.assertIsInstance(result, StreamingResponse)
+            self.assertEqual(result.headers["X-Sgl-Cached-Tokens"], "256")
+            await collect_stream_events(result.body_iterator)
+
+        asyncio.run(run())
+
+    def test_early_engine_errors_are_http_errors_without_physical_headers(self):
+        """An early error or empty engine cannot be mistaken for a successful SSE."""
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                closed = []
+
+                async def generate(*args, **kwargs):
+                    try:
+                        if not empty:
+                            raise ValueError("invalid engine input")
+                        if False:
+                            yield
+                    finally:
+                        closed.append(True)
+
+                self.serving.tokenizer_manager.generate_request = generate
+                result = asyncio.run(
+                    self.serving.create_responses(
+                        ResponsesRequest(
+                            model="x", input="hi", stream=True, store=False
+                        )
+                    )
+                )
+                self.assertIsInstance(result, ORJSONResponse)
+                self.assertEqual(result.status_code, 500 if empty else 400)
+                self.assertNotIn("X-Sgl-Cached-Tokens", result.headers)
+                self.assertEqual(closed, [True])
+
+    def test_failed_first_event_cannot_acquire_usage_from_a_later_event(self):
+        """Headers describe the first engine event, even when it was a failure."""
+        headers = {}
+
+        async def generate(*args, **kwargs):
+            failed = engine_chunk("", finish=True)
+            failed["meta_info"].update(
+                cached_tokens=256,
+                finish_reason={
+                    "type": "abort",
+                    "message": "failed",
+                    "status_code": 500,
+                },
+            )
+            yield failed
+            subsequent = engine_chunk("ok", finish=True)
+            subsequent["meta_info"]["cached_tokens"] = 1024
+            yield subsequent
+
+        self.serving.tokenizer_manager.generate_request = generate
+
+        async def run():
+            outputs = []
+            async for context in self.serving._generate_with_builtin_tools(
+                "resp_failed",
+                "hi",
+                Mock(),
+                {},
+                SimpleContext(),
+                physical_usage_headers=headers,
+            ):
+                outputs.append(context.last_output)
+            self.assertEqual(len(outputs), 2)
+            self.assertEqual(headers, {})
+
+        asyncio.run(run())
+
+
 STORE_DISABLED_MESSAGE = (
     "Response store is disabled. Stateful Responses require "
     "--enable-response-store on a standalone server; response storage "
@@ -3007,7 +3175,8 @@ def response_serving():
 async def create_response_result(serving, request):
     result = await serving.create_responses(request)
     if request.stream:
-        payloads = event_payloads([event async for event in result])
+        assert isinstance(result, StreamingResponse)
+        payloads = event_payloads([event async for event in result.body_iterator])
         assert payloads[0]["type"] == "response.created"
         assert payloads[-1]["type"] == "response.completed"
         return ResponsesResponse.model_validate(payloads[-1]["response"])
@@ -3182,6 +3351,7 @@ def test_background_task_lifecycle(response_serving, outcome):
         request = ResponsesRequest(model="x", input="hi", background=True)
         queued = await serving.create_responses(request)
         assert queued.status == "queued"
+        assert queued._response_headers == {}
         assert serving.response_store[queued.id] is queued
         assert request.request_id in serving.msg_store
         task = serving.background_tasks[queued.id]
@@ -3214,11 +3384,12 @@ def test_active_stream_cancel_and_final_history(response_serving):
     async def run():
         request = ResponsesRequest(model="x", input="hi", background=True, stream=True)
         stream = await serving.create_responses(request)
-        assert "response.created" in await anext(stream)
+        assert isinstance(stream, StreamingResponse)
+        assert "response.created" in await anext(stream.body_iterator)
         assert not serving.background_tasks
         assert (await serving.cancel_responses(request.request_id)).status_code == 404
         serving.tokenizer_manager.abort_request.assert_not_called()
-        events = [event async for event in stream]
+        events = [event async for event in stream.body_iterator]
         assert event_payloads(events)[-1]["type"] == "response.completed"
         assert serving.response_store[request.request_id].status == "completed"
         assert len(serving.msg_store[request.request_id]) == 2
@@ -3361,6 +3532,9 @@ def test_standalone_builtin_tools_without_storage(response_serving):
 
     async def generate(*args, **kwargs):
         chunk = engine_chunk("", finish=True)
+        chunk["meta_info"]["cached_tokens"] = (
+            256 if serving.tokenizer_manager.generate_request.call_count == 1 else 1024
+        )
         chunk["output_ids"] = get_encoding().render_conversation(
             Conversation.from_messages([next(turns)])
         )
@@ -3383,6 +3557,7 @@ def test_standalone_builtin_tools_without_storage(response_serving):
     tool_session.call_tool.assert_awaited_once_with("search", {"query": "answer"})
     assert response.status == "completed"
     assert response.output[-1].content[0].text == "The answer is 42."
+    assert response._response_headers == {"X-Sgl-Cached-Tokens": "256"}
     assert serving.tokenizer_manager.generate_request.call_count == 2
     continuation = serving.tokenizer_manager.generate_request.call_args_list[1].args[0]
     assert "Search result: 42" in get_encoding().decode(continuation.input_ids)

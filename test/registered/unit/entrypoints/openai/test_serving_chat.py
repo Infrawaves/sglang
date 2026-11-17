@@ -453,6 +453,142 @@ class ServingChatTestCase(CustomTestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_non_streaming_cache_headers_preserve_the_model_for_internal_callers(self):
+        """Usage headers must not turn the internal model into an HTTP response."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ledger = {"ttl_seconds": 300, "read_tokens": 256, "write_tokens": 512}
+        for prefix, physical, cache_usage in (
+            ("", 0, None),
+            ("", 1920, None),
+            ("", 1920, ledger),
+            ("X-Sgl", 1920, ledger),
+            ("x-SGL", 1920, ledger),
+            ("X-Billing", 1920, ledger),
+        ):
+            with self.subTest(prefix=prefix, physical=physical, ledger=cache_usage):
+                event = _spec_result(0)
+                event["meta_info"].update(
+                    prompt_tokens=1922, cached_tokens=physical, cache_usage=cache_usage
+                )
+
+                async def generate(*_args, **_kwargs):
+                    yield event
+
+                self.tm.generate_request = generate
+                with envs.SGLANG_USAGE_HEADER_PREFIX.override(prefix):
+                    response = asyncio.run(
+                        self.chat._handle_non_streaming_request(
+                            Mock(), self.basic_req, self.fastapi_request
+                        )
+                    )
+                self.assertIsInstance(response, ChatCompletionResponse)
+                self.assertEqual(response.choices[0].message.content, "choice-0")
+                headers = response._response_headers
+                self.assertEqual(headers["X-Sgl-Cached-Tokens"], str(physical))
+                self.assertEqual(
+                    sum(name.lower() == "x-sgl-cached-tokens" for name in headers), 1
+                )
+                body = response.model_dump()
+                self.assertNotIn("_response_headers", body)
+                self.assertNotIn("X-Sgl-Cached-Tokens", response.model_dump_json())
+                self.assertEqual(body["usage"]["prompt_tokens"], 1919)
+                if cache_usage is not None:
+                    self.assertEqual(
+                        body["usage"]["prompt_tokens_details"]["cached_tokens"], 256
+                    )
+                    self.assertEqual(headers["Msh-Usage-Cache-Write-Tokens-5m"], "512")
+                    self.assertEqual(headers["Msh-Usage-Cache-Write-Tokens-1h"], "0")
+                if prefix:
+                    self.assertEqual(headers[f"{prefix}-Prompt-Tokens"], "1919")
+                if prefix == "X-Billing":
+                    self.assertEqual(headers["X-Billing-Cached-Tokens"], "256")
+
+    def test_streaming_cache_header_uses_first_engine_count_without_usage_opt_in(self):
+        """The physical snapshot survives later events and differs from Redis usage."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        for physical, include_usage, ttl in ((0, False, 300), (1920, True, 3600)):
+            with self.subTest(physical=physical, include_usage=include_usage, ttl=ttl):
+                first = _spec_result(0)
+                first["meta_info"].update(
+                    prompt_tokens=1922,
+                    cached_tokens=physical,
+                    finish_reason=None,
+                    cache_usage={
+                        "ttl_seconds": ttl,
+                        "read_tokens": 256,
+                        "write_tokens": 512,
+                    },
+                )
+                final = copy.deepcopy(first)
+                final["meta_info"].update(
+                    cached_tokens=128, finish_reason={"type": "stop"}
+                )
+
+                async def generate(*_args, **_kwargs):
+                    yield first
+                    yield final
+
+                self.tm.generate_request = generate
+                request = self.stream_req.model_copy(
+                    update={
+                        "stream_options": StreamOptions(include_usage=include_usage)
+                    }
+                )
+
+                async def collect():
+                    response = await self.chat._handle_streaming_request(
+                        Mock(), request, self.fastapi_request
+                    )
+                    self.assertIsInstance(response, StreamingResponse)
+                    self.assertEqual(
+                        response.headers["X-Sgl-Cached-Tokens"], str(physical)
+                    )
+                    chunks = [chunk async for chunk in response.body_iterator]
+                    self.assertEqual(
+                        response.headers["X-Sgl-Cached-Tokens"], str(physical)
+                    )
+                    return response, chunks
+
+                with envs.SGLANG_USAGE_HEADER_PREFIX.override(""):
+                    response, chunks = asyncio.run(collect())
+                frames = self._parse_chunks(chunks)
+                self.assertEqual(frames[0]["choices"][0]["delta"]["role"], "assistant")
+                self.assertIsNone(frames[0].get("usage"))
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                summaries = [frame for frame in frames if not frame.get("choices")]
+                self.assertEqual(len(summaries), int(include_usage))
+                if include_usage:
+                    self.assertEqual(
+                        summaries[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
+                        256,
+                    )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-5m"],
+                    "512" if ttl == 300 else "0",
+                )
+                self.assertEqual(
+                    response.headers["Msh-Usage-Cache-Write-Tokens-1h"],
+                    "512" if ttl == 3600 else "0",
+                )
+
+    def test_failed_initial_result_has_no_physical_cache_header(self):
+        """A failed first result must not look like a measured successful request."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        for finish_reason in ("abort", "error", {"type": "abort"}, {"type": "error"}):
+            for prefix in ("", "X-Sgl", "x-SGL"):
+                with self.subTest(finish_reason=finish_reason, prefix=prefix):
+                    with envs.SGLANG_USAGE_HEADER_PREFIX.override(prefix):
+                        headers = self.chat._usage_headers(
+                            {
+                                "prompt_tokens": 1922,
+                                "cached_tokens": 1920,
+                                "finish_reason": finish_reason,
+                            }
+                        )
+                    self.assertNotIn(
+                        "x-sgl-cached-tokens", {h.lower() for h in headers}
+                    )
+
     def test_undeclared_tools_run_the_tool_parser_only_for_the_m3_parser(self):
         """With no tools declared the M3 model can still call a tool; only its parser runs anyway."""
         user = [{"role": "user", "content": "Hi?"}]
@@ -7701,8 +7837,8 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         # And the reported prompt count still excludes K3's generation stub.
         self.assertEqual(usage["prompt_tokens"], 10 - self._STUB)
 
-    def test_usage_headers_are_off_without_a_prefix(self):
-        """No SGLANG_USAGE_HEADER_PREFIX: no usage headers are sent."""
+    def test_physical_cache_header_is_independent_of_the_usage_prefix(self):
+        """Disabling configurable usage headers keeps the physical cache count."""
         headers = {}
         req = self._req(stream_options={"include_usage": True})
         with envs.SGLANG_USAGE_HEADER_PREFIX.override(""):
@@ -7713,7 +7849,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
                     usage_headers=headers,
                 )
             )
-        self.assertEqual(headers, {})
+        self.assertEqual(headers, {"X-Sgl-Cached-Tokens": "6"})
 
     # ------------- constant response id -------------
     def test_wire_id_is_constant_across_frames_with_n_gt_1(self):

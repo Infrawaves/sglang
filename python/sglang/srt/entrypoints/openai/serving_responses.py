@@ -324,9 +324,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
-    ) -> Union[
-        AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse, StreamingResponse
-    ]:
+    ) -> Union[ResponsesResponse, ORJSONResponse, StreamingResponse]:
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -864,12 +862,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     cache_context=cache_context,
                 )
                 if isinstance(result, ResponsesResponse) and physical_usage_headers:
-                    headers = dict(physical_usage_headers)
-                    if result.usage is not None and result.usage.cache_usage is not None:
-                        headers.update(result.usage.cache_usage.response_headers())
-                    return ORJSONResponse(
-                        content=result.model_dump(mode="json"), headers=headers
-                    )
+                    result._response_headers.update(physical_usage_headers)
                 return result
             except HTTPException as e:
                 return self.create_error_response(
@@ -3383,6 +3376,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
         completed_usage = None
+        capture_physical_usage = physical_usage_headers is not None
 
         while True:
             # Generate using SGLang's tokenizer manager
@@ -3395,12 +3389,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             turn_usage = None
             try:
                 async for res in generator:
-                    if (
-                        physical_usage_headers is not None
-                        and not physical_usage_headers
-                        and isinstance(res, dict)
-                    ):
-                        meta_info = res.get("meta_info")
+                    if physical_usage_headers is not None and capture_physical_usage:
+                        # Even a failed or malformed first event freezes the
+                        # snapshot; later tool turns cannot supply HTTP headers.
+                        capture_physical_usage = False
+                        meta_info = (
+                            res.get("meta_info") if isinstance(res, dict) else None
+                        )
                         if (
                             isinstance(meta_info, dict)
                             and self._status_from_finish_reason(
