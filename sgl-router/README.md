@@ -286,8 +286,9 @@ chats forward `input_ids`.
 
 `--chat-encoder kimi-k3` renders and tokenizes supported text and image chats once
 in persistent Python processes, then sends the same IDs to compatible P/D
-workers. It shares the Python serving encoder, preserves K3.1 token accounting,
-and falls back to worker encoding when capabilities are missing. See
+workers. It shares the Python serving encoder and preserves K3.1 token
+accounting; every other request, including chats no worker can take the IDs
+for, is handled by the Rust tokenizer as without the flag. See
 [Python encoder pool](REFERENCE.md#kimi-k3-and-k31-python-chat-encoder) for the
 Python environment, flags, compatibility rules, and metrics.
 

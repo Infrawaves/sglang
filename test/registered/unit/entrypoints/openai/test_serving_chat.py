@@ -2076,11 +2076,11 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(ids, [10, 20])
         self.assertFalse(self.chat.supports_kimi_k3_input_ids())
 
-    def test_kimi_k3_router_media_ids_keep_images_and_fall_back_when_ineligible(self):
+    def test_kimi_k3_router_image_ids_keep_images_and_fall_back_when_ineligible(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         self.template_manager.chat_template_name = None
         self.tm.model_config.is_multimodal = True
-        self.tm.mm_processor = Mock(kimi_k3_media_input_ids_version=1)
+        self.tm.mm_processor = Mock(kimi_k3_input_ids_version=1)
         self.tm.tokenizer.apply_chat_template.return_value = [71, 72]
         body = {
             "model": "x",
@@ -2096,18 +2096,14 @@ class ServingChatTestCase(CustomTestCase):
                     ],
                 }
             ],
-            "kimi_k3_media_input_ids": [81, 82],
+            "kimi_k3_input_ids": [81, 82],
         }
         result = self.chat._process_messages(ChatCompletionRequest(**body), True)
         self.assertEqual(result.prompt_ids, [81, 82])
         self.assertEqual(len(result.image_data), 1)
         self.assertIn("https://example.com/image.png", str(result.image_data[0]))
-        self.tm.mm_processor.kimi_k3_media_input_ids_version = None
-        fallback = self.chat._process_messages(ChatCompletionRequest(**body), True)
-        self.assertEqual(fallback.prompt_ids, [71, 72])
-        self.assertEqual(fallback.image_data, result.image_data)
-        # A text-only contract never admits image placeholders by accident.
-        body["kimi_k3_input_ids"] = body.pop("kimi_k3_media_input_ids")
+        # Without a processor that expands the placeholders, render locally.
+        self.tm.mm_processor.kimi_k3_input_ids_version = None
         fallback = self.chat._process_messages(ChatCompletionRequest(**body), True)
         self.assertEqual(fallback.prompt_ids, [71, 72])
         self.assertEqual(fallback.image_data, result.image_data)
@@ -2116,15 +2112,13 @@ class ServingChatTestCase(CustomTestCase):
         self.chat.chat_encoding_spec = "kimi_k3"
         self.template_manager.chat_template_name = None
         self.tm.model_config.is_multimodal = True
-        self.tm.mm_processor = Mock(kimi_k3_media_input_ids_version=1)
+        self.tm.mm_processor = Mock(kimi_k3_input_ids_version=1)
         self.assertTrue(self.chat.supports_kimi_k3_input_ids())
-        self.assertTrue(self.chat.supports_kimi_k3_media_input_ids())
         with get_context().override_server_args(chat_template="custom.jinja"):
             self.assertFalse(self.chat.supports_kimi_k3_input_ids())
-            self.assertFalse(self.chat.supports_kimi_k3_media_input_ids())
         with get_context().override_server_args(enable_multimodal=False):
             self.assertTrue(self.chat.supports_kimi_k3_input_ids())
-            self.assertFalse(self.chat.supports_kimi_k3_media_input_ids())
+            self.assertFalse(self.chat._expands_kimi_k3_media_placeholders(True))
         self.chat.default_chat_template_kwargs = {"chat_template": "custom"}
         self.assertFalse(self.chat.supports_kimi_k3_input_ids())
         self.chat.default_chat_template_kwargs = {}

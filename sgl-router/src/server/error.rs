@@ -41,8 +41,6 @@ enum ErrorClass {
     Timeout,
     /// 500 — internal router fault.
     Internal,
-    /// 501 — endpoint unavailable for this model backend.
-    NotImplemented,
 }
 
 impl ErrorClass {
@@ -54,7 +52,6 @@ impl ErrorClass {
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorClass::NotImplemented => StatusCode::NOT_IMPLEMENTED,
         }
     }
 }
@@ -83,9 +80,6 @@ pub enum ApiError {
 
     #[error("prompt encoder unavailable: {0:#}")]
     EncoderUnavailable(#[source] anyhow::Error),
-
-    #[error("not supported: {0}")]
-    NotSupported(String),
 
     /// A request refused by the fleet-wide sampling contract
     /// (`--override-sampling-params` under `--sampling-param-conflict
@@ -216,7 +210,6 @@ impl ApiError {
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
             ApiError::EncoderUnavailable(_) => ErrorClass::NoTarget,
-            ApiError::NotSupported(_) => ErrorClass::NotImplemented,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } | ApiError::PrefillFailed { .. } => {
                 ErrorClass::Upstream
@@ -248,7 +241,6 @@ impl ApiError {
             ApiError::SamplingContract { .. } => "sampling_contract_violation",
             ApiError::ModelNotFound(_) => "model_not_found",
             ApiError::EncoderUnavailable(_) => "encoder_unavailable",
-            ApiError::NotSupported(_) => "not_supported",
             ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
             // Mid-body drop: headers (incl. a status) arrived, then the body
             // didn't. We surface a 502 but echo the worker's status in
@@ -282,7 +274,6 @@ impl ApiError {
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
-            | ApiError::NotSupported(_)
             | ApiError::EncoderUnavailable(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
@@ -348,6 +339,26 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Encoder request errors are the client's; transport and internal failures
+/// return 503 without dispatching to the workers.
+impl From<crate::tokenizer::kimi_k3::EncodeError> for ApiError {
+    fn from(error: crate::tokenizer::kimi_k3::EncodeError) -> Self {
+        use crate::tokenizer::kimi_k3::EncodeError;
+        match error {
+            EncodeError::Request(message) => ApiError::BadRequest(message),
+            EncodeError::Internal(message) => {
+                ApiError::EncoderUnavailable(anyhow::anyhow!(message))
+            }
+            EncodeError::QueueTimeout => ApiError::EncoderUnavailable(anyhow::anyhow!(
+                "Kimi-K3 encoder deadline elapsed waiting for a process"
+            )),
+            EncodeError::Timeout(error) | EncodeError::Unavailable(error) => {
+                ApiError::EncoderUnavailable(error)
+            }
+        }
+    }
+}
+
 impl ApiError {
     /// What a gRPC client receives: an engine's status unchanged, otherwise the
     /// error's class as a gRPC code, with the HTTP path's message and error code.
@@ -362,7 +373,6 @@ impl ApiError {
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
             ErrorClass::Timeout => Code::DeadlineExceeded,
             ErrorClass::Internal => Code::Internal,
-            ErrorClass::NotImplemented => Code::Unimplemented,
         };
         router_grpc_status(code, self.error_code(), self.client_message())
     }
@@ -448,7 +458,6 @@ impl ApiError {
             }
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
-            | ApiError::NotSupported(_)
             | ApiError::SamplingContract { .. } => self.to_string(),
             ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
@@ -730,13 +739,6 @@ mod tests {
                 ApiError::EncoderUnavailable(anyhow::anyhow!("private process error")),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "encoder_unavailable",
-                None,
-            ),
-            (
-                "encoder endpoint unsupported",
-                ApiError::NotSupported("raw tokenize".into()),
-                StatusCode::NOT_IMPLEMENTED,
-                "not_supported",
                 None,
             ),
             (

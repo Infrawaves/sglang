@@ -9,7 +9,7 @@ pub mod options;
 pub mod stats;
 
 use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
@@ -157,37 +157,55 @@ impl TokenizerRegistry {
         cfg: &crate::config::Config,
         options: ChatEncodingOptions,
     ) -> Result<Self> {
-        let mut me = Self::with_options(&options);
+        if !options.is_kimi_k3() {
+            let ignored = options.non_default_kimi_only_flags();
+            anyhow::ensure!(
+                ignored.is_empty(),
+                "{} require --chat-encoder kimi-k3",
+                ignored.join(", ")
+            );
+        }
         let m = &cfg.model;
         if options.is_kimi_k3() {
-            let source = m.tokenizer_path.as_deref().ok_or_else(|| {
+            if let Some(path) = m.tokenizer_path.as_deref() {
+                anyhow::ensure!(
+                    !std::path::Path::new(path).is_dir(),
+                    "--chat-encoder kimi-k3 takes --tokenizer-path as the checkpoint's \
+                     tiktoken.model or an HF repo id, not a directory; the encoder reads \
+                     config.json beside that file"
+                );
+            }
+        }
+        let mut me = Self::with_options(&options);
+        me.load_rust(cfg)?;
+        if options.is_kimi_k3() {
+            let tokenizer_path = m.tokenizer_path.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--chat-encoder kimi-k3 cannot be combined with --no-tokenizer")
             })?;
-            let count = options
-                .tokenizer_workers
-                .map_or(1, std::num::NonZeroUsize::get);
             let pool = kimi_k3::KimiK3Pool::new_with_metrics(
-                source,
+                &kimi_k3::encoder_source(tokenizer_path),
                 &options,
                 serde_json::to_value(&m.default_chat_template_kwargs)?,
                 EncoderMetrics::new(&m.id),
             )?;
+            let count = options
+                .tokenizer_workers
+                .map_or(1, std::num::NonZeroUsize::get);
             me.kimi_encoders.insert(m.id.clone(), Arc::new(pool));
             me.kimi_encode_slots = Arc::new(Semaphore::new(count));
             tracing::info!(model = %m.id, workers = count,
-                "Kimi-K3/K3.1 prompt encoding enabled in persistent Python processes");
-            return Ok(me);
+                "Kimi-K3/K3.1 text and image chats encode in persistent Python processes");
         }
-        let ignored = options.non_default_kimi_only_flags();
-        anyhow::ensure!(
-            ignored.is_empty(),
-            "{} require --chat-encoder kimi-k3",
-            ignored.join(", ")
-        );
+        Ok(me)
+    }
 
+    /// The Rust tokenizer and chat formatter, as every `--chat-encoder` uses.
+    fn load_rust(&mut self, cfg: &crate::config::Config) -> Result<()> {
+        let me = self;
+        let m = &cfg.model;
         let Some(tokenizer_path) = &m.tokenizer_path else {
             tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
-            return Ok(me);
+            return Ok(());
         };
         let (t, stats) = adapter::load_with(tokenizer_path, m.tokenizer)?;
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
@@ -273,7 +291,7 @@ impl TokenizerRegistry {
                 ForwardingScope::Never => {}
             }
         }
-        Ok(me)
+        Ok(())
     }
 
     pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
@@ -341,21 +359,46 @@ impl TokenizerRegistry {
         EncoderMetrics::render(&snapshots)
     }
 
-    pub fn encode_kimi_request(
-        &self,
+    /// Encode a Chat Completions body with the Kimi-K3 pool by `deadline`:
+    /// wait for an encoder slot, then encode on a blocking thread. A caller
+    /// that gives up leaves the job running until it releases its process.
+    pub(crate) async fn encode_kimi_chat(
+        self: &Arc<Self>,
         model_id: &str,
-        request: &serde_json::Value,
+        request: serde_json::Value,
         deadline: std::time::Instant,
-    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
-        let pool = self
-            .kimi_encoders
-            .get(model_id)
-            .map(|entry| Arc::clone(&*entry))
-            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
-        pool.encode(request, deadline)
+    ) -> std::result::Result<(serde_json::Value, Vec<u32>), kimi_k3::EncodeError> {
+        let metrics = self
+            .kimi_metrics(model_id)
+            .with_context(|| format!("Kimi-K3 encoder missing for model {model_id}"))?;
+        let tokio_deadline = tokio::time::Instant::from_std(deadline);
+        let queue = metrics.queue();
+        let encoding_started = queue.encoding_started();
+        let permit = tokio::time::timeout_at(
+            tokio_deadline,
+            Arc::clone(&self.kimi_encode_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| kimi_k3::EncodeError::QueueTimeout)?
+        .context("Kimi-K3 encoder admission closed")?;
+        let registry = Arc::clone(self);
+        let model_id = model_id.to_owned();
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let ids = registry.encode_kimi_request(&model_id, &request, deadline, queue)?;
+            Ok((request, ids))
+        });
+        match tokio::time::timeout_at(tokio_deadline, job).await {
+            Ok(joined) => joined.context("Kimi-K3 encode job failed")?,
+            Err(_) if encoding_started.load(Ordering::Relaxed) => Err(
+                kimi_k3::EncodeError::Timeout(anyhow::anyhow!("deadline elapsed while encoding")),
+            ),
+            // A job that starts after the deadline returns without taking a process.
+            Err(_) => Err(kimi_k3::EncodeError::QueueTimeout),
+        }
     }
 
-    pub(crate) fn encode_kimi_request_queued(
+    fn encode_kimi_request(
         &self,
         model_id: &str,
         request: &serde_json::Value,
@@ -396,11 +439,7 @@ impl TokenizerRegistry {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.inner
-            .iter()
-            .map(|kv| kv.key().clone())
-            .chain(self.kimi_encoders.iter().map(|kv| kv.key().clone()))
-            .collect()
+        self.inner.iter().map(|kv| kv.key().clone()).collect()
     }
 
     /// Attach a chat formatter to an already-loaded model. Lets policy tests in

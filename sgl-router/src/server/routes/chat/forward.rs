@@ -5,8 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, pd_prefill_body, BootstrapFields,
-    PreparedRequest,
+    accepts_router_kimi_ids, append_fields, generate_room_id, generate_room_id_for_rank,
+    pd_prefill_body, BootstrapFields, PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -178,17 +178,12 @@ async fn dispatch<T: Transport>(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
-    request.set_kimi_dispatch_capabilities(
-        workers.prefill.supports_kimi_k3_input_ids()
+    request.set_kimi_dispatch_supported(
+        accepts_router_kimi_ids(ctx, &workers.prefill)
             && workers
                 .decode
                 .as_ref()
-                .is_none_or(|worker| worker.supports_kimi_k3_input_ids()),
-        workers.prefill.supports_kimi_k3_media_input_ids()
-            && workers
-                .decode
-                .as_ref()
-                .is_none_or(|worker| worker.supports_kimi_k3_media_input_ids()),
+                .is_none_or(|worker| accepts_router_kimi_ids(ctx, worker)),
     );
     let SelectedWorkers {
         prefill,

@@ -47,13 +47,11 @@ pub enum WireProtocol {
 /// versions leave prompt encoding on the worker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct WorkerCapabilities {
-    /// Version 1 distinguishes router text IDs from caller-owned `input_ids`,
-    /// preserving K3/K3.1 generation-stub budgets and usage accounting.
+    /// Version 1 renders from router K3 IDs in `kimi_k3_input_ids`, apart from
+    /// caller-owned `input_ids`, so K3/K3.1 generation-stub accounting holds;
+    /// image chats also need the worker's processor to expand their placeholders.
     #[serde(default)]
     pub kimi_k3_input_ids_version: Option<u32>,
-    /// Version 1 expands router image placeholders and recovers media from messages.
-    #[serde(default)]
-    pub kimi_k3_media_input_ids_version: Option<u32>,
 }
 
 /// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
@@ -371,11 +369,6 @@ impl Worker {
     /// Whether this worker preserves the semantics of router-generated K3 IDs.
     pub fn supports_kimi_k3_input_ids(&self) -> bool {
         self.capabilities.kimi_k3_input_ids_version == Some(1)
-    }
-
-    /// Whether this worker can expand unprocessed K3 image placeholders.
-    pub fn supports_kimi_k3_media_input_ids(&self) -> bool {
-        self.capabilities.kimi_k3_media_input_ids_version == Some(1)
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {

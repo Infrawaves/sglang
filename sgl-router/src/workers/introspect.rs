@@ -525,26 +525,15 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_kimi_input_ids_capabilities_are_explicit_and_versioned() {
-        for (text_version, media_version) in [
-            (None, None),
-            (Some(1), None),
-            (Some(1), Some(1)),
-            (Some(2), Some(1)),
-            (Some(1), Some(2)),
-        ] {
+        for version in [None, Some(1), Some(2)] {
             let body = json!({
                 "served_model_name": "kimi-k31",
-                "kimi_k3_input_ids_version": text_version,
-                "kimi_k3_media_input_ids_version": media_version,
+                "kimi_k3_input_ids_version": version,
             });
             let (url, _shutdown) = spawn_fake_worker(body).await;
             let info = fast_introspector().fetch(&url).await;
             assert_eq!(info.served_model_name.as_deref(), Some("kimi-k31"));
-            assert_eq!(info.capabilities.kimi_k3_input_ids_version, text_version);
-            assert_eq!(
-                info.capabilities.kimi_k3_media_input_ids_version,
-                media_version
-            );
+            assert_eq!(info.capabilities.kimi_k3_input_ids_version, version);
         }
     }
 

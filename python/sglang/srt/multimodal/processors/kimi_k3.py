@@ -1010,7 +1010,7 @@ class KimiK3ImageProcessor(
     SGLangBaseProcessor,
 ):
     models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
-    kimi_k3_media_input_ids_version = 1
+    kimi_k3_input_ids_version = 1
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3

@@ -14,6 +14,7 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{EncoderOutcome, InputIdsForwarding, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::{kimi_k3, ForwardingScope};
+use crate::workers::Worker;
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
@@ -134,13 +135,16 @@ struct KimiK3Request {
 }
 
 impl PreparedRequest {
-    /// Encode a Kimi-K3 chat once so prefill and decode receive the same IDs.
-    /// Caller IDs and unsupported content (audio, video, custom templates)
-    /// bypass the encoder queue and are tokenized by the workers.
+    /// Encode a Kimi-K3 chat once with the Python encoder, so prefill and decode
+    /// receive the same IDs in `kimi_k3_input_ids`. Chats whose IDs could not be
+    /// forwarded (audio, video, request templates, caller IDs, forwarding off,
+    /// or no worker that accepts them) take the Rust path, as without the encoder.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_kimi_k3(
         ctx: &AppContext,
         model: ModelId,
         fields: RoutingFields,
+        headers: &HeaderMap,
         body: Bytes,
         policy_needs_request_tokens: bool,
         policy_needs_token_count: bool,
@@ -154,12 +158,6 @@ impl PreparedRequest {
         let mut request_metrics = encoder_metrics.request();
         let mut outcome = EncoderOutcome::InternalError;
         let result = async {
-            let sampling_defaults = resolve_sampling_defaults(
-                &ctx.config.model.sampling_overrides,
-                &fields,
-                &ctx.metrics,
-            )?;
-            let forwarding_enabled = !ctx.config.model.disable_input_ids_forwarding;
             // Parsing, queue wait and encoding share one deadline. Blocking-pool
             // joins are bounded too, so a congested pool cannot outlast it.
             let deadline = Instant::now()
@@ -167,141 +165,74 @@ impl PreparedRequest {
                 .ok_or_else(|| {
                     ApiError::Internal(anyhow::anyhow!("Kimi-K3 tokenizer timeout is too large"))
                 })?;
-            let tokio_deadline = tokio::time::Instant::from_std(deadline);
-            let blocking_timeout = || {
-                ApiError::EncoderUnavailable(anyhow::anyhow!(
-                    "Kimi-K3 request preparation timed out waiting for a blocking thread"
-                ))
-            };
-
             // Parse large bodies off the async executor.
             let parse_body = body.clone();
             let parse = tokio::task::spawn_blocking(move || {
-                let value: Value =
-                    serde_json::from_slice(&parse_body).map_err(|_| invalid_request())?;
-                let caller_ids = if has_caller_input_ids(&value) {
-                    Some(Vec::<u32>::deserialize(&value["input_ids"]).map_err(|_| {
-                        ApiError::BadRequest(
-                            "input_ids must be an array of unsigned token IDs".into(),
-                        )
-                    })?)
-                } else {
-                    None
-                };
-                Ok::<_, ApiError>((value, caller_ids))
+                serde_json::from_slice::<Value>(&parse_body).map_err(|_| invalid_request())
             });
-            let (value, caller_ids) = tokio::time::timeout_at(tokio_deadline, parse)
-                .await
-                .map_err(|_| {
-                    outcome = EncoderOutcome::PreparationTimeout;
-                    blocking_timeout()
-                })?
-                .map_err(|e| ApiError::Internal(e.into()))??;
-
-            // Media IDs never drive routing, so encode them only when they are forwarded.
-            let has_media = kimi_k3::requires_media_processing(&value);
-            let supported_request = kimi_k3::is_supported_request(&value);
-            // Avoid encoding unless a current plain worker or complete PD pair
-            // can consume the dedicated IDs fields. Selection still happens
-            // after encoding and checks the actual workers again at dispatch.
-            let worker_capability_missing = caller_ids.is_none()
-                && supported_request
-                && forwarding_enabled
-                && !has_kimi_input_ids_workers(ctx, &model, has_media);
-            let wants_encoding = caller_ids.is_none()
-                && supported_request
-                && !worker_capability_missing
-                && (forwarding_enabled
-                    || (!has_media
-                        && (policy_needs_request_tokens || ctx.bucket_selector.is_enabled())));
-            let (value, encoder_ids) = if wants_encoding {
-                let queue = encoder_metrics.queue();
-                let encoding_started = queue.encoding_started();
-                let permit = tokio::time::timeout_at(
-                    tokio_deadline,
-                    Arc::clone(&ctx.tokenizers.kimi_encode_slots).acquire_owned(),
-                )
-                .await
-                .map_err(|_| {
-                    outcome = EncoderOutcome::QueueTimeout;
-                    ApiError::EncoderUnavailable(anyhow::anyhow!(
-                        "Kimi-K3 tokenizer queue timed out"
-                    ))
-                })?
-                .map_err(|e| ApiError::Internal(e.into()))?;
-                let tokenizers = Arc::clone(&ctx.tokenizers);
-                let model_id = model.0.clone();
-                let encode = tokio::task::spawn_blocking(move || {
-                    // Cancellation does not release the permit until the CPU job exits.
-                    let _permit = permit;
-                    let ids = tokenizers
-                        .encode_kimi_request_queued(&model_id, &value, deadline, queue)?;
-                    Ok::<_, kimi_k3::EncodeError>((value, Some(ids)))
-                });
-                // A job that starts after the deadline returns without taking a process.
-                tokio::time::timeout_at(tokio_deadline, encode)
+            let mut value =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), parse)
                     .await
                     .map_err(|_| {
-                        outcome = if encoding_started.load(Ordering::Relaxed) {
-                            EncoderOutcome::EncodeTimeout
-                        } else {
-                            EncoderOutcome::QueueTimeout
-                        };
-                        blocking_timeout()
+                        outcome = EncoderOutcome::PreparationTimeout;
+                        ApiError::EncoderUnavailable(anyhow::anyhow!(
+                            "Kimi-K3 request preparation timed out parsing the request"
+                        ))
                     })?
-                    .map_err(|e| ApiError::Internal(e.into()))?
-                    .map_err(|error| {
-                        outcome = match &error {
-                            kimi_k3::EncodeError::Request(_) => EncoderOutcome::RequestError,
-                            kimi_k3::EncodeError::Internal(_) => EncoderOutcome::InternalError,
-                            kimi_k3::EncodeError::QueueTimeout => EncoderOutcome::QueueTimeout,
-                            kimi_k3::EncodeError::Timeout(_) => EncoderOutcome::EncodeTimeout,
-                            kimi_k3::EncodeError::Unavailable(_) => EncoderOutcome::Unavailable,
-                        };
-                        kimi_encode_error(error)
-                    })?
-            } else {
-                (value, None)
-            };
+                    .map_err(|e| ApiError::Internal(e.into()))??;
 
-            // Media IDs are valid worker input, but workers expand the placeholders
+            // The selected workers are checked again at dispatch.
+            let encodes = !ctx.config.model.disable_input_ids_forwarding
+                && kimi_k3::is_supported_request(&value)
+                && has_kimi_input_ids_workers(ctx, &model);
+            if !encodes {
+                outcome = EncoderOutcome::Bypassed;
+                return Self::openai(
+                    ctx,
+                    CHAT_PATH,
+                    model,
+                    fields,
+                    headers,
+                    body,
+                    policy_needs_request_tokens,
+                    policy_needs_token_count,
+                );
+            }
+
+            let sampling_defaults = resolve_sampling_defaults(
+                &ctx.config.model.sampling_overrides,
+                &fields,
+                &ctx.metrics,
+            )?;
+            // The workers receive the sampling contract's defaults (`outgoing_body`
+            // injects them), so the encoder validates and renders that request.
+            if let Value::Object(body_fields) = &mut value {
+                for (field, default) in &sampling_defaults {
+                    body_fields.insert(field.wire_name().into(), default.clone().into());
+                }
+            }
+            let has_media = kimi_k3::requires_media_processing(&value);
+            let (value, ids) = ctx
+                .tokenizers
+                .encode_kimi_chat(&model.0, value, deadline)
+                .await
+                .map_err(|error| {
+                    outcome = error.outcome();
+                    ApiError::from(error)
+                })?;
+            outcome = EncoderOutcome::Encoded;
+
+            // Image IDs are valid worker input, but workers expand the placeholders
             // and add media hashes, so they must not drive prefix matching or claim
-            // an exact prefill length. The same applies to caller IDs with media.
-            let (tokens, media_input_ids) = match (encoder_ids, has_media) {
-                (Some(ids), false) => (
-                    Some(RequestTokens {
-                        ids,
-                        rendered_from_chat: true,
-                    }),
-                    None,
-                ),
-                (Some(ids), true) => (None, Some(ids)),
-                (None, false) => (
-                    caller_ids.map(|ids| RequestTokens {
-                        ids,
-                        rendered_from_chat: false,
-                    }),
-                    None,
-                ),
-                (None, true) => (None, None),
-            };
-            let encoded =
-                media_input_ids.is_some() || tokens.as_ref().is_some_and(|t| t.rendered_from_chat);
-            outcome = if encoded {
-                EncoderOutcome::Encoded
+            // an exact prefill length.
+            let (tokens, media_input_ids) = if has_media {
+                (None, Some(ids))
             } else {
-                EncoderOutcome::Bypassed
-            };
-            let forwarding = if !forwarding_enabled {
-                InputIdsForwarding::Disabled
-            } else if encoded {
-                InputIdsForwarding::Forwarded
-            } else if worker_capability_missing {
-                InputIdsForwarding::IneligibleWorkerCapability
-            } else if request_has_multimodal_content(&value) {
-                InputIdsForwarding::IneligibleMultimodal
-            } else {
-                InputIdsForwarding::Ineligible
+                let tokens = RequestTokens {
+                    ids,
+                    rendered_from_chat: true,
+                };
+                (Some(tokens), None)
             };
             let input_tokens = input_token_count(tokens.as_ref(), &body);
             let output_tokens = fields.requested_max_output_tokens();
@@ -332,7 +263,7 @@ impl PreparedRequest {
                 parsed_body: Some(value),
                 sampling_defaults,
                 prefill_token_override,
-                input_ids_forwarding: Some(forwarding),
+                input_ids_forwarding: Some(InputIdsForwarding::Forwarded),
                 forwarding_booked: false,
                 responder: None,
                 kimi_k3: Some(KimiK3Request {
@@ -895,9 +826,7 @@ impl PreparedRequest {
                 &reparsed
             }
         };
-        let rid = body
-            .get(self.request_id_key())
-            .filter(|rid| !rid.is_null())?;
+        let rid = body.get(self.request_id_key()).filter(|rid| !rid.is_null())?;
         Some(rid.as_str().map_or_else(|| rid.to_string(), str::to_owned))
     }
 
@@ -909,11 +838,11 @@ impl PreparedRequest {
         }
     }
 
-    /// Both sides of a PD pair must implement the same dedicated-ID semantics.
-    /// Keep the encoded data so a later retry can independently recheck its pair.
-    pub(super) fn set_kimi_dispatch_capabilities(&mut self, text: bool, media: bool) {
+    /// Both sides of a PD pair must accept `kimi_k3_input_ids`. Keep the
+    /// encoded IDs so a retry on another pair can recheck its own workers.
+    pub(super) fn set_kimi_dispatch_supported(&mut self, supported: bool) {
         if let Some(kimi) = &mut self.kimi_k3 {
-            kimi.dispatch_supported = text && (kimi.media_input_ids.is_none() || media);
+            kimi.dispatch_supported = supported;
         }
     }
 
@@ -942,13 +871,13 @@ impl PreparedRequest {
                 Some(kimi) => kimi
                     .media_input_ids
                     .as_deref()
-                    .map(|ids| ("kimi_k3_media_input_ids", ids))
                     .or_else(|| {
                         self.tokens
                             .as_ref()
                             .filter(|tokens| tokens.rendered_from_chat)
-                            .map(|tokens| ("kimi_k3_input_ids", tokens.ids.as_slice()))
-                    }),
+                            .map(|tokens| tokens.ids.as_slice())
+                    })
+                    .map(|ids| ("kimi_k3_input_ids", ids)),
                 None => self
                     .tokens
                     .as_ref()
@@ -984,13 +913,11 @@ impl PreparedRequest {
 /// A conservative precheck shared by legacy and bucket-based routing. A
 /// supported pair may still be outside the ultimately selected bucket, so
 /// forwarding must also validate the actual picks.
-fn has_kimi_input_ids_workers(ctx: &AppContext, model: &ModelId, media: bool) -> bool {
+fn has_kimi_input_ids_workers(ctx: &AppContext, model: &ModelId) -> bool {
     let mut prefill = false;
     let mut decode = false;
     for worker in ctx.registry.healthy_workers_for(model) {
-        if !worker.supports_kimi_k3_input_ids()
-            || (media && !worker.supports_kimi_k3_media_input_ids())
-        {
+        if !accepts_router_kimi_ids(ctx, &worker) {
             continue;
         }
         match worker.mode() {
@@ -1000,6 +927,36 @@ fn has_kimi_input_ids_workers(ctx: &AppContext, model: &ModelId, media: bool) ->
         }
     }
     prefill && decode
+}
+
+/// Whether `worker` renders from router K3 IDs as the encoder rendered them: it
+/// advertises `kimi_k3_input_ids_version`, and reports the router's
+/// `--default-chat-template-kwargs`, which the encoder applied. Otherwise the
+/// IDs would silently differ from the worker's own rendering.
+pub(super) fn accepts_router_kimi_ids(ctx: &AppContext, worker: &Worker) -> bool {
+    if !worker.supports_kimi_k3_input_ids() {
+        return false;
+    }
+    let same_defaults = worker
+        .openai_settings()
+        .is_some_and(|settings| same_default_chat_template_kwargs(ctx, settings));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !same_defaults && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(worker = %worker.url,
+            "worker reports --default-chat-template-kwargs other than the router's, or none; \
+             Kimi-K3 router-rendered IDs are not forwarded to it");
+    }
+    same_defaults
+}
+
+/// The engine's `--default-chat-template-kwargs` equal the router's.
+fn same_default_chat_template_kwargs(ctx: &AppContext, settings: &OpenAiSettings) -> bool {
+    let engine_kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    engine_kwargs.into_iter().collect::<HashMap<_, _>>()
+        == ctx.config.model.default_chat_template_kwargs
 }
 
 fn forwarding_scope(ctx: &AppContext, model: &ModelId) -> ForwardingScope {
@@ -1040,13 +997,7 @@ fn lower_openai(
     if forwarding_scope(ctx, model) != ForwardingScope::AllText {
         return Err("chat_rendering_unverified");
     }
-    let engine_kwargs = settings
-        .default_chat_template_kwargs
-        .clone()
-        .unwrap_or_default();
-    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
-        != ctx.config.model.default_chat_template_kwargs
-    {
+    if !same_default_chat_template_kwargs(ctx, &settings) {
         return Err("default_chat_template_kwargs_differ");
     }
     let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
@@ -1260,6 +1211,8 @@ pub(super) struct RoutingFields {
     caller_set_rid: bool,
     /// A completions `prompt` listing several prompts, as strings or id lists.
     prompt_batch: bool,
+    /// The body sets `kimi_k3_input_ids`, which only the router may send.
+    pub(super) sets_router_input_ids: bool,
 }
 
 impl RoutingFields {
@@ -1417,6 +1370,7 @@ enum RequestKey {
     /// The Responses API request ID (`request_id`).
     RequestId,
     Prompt,
+    RouterInputIds,
     Other,
 }
 
@@ -1457,6 +1411,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "rid" => RequestKey::Rid,
                     "request_id" => RequestKey::RequestId,
                     "prompt" => RequestKey::Prompt,
+                    "kimi_k3_input_ids" => RequestKey::RouterInputIds,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -1520,6 +1475,10 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                 }
                 RequestKey::Rid => {
                     fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
+                }
+                RequestKey::RouterInputIds => {
+                    fields.sets_router_input_ids =
+                        map.next_value::<Option<IgnoredAny>>()?.is_some();
                 }
                 RequestKey::Prompt => {
                     let prompt = map.next_value::<Value>()?;
@@ -1799,9 +1758,9 @@ pub(super) fn pd_prefill_body(body: &Bytes) -> Result<Bytes, ApiError> {
     };
     fields.insert("stream".into(), Value::Bool(false));
     fields.remove("stream_options");
-    serde_json::to_vec(&value).map(Bytes::from).map_err(|e| {
-        ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request"))
-    })
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request")))
 }
 
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
@@ -2111,22 +2070,6 @@ pub(super) fn parse_request_fields(
     // Keep deserialization details out of the client-visible error.
     tracing::debug!(error = %err, path, "routing-fields deserialize failed");
     Err(invalid_request())
-}
-
-/// Encoder request errors are the client's; transport and internal failures
-/// return 503 without dispatching to the workers.
-fn kimi_encode_error(error: kimi_k3::EncodeError) -> ApiError {
-    match error {
-        kimi_k3::EncodeError::Request(message) => ApiError::BadRequest(message),
-        kimi_k3::EncodeError::Internal(message) => {
-            ApiError::EncoderUnavailable(anyhow::anyhow!(message))
-        }
-        kimi_k3::EncodeError::QueueTimeout => ApiError::EncoderUnavailable(anyhow::anyhow!(
-            "Kimi-K3 tokenizer deadline elapsed waiting for a process"
-        )),
-        kimi_k3::EncodeError::Timeout(error) => ApiError::EncoderUnavailable(error),
-        kimi_k3::EncodeError::Unavailable(error) => ApiError::EncoderUnavailable(error),
-    }
 }
 
 fn invalid_request() -> ApiError {

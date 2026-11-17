@@ -24,6 +24,7 @@ use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{
     EngineProfile, WireProtocol, Worker, WorkerCapabilities, WorkerRegistry,
 };
+use sglang_processor::openai::OpenAiSettings;
 use std::fs;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::unix::fs::symlink;
@@ -41,6 +42,8 @@ const GENERATED_IDS: &[u32] = &[100279, 781, 321, 100282];
 
 struct FakeTokenizer {
     directory: TempDir,
+    /// The Rust tokenizer the router loads beside the fake Python encoder.
+    model: TempDir,
     executable: PathBuf,
     requests: PathBuf,
     process_ids: PathBuf,
@@ -80,6 +83,7 @@ impl FakeTokenizer {
         .unwrap();
         Self {
             directory,
+            model: crate::kimi_fixture::tokenizer(),
             executable,
             requests,
             process_ids,
@@ -125,8 +129,14 @@ impl FakeTokenizer {
                 load_based_token_gate: Default::default(),
                 reorg_buckets: None,
                 reorg_admission: Default::default(),
-                // Deliberately no tokenizer.json: K3 uses its Python tokenizer.
-                tokenizer_path: Some(self.directory.path().to_str().unwrap().into()),
+                tokenizer_path: Some(
+                    self.model
+                        .path()
+                        .join("tiktoken.model")
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                ),
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
@@ -195,13 +205,13 @@ impl FakeTokenizer {
         };
         let tokenizers = Arc::new(TokenizerRegistry::load_with_options(&cfg, options).unwrap());
         assert!(tokenizers.has_kimi_encoder(MODEL));
-        assert!(tokenizers.get(MODEL).is_none());
+        assert!(tokenizers.get(MODEL).is_some());
         let registry = Arc::new(WorkerRegistry::default());
         for (worker, mode, port) in [
             (prefill, WorkerMode::Prefill, Some(8997)),
             (decode, WorkerMode::Decode, None),
         ] {
-            register_capabilities(&registry, worker, mode, Some(1), Some(1), port);
+            register_capabilities(&registry, worker, mode, Some(1), port);
         }
         let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
         let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
@@ -283,64 +293,70 @@ fn text_request() -> Value {
     })
 }
 
+/// The pool starts beside the Rust tokenizer, from the directory of
+/// `--tokenizer-path`, whose `config.json` the encoder reads; it is opt-in.
 #[test]
-fn kimi_k3_pool_is_opt_in_and_loads_without_rust_tokenizer() {
-    for model in [MODEL, "custom-served-model"] {
-        let tokenizer = FakeTokenizer::successful();
-        let mut cfg = tokenizer.config();
-        cfg.model.id = model.into();
-        let options = ChatEncodingOptions {
-            chat_encoder: ChatEncoderKind::KimiK3,
-            tokenizer_python: tokenizer.executable.to_str().unwrap().into(),
-            tokenizer_workers: NonZeroUsize::new(1),
-            tokenizer_timeout_secs: 5,
-            ..Default::default()
-        };
-        let registry = TokenizerRegistry::load_with_options(&cfg, options).unwrap();
-        assert!(registry.has_kimi_encoder(model));
-        assert!(registry.get(model).is_none());
-        assert!(tokenizer.captured_requests().is_empty());
-    }
-    // Without --chat-encoder kimi-k3 a K3 model name keeps the native
-    // dynamo-render path, so no Python process is started.
+fn kimi_k3_pool_loads_beside_the_rust_tokenizer() {
     let tokenizer = FakeTokenizer::successful();
-    let mut cfg = tokenizer.config();
-    cfg.model.tokenizer_path = Some("tests/fixtures/tiny_tokenizer.json".into());
+    let options = ChatEncodingOptions {
+        chat_encoder: ChatEncoderKind::KimiK3,
+        tokenizer_python: tokenizer.executable.to_str().unwrap().into(),
+        tokenizer_timeout_secs: 5,
+        ..Default::default()
+    };
+    let registry = TokenizerRegistry::load_with_options(&tokenizer.config(), options).unwrap();
+    assert!(registry.has_kimi_encoder(MODEL));
+    assert!(registry.get(MODEL).is_some());
+    let init: Value = serde_json::from_str(
+        &fs::read_to_string(tokenizer.directory.path().join("init.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        init["tokenizer_path"],
+        json!(tokenizer.model.path().to_str().unwrap())
+    );
+
+    let tokenizer = FakeTokenizer::successful();
     let registry =
-        TokenizerRegistry::load_with_options(&cfg, ChatEncodingOptions::default()).unwrap();
+        TokenizerRegistry::load_with_options(&tokenizer.config(), ChatEncodingOptions::default())
+            .unwrap();
     assert!(!registry.has_kimi_encoder(MODEL));
     assert!(tokenizer.started_processes().is_empty());
 }
 
+/// Endpoints that need the Rust tokenizer keep working beside the encoder.
 #[tokio::test]
-async fn kimi_k3_raw_tokenize_endpoints_report_not_supported() {
+async fn kimi_k3_rust_tokenizer_serves_the_other_endpoints() {
     let tokenizer = FakeTokenizer::successful();
     let prefill = MockWorker::start(vec![]).await;
     let decode = MockWorker::start(vec![]).await;
     let ctx = tokenizer.context(&prefill, &decode);
-    for (uri, body) in [
-        ("/v1/tokenize", json!({"model": MODEL, "prompt": "hi"})),
-        ("/v1/detokenize", json!({"model": MODEL, "tokens": [1, 2]})),
-        ("/v1/tokenize", json!({"model": "unknown", "prompt": "hi"})),
-    ] {
-        let request = Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let status = build_router(Arc::clone(&ctx))
-            .oneshot(request)
-            .await
-            .unwrap()
-            .status();
-        let expected = if body["model"] == MODEL {
-            StatusCode::NOT_IMPLEMENTED
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        assert_eq!(status, expected, "{uri} {body}");
-    }
+    let tokenize = Request::post("/v1/tokenize")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": MODEL, "prompt": "hi"}).to_string(),
+        ))
+        .unwrap();
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(tokenize)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let generate = Request::post("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"text": "hi"}).to_string()))
+        .unwrap();
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(generate)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = captured_body(&decode).await;
+    assert!(body.get("text").is_none(), "{body}");
+    assert_eq!(
+        body["input_ids"],
+        json!(ctx.tokenizers.encode_prompt(MODEL, "hi").unwrap())
+    );
     assert!(tokenizer.captured_requests().is_empty());
 }
 
@@ -410,21 +426,6 @@ async fn kimi_k3_caller_input_ids_bypass_tokenization_and_are_preserved() {
 }
 
 #[tokio::test]
-async fn kimi_k3_malformed_caller_input_ids_are_rejected_at_router() {
-    let tokenizer = FakeTokenizer::successful();
-    let prefill = MockWorker::start(vec![]).await;
-    let decode = MockWorker::start(vec![]).await;
-    let ctx = tokenizer.context(&prefill, &decode);
-    let mut request = text_request();
-    request["input_ids"] = json!("not an array of token IDs");
-
-    assert_eq!(send(ctx, &request).await, StatusCode::BAD_REQUEST);
-    assert!(tokenizer.captured_requests().is_empty());
-    assert!(prefill.captured.lock().unwrap().last_body.is_none());
-    assert!(decode.captured.lock().unwrap().last_body.is_none());
-}
-
-#[tokio::test]
 async fn kimi_k3_images_encode_once_and_preserve_image_payloads_for_pd() {
     let tokenizer = FakeTokenizer::successful();
     let prefill = MockWorker::start(vec![]).await;
@@ -442,100 +443,72 @@ async fn kimi_k3_images_encode_once_and_preserve_image_payloads_for_pd() {
     });
     assert_eq!(send(ctx, &request).await, StatusCode::OK);
     for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-        assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
+        assert_eq!(body["kimi_k3_input_ids"], json!(GENERATED_IDS));
         // Old schemas ignore the dedicated field and encode the messages.
         assert!(body.get("input_ids").is_none());
-        assert!(body.get("kimi_k3_input_ids").is_none());
         assert_eq!(body["messages"], request["messages"]);
         assert_eq!(body["reasoning_effort"], request["reasoning_effort"]);
     }
     assert_eq!(tokenizer.captured_requests(), vec![request]);
 }
 
+/// Every selected worker must advertise `kimi_k3_input_ids_version: 1`;
+/// otherwise text and image chats stay on the workers, unencoded.
 #[tokio::test]
-async fn kimi_k3_media_ids_require_capability_on_both_pd_workers() {
-    for (prefill_version, decode_version) in [
+async fn kimi_k3_ids_need_every_selected_worker_to_advertise_version_1() {
+    let pd = [
         (None, Some(1)),
         (Some(1), None),
-        (None, None),
         (Some(0), Some(1)),
         (Some(1), Some(2)),
-    ] {
-        let tokenizer = FakeTokenizer::successful();
-        let prefill = MockWorker::start(vec![]).await;
-        let decode = MockWorker::start(vec![]).await;
-        let ctx = tokenizer.context(&prefill, &decode);
-        for (worker, mode, version) in [
-            (&prefill, WorkerMode::Prefill, prefill_version),
-            (&decode, WorkerMode::Decode, decode_version),
-        ] {
-            register_with_media_capability(&ctx.registry, worker, mode, version);
-        }
-        let mut request = text_request();
-        request["messages"][0]["content"] = json!([
-            {"type": "text", "text": "Describe this image."},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U=", "detail": "high"}}
-        ]);
-        assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
-        // The whole PD pair must use local encoding if either side is old.
-        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-            assert!(body.get("input_ids").is_none());
-            assert!(body.get("kimi_k3_input_ids").is_none());
-            assert!(body.get("kimi_k3_media_input_ids").is_none());
-            assert_eq!(body["messages"], request["messages"]);
-        }
-        let exposed = metrics(&ctx).await;
-        assert_encoder_outcome(&exposed, "encoded", 0);
-        assert_encoder_outcome(&exposed, "bypassed", 1);
-        assert!(tokenizer.captured_requests().is_empty());
-        assert!(exposed.contains(&format!(
-            "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"ineligible_worker_capability\"}} 1"
-        )));
-    }
-}
-
-#[tokio::test]
-async fn kimi_k3_media_capability_gate_covers_plain_workers_and_preserves_caller_ids() {
-    for version in [None, Some(1), Some(2)] {
-        for caller_ids in [false, true] {
+    ];
+    let cases = pd
+        .into_iter()
+        .map(|(p, d)| (false, p, d))
+        .chain([None, Some(2)].map(|version| (true, version, None)));
+    for (plain, prefill_version, decode_version) in cases {
+        for media in [false, true] {
             let tokenizer = FakeTokenizer::successful();
-            let plain = MockWorker::start(vec![]).await;
-            let unused = MockWorker::start(vec![]).await;
-            let ctx = tokenizer.context(&plain, &unused);
-            ctx.registry.remove(&WorkerId(plain.url.clone()));
-            ctx.registry.remove(&WorkerId(unused.url.clone()));
-            register_with_media_capability(&ctx.registry, &plain, WorkerMode::Plain, version);
-            let mut request = text_request();
-            request["messages"][0]["content"] = json!([
-                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
-            ]);
-            if caller_ids {
-                request["input_ids"] = json!([17, 18, 19]);
-            }
-            assert_eq!(send(ctx, &request).await, StatusCode::OK);
-            let body = captured_body(&plain).await;
-            assert_eq!(body["messages"], request["messages"]);
-            if caller_ids {
-                assert_eq!(body["input_ids"], request["input_ids"]);
-                assert!(body.get("kimi_k3_media_input_ids").is_none());
-                assert!(tokenizer.captured_requests().is_empty());
-            } else if version == Some(1) {
-                assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
-                assert!(body.get("input_ids").is_none());
-                assert!(body.get("kimi_k3_input_ids").is_none());
+            let prefill = MockWorker::start(vec![]).await;
+            let decode = MockWorker::start(vec![]).await;
+            let ctx = tokenizer.context(&prefill, &decode);
+            if plain {
+                ctx.registry.remove(&WorkerId(decode.url.clone()));
+                ctx.registry.remove(&WorkerId(prefill.url.clone()));
+                register_capabilities(
+                    &ctx.registry,
+                    &prefill,
+                    WorkerMode::Plain,
+                    prefill_version,
+                    None,
+                );
             } else {
-                assert!(body.get("input_ids").is_none());
-                assert!(body.get("kimi_k3_input_ids").is_none());
-                assert!(body.get("kimi_k3_media_input_ids").is_none());
-                assert!(tokenizer.captured_requests().is_empty());
+                for (worker, mode, version) in [
+                    (&prefill, WorkerMode::Prefill, prefill_version),
+                    (&decode, WorkerMode::Decode, decode_version),
+                ] {
+                    let port = (mode == WorkerMode::Prefill).then_some(8997);
+                    register_capabilities(&ctx.registry, worker, mode, version, port);
+                }
             }
-            assert!(unused.captured.lock().unwrap().last_body.is_none());
+            let request = request_with_image(media);
+            assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+            let workers = if plain {
+                vec![&prefill]
+            } else {
+                vec![&prefill, &decode]
+            };
+            for worker in workers {
+                assert_not_router_encoded(&captured_body(worker).await);
+            }
+            assert!(tokenizer.captured_requests().is_empty());
+            assert_encoder_outcome(&metrics(&ctx).await, "bypassed", 1);
         }
     }
 }
 
 #[tokio::test]
-async fn kimi_k3_media_capability_is_rechecked_after_encoding() {
+async fn kimi_k3_capability_is_rechecked_after_encoding() {
     let tokenizer = FakeTokenizer::new("__wait_for_release__");
     let prefill = MockWorker::start(vec![]).await;
     let decode = MockWorker::start(vec![]).await;
@@ -558,14 +531,17 @@ async fn kimi_k3_media_capability_is_rechecked_after_encoding() {
     .expect("supported workers should allow image encoding to start");
 
     // A replacement can lose support while the prompt is being encoded.
-    register_with_media_capability(&ctx.registry, &prefill, WorkerMode::Prefill, None);
+    register_capabilities(
+        &ctx.registry,
+        &prefill,
+        WorkerMode::Prefill,
+        None,
+        Some(8997),
+    );
     fs::write(tokenizer.directory.path().join("release"), "").unwrap();
     assert_eq!(sending.await.unwrap(), StatusCode::OK);
     for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-        assert!(body.get("input_ids").is_none());
-        assert!(body.get("kimi_k3_input_ids").is_none());
-        assert!(body.get("kimi_k3_media_input_ids").is_none());
-        assert_eq!(body["messages"], request["messages"]);
+        assert_not_router_encoded(&body);
     }
     let exposed = metrics(&ctx).await;
     // Encoding succeeded and consumed CPU even though its result was discarded.
@@ -576,29 +552,32 @@ async fn kimi_k3_media_capability_is_rechecked_after_encoding() {
     )));
 }
 
-fn register_with_media_capability(
-    registry: &WorkerRegistry,
-    worker: &MockWorker,
-    mode: WorkerMode,
-    version: Option<u32>,
-) {
-    register_capabilities(
-        registry,
-        worker,
-        mode,
-        Some(1),
-        version,
-        (mode == WorkerMode::Prefill).then_some(8997),
-    );
-}
-
 fn register_capabilities(
     registry: &WorkerRegistry,
     worker: &MockWorker,
     mode: WorkerMode,
-    text_version: Option<u32>,
-    media_version: Option<u32>,
+    version: Option<u32>,
     bootstrap_port: Option<u16>,
+) {
+    register_worker(
+        registry,
+        worker,
+        mode,
+        version,
+        bootstrap_port,
+        OpenAiSettings::default(),
+    );
+}
+
+/// A worker whose `/server_info` reported `settings`, which carry its
+/// `--default-chat-template-kwargs`.
+fn register_worker(
+    registry: &WorkerRegistry,
+    worker: &MockWorker,
+    mode: WorkerMode,
+    version: Option<u32>,
+    bootstrap_port: Option<u16>,
+    settings: OpenAiSettings,
 ) {
     registry
         .add_with_cb(
@@ -613,9 +592,9 @@ fn register_capabilities(
             None,
             EngineProfile {
                 capabilities: WorkerCapabilities {
-                    kimi_k3_input_ids_version: text_version,
-                    kimi_k3_media_input_ids_version: media_version,
+                    kimi_k3_input_ids_version: version,
                 },
+                openai: Some(Arc::new(settings)),
                 ..WireProtocol::default().into()
             },
         )
@@ -649,33 +628,28 @@ async fn kimi_k3_audio_and_video_requests_bypass_encoder() {
     }
 }
 
+/// A request template replaces the checkpoint's encoder, so neither the Python
+/// encoder nor the Rust renderer renders the chat; the worker renders it, or
+/// rejects it without `--trust-request-chat-template`.
 #[tokio::test]
-async fn kimi_k3_request_chat_templates_bypass_encoder() {
-    for extra in [
-        json!({"chat_template_kwargs": {"chat_template": "{{ custom }}"}}),
-        json!({"chat_template": "{{ custom }}"}),
-    ] {
-        let tokenizer = FakeTokenizer::successful();
-        let prefill = MockWorker::start(vec![]).await;
-        let decode = MockWorker::start(vec![]).await;
-        let ctx = tokenizer.context(&prefill, &decode);
-        let mut request = text_request();
-        request
-            .as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        assert_eq!(send(ctx, &request).await, StatusCode::OK, "{extra}");
-        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-            assert!(body.get("input_ids").is_none(), "{extra}");
-            assert!(body.get("kimi_k3_input_ids").is_none(), "{extra}");
-            assert_eq!(body["messages"], request["messages"]);
-            assert_eq!(
-                body["chat_template_kwargs"],
-                request["chat_template_kwargs"]
-            );
-        }
-        assert!(tokenizer.captured_requests().is_empty(), "{extra}");
+async fn kimi_k3_request_chat_templates_render_on_the_worker() {
+    let tokenizer = FakeTokenizer::successful();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context(&prefill, &decode);
+    let mut request = text_request();
+    request["chat_template_kwargs"] = json!({"chat_template": "{{ custom }}"});
+    assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+    for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+        assert!(body.get("input_ids").is_none(), "{body}");
+        assert_not_router_encoded(&body);
+        assert_eq!(body["messages"], request["messages"]);
+        assert_eq!(
+            body["chat_template_kwargs"],
+            request["chat_template_kwargs"]
+        );
     }
+    assert!(tokenizer.captured_requests().is_empty());
 }
 
 #[tokio::test]
@@ -727,7 +701,6 @@ async fn kimi_k3_workers_are_selected_after_encoding_finishes() {
         &ctx.registry,
         &new_prefill,
         WorkerMode::Prefill,
-        Some(1),
         Some(1),
         Some(8998),
     );
@@ -809,69 +782,54 @@ impl sgl_kv_indexer::PrefixIndex for CountingPrefixIndex {
 
 #[tokio::test]
 async fn kimi_k3_image_ids_are_forwarded_but_excluded_from_cache_and_exact_length() {
-    for caller_ids in [false, true] {
-        for external_index in [false, true] {
-            let tokenizer = FakeTokenizer::successful();
-            let prefill = MockWorker::start(vec![]).await;
-            let decode = MockWorker::start(vec![]).await;
-            let mut ctx = tokenizer.context(&prefill, &decode);
-            let mut request = json!({
-                "model": MODEL,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "Describe the scene."},
-                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
-                ]}],
-            });
-            if caller_ids {
-                request["input_ids"] = json!(GENERATED_IDS);
-            }
-            let selections = Arc::new(AtomicUsize::new(0));
-            let queries = Arc::new(AtomicUsize::new(0));
-            let context = Arc::get_mut(&mut ctx).unwrap();
-            context.policies.insert(
-                ModelId(MODEL.into()),
-                Arc::new(ImageRoutingProbe {
-                    expected_estimate: (serde_json::to_vec(&request).unwrap().len() / 4).max(1)
-                        as u64,
-                    selections: Arc::clone(&selections),
-                }),
+    for external_index in [false, true] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let mut ctx = tokenizer.context(&prefill, &decode);
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe the scene."},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+            ]}],
+        });
+        let selections = Arc::new(AtomicUsize::new(0));
+        let queries = Arc::new(AtomicUsize::new(0));
+        let context = Arc::get_mut(&mut ctx).unwrap();
+        context.policies.insert(
+            ModelId(MODEL.into()),
+            Arc::new(ImageRoutingProbe {
+                expected_estimate: (serde_json::to_vec(&request).unwrap().len() / 4).max(1) as u64,
+                selections: Arc::clone(&selections),
+            }),
+        );
+        context.block_size_oracle.try_set(1).unwrap();
+        if external_index {
+            context.prefix_index = Some(Arc::new(CountingPrefixIndex(Arc::clone(&queries))));
+        } else {
+            // Deliberately cache the placeholder IDs. If the router hashes
+            // these, the probe would see a false match for any image URL.
+            let tree = Arc::new(HashTree::new());
+            tree.insert(
+                &KvWorkerId::new(prefill.url.clone(), 0),
+                None,
+                &compute_block_hashes(GENERATED_IDS, 1),
             );
-            context.block_size_oracle.try_set(1).unwrap();
-            if external_index {
-                context.prefix_index = Some(Arc::new(CountingPrefixIndex(Arc::clone(&queries))));
-            } else {
-                // Deliberately cache the placeholder IDs. If the router hashes
-                // these, the probe would see a false match for any image URL.
-                let tree = Arc::new(HashTree::new());
-                tree.insert(
-                    &KvWorkerId::new(prefill.url.clone(), 0),
-                    None,
-                    &compute_block_hashes(GENERATED_IDS, 1),
-                );
-                context.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(
-                    tree,
-                    Arc::clone(&context.block_size_oracle),
-                ));
-            }
-            assert_eq!(send(ctx, &request).await, StatusCode::OK);
-            for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-                if caller_ids {
-                    assert_eq!(body["input_ids"], json!(GENERATED_IDS));
-                    assert!(body.get("kimi_k3_media_input_ids").is_none());
-                } else {
-                    assert_eq!(body["kimi_k3_media_input_ids"], json!(GENERATED_IDS));
-                    assert!(body.get("input_ids").is_none());
-                    assert!(body.get("kimi_k3_input_ids").is_none());
-                }
-                assert_eq!(body["messages"], request["messages"]);
-            }
-            assert!(selections.load(Ordering::Relaxed) > 0);
-            assert_eq!(queries.load(Ordering::Relaxed), 0);
-            assert_eq!(
-                tokenizer.captured_requests(),
-                if caller_ids { vec![] } else { vec![request] }
-            );
+            context.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(
+                tree,
+                Arc::clone(&context.block_size_oracle),
+            ));
         }
+        assert_eq!(send(ctx, &request).await, StatusCode::OK);
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            assert_eq!(body["kimi_k3_input_ids"], json!(GENERATED_IDS));
+            assert!(body.get("input_ids").is_none());
+            assert_eq!(body["messages"], request["messages"]);
+        }
+        assert!(selections.load(Ordering::Relaxed) > 0);
+        assert_eq!(queries.load(Ordering::Relaxed), 0);
+        assert_eq!(tokenizer.captured_requests(), vec![request]);
     }
 }
 
@@ -1085,26 +1043,6 @@ async fn kimi_k3_cancelled_request_keeps_process_in_use_until_encoding_exits() {
 }
 
 #[tokio::test]
-async fn kimi_k3_pre_dispatch_timeout_preserves_healthy_process() {
-    let tokenizer = FakeTokenizer::successful();
-    let prefill = MockWorker::start(vec![]).await;
-    let decode = MockWorker::start(vec![]).await;
-    let ctx = tokenizer.context(&prefill, &decode);
-    let request = text_request();
-    let expired = std::time::Instant::now() - Duration::from_millis(1);
-
-    assert!(ctx
-        .tokenizers
-        .encode_kimi_request(MODEL, &request, expired)
-        .is_err());
-    assert_eq!(tokenizer.started_processes().len(), 1);
-
-    assert_eq!(send(ctx, &request).await, StatusCode::OK);
-    assert_eq!(tokenizer.started_processes().len(), 1);
-    assert_eq!(tokenizer.captured_requests(), vec![request]);
-}
-
-#[tokio::test]
 async fn kimi_k3_restart_finishes_after_request_timeout_for_later_request() {
     let success = json!({"input_ids": GENERATED_IDS}).to_string();
     let tokenizer =
@@ -1212,53 +1150,6 @@ async fn kimi_k3_caller_ids_and_audio_bypass_a_busy_encoder() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// A worker supporting the legacy media field alone cannot apply the new text
-/// accounting semantics. Both text and images must stay on the worker then.
-#[tokio::test]
-async fn kimi_k3_generic_capability_is_required_for_text_and_images() {
-    for media in [false, true] {
-        for plain in [false, true] {
-            for version in [None, Some(0), Some(2)] {
-                let tokenizer = FakeTokenizer::successful();
-                let prefill = MockWorker::start(vec![]).await;
-                let decode = MockWorker::start(vec![]).await;
-                let ctx = tokenizer.context(&prefill, &decode);
-                if plain {
-                    ctx.registry.remove(&WorkerId(prefill.url.clone()));
-                    ctx.registry.remove(&WorkerId(decode.url.clone()));
-                    register_capabilities(
-                        &ctx.registry,
-                        &prefill,
-                        WorkerMode::Plain,
-                        version,
-                        Some(1),
-                        None,
-                    );
-                } else {
-                    register_capabilities(
-                        &ctx.registry,
-                        &decode,
-                        WorkerMode::Decode,
-                        version,
-                        Some(1),
-                        None,
-                    );
-                }
-                let request = request_with_image(media);
-                assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
-                for worker in [&prefill, &decode]
-                    .into_iter()
-                    .take(if plain { 1 } else { 2 })
-                {
-                    assert_local_encoding(&captured_body(worker).await, &request);
-                }
-                assert!(tokenizer.captured_requests().is_empty());
-                assert_encoder_outcome(&metrics(&ctx).await, "bypassed", 1);
-            }
-        }
-    }
-}
-
 fn request_with_image(media: bool) -> Value {
     let mut request = text_request();
     if media {
@@ -1270,28 +1161,26 @@ fn request_with_image(media: bool) -> Value {
     request
 }
 
-fn assert_local_encoding(body: &Value, request: &Value) {
-    assert!(body.get("input_ids").is_none());
-    assert!(body.get("kimi_k3_input_ids").is_none());
-    assert!(body.get("kimi_k3_media_input_ids").is_none());
-    assert_eq!(body["messages"], request["messages"]);
+/// The chat took the Rust path, as without the Python encoder.
+fn assert_not_router_encoded(body: &Value) {
+    assert!(body.get("kimi_k3_input_ids").is_none(), "{body}");
 }
 
 #[derive(Debug)]
 struct FirstWorkerPolicy {
     preferred_url: String,
-    routing_tokens: bool,
+    /// The routing tokens the policy must see, when it asks for them.
+    expected_tokens: Option<Vec<u32>>,
 }
 
 impl Policy for FirstWorkerPolicy {
     fn needs_request_tokens(&self) -> bool {
-        self.routing_tokens
+        self.expected_tokens.is_some()
     }
 
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        if self.routing_tokens {
-            assert_eq!(ctx.request_tokens(), Some(GENERATED_IDS));
-            assert_eq!(ctx.input_tokens(), Some(GENERATED_IDS.len() as u64));
+        if let Some(expected) = &self.expected_tokens {
+            assert_eq!(ctx.request_tokens(), Some(expected.as_slice()));
         }
         workers
             .iter()
@@ -1325,7 +1214,6 @@ async fn kimi_k3_retries_recheck_capabilities_without_losing_encoded_ids() {
                     worker,
                     WorkerMode::Plain,
                     supports.then_some(1),
-                    Some(1),
                     None,
                 );
             }
@@ -1333,7 +1221,7 @@ async fn kimi_k3_retries_recheck_capabilities_without_losing_encoded_ids() {
                 ModelId(MODEL.into()),
                 Arc::new(FirstWorkerPolicy {
                     preferred_url: failed.url.clone(),
-                    routing_tokens: false,
+                    expected_tokens: None,
                 }),
             );
             let request = request_with_image(media);
@@ -1341,15 +1229,10 @@ async fn kimi_k3_retries_recheck_capabilities_without_losing_encoded_ids() {
             for (worker, supports) in [(&failed, first_supports), (&ok, !first_supports)] {
                 let body = captured_body(worker).await;
                 if supports {
-                    let field = if media {
-                        "kimi_k3_media_input_ids"
-                    } else {
-                        "kimi_k3_input_ids"
-                    };
-                    assert_eq!(body[field], json!(GENERATED_IDS));
+                    assert_eq!(body["kimi_k3_input_ids"], json!(GENERATED_IDS));
                     assert!(body.get("input_ids").is_none());
                 } else {
-                    assert_local_encoding(&body, &request);
+                    assert_not_router_encoded(&body);
                 }
             }
             assert_eq!(tokenizer.captured_requests(), vec![request]);
@@ -1360,42 +1243,53 @@ async fn kimi_k3_retries_recheck_capabilities_without_losing_encoded_ids() {
     }
 }
 
-/// Turning off forwarding must still supply exact text tokens to a policy
-/// that needs them, even when workers have no dedicated-ID capability.
+/// A chat the encoder skips takes the Rust path, as without the encoder: the
+/// Rust tokenizer's tokens drive routing, and the IDs it forwards, if any, go
+/// in `input_ids`.
 #[tokio::test]
-async fn kimi_k3_disabled_forwarding_keeps_text_tokens_for_routing() {
-    let tokenizer = FakeTokenizer::successful();
-    let prefill = MockWorker::start(vec![]).await;
-    let decode = MockWorker::start(vec![]).await;
-    let mut cfg = tokenizer.config();
-    cfg.model.disable_input_ids_forwarding = true;
-    let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
-    for (worker, mode) in [
-        (&prefill, WorkerMode::Prefill),
-        (&decode, WorkerMode::Decode),
-    ] {
-        register_capabilities(
-            &ctx.registry,
-            worker,
-            mode,
-            None,
-            None,
-            (mode == WorkerMode::Prefill).then_some(8997),
+async fn kimi_k3_skipped_chats_route_on_rust_tokens() {
+    for disable_forwarding in [true, false] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let mut cfg = tokenizer.config();
+        cfg.model.disable_input_ids_forwarding = disable_forwarding;
+        let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
+        for (worker, mode) in [
+            (&prefill, WorkerMode::Prefill),
+            (&decode, WorkerMode::Decode),
+        ] {
+            register_capabilities(
+                &ctx.registry,
+                worker,
+                mode,
+                None,
+                (mode == WorkerMode::Prefill).then_some(8997),
+            );
+        }
+        let request = text_request();
+        let rust_ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+        ctx.policies.insert(
+            ModelId(MODEL.into()),
+            Arc::new(FirstWorkerPolicy {
+                preferred_url: prefill.url.clone(),
+                expected_tokens: Some(rust_ids),
+            }),
         );
+        assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            assert_not_router_encoded(&body);
+        }
+        assert!(tokenizer.captured_requests().is_empty());
+        let outcome = if disable_forwarding {
+            "disabled"
+        } else {
+            "forwarded"
+        };
+        assert!(metrics(&ctx).await.contains(&format!(
+            "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"{outcome}\"}} 1"
+        )));
     }
-    ctx.policies.insert(
-        ModelId(MODEL.into()),
-        Arc::new(FirstWorkerPolicy {
-            preferred_url: prefill.url.clone(),
-            routing_tokens: true,
-        }),
-    );
-    let request = text_request();
-    assert_eq!(send(ctx, &request).await, StatusCode::OK);
-    for body in [captured_body(&prefill).await, captured_body(&decode).await] {
-        assert_local_encoding(&body, &request);
-    }
-    assert_eq!(tokenizer.captured_requests(), vec![request]);
 }
 
 /// Both policy implementations share asynchronous preparation and PD body
@@ -1420,17 +1314,110 @@ async fn kimi_k3_reorg_routes_text_and_images_with_one_encoding() {
         context.chat_routing = ChatRouting::Reorg([(ModelId(MODEL.into()), resolver)].into());
         let request = request_with_image(media);
         assert_eq!(send(ctx, &request).await, StatusCode::OK);
-        let field = if media {
-            "kimi_k3_media_input_ids"
-        } else {
-            "kimi_k3_input_ids"
-        };
         let p = captured_body(&prefill).await;
         let d = captured_body(&decode).await;
-        assert_eq!(p[field], json!(GENERATED_IDS));
-        assert_eq!(d[field], p[field]);
+        assert_eq!(p["kimi_k3_input_ids"], json!(GENERATED_IDS));
+        assert_eq!(d["kimi_k3_input_ids"], p["kimi_k3_input_ids"]);
         assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
         assert_eq!(p["rid"], d["rid"]);
         assert_eq!(tokenizer.captured_requests(), vec![request]);
     }
+}
+
+/// The encoder applies the router's `--default-chat-template-kwargs`; a worker
+/// reporting other defaults, or none, would take IDs that differ from its own
+/// rendering, so it renders locally.
+#[tokio::test]
+async fn kimi_k3_ids_need_the_workers_default_chat_template_kwargs() {
+    let other_defaults = OpenAiSettings {
+        default_chat_template_kwargs: json!({"thinking": false}).as_object().cloned(),
+        ..Default::default()
+    };
+    // `None`: the worker's /server_info carried no OpenAI settings to compare.
+    for settings in [Some(other_defaults), None] {
+        let tokenizer = FakeTokenizer::successful();
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = tokenizer.context(&prefill, &decode);
+        let spec = WorkerSpec {
+            id: WorkerId(decode.url.clone()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId(MODEL.into())],
+            ..Default::default()
+        };
+        let profile = EngineProfile {
+            capabilities: WorkerCapabilities {
+                kimi_k3_input_ids_version: Some(1),
+            },
+            openai: settings.map(Arc::new),
+            ..WireProtocol::default().into()
+        };
+        ctx.registry.add_with_cb(spec, None, profile).unwrap();
+        let request = text_request();
+        assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+        for body in [captured_body(&prefill).await, captured_body(&decode).await] {
+            assert_not_router_encoded(&body);
+        }
+        assert!(tokenizer.captured_requests().is_empty());
+    }
+}
+
+/// Workers take `kimi_k3_input_ids` as the router's own rendering, so a client
+/// must not send it.
+#[tokio::test]
+async fn kimi_k3_router_input_ids_from_clients_are_rejected() {
+    let tokenizer = FakeTokenizer::successful();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let ctx = tokenizer.context(&prefill, &decode);
+    let mut request = text_request();
+    request["kimi_k3_input_ids"] = json!([1, 2, 3]);
+    assert_eq!(
+        send(Arc::clone(&ctx), &request).await,
+        StatusCode::BAD_REQUEST
+    );
+    request["kimi_k3_input_ids"] = Value::Null;
+    assert_eq!(send(Arc::clone(&ctx), &request).await, StatusCode::OK);
+    assert_eq!(
+        captured_body(&decode).await["kimi_k3_input_ids"],
+        json!(GENERATED_IDS)
+    );
+}
+
+/// The encoder validates the request the workers receive, so a null that the
+/// sampling contract fills must reach it filled; the Python schema rejects it.
+#[tokio::test]
+async fn kimi_k3_sampling_defaults_reach_the_encoder() {
+    let tokenizer = FakeTokenizer::successful();
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let mut cfg = tokenizer.config();
+    let argv = [
+        "sgl-router",
+        "--model-id",
+        MODEL,
+        "--worker-urls",
+        "http://placeholder:0",
+        "--override-sampling-params",
+        r#"{"n": 1, "frequency_penalty": 0.5}"#,
+    ];
+    cfg.model.sampling_overrides = <sgl_router::config::Cli as clap::Parser>::parse_from(argv)
+        .into_config()
+        .unwrap()
+        .model
+        .sampling_overrides;
+    let ctx = tokenizer.context_with_config(&prefill, &decode, cfg, 5, 300);
+    let mut request = text_request();
+    request["n"] = Value::Null;
+    request["frequency_penalty"] = Value::Null;
+    assert_eq!(send(ctx, &request).await, StatusCode::OK);
+    let encoded = tokenizer.captured_requests();
+    assert_eq!(encoded.len(), 1);
+    assert_eq!(encoded[0]["n"], json!(1));
+    assert_eq!(encoded[0]["frequency_penalty"], json!(0.5));
+    assert_eq!(
+        captured_body(&decode).await["kimi_k3_input_ids"],
+        json!(GENERATED_IDS)
+    );
 }

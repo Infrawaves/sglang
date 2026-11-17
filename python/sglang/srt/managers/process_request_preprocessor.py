@@ -62,9 +62,7 @@ logger = logging.getLogger(__name__)
 # Request fields too large to deep-copy for change detection. Conversion only
 # reads them (it renders dumps/copies), so the child reports them back only if
 # the attribute was rebound or resized.
-_IDENTITY_TRACKED_FIELDS = frozenset(
-    {"messages", "kimi_k3_input_ids", "kimi_k3_media_input_ids"}
-)
+_IDENTITY_TRACKED_FIELDS = frozenset({"messages"})
 # Token id lists at least this long cross the process boundary as int64 arrays:
 # unpickling a list costs ~40ns per id on the receiving side, an array ~nothing.
 _PACK_MIN_IDS = 256
@@ -565,10 +563,14 @@ class ProcessRequestPreprocessor:
         Conversion errors are re-raised here with the same type the in-process
         path would raise (ValueError, HTTPException, ...).
         """
-        if getattr(request, "kimi_k3_media_input_ids", None) is not None:
-            # Children intentionally have no multimodal processor. The parent
-            # must check its processor's capability and preserve router IDs;
-            # a child would fall back to rendering the same media prompt again.
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and request.kimi_k3_input_ids is not None
+        ):
+            # Router IDs need no rendering, and a child has no multimodal
+            # processor to accept image IDs with, so convert in-process.
             return None
         pool = self._pool
         if pool is None or not self.accepts(handler):

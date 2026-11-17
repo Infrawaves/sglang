@@ -28,6 +28,8 @@ dynamo-tokenizers = "=3.1.0"
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
 dynamo-renderer = "=7.1.1"
+# Kills the Kimi-K3 encoder's process group, wrapper children included.
+libc = "0.2"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.

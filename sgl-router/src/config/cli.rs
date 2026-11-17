@@ -1284,9 +1284,7 @@ mod tests {
         let config = Cli::try_parse_from(base).unwrap().into_config().unwrap();
         assert_eq!(config.proxy.max_chat_body_bytes, 70_000_000);
 
-        let args = base
-            .iter()
-            .chain(["--max-chat-body-bytes", "536870912"].iter());
+        let args = base.iter().chain(["--max-chat-body-bytes", "536870912"].iter());
         let config = Cli::try_parse_from(args).unwrap().into_config().unwrap();
         assert_eq!(config.proxy.max_chat_body_bytes, 512 << 20);
     }

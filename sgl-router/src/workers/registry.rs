@@ -341,7 +341,6 @@ mod tests {
             EngineProfile {
                 capabilities: crate::workers::WorkerCapabilities {
                     kimi_k3_input_ids_version: Some(1),
-                    kimi_k3_media_input_ids_version: Some(1),
                 },
                 ..WireProtocol::Http1.into()
             },
@@ -349,7 +348,6 @@ mod tests {
         .unwrap();
         let second = r.get(&id).unwrap();
         assert!(second.supports_kimi_k3_input_ids());
-        assert!(second.supports_kimi_k3_media_input_ids());
         assert_eq!(second.measured_prefill_cold_ratio(), Some(0.25));
         assert_eq!(
             second.prefill_cold_ratio(window / 2, Some(3 * window / 2)),
@@ -375,7 +373,6 @@ mod tests {
                     EngineProfile {
                         capabilities: crate::workers::WorkerCapabilities {
                             kimi_k3_input_ids_version: version,
-                            kimi_k3_media_input_ids_version: version,
                         },
                         ..WireProtocol::Http1.into()
                     },
@@ -383,10 +380,6 @@ mod tests {
                 .unwrap();
             let worker = registry.get(&spec.id).unwrap();
             assert_eq!(worker.supports_kimi_k3_input_ids(), version == Some(1));
-            assert_eq!(
-                worker.supports_kimi_k3_media_input_ids(),
-                version == Some(1)
-            );
         }
     }
 

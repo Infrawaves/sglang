@@ -168,8 +168,6 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
-_truncate_kimi_k3_videos = kimi_k3_tokenization.truncate_kimi_k3_videos
-
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
@@ -260,30 +258,6 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
-
-
-KIMI_K3_IMAGE_PLACEHOLDER = kimi_k3_tokenization.KIMI_K3_IMAGE_PLACEHOLDER
-KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = (
-    kimi_k3_tokenization.KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED
-)
-_KIMI_K3_EFFORT_TIERS = kimi_k3_tokenization._KIMI_K3_EFFORT_TIERS
-_KIMI_K31_EFFORT_TIERS = kimi_k3_tokenization._KIMI_K31_EFFORT_TIERS
-
-
-kimi_k3_thinking_effort = kimi_k3_tokenization.kimi_k3_thinking_effort
-
-
-neutralize_kimi_k3_image_placeholder = (
-    kimi_k3_tokenization.neutralize_kimi_k3_image_placeholder
-)
-
-
-neutralize_kimi_k3_image_placeholder_value = (
-    kimi_k3_tokenization.neutralize_kimi_k3_image_placeholder_value
-)
-
-
-_validate_kimi_k3_message_tools = kimi_k3_tokenization.validate_kimi_k3_message_tools
 
 
 _M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
@@ -677,24 +651,12 @@ class OpenAIServingChat(OpenAIServingBase):
         return "chatcmpl-"
 
     def _kimi_k3_effort_tiers(self) -> dict:
-        """K3.1 adds a native "medium" thinking tier on top of K3's three."""
-        model_type = getattr(
-            self.tokenizer_manager.model_config.hf_config, "model_type", None
+        return kimi_k3_tokenization.kimi_k3_effort_tiers(
+            self.tokenizer_manager.model_config.hf_config.model_type
         )
-        if model_type == "kimi_k31":
-            return _KIMI_K31_EFFORT_TIERS
-        return _KIMI_K3_EFFORT_TIERS
 
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
-        tools = list(request.tools or [])
-        for message in request.messages:
-            if (
-                isinstance(message, ChatCompletionMessageGenericParam)
-                and message.role in ("root", "system", "developer")
-                and message.tools
-            ):
-                tools.extend(message.tools)
-        return tools
+        return kimi_k3_tokenization.effective_tools(request)
 
     def _prepare_kimi_k3_messages(
         self,
@@ -729,9 +691,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tokenizer_manager.tokenizer,
                 messages,
                 request,
-                model_type=getattr(
-                    self.tokenizer_manager.model_config.hf_config, "model_type", None
-                ),
+                model_type=self.tokenizer_manager.model_config.hf_config.model_type,
                 append_prefix=self._append_assistant_prefix_to_prompt_ids,
             )
         return None
@@ -1210,7 +1170,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if m3_error:
                 return m3_error
         if self.chat_encoding_spec == "kimi_k3":
-            k3_error = _validate_kimi_k3_message_tools(request)
+            k3_error = kimi_k3_tokenization.validate_kimi_k3_message_tools(request)
             if k3_error:
                 return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
@@ -1229,7 +1189,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 except ValidationError as exc:
                     return f"invalid thinking: {exc}"
             try:
-                kimi_k3_thinking_effort(
+                kimi_k3_tokenization.kimi_k3_thinking_effort(
                     request.reasoning_effort, self._kimi_k3_effort_tiers()
                 )
             except ValueError as exc:
@@ -1954,7 +1914,8 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def supports_kimi_k3_input_ids(self) -> bool:
-        """Whether router-rendered chat IDs can replace native encoding."""
+        """Whether router-rendered chat IDs can replace native encoding, for
+        `/server_info`'s `kimi_k3_input_ids_version`."""
         return (
             self.chat_encoding_spec == "kimi_k3"
             and self.tokenizer_manager.tokenizer is not None
@@ -1966,14 +1927,15 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.default_chat_template_kwargs.get("chat_template") is None
         )
 
-    def supports_kimi_k3_media_input_ids(self) -> bool:
+    def _expands_kimi_k3_media_placeholders(self, is_multimodal: bool) -> bool:
+        """Router IDs hold one placeholder per image, which only a K3
+        processor expands; without one, image chats render locally."""
         processor = self.tokenizer_manager.mm_processor
         return (
-            self.supports_kimi_k3_input_ids()
-            and self.tokenizer_manager.model_config.is_multimodal
+            is_multimodal
             and get_mm().enable_multimodal is not False
             and processor is not None
-            and processor.kimi_k3_media_input_ids_version == 1
+            and processor.kimi_k3_input_ids_version == 1
         )
 
     def _process_messages(
@@ -2151,30 +2113,25 @@ class OpenAIServingChat(OpenAIServingBase):
         input_ids = request.input_ids
         if (
             input_ids is None
+            and request.kimi_k3_input_ids is not None
             and (request.chat_template_kwargs or {}).get("chat_template") is None
-        ):
-            if (
-                request.kimi_k3_media_input_ids is not None
-                and is_multimodal
-                and self.supports_kimi_k3_media_input_ids()
-            ):
-                input_ids = request.kimi_k3_media_input_ids
-            elif (
-                request.kimi_k3_input_ids is not None
-                and self.supports_kimi_k3_input_ids()
-                and not any(
+            and self.supports_kimi_k3_input_ids()
+            and (
+                not any(
                     part.type in _MEDIA_CONTENT_PART_TYPES
                     for message in request.messages
                     if isinstance(message.content, list)
                     for part in message.content
                 )
-            ):
-                input_ids = request.kimi_k3_input_ids
+                or self._expands_kimi_k3_media_placeholders(is_multimodal)
+            )
+        ):
+            input_ids = request.kimi_k3_input_ids
         if input_ids is not None:
             image_data, video_data, audio_data, modalities = [], [], [], []
             if self.chat_encoding_spec == "kimi_k3" and is_multimodal:
                 messages = [msg.model_dump() for msg in request.messages]
-                _truncate_kimi_k3_videos(messages)
+                kimi_k3_tokenization.truncate_kimi_k3_videos(messages)
                 image_data, video_data, audio_data, modalities = (
                     self._extract_media_from_messages(messages)
                 )
@@ -2297,7 +2254,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     message, strict=strict_tool_call_arguments
                 )
         if self.chat_encoding_spec == "kimi_k3":
-            _truncate_kimi_k3_videos(messages)
+            kimi_k3_tokenization.truncate_kimi_k3_videos(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),

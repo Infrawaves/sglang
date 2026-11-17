@@ -1220,13 +1220,13 @@ class ChatCompletionRequest(PDRoutingFields):
     # provide one unexpanded image placeholder per image for its MM processor.
     input_ids: Optional[List[int]] = None
 
-    # Internal router-worker protocol v1. Unlike caller input_ids, these are
-    # rendered chat prompts and retain K3's generation-stub usage accounting.
-    # Older workers ignore the fields and encode messages locally.
+    # Internal router-worker protocol v1: the sgl-router's rendering of these
+    # messages, with one unexpanded placeholder per image. Unlike caller
+    # input_ids, they keep K3's generation-stub usage accounting. Workers that do
+    # not advertise kimi_k3_input_ids_version ignore the field.
     kimi_k3_input_ids: Optional[List[int]] = None
-    kimi_k3_media_input_ids: Optional[List[int]] = None
 
-    @field_validator("kimi_k3_input_ids", "kimi_k3_media_input_ids", mode="before")
+    @field_validator("kimi_k3_input_ids", mode="before")
     @classmethod
     def validate_kimi_k3_router_input_ids(cls, value):
         if value is not None and (

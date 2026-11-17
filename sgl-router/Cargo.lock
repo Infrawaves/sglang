@@ -3762,6 +3762,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "libc",
  "minijinja",
  "parking_lot",
  "prost",

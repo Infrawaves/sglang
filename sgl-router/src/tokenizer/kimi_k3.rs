@@ -8,7 +8,7 @@
 //! with a pending response from a timed-out request.
 
 use super::options::ChatEncodingOptions;
-use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
+use crate::server::metrics::{EncoderMetrics, EncoderOutcome, EncoderQueueGuard};
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,6 +33,18 @@ pub enum EncodeError {
     Timeout(anyhow::Error),
     #[error("Kimi-K3 encoder unavailable: {0:#}")]
     Unavailable(#[from] anyhow::Error),
+}
+
+impl EncodeError {
+    pub(crate) fn outcome(&self) -> EncoderOutcome {
+        match self {
+            Self::Request(_) => EncoderOutcome::RequestError,
+            Self::Internal(_) => EncoderOutcome::InternalError,
+            Self::QueueTimeout => EncoderOutcome::QueueTimeout,
+            Self::Timeout(_) => EncoderOutcome::EncodeTimeout,
+            Self::Unavailable(_) => EncoderOutcome::Unavailable,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -68,12 +80,19 @@ impl Process {
             deadline > Instant::now(),
             "Kimi-K3 tokenizer startup deadline elapsed before process start"
         );
-        let mut child = Command::new(&options.tokenizer_python)
+        let mut command = Command::new(&options.tokenizer_python);
+        // Its own process group, so cleanup also reaches processes a wrapper
+        // `--tokenizer-python` starts, which would otherwise hold the pipes open.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .args([
                 "-u",
                 "-m",
                 "sglang.srt.entrypoints.openai.kimi_k3_tokenization",
             ])
+            // The encoder exits when this process does, even mid-startup.
+            .args(["--parent-pid", &std::process::id().to_string()])
             .env("TOKENIZERS_PARALLELISM", "false")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -180,12 +199,43 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         // Killing before joining also unblocks a full stdin pipe or a stalled read.
+        // The unreaped child keeps its PID, so its process group cannot be reused yet.
+        #[cfg(unix)]
+        let group = i32::try_from(self.child.id()).ok();
+        #[cfg(unix)]
+        if let Some(group) = group {
+            // SAFETY: kill(2) only signals; `group` is the group created for this child.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(unix)]
+        if let Some(group) = group {
+            reap_adopted(group);
+        }
         self.requests.take();
         if let Some(thread) = self.io_thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Reap members of the killed `group` this process adopted. A wrapper's
+/// children are reparented to the router when it is PID 1 or a subreaper, as in
+/// a container without an init, and would otherwise stay zombies. Any adopted
+/// members were reparented before the wrapper's own reap returned, and are
+/// already SIGKILLed; elsewhere none are this process's children.
+#[cfg(unix)]
+fn reap_adopted(group: i32) {
+    loop {
+        // SAFETY: waitpid(2) on this process's own children in `group` only.
+        let reaped = unsafe { libc::waitpid(-group, std::ptr::null_mut(), 0) };
+        if reaped > 0
+            || (reaped < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
+        {
+            continue;
+        }
+        break;
     }
 }
 
@@ -215,10 +265,6 @@ pub struct KimiK3Pool {
 }
 
 impl KimiK3Pool {
-    pub fn new(source: &str, options: &ChatEncodingOptions, defaults: Value) -> Result<Self> {
-        Self::new_with_metrics(source, options, defaults, EncoderMetrics::new(source))
-    }
-
     pub(crate) fn new_with_metrics(
         source: &str,
         options: &ChatEncodingOptions,
@@ -255,10 +301,6 @@ impl KimiK3Pool {
                 returned: Condvar::new(),
             }),
         })
-    }
-
-    pub fn encode(&self, request: &Value, deadline: Instant) -> Result<Vec<u32>, EncodeError> {
-        self.encode_queued(request, deadline, self.metrics.queue())
     }
 
     pub(crate) fn metrics(&self) -> Arc<EncoderMetrics> {
@@ -474,6 +516,17 @@ impl KimiK3Pool {
     }
 }
 
+/// What the Python encoder loads for `--tokenizer-path`: the directory of a
+/// local tokenizer file, which also holds the `config.json` the encoder reads,
+/// or the same HF repo id the Rust tokenizer resolves.
+pub fn encoder_source(tokenizer_path: &str) -> String {
+    let path = std::path::Path::new(tokenizer_path);
+    match path.parent() {
+        Some(dir) if path.is_file() => dir.to_string_lossy().into_owned(),
+        _ => tokenizer_path.to_owned(),
+    }
+}
+
 /// Request-supplied templates stay on the workers, which gate them behind
 /// `--trust-request-chat-template`; serving reads them from `chat_template_kwargs`.
 fn has_request_chat_template(request: &Value) -> bool {
@@ -489,7 +542,7 @@ fn has_request_chat_template(request: &Value) -> bool {
 /// Image URLs remain in messages for worker-side loading and placeholder
 /// expansion. Audio, video and custom templates retain worker-side encoding.
 pub fn is_supported_request(request: &Value) -> bool {
-    ["input_ids", "kimi_k3_input_ids", "kimi_k3_media_input_ids"]
+    ["input_ids", "kimi_k3_input_ids"]
         .iter()
         .all(|field| request.get(*field).is_none_or(Value::is_null))
         && !has_request_chat_template(request)
@@ -569,5 +622,120 @@ mod tests {
         ] {
             assert!(is_supported_request(&chat(extra.clone())), "{extra}");
         }
+    }
+
+    /// A pool of one fake encoder (`tests/fixtures/kimi_k3/fake_tokenizer.py`)
+    /// answering `replies` in turn; with `wrapped`, started through a shell
+    /// that does not exec, as a `--tokenizer-python` wrapper can be.
+    fn fake_pool(dir: &std::path::Path, replies: &[&str], wrapped: bool) -> KimiK3Pool {
+        let fixture = json!({"replies": replies, "restart_delay_millis": 0, "generated_ids": [7]});
+        std::fs::write(dir.join("fixture.json"), fixture.to_string()).unwrap();
+        let encoder = dir.join("fake-tokenizer");
+        std::os::unix::fs::symlink(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/kimi_k3/fake_tokenizer.py"),
+            &encoder,
+        )
+        .unwrap();
+        let python = if wrapped {
+            let wrapper = dir.join("wrapper.sh");
+            let script = format!("#!/bin/sh\n{} \"$@\"\n", encoder.display());
+            std::fs::write(&wrapper, script).unwrap();
+            std::fs::set_permissions(
+                &wrapper,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            wrapper
+        } else {
+            encoder
+        };
+        let options = ChatEncodingOptions {
+            chat_encoder: super::super::options::ChatEncoderKind::KimiK3,
+            tokenizer_python: python.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        KimiK3Pool::new_with_metrics("unused", &options, json!({}), EncoderMetrics::new("k3"))
+            .unwrap()
+    }
+
+    /// A job whose deadline passed while it waited for a blocking thread must
+    /// not take, and then retire, a healthy process.
+    #[test]
+    fn an_expired_deadline_leaves_the_process_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &[r#"{"input_ids": [7]}"#], false);
+        let request = chat(json!({}));
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            pool.encode_queued(&request, expired, pool.metrics().queue()),
+            Err(EncodeError::QueueTimeout)
+        ));
+        assert_eq!(pool.process_counts(), [1, 0, 0, 0]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ids = pool.encode_queued(&request, deadline, pool.metrics().queue());
+        assert_eq!(ids.unwrap(), vec![7]);
+        let captured = std::fs::read_to_string(dir.path().join("requests.jsonl")).unwrap();
+        assert_eq!(captured.lines().count(), 1);
+    }
+
+    /// A timed-out encoder started through a wrapper that does not exec must
+    /// die with the wrapper: a survivor holds the pipes open, so the slot is
+    /// never freed and every later request times out.
+    #[test]
+    fn a_timed_out_wrapped_encoder_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &["__stall__", r#"{"input_ids": [7]}"#], true);
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let request = chat(json!({}));
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let first = pool.encode_queued(&request, deadline, pool.metrics().queue());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let second = pool.encode_queued(&request, deadline, pool.metrics().queue());
+            let _ = done.send((
+                first.map_err(|e| e.to_string()),
+                second.map_err(|e| e.to_string()),
+            ));
+        });
+        let (first, second) = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the timed-out encoder blocked its slot");
+        assert!(first.unwrap_err().contains("timed out"));
+        assert_eq!(second.unwrap(), vec![7]);
+    }
+
+    /// As PID 1 or a subreaper (a container without an init), the router adopts
+    /// a killed wrapper's encoder and must reap it, or each timeout leaks a zombie.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_killed_wrapper_leaves_no_zombie_under_a_subreaper() {
+        // SAFETY: prctl(2) only marks this test process as a subreaper.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &["__stall__", r#"{"input_ids": [7]}"#], true);
+        let group = match &pool.shared.state.lock().unwrap().slots[0] {
+            ProcessSlot::Ready { process, .. } => process.child.id().to_string(),
+            _ => unreachable!("the pool starts ready"),
+        };
+        let request = chat(json!({}));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        assert!(pool
+            .encode_queued(&request, deadline, pool.metrics().queue())
+            .is_err());
+        // Fields after the command name: state, ppid, pgrp.
+        let members: Vec<String> = std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path().join("stat")).ok())
+            .filter_map(|stat| {
+                let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+                (fields.get(2) == Some(&group.as_str())).then(|| stat.clone())
+            })
+            .collect();
+        assert!(members.is_empty(), "group {group} left: {members:?}");
+        // The replacement must be up before the fixture directory goes away.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ids = pool.encode_queued(&request, deadline, pool.metrics().queue());
+        assert_eq!(ids.unwrap(), vec![7]);
     }
 }

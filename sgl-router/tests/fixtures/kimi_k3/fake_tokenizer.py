@@ -19,7 +19,9 @@ started_count = int(process_count.read_text()) if process_count.exists() else 0
 process_count.write_text(str(started_count + 1))
 with (directory / "processes.txt").open("a", encoding="utf-8") as started:
     started.write(str(os.getpid()) + "\n")
-json.loads(sys.stdin.readline())
+init = sys.stdin.readline()
+json.loads(init)
+(directory / "init.json").write_text(init)
 if started_count:
     time.sleep(scenario["restart_delay_millis"] / 1000)
 print(json.dumps({"ready": True}), flush=True)

@@ -176,7 +176,7 @@ class TestServerInfoKimiK3RouterCapabilities(CustomTestCase):
         chat.tokenizer_manager = SimpleNamespace(
             tokenizer=object(),
             model_config=SimpleNamespace(is_multimodal=True),
-            mm_processor=SimpleNamespace(kimi_k3_media_input_ids_version=1),
+            mm_processor=SimpleNamespace(kimi_k3_input_ids_version=1),
         )
         chat.template_manager = SimpleNamespace(chat_template_name=None)
         chat.default_chat_template_kwargs = {}
@@ -184,18 +184,11 @@ class TestServerInfoKimiK3RouterCapabilities(CustomTestCase):
         with get_context().override_server_args(enable_multimodal=True):
             payload = _call_server_info_with(args, serving_chat=chat)
             self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
-            self.assertEqual(payload["kimi_k3_media_input_ids_version"], 1)
-            chat.tokenizer_manager.mm_processor.kimi_k3_media_input_ids_version = None
-            payload = _call_server_info_with(args, serving_chat=chat)
-            self.assertEqual(payload["kimi_k3_input_ids_version"], 1)
-            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
             chat.default_chat_template_kwargs = {"chat_template": "custom"}
             payload = _call_server_info_with(args, serving_chat=chat)
             self.assertIsNone(payload["kimi_k3_input_ids_version"])
-            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
             payload = _call_server_info_with(args)
             self.assertIsNone(payload["kimi_k3_input_ids_version"])
-            self.assertIsNone(payload["kimi_k3_media_input_ids_version"])
 
 
 class TestServerInfoTransportParity(CustomTestCase):

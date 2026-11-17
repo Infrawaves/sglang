@@ -9,6 +9,8 @@
 //! `tests/component/`.
 
 mod common;
+#[path = "../fixtures/kimi_k3.rs"]
+mod kimi_fixture;
 
 mod bucket_routing;
 mod cache_aware_input_ids;

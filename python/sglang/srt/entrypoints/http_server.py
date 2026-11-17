@@ -938,19 +938,11 @@ async def server_info(raw_request: Request = None):
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    serving_chat = (
-        getattr(raw_request.app.state, "openai_serving_chat", None)
-        if raw_request is not None
-        else None
-    )
+    # Read by the sgl-router before it forwards router-rendered K3 prompt IDs.
     kimi_k3_input_ids_version = (
         1
-        if serving_chat is not None and serving_chat.supports_kimi_k3_input_ids()
-        else None
-    )
-    kimi_k3_media_input_ids_version = (
-        1
-        if serving_chat is not None and serving_chat.supports_kimi_k3_media_input_ids()
+        if raw_request is not None
+        and raw_request.app.state.openai_serving_chat.supports_kimi_k3_input_ids()
         else None
     )
 
@@ -963,7 +955,6 @@ async def server_info(raw_request: Request = None):
                 "version": __version__,
                 "frontend": "python",
                 "kimi_k3_input_ids_version": kimi_k3_input_ids_version,
-                "kimi_k3_media_input_ids_version": kimi_k3_media_input_ids_version,
             }
         )
     )

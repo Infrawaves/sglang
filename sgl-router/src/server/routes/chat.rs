@@ -220,6 +220,12 @@ async fn prepare<'a>(
         Endpoint::Chat | Endpoint::Completions | Endpoint::Responses => {
             let path = endpoint.path();
             let mut fields = parse_request_fields(&body, path)?;
+            // Workers trust this field as the router's own rendering.
+            if fields.sets_router_input_ids && matches!(endpoint, Endpoint::Chat) {
+                return Err(ApiError::BadRequest(
+                    "kimi_k3_input_ids is reserved for the router; send input_ids instead".into(),
+                ));
+            }
             let model = match fields.model.take() {
                 Some(model) => ModelId(model),
                 // `model` is optional in the Responses API; use the served model.
@@ -241,6 +247,7 @@ async fn prepare<'a>(
                     ctx,
                     model,
                     fields,
+                    headers,
                     body,
                     needs_tokens,
                     needs_token_count,

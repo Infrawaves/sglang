@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -215,9 +217,8 @@ class EncodingTests(unittest.TestCase):
         )
         self.assertEqual(body, original)
 
-    def test_router_rejects_media_and_unrecognized_content(self):
+    def test_router_rejects_unrecognized_content(self):
         for content in (
-            [{"type": "image_url", "image_url": {"url": "image"}}],
             [{"type": "input_audio", "input_audio": {}}],
             [{"type": "input_text", "text": "hello"}],
             [{"type": "thinking", "thinking": "hello"}],
@@ -225,11 +226,11 @@ class EncodingTests(unittest.TestCase):
             123,
         ):
             with self.subTest(content=content), self.assertRaises(ValueError):
-                k3.validate_text_request(
+                k3.validate_request(
                     {"messages": [{"role": "user", "content": content}]}
                 )
         for content in (None, "Hello", [{"type": "text", "text": "Hello"}]):
-            k3.validate_text_request(
+            k3.validate_request(
                 {"messages": [{"role": "assistant", "content": content}]}
             )
 
@@ -306,7 +307,7 @@ class RequestPreparationTests(unittest.TestCase):
             sys.modules,
             {protocol.__name__: protocol, utils.__name__: utils, "orjson": orjson},
         ):
-            k3.encode_text_request(
+            k3.encode_request(
                 tokenizer,
                 body,
                 {"reasoning_effort": "high", "custom": "server", "server_only": True},
@@ -503,10 +504,10 @@ class RealSchemaImageTests(unittest.TestCase):
         original = copy.deepcopy(body)
         tokenizer = RecordingTokenizer()
         router_ids = k3.encode_request(tokenizer, body)
-        forwarded = {**copy.deepcopy(body), "kimi_k3_media_input_ids": router_ids}
+        forwarded = {**copy.deepcopy(body), "kimi_k3_input_ids": router_ids}
         validated = self.request_class.model_validate(forwarded)
         self.assertIsNone(validated.input_ids)
-        self.assertEqual(validated.kimi_k3_media_input_ids, router_ids)
+        self.assertEqual(validated.kimi_k3_input_ids, router_ids)
         baseline = RecordingTokenizer()
         worker_ids = k3.encode_kimi_k3_messages(
             baseline,
@@ -605,7 +606,7 @@ class RealSchemaImageTests(unittest.TestCase):
                     {"messages": messages, "chat_template_kwargs": kwargs},
                     model_type="kimi_k31",
                 )
-        for field in ("input_ids", "kimi_k3_input_ids", "kimi_k3_media_input_ids"):
+        for field in ("input_ids", "kimi_k3_input_ids"):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 k3.encode_request(
                     RecordingTokenizer(), {"messages": messages, field: [1]}
@@ -728,6 +729,96 @@ out.flush()
         self.assertEqual(result.stdout, '{"ready":true}\n')
         self.assertIn("native noise", result.stderr)
         self.assertIn("python noise", result.stderr)
+
+
+class ParentWatchdogTests(unittest.TestCase):
+    """A process still loading its tokenizer, as a background restart is, must
+    not outlive the router that started it, even one that exits before the
+    watchdog starts."""
+
+    # The child records its PID, then starts the watchdog after `delay`.
+    CHILD = (
+        "import importlib.util, os, sys, time\n"
+        f"spec = importlib.util.spec_from_file_location('k3', {str(HELPER)!r})\n"
+        "k3 = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(k3)\n"
+        "parent, pid_file, delay = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])\n"
+        "open(pid_file + '.tmp', 'w').write(str(os.getpid()))\n"
+        "os.rename(pid_file + '.tmp', pid_file)\n"
+        "time.sleep(delay)\n"
+        "k3._exit_when_parent_dies(parent, interval=0.05)\n"
+        "open(pid_file + '.watching', 'w').close()\n"
+        "time.sleep(30)\n"
+    )
+    # The parent passes its own PID, as the router does, then exits. With
+    # `wrap`, a shell that does not exec stands between them, as a
+    # `--tokenizer-python` wrapper script can.
+    PARENT = (
+        "import os, shlex, subprocess, sys, time\n"
+        "child, pid_file, delay, wait, wrap = sys.argv[1:6]\n"
+        "argv = [sys.executable, '-c', child, str(os.getpid()), pid_file, delay]\n"
+        "if wrap == '1':\n"
+        "    argv = ['sh', '-c', shlex.join(argv) + '; true']\n"
+        "subprocess.Popen(argv)\n"
+        "while wait == '1' and not os.path.exists(pid_file + '.watching'):\n"
+        "    time.sleep(0.01)\n"
+    )
+
+    def _assert_child_exits(self, *, delay: str, wait: str, wrap: str = "0"):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = os.path.join(directory, "child.pid")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    self.PARENT,
+                    self.CHILD,
+                    pid_file,
+                    delay,
+                    wait,
+                    wrap,
+                ],
+                check=True,
+                timeout=30,
+            )
+            deadline = time.monotonic() + 5
+            while not os.path.exists(pid_file) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with open(pid_file, encoding="utf-8") as f:
+                pid = int(f.read())
+
+            def alive():
+                try:
+                    with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
+                        # An exited child stays a zombie until its new parent reaps it.
+                        return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+                except (FileNotFoundError, ProcessLookupError):
+                    return False
+
+            # The directory outlives the check, so the child cannot fail on its own.
+            deadline = time.monotonic() + float(delay) + 2
+            while alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if alive():
+                os.kill(pid, 9)
+                self.fail("encoder outlived its parent")
+
+    def test_encoder_exits_when_its_parent_dies_after_the_watchdog_starts(self):
+        self._assert_child_exits(delay="0", wait="1")
+
+    def test_encoder_exits_when_its_parent_dies_before_the_watchdog_starts(self):
+        self._assert_child_exits(delay="0.5", wait="0")
+
+    def test_encoder_behind_a_wrapper_exits_when_the_router_dies(self):
+        self._assert_child_exits(delay="0", wait="1", wrap="1")
+
+    def test_liveness_without_procfs_uses_kill(self):
+        """Without /proc (macOS), a live router must not read as exited."""
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait()
+        with patch.object(k3, "_HAS_PROCFS", False):
+            self.assertTrue(k3._process_alive(os.getpid()))
+            self.assertFalse(k3._process_alive(exited.pid))
 
 
 if __name__ == "__main__":

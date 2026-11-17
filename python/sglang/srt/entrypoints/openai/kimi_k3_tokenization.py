@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from typing import TYPE_CHECKING, Any, Optional
@@ -171,9 +173,13 @@ def _message_tools(message: Any) -> list:
 
 
 def effective_tools(request: Any) -> list:
+    """Request tools plus message tools, as ``OpenAIServingChat._effective_tools``."""
     tools = list(request.tools or [])
     for message in request.messages:
-        tools.extend(_message_tools(message))
+        if message.role == "root":
+            tools.extend(getattr(message, "tools", None) or [])
+        else:
+            tools.extend(_message_tools(message))
     return tools
 
 
@@ -335,7 +341,7 @@ def encode_kimi_k3_messages(
     return prompt_ids
 
 
-def validate_request(body: Any, *, allow_images: bool = True) -> None:
+def validate_request(body: Any) -> None:
     """Reject unsupported content before validation can discard extra fields.
 
     Image URLs are retained verbatim. Loading pixels, checking image bytes,
@@ -343,10 +349,7 @@ def validate_request(body: Any, *, allow_images: bool = True) -> None:
     """
     if not isinstance(body, dict):
         raise ValueError("The chat request must be a JSON object")  # noqa: TRY004
-    if any(
-        body.get(field) is not None
-        for field in ("input_ids", "kimi_k3_input_ids", "kimi_k3_media_input_ids")
-    ):
+    if any(body.get(field) is not None for field in ("input_ids", "kimi_k3_input_ids")):
         raise ValueError(
             "Kimi-K3 encoder expects messages without precomputed input_ids"
         )
@@ -374,7 +377,7 @@ def validate_request(body: Any, *, allow_images: bool = True) -> None:
                 raise ValueError("Each content part must be a JSON object")  # noqa: TRY004
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 continue
-            if allow_images and part.get("type") == "image_url":
+            if part.get("type") == "image_url":
                 image = part.get("image_url")
                 if (
                     not isinstance(image, dict)
@@ -385,15 +388,9 @@ def validate_request(body: Any, *, allow_images: bool = True) -> None:
                 if part.get("modalities") not in (None, "image", "multi-images"):
                     raise ValueError("Router Kimi-K3 encoding does not support video")
                 continue
-            supported = "text and image_url" if allow_images else "text"
             raise ValueError(
-                f"Router Kimi-K3 encoding only supports {supported} content"
+                "Router Kimi-K3 encoding only supports text and image_url content"
             )
-
-
-def validate_text_request(body: Any) -> None:
-    """Compatibility entry point for callers requiring strictly text input."""
-    validate_request(body, allow_images=False)
 
 
 def encode_request(
@@ -452,18 +449,6 @@ def encode_request(
     messages = [message.model_dump() for message in request.messages]
     # K3's renderer preserves nested argument JSON bytes; do not parse them.
     return encode_kimi_k3_messages(tokenizer, messages, request, model_type=model_type)
-
-
-def encode_text_request(
-    tokenizer: Any,
-    body: dict,
-    defaults: dict | None = None,
-    *,
-    model_type: str | None = None,
-):
-    """Compatibility entry point that preserves the original text-only guard."""
-    validate_text_request(body)
-    return encode_request(tokenizer, body, defaults, model_type=model_type)
 
 
 def _validate_token_ids(token_ids: Any) -> list[int]:
@@ -585,6 +570,52 @@ def _protocol_stdout():
     return os.fdopen(protocol_fd, "w", encoding="utf-8", buffering=1)
 
 
+# Without procfs (macOS), liveness falls back to kill(pid, 0) alone.
+_HAS_PROCFS = os.path.exists("/proc/self/stat")
+
+
+def _process_alive(pid: int) -> bool:
+    if _HAS_PROCFS:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
+                # An exited process stays a zombie until its parent reaps it.
+                return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except OSError:
+            pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _exit_when_parent_dies(parent: int, interval: float = 0.1) -> None:
+    """Exit once ``parent``, the router that started this process, is gone.
+
+    Stdin EOF reaches the protocol loop only between requests; a process still
+    loading its tokenizer, as a background restart is, would otherwise outlive
+    a router that exited or was killed. The router passes its PID, which works
+    when it exited before this ran and when ``--tokenizer-python`` is a wrapper
+    that is this process's parent instead.
+    """
+
+    def watch():
+        while _process_alive(parent):
+            time.sleep(interval)
+        os._exit(1)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parent-pid", type=int, default=os.getppid())
+    _exit_when_parent_dies(parser.parse_args().parent_pid)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     raise SystemExit(run_worker(output_stream=_protocol_stdout()))
