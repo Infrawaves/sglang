@@ -1608,7 +1608,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prefill_pull_internal = False
         if get_disagg().prefill_pull_router is not None:
             prefill_pull_internal = prepare_prefill_pull_request(
-                obj, request, starting=self.server_status == ServerStatus.Starting
+                obj,
+                request,
+                starting=self.server_status == ServerStatus.Starting,
+                allow_push=get_disagg().prefill_pull_allow_push,
             )
 
         self._resolve_cache_identity(obj, request)

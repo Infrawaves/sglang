@@ -48,6 +48,7 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.local_auth = []
         self.router_auth = []
         self.local_response = b"raw prefill error\nwith details"
+        self.local_status = 503
         app = web.Application()
         app.router.add_post("/generate", self._generate)
         app.router.add_post("/internal/pull/{action}", self._control)
@@ -64,10 +65,16 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.longpoll_continue.set()
         await self.runner.cleanup()
 
-    async def _start(self, max_inflight=1, max_response_bytes=4 * 1024 * 1024):
+    async def _start(
+        self,
+        max_inflight=1,
+        max_response_bytes=4 * 1024 * 1024,
+        other_routers=(),
+        **config,
+    ):
         self.agent = PrefillPullAgent(
             PrefillPullAgentConfig(
-                router_url=self.url,
+                router_urls=(self.url, *other_routers),
                 worker_url="http://registered-prefill:30000",
                 local_url=self.url,
                 max_inflight=max_inflight,
@@ -77,6 +84,7 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 status_interval=0.01,
                 control_timeout=1,
                 max_response_bytes=max_response_bytes,
+                **config,
             ),
             budget=self._budget,
             abort=self._abort,
@@ -85,6 +93,8 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         await self.agent.start()
 
     async def _budget(self, *, action, reservation_id, **kwargs):
+        if action == "peek":
+            return {"success": True, "data": {"max_tokens": 64}}
         if action == "reserve":
             self.reservations[reservation_id] = "reserved"
             return {"success": True, "data": {"max_tokens": 64}}
@@ -168,7 +178,7 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.reservations[reservation_id] = "consumed"
         self.executed.append(body["rid"])
         self.intake_finished.set()
-        return web.Response(status=503, body=self.local_response)
+        return web.Response(status=self.local_status, body=self.local_response)
 
     async def test_lost_offer_and_commit_responses_execute_once_and_preserve_outcome(
         self,
@@ -254,6 +264,190 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.assertEqual(self.executed, [])
         self.assertEqual(self.agent._assignments, {})
         self.assertEqual(self.agent._assignment_reservations, {})
+
+    async def test_claims_from_every_router_and_reports_to_the_claiming_one(self):
+        """Routers keep separate queues; an outcome sent to another router would
+        leave the claiming router's client waiting until its deadline."""
+        other_polls = []
+        other_outcomes = []
+
+        async def other(request):
+            body = await request.json()
+            action = request.match_info["action"]
+            if action == "acquire":
+                other_polls.append(body["poll_id"])
+                await asyncio.sleep(0.01)
+                return web.json_response({"status": "empty"})
+            if action == "outcome":
+                other_outcomes.append(body)
+            return web.json_response({"status": "expired"})
+
+        app = web.Application()
+        app.router.add_post("/internal/pull/{action}", other)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        other_url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        await self._start(max_inflight=2, other_routers=(other_url,))
+        await asyncio.wait_for(self.outcome_finished.wait(), 3)
+        self.assertEqual(self.executed, ["router-engine-rid"])
+        self.assertTrue(other_polls)
+        self.assertEqual(other_outcomes, [])
+
+    async def test_empty_router_long_poll_holds_no_reservation(self):
+        """With one request slot, an empty router's long poll that held a
+        reservation starved every other router's claims for its whole wait."""
+        polling = asyncio.Event()
+
+        async def empty(request):
+            if request.match_info["action"] == "acquire":
+                polling.set()
+                await asyncio.sleep(30)
+            return web.json_response({"status": "empty"})
+
+        app = web.Application()
+        app.router.add_post("/internal/pull/{action}", empty)
+        # Cleanup must not wait for the parked long poll to finish.
+        runner = web.AppRunner(app, shutdown_timeout=0.1)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        empty_url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        self.agent = PrefillPullAgent(
+            PrefillPullAgentConfig(
+                router_urls=(empty_url,),
+                worker_url="http://registered-prefill:30000",
+                local_url=self.url,
+                max_inflight=1,
+                retry_interval=0.01,
+            ),
+            budget=self._budget,
+            abort=self._abort,
+            ready=lambda: True,
+        )
+        await self.agent.start()
+        await asyncio.wait_for(polling.wait(), 3)
+        self.assertNotIn("reserved", self.reservations.values())
+
+    async def test_outcome_reaches_a_draining_router_for_as_long_as_it_answers(self):
+        """A rolling update removes a router from DNS while it still serves the
+        client, possibly for longer than any fixed grace; giving up while it
+        still reported the assignment committed left that client to time out."""
+        self.fail_outcome = True
+        await self._start(router_unreachable_grace=0.05)
+        await asyncio.wait_for(self.outcome_attempted.wait(), 3)
+        await self.agent._drop_router(self.url)
+        # Well past the grace, but the router answers status throughout.
+        await asyncio.sleep(0.3)
+        self.fail_outcome = False
+        await asyncio.wait_for(self.outcome_finished.wait(), 3)
+        self.assertEqual(self.state, "completed")
+
+    async def test_unreachable_listed_router_frees_its_inflight_slot(self):
+        """A fixed IP or https router is never removed from the list; while its
+        outcome retried forever, it held the only in-flight slot and no other
+        claim could start."""
+        self.fail_outcome = True
+        await self._start(max_inflight=1, router_unreachable_grace=0.05)
+        await asyncio.wait_for(self.outcome_attempted.wait(), 3)
+        self.fail_status = True
+        async with asyncio.timeout(3):
+            while self.agent._assignments:
+                await asyncio.sleep(0.01)
+        self.assertIn(self.url, self.agent._routers)
+        self.assertEqual(self.state, "committed")
+        # The freed slot lets claims resume.
+        await asyncio.wait_for(self.longpoll_started.wait(), 3)
+
+    async def test_router_leaves_only_after_repeated_missing_resolutions(self):
+        """A transient DNS gap must not stop claims or outcome reporting for a
+        router that is still serving clients."""
+        self.agent = PrefillPullAgent(
+            PrefillPullAgentConfig(
+                router_urls=("http://routers.example:8000",),
+                worker_url="http://registered-prefill:30000",
+                local_url=self.url,
+                max_inflight=1,
+                retry_interval=0.01,
+                router_missing_refreshes=2,
+            ),
+            budget=self._budget,
+            abort=self._abort,
+            # Never ready: the claim loops idle without touching the network.
+            ready=lambda: False,
+        )
+        both = {"http://10.0.0.1:8000", "http://10.0.0.2:8000"}
+        answers = [both, {"http://10.0.0.1:8000"}, {"http://10.0.0.1:8000"}]
+
+        async def resolve(url):
+            return answers.pop(0)
+
+        self.agent._resolve = resolve
+        await self.agent._refresh_routers()
+        self.assertEqual(set(self.agent._routers), both)
+        await self.agent._refresh_routers()
+        self.assertEqual(set(self.agent._routers), both)
+        await self.agent._refresh_routers()
+        self.assertEqual(set(self.agent._routers), {"http://10.0.0.1:8000"})
+
+    async def test_large_successful_prefill_response_still_reports_success(self):
+        """Logprobs or hidden states can make a 200 body exceed the outcome
+        limit; relaying it turned a successful prefill into a 502."""
+        self.local_status = 200
+        self.local_response = b'{"meta_info": "' + b"x" * 1024 + b'"}'
+        await self._start(max_response_bytes=64)
+        await asyncio.wait_for(self.outcome_finished.wait(), 3)
+        self.assertEqual(self.outcomes[0]["status_code"], 200)
+        self.assertEqual(self.outcomes[0]["body"], "{}")
+
+    async def test_offers_from_several_routers_respect_max_inflight(self):
+        """Every router's loop passes the pre-poll check while its poll is open;
+        admitting each returned offer exceeded max_inflight."""
+        release = asyncio.Event()
+        rejected = []
+
+        async def other(request):
+            body = await request.json()
+            action = request.match_info["action"]
+            if action == "acquire":
+                if rejected:
+                    await asyncio.sleep(30)
+                await release.wait()
+                return web.json_response(
+                    {
+                        "status": "offer",
+                        "assignment_id": "assignment-b",
+                        "request_id": "other-rid",
+                        "path": "/generate",
+                        "input_tokens": 3,
+                        "body": {"input_ids": [1, 2, 3]},
+                        "expires_in_ms": 30000,
+                    }
+                )
+            if action == "reject":
+                rejected.append(body["assignment_id"])
+            return web.json_response({"status": "expired"})
+
+        app = web.Application()
+        app.router.add_post("/internal/pull/{action}", other)
+        runner = web.AppRunner(app, shutdown_timeout=0.1)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        other_url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        self.delay_intake = True
+        await self._start(max_inflight=1, other_routers=(other_url,))
+        await asyncio.wait_for(self.intake_started.wait(), 3)
+        release.set()
+        async with asyncio.timeout(3):
+            while not rejected:
+                await asyncio.sleep(0.01)
+        self.assertEqual(rejected, ["assignment-b"])
+        self.assertEqual(list(self.agent._assignments), ["assignment-a"])
 
     async def test_invalid_utf8_cannot_expand_beyond_outcome_limit(self):
         """Decoding replacement bytes must not create an unreportable outcome."""

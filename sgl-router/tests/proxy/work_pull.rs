@@ -35,6 +35,7 @@ struct Fixture {
     app: Router,
     prefill: MockWorker,
     decode: MockWorker,
+    registry: Arc<WorkerRegistry>,
 }
 impl Fixture {
     async fn new(lease_ms: u64, max_requests: usize) -> Self {
@@ -79,7 +80,7 @@ impl Fixture {
         cfg.proxy.request_timeout_secs = 3;
         if let Some(path) = tokenizer {
             cfg.model.tokenizer_path = Some(path.to_owned());
-            // Cover exact routing counts when the execution body remains text.
+            // Pull must forward ids even when text forwarding is disabled.
             cfg.model.disable_input_ids_forwarding = true;
         }
         let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -104,7 +105,7 @@ impl Fixture {
             cfg,
             tokenizers,
             Arc::new(Proxy::new(Duration::from_secs(3)).unwrap()),
-            registry,
+            registry.clone(),
             policies,
         );
         let policy = Arc::new(PowerOfTwoPolicy::new(ctx.engine_reported_load.clone()));
@@ -127,6 +128,7 @@ impl Fixture {
             app: build_router(Arc::new(ctx)),
             prefill,
             decode,
+            registry,
         }
     }
     fn generate(&self) -> tokio::task::JoinHandle<axum::response::Response> {
@@ -441,7 +443,9 @@ async fn pull_requires_exact_text_tokens_before_queueing() {
 }
 
 #[tokio::test]
-async fn pull_text_budget_uses_tokenizer_ids_even_when_forwarding_text() {
+async fn pull_forwards_router_ids_even_when_text_forwarding_is_disabled() {
+    // P rejects an engine token count above the router's; forwarding text let a
+    // P-side tokenization difference (e.g. one more special token) fail every request.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer.json");
     let mut tokenizer: Value =
@@ -473,7 +477,8 @@ async fn pull_text_budget_uses_tokenizer_ids_even_when_forwarding_text() {
         .await;
     assert_eq!(offer["status"], "offer");
     assert_eq!(offer["input_tokens"], 2);
-    assert_eq!(offer["body"]["text"], "中文中文");
+    assert_eq!(offer["body"]["input_ids"], json!([257, 257]));
+    assert!(offer["body"].get("text").is_none());
     f.post("accept", Fixture::action(&offer)).await;
     f.outcome(&offer, 200, "{}").await;
     assert_eq!(client.await.unwrap().status(), 200);
@@ -596,4 +601,133 @@ fn pull_configuration_rejects_unsupported_combinations() {
             .to_string();
         assert!(error.contains(expected), "{error}");
     }
+}
+
+#[tokio::test]
+async fn pull_replacement_prefill_claims_requests_queued_before_it_joined() {
+    // The eligible set was fixed at enqueue, so after a rolling replacement the
+    // new prefill's acquire returned empty and the queued request waited out
+    // its deadline.
+    let f = Fixture::new(1000, 10).await;
+    let client = f.generate();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let replacement = MockWorker::start(vec![]).await;
+    f.registry
+        .add(WorkerSpec {
+            id: WorkerId("p2".into()),
+            url: replacement.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+            ..Default::default()
+        })
+        .unwrap();
+    f.registry.remove(&WorkerId("p".into()));
+    let offer = f
+        .post(
+            "acquire",
+            json!({
+                "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                "poll_id": "replacement", "max_tokens": 100, "max_requests": 1,
+                "wait_ms": 3000
+            }),
+        )
+        .await;
+    assert_eq!(offer["status"], "offer");
+    f.post("accept", Fixture::action(&offer)).await;
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
+}
+
+fn prefill_spec(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
+    WorkerSpec {
+        id: WorkerId(id.into()),
+        url: url.to_owned(),
+        mode,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: Some(8997),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn pull_candidates_refresh_when_decode_returns() {
+    // Replacing P while D was down refreshed to an empty set; D coming back
+    // left the prefill fleet unchanged, so the new P never became eligible.
+    let f = Fixture::new(1000, 10).await;
+    let client = f.generate();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let replacement = MockWorker::start(vec![]).await;
+    f.registry.remove(&WorkerId("d".into()));
+    f.registry
+        .add(prefill_spec("p2", &replacement.url, WorkerMode::Prefill))
+        .unwrap();
+    f.registry.remove(&WorkerId("p".into()));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    f.registry
+        .add(prefill_spec("d", &f.decode.url, WorkerMode::Decode))
+        .unwrap();
+    let offer = f
+        .post(
+            "acquire",
+            json!({
+                "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                "poll_id": "after-decode", "max_tokens": 100, "max_requests": 1,
+                "wait_ms": 3000
+            }),
+        )
+        .await;
+    assert_eq!(offer["status"], "offer");
+    f.post("accept", Fixture::action(&offer)).await;
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn pull_candidate_refresh_is_not_postponed_by_repeated_rejections() {
+    // Each reject restarted the one-second refresh timer, so an old P that
+    // claimed and rejected every 50 ms kept a new P from ever becoming eligible.
+    let f = Arc::new(Fixture::new(1000, 10).await);
+    let client = f.generate();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let replacement = MockWorker::start(vec![]).await;
+    f.registry
+        .add(prefill_spec("p2", &replacement.url, WorkerMode::Prefill))
+        .unwrap();
+    let churn = {
+        let f = f.clone();
+        tokio::spawn(async move {
+            for i in 0.. {
+                let offer = f
+                    .post(
+                        "acquire",
+                        json!({
+                            "worker_url": f.prefill.url, "worker_epoch": "epoch-1",
+                            "dp_rank": 0, "poll_id": format!("churn-{i}"),
+                            "max_tokens": 100, "max_requests": 1, "wait_ms": 50
+                        }),
+                    )
+                    .await;
+                if offer["status"] == "offer" {
+                    f.post("reject", Fixture::action(&offer)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+    let offer = f
+        .post(
+            "acquire",
+            json!({
+                "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                "poll_id": "new-p", "max_tokens": 100, "max_requests": 1,
+                "wait_ms": 3000
+            }),
+        )
+        .await;
+    churn.abort();
+    assert_eq!(offer["status"], "offer");
+    f.post("accept", Fixture::action(&offer)).await;
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
 }

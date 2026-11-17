@@ -29,6 +29,12 @@ pub struct PullConfig {
     pub max_bytes: usize,
     pub max_tokens: usize,
     pub offer_timeout_ms: u64,
+    /// How long a request waits for the worker holding its longest prefix
+    /// before any eligible worker may claim it.
+    pub affinity_max_wait_ms: u64,
+    /// Queue age after which a request that does not fit stops its workers
+    /// from claiming younger ones.
+    pub starvation_ms: u64,
 }
 
 impl Default for PullConfig {
@@ -39,6 +45,8 @@ impl Default for PullConfig {
             max_bytes: 64 * 1024 * 1024,
             max_tokens: 4 * 1024 * 1024,
             offer_timeout_ms: 30_000,
+            affinity_max_wait_ms: 500,
+            starvation_ms: 5_000,
         }
     }
 }

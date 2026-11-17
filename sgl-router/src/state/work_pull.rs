@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -39,8 +40,20 @@ pub struct Acquire {
     pub poll_id: String,
     pub max_tokens: usize,
     pub max_requests: usize,
+    /// Uncommitted offers this worker may hold at once: its concurrent claims.
+    #[serde(default = "one")]
+    pub max_offered: usize,
     pub wait_ms: u64,
 }
+
+fn one() -> usize {
+    1
+}
+
+/// Upper bound on `Acquire::max_offered`, so one agent cannot pin the queue.
+pub const MAX_OFFERED_PER_WORKER: usize = 16;
+/// Fitting requests one claim compares for prefix affinity.
+const AFFINITY_SCAN: usize = 16;
 
 #[derive(Deserialize)]
 pub struct Action {
@@ -79,6 +92,26 @@ impl Phase {
         matches!(self, Self::Completed | Self::Cancelled | Self::Expired)
     }
 }
+/// Cumulative pull counters, rendered on `/metrics` scrape.
+#[derive(Default)]
+struct PullCounters {
+    enqueued: AtomicU64,
+    queue_full: AtomicU64,
+    offered: AtomicU64,
+    committed: AtomicU64,
+    completed: AtomicU64,
+    cancelled: AtomicU64,
+    expired: AtomicU64,
+    /// Enqueue to commit, across every attempt of the request.
+    queue_wait_us: AtomicU64,
+    /// Assignment creation to commit: one claim's control-plane round trips.
+    claim_us: AtomicU64,
+}
+
+fn micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
 struct AssignmentState {
     phase: Phase,
     offer: Option<Offer>,
@@ -92,9 +125,11 @@ pub struct Assignment {
     tokens: usize,
     expires: Instant,
     created: Instant,
+    enqueued: Instant,
     state: Mutex<AssignmentState>,
     changed: Notify,
     queue_changed: Arc<Notify>,
+    counters: Arc<PullCounters>,
 }
 impl Assignment {
     fn notify_changed(&self) {
@@ -103,10 +138,37 @@ impl Assignment {
         // Wake queue waiters as well as this assignment's client/worker.
         self.queue_changed.notify_waiters();
     }
+    /// The only writer of `phase` outside tests, so each change counts once.
+    fn transition(&self, state: &mut AssignmentState, to: Phase) {
+        if state.phase == to {
+            return;
+        }
+        state.phase = to;
+        let c = &self.counters;
+        match to {
+            Phase::Committed => {
+                c.committed.fetch_add(1, Ordering::Relaxed);
+                c.queue_wait_us
+                    .fetch_add(micros(self.enqueued.elapsed()), Ordering::Relaxed);
+                c.claim_us
+                    .fetch_add(micros(self.created.elapsed()), Ordering::Relaxed);
+            }
+            Phase::Completed => {
+                c.completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Phase::Cancelled => {
+                c.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            Phase::Expired => {
+                c.expired.fetch_add(1, Ordering::Relaxed);
+            }
+            Phase::Offered => {}
+        }
+    }
     fn state(&self) -> std::sync::MutexGuard<'_, AssignmentState> {
         let mut state = self.state.lock().unwrap();
         if state.phase == Phase::Offered && Instant::now() >= self.expires {
-            state.phase = Phase::Expired;
+            self.transition(&mut state, Phase::Expired);
             state.offer = None;
             self.notify_changed();
         }
@@ -121,7 +183,7 @@ impl Assignment {
     pub fn cancel(&self) {
         let mut state = self.state();
         if matches!(state.phase, Phase::Offered | Phase::Committed) {
-            state.phase = Phase::Cancelled;
+            self.transition(&mut state, Phase::Cancelled);
             state.offer = None;
             self.notify_changed();
         }
@@ -137,7 +199,7 @@ impl Assignment {
         let mut state = self.state();
         if state.phase == Phase::Offered && state.offer.is_some() {
             // The durable-in-process transition precedes both D dispatch and the ACK.
-            state.phase = Phase::Committed;
+            self.transition(&mut state, Phase::Committed);
             state.offer = None;
             self.notify_changed();
         }
@@ -145,11 +207,12 @@ impl Assignment {
     }
     pub fn reject(&self) -> &'static str {
         let mut state = self.state();
-        state.phase = match state.phase {
+        let to = match state.phase {
             Phase::Offered => Phase::Expired,
             Phase::Committed => Phase::Cancelled,
             other => other,
         };
+        self.transition(&mut state, to);
         state.offer = None;
         self.notify_changed();
         state.phase.name()
@@ -159,10 +222,10 @@ impl Assignment {
         match state.phase {
             Phase::Committed => {
                 state.outcome = Some((status, body));
-                state.phase = Phase::Completed;
+                self.transition(&mut state, Phase::Completed);
             }
             // No execution was authorized; let the waiting client reoffer safely.
-            Phase::Offered => state.phase = Phase::Expired,
+            Phase::Offered => self.transition(&mut state, Phase::Expired),
             _ => {}
         }
         state.offer = None;
@@ -270,6 +333,9 @@ struct Pending {
     bytes: usize,
     claims: mpsc::UnboundedSender<Arc<Assignment>>,
     current: Option<Arc<Assignment>>,
+    enqueued: Instant,
+    /// Prompt tokens each eligible worker held cached at enqueue, by URL.
+    matched: HashMap<String, usize>,
 }
 #[derive(Default)]
 struct QueueState {
@@ -279,13 +345,46 @@ struct QueueState {
     // Retired epochs never become current again. Rotation count is bounded;
     // after 128 agent restarts this experimental single-router session must restart.
     epochs: HashMap<String, (String, HashSet<String>)>,
+    /// Largest grant each worker has reported: a request above it may never fit.
+    largest_grant: HashMap<String, usize>,
+    /// Last acquire per worker. Discovered workers come and go with their URLs,
+    /// so per-worker state is dropped once a worker stops polling.
+    last_poll: HashMap<String, Instant>,
     bytes: usize,
     tokens: usize,
 }
+/// An agent long-polls at least every 30 s, so ten idle minutes means it is gone.
+const WORKER_IDLE_FORGET: Duration = Duration::from_secs(600);
+
+impl QueueState {
+    /// Drops the epoch fence and grant history of workers that stopped polling
+    /// and hold no live assignment, so worker churn under discovery stays bounded.
+    fn forget_idle_workers(&mut self, now: Instant) {
+        let idle: Vec<String> = self
+            .last_poll
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) >= WORKER_IDLE_FORGET)
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in idle {
+            let live = self
+                .assignments
+                .values()
+                .any(|a| a.worker_url == url && !a.state().phase.terminal());
+            if !live {
+                self.last_poll.remove(&url);
+                self.epochs.remove(&url);
+                self.largest_grant.remove(&url);
+            }
+        }
+    }
+}
+
 pub struct PullQueue {
     limits: PullConfig,
     state: Mutex<QueueState>,
     changed: Arc<Notify>,
+    counters: Arc<PullCounters>,
 }
 impl PullQueue {
     pub fn new(limits: PullConfig) -> Arc<Self> {
@@ -293,11 +392,99 @@ impl PullQueue {
             limits,
             state: Mutex::new(QueueState::default()),
             changed: Arc::new(Notify::new()),
+            counters: Arc::new(PullCounters::default()),
         })
+    }
+
+    /// Prometheus text for the pull queue: live occupancy plus cumulative counters.
+    pub fn render_metrics(&self) -> String {
+        let (waiting, claimed, bytes, tokens) = {
+            let state = self.state.lock().unwrap();
+            let waiting = state
+                .pending
+                .values()
+                .filter(|p| p.current.is_none())
+                .count();
+            (
+                waiting,
+                state.pending.len() - waiting,
+                state.bytes,
+                state.tokens,
+            )
+        };
+        let c = &self.counters;
+        let read = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let mut out = String::new();
+        let mut metric = |name: &str, kind: &str, help: &str, samples: &[(&str, String)]| {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+            for (labels, value) in samples {
+                out.push_str(&format!("{name}{labels} {value}\n"));
+            }
+        };
+        metric(
+            "sgl_router_pull_requests",
+            "gauge",
+            "Requests the pull queue holds. state=waiting: unclaimed; state=claimed: offered, executing, or in decode until the response ends.",
+            &[
+                ("{state=\"waiting\"}", waiting.to_string()),
+                ("{state=\"claimed\"}", claimed.to_string()),
+            ],
+        );
+        metric(
+            "sgl_router_pull_held_bytes",
+            "gauge",
+            "Request body bytes counted against --pull-max-bytes.",
+            &[("", bytes.to_string())],
+        );
+        metric(
+            "sgl_router_pull_held_tokens",
+            "gauge",
+            "Prompt tokens counted against --pull-max-tokens.",
+            &[("", tokens.to_string())],
+        );
+        metric(
+            "sgl_router_pull_enqueued_total",
+            "counter",
+            "Requests admitted to the pull queue.",
+            &[("", read(&c.enqueued).to_string())],
+        );
+        metric(
+            "sgl_router_pull_queue_full_total",
+            "counter",
+            "Requests refused with 503 pull_queue_full.",
+            &[("", read(&c.queue_full).to_string())],
+        );
+        metric(
+            "sgl_router_pull_assignments_total",
+            "counter",
+            "Assignment transitions. phase=offered: claims; expired: uncommitted offers that timed out or were rejected, and may be reoffered; cancelled: committed or offered work revoked by the client or an epoch change.",
+            &[
+                ("{phase=\"offered\"}", read(&c.offered).to_string()),
+                ("{phase=\"committed\"}", read(&c.committed).to_string()),
+                ("{phase=\"completed\"}", read(&c.completed).to_string()),
+                ("{phase=\"cancelled\"}", read(&c.cancelled).to_string()),
+                ("{phase=\"expired\"}", read(&c.expired).to_string()),
+            ],
+        );
+        let seconds = |v: &AtomicU64| format!("{:.6}", read(v) as f64 / 1e6);
+        metric(
+            "sgl_router_pull_queue_wait_seconds_sum",
+            "counter",
+            "Enqueue-to-commit time summed over committed requests; divide by assignments_total{phase=\"committed\"}.",
+            &[("", seconds(&c.queue_wait_us))],
+        );
+        metric(
+            "sgl_router_pull_claim_seconds_sum",
+            "counter",
+            "Offer-to-commit time (bind and accept round trips) summed over committed requests.",
+            &[("", seconds(&c.claim_us))],
+        );
+        out
     }
     pub fn enqueue(
         self: &Arc<Self>,
         eligible: HashSet<String>,
+        matched: HashMap<String, usize>,
         tokens: usize,
         bytes: usize,
     ) -> Result<(RequestLease, mpsc::UnboundedReceiver<Arc<Assignment>>), ApiError> {
@@ -306,6 +493,7 @@ impl PullQueue {
             || bytes > self.limits.max_bytes.saturating_sub(state.bytes)
             || tokens > self.limits.max_tokens.saturating_sub(state.tokens)
         {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
             return Err(ApiError::PullQueueFull);
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -318,11 +506,14 @@ impl PullQueue {
                 bytes,
                 claims,
                 current: None,
+                enqueued: Instant::now(),
+                matched,
             },
         );
         state.fifo.push_back(id.clone());
         state.bytes += bytes;
         state.tokens += tokens;
+        self.counters.enqueued.fetch_add(1, Ordering::Relaxed);
         self.changed.notify_waiters();
         Ok((
             RequestLease {
@@ -332,6 +523,22 @@ impl PullQueue {
             receiver,
         ))
     }
+    /// Replaces who may claim a queued request and their prefix hits, e.g.
+    /// after prefill workers were replaced. A live claim keeps its worker.
+    pub fn update_candidates(
+        &self,
+        lease: &RequestLease,
+        eligible: HashSet<String>,
+        matched: HashMap<String, usize>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(p) = state.pending.get_mut(&lease.id) {
+            p.eligible = eligible;
+            p.matched = matched;
+            self.changed.notify_waiters();
+        }
+    }
+
     pub fn requeue(&self, lease: &RequestLease) {
         let mut state = self.state.lock().unwrap();
         if let Some(p) = state.pending.get_mut(&lease.id) {
@@ -343,12 +550,80 @@ impl PullQueue {
             }
         }
     }
+    /// FIFO position of the request this worker should claim, if any.
+    ///
+    /// The queue is in enqueue order, so requests past the affinity wait form
+    /// its head: the first that fits is taken as is. Among younger requests,
+    /// the first `AFFINITY_SCAN` that fit are compared and the longest prefix
+    /// hit on this worker wins, FIFO on ties; one whose prefix another worker
+    /// holds longer is left for that worker until it ages. A request starved
+    /// past `starvation_ms` that this worker has ever had room for stops it
+    /// from claiming anything younger, so its headroom can grow to fit.
+    fn select(
+        &self,
+        state: &QueueState,
+        input: &Acquire,
+        largest_grant: usize,
+        now: Instant,
+    ) -> Option<usize> {
+        let affinity_wait = Duration::from_millis(self.limits.affinity_max_wait_ms);
+        let starvation = Duration::from_millis(self.limits.starvation_ms);
+        let worker = input.worker_url.as_str();
+        let mut pick: Option<(usize, usize)> = None;
+        let mut compared = 0;
+        for (position, id) in state.fifo.iter().enumerate() {
+            let Some(p) = state.pending.get(id) else {
+                continue;
+            };
+            if p.current.is_some() || !p.eligible.contains(worker) {
+                continue;
+            }
+            let waited = now.saturating_duration_since(p.enqueued);
+            if p.tokens > input.max_tokens {
+                if pick.is_none() && waited >= starvation && p.tokens <= largest_grant {
+                    return None;
+                }
+                continue;
+            }
+            if waited >= affinity_wait {
+                return Some(pick.map_or(position, |(chosen, _)| chosen));
+            }
+            let mine = p.matched.get(worker).copied().unwrap_or(0);
+            let elsewhere = p
+                .matched
+                .iter()
+                .filter(|(url, _)| url.as_str() != worker)
+                .map(|(_, &tokens)| tokens)
+                .max()
+                .unwrap_or(0);
+            if elsewhere <= mine && pick.is_none_or(|(_, best)| mine > best) {
+                pick = Some((position, mine));
+            }
+            compared += 1;
+            if compared >= AFFINITY_SCAN {
+                break;
+            }
+        }
+        pick.map(|(position, _)| position)
+    }
+
     fn try_acquire(&self, input: &Acquire) -> Result<Option<Arc<Assignment>>, ApiError> {
+        self.try_acquire_at(input, Instant::now())
+    }
+
+    /// `now` is shared with [`Self::affinity_expiry`] so both agree on which
+    /// requests are still within their affinity wait.
+    fn try_acquire_at(
+        &self,
+        input: &Acquire,
+        now: Instant,
+    ) -> Result<Option<Arc<Assignment>>, ApiError> {
         let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
         state.assignments.retain(|_, a| {
             !a.state().phase.terminal() || now.duration_since(a.created) < Duration::from_secs(600)
         });
+        state.forget_idle_workers(now);
+        state.last_poll.insert(input.worker_url.clone(), now);
         if let Some((current, retired)) = state.epochs.get_mut(&input.worker_url) {
             if current != &input.worker_epoch {
                 if retired.contains(&input.worker_epoch) || retired.len() >= 128 {
@@ -381,11 +656,12 @@ impl PullQueue {
         }) {
             return Ok(Some(a.clone()));
         }
-        if state
+        let offered = state
             .assignments
             .values()
-            .any(|a| a.worker_url == input.worker_url && a.state().phase == Phase::Offered)
-        {
+            .filter(|a| a.worker_url == input.worker_url && a.state().phase == Phase::Offered)
+            .count();
+        if offered >= input.max_offered {
             return Ok(None);
         }
         // Bound outcome tombstones independently of live requests.
@@ -402,14 +678,15 @@ impl PullQueue {
                 return Ok(None);
             }
         }
-        let position = state.fifo.iter().position(|id| {
-            state.pending.get(id).is_some_and(|p| {
-                p.current.is_none()
-                    && p.tokens <= input.max_tokens
-                    && p.eligible.contains(&input.worker_url)
-            })
-        });
-        let Some(position) = position else {
+        let largest_grant = {
+            let largest = state
+                .largest_grant
+                .entry(input.worker_url.clone())
+                .or_default();
+            *largest = (*largest).max(input.max_tokens);
+            *largest
+        };
+        let Some(position) = self.select(&state, input, largest_grant, now) else {
             return Ok(None);
         };
         let id = state.fifo[position].clone();
@@ -429,7 +706,10 @@ impl PullQueue {
             }),
             changed: Notify::new(),
             queue_changed: self.changed.clone(),
+            enqueued: p.enqueued,
+            counters: self.counters.clone(),
         });
+        self.counters.offered.fetch_add(1, Ordering::Relaxed);
         p.current = Some(assignment.clone());
         let _ = p.claims.send(assignment.clone());
         state
@@ -445,12 +725,20 @@ impl PullQueue {
             // Register before checking the queue so a concurrent accept cannot
             // fall between observing Offered and beginning the long poll.
             changed.as_mut().enable();
-            if let Some(a) = self.try_acquire(input)? {
+            // One instant for both checks: with two, a wait ending between them
+            // was "not yet" to the claim and "already over" to the wake-up, and
+            // the poll slept to its deadline.
+            let now = Instant::now();
+            if let Some(a) = self.try_acquire_at(input, now)? {
                 return Ok(a.offer().await);
             }
-            if tokio::time::timeout_at(deadline.into(), changed)
-                .await
-                .is_err()
+            // A request left for another worker's cache becomes claimable when
+            // its affinity wait ends, which no queue notification signals.
+            let wake = self
+                .affinity_expiry(input, now)
+                .map_or(deadline, |at| at.min(deadline));
+            if tokio::time::timeout_at(wake.into(), changed).await.is_err()
+                && Instant::now() >= deadline
             {
                 // Check once at the boundary: work becoming claimable at the
                 // deadline should not force an additional empty poll/backoff.
@@ -460,6 +748,33 @@ impl PullQueue {
                 };
             }
         }
+    }
+
+    /// When the next request this worker skips for another worker's longer
+    /// prefix hit stops waiting for that worker; mirrors `select`'s test.
+    /// Only future instants count: a request whose wait already ended and is
+    /// still unclaimed is held by starvation or `max_offered`, which change
+    /// only with a queue notification. Returning a past instant made the long
+    /// poll time out immediately and rescan the queue in a busy loop.
+    fn affinity_expiry(&self, input: &Acquire, now: Instant) -> Option<Instant> {
+        let wait = Duration::from_millis(self.limits.affinity_max_wait_ms);
+        let worker = input.worker_url.as_str();
+        let state = self.state.lock().unwrap();
+        state
+            .pending
+            .values()
+            .filter(|p| {
+                p.current.is_none() && p.tokens <= input.max_tokens && p.eligible.contains(worker)
+            })
+            .filter(|p| {
+                let mine = p.matched.get(worker).copied().unwrap_or(0);
+                p.matched
+                    .iter()
+                    .any(|(url, &tokens)| url.as_str() != worker && tokens > mine)
+            })
+            .map(|p| p.enqueued + wait)
+            .filter(|&at| at > now)
+            .min()
     }
     pub fn assignment(&self, input: &Action) -> Result<Option<Arc<Assignment>>, ApiError> {
         let state = self.state.lock().unwrap();
@@ -502,13 +817,14 @@ impl Drop for RequestLease {
 pub fn validate_acquire(input: &Acquire) -> Result<(), ApiError> {
     if input.dp_rank != 0
         || input.max_requests != 1
+        || !(1..=MAX_OFFERED_PER_WORKER).contains(&input.max_offered)
         || input.max_tokens == 0
         || input.worker_epoch.is_empty()
         || input.worker_epoch.len() > 128
         || input.poll_id.is_empty()
         || input.poll_id.len() > 128
     {
-        return Err(ApiError::BadRequest("pull requires dp_rank=0, max_requests=1, positive max_tokens and bounded epoch/poll IDs".into()));
+        return Err(ApiError::BadRequest("pull requires dp_rank=0, max_requests=1, max_offered in 1..=16, positive max_tokens and bounded epoch/poll IDs".into()));
     }
     Ok(())
 }
@@ -537,6 +853,7 @@ mod tests {
             poll_id: poll.into(),
             max_tokens,
             max_requests: 1,
+            max_offered: 1,
             wait_ms: 0,
         }
     }
@@ -548,16 +865,26 @@ mod tests {
             max_tokens: 20,
             ..Default::default()
         });
-        let (first, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 60).unwrap();
-        assert!(queue.enqueue(HashSet::new(), 1, 41).is_err());
-        assert!(queue.enqueue(HashSet::new(), 11, 1).is_err());
+        let (first, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 60)
+            .unwrap();
+        assert!(queue
+            .enqueue(HashSet::new(), HashMap::new(), 1, 41)
+            .is_err());
+        assert!(queue
+            .enqueue(HashSet::new(), HashMap::new(), 11, 1)
+            .is_err());
         drop(first);
-        assert!(queue.enqueue(HashSet::new(), 20, 100).is_ok());
+        assert!(queue
+            .enqueue(HashSet::new(), HashMap::new(), 20, 100)
+            .is_ok());
     }
     #[test]
     fn claimant_is_pinned_and_another_poll_cannot_steal_an_offer() {
         let queue = PullQueue::new(PullConfig::default());
-        let (_lease, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (_lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         assert!(queue
             .try_acquire(&acquire("q", "e", "1", 10))
             .unwrap()
@@ -585,7 +912,9 @@ mod tests {
     #[test]
     fn epoch_rotation_requeues_unpublished_work_after_decode_rejection() {
         let queue = PullQueue::new(PullConfig::default());
-        let (lease, mut claims) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (lease, mut claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let a = queue
             .try_acquire(&acquire("p", "old", "1", 10))
             .unwrap()
@@ -610,7 +939,9 @@ mod tests {
     #[tokio::test]
     async fn epoch_rotation_cancels_committed_work_without_requeue() {
         let queue = PullQueue::new(PullConfig::default());
-        let (lease, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let a = queue
             .try_acquire(&acquire("p", "old", "1", 10))
             .unwrap()
@@ -638,7 +969,9 @@ mod tests {
     #[test]
     fn stale_actions_cannot_commit_another_workers_assignment() {
         let queue = PullQueue::new(PullConfig::default());
-        let (_lease, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (_lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let a = queue
             .try_acquire(&acquire("p", "e", "1", 10))
             .unwrap()
@@ -663,7 +996,9 @@ mod tests {
     #[test]
     fn client_cancellation_drops_a_completed_but_unread_outcome() {
         let queue = PullQueue::new(PullConfig::default());
-        let (lease, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let assignment = queue
             .try_acquire(&acquire("p", "e", "1", 10))
             .unwrap()
@@ -685,10 +1020,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn accepting_one_offer_wakes_the_next_acquire_without_new_arrivals() {
         let queue = PullQueue::new(PullConfig::default());
-        let (_first, mut first_claims) =
-            queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
-        let (_second, mut second_claims) =
-            queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (_first, mut first_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        let (_second, mut second_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let first = queue
             .try_acquire(&acquire("p", "e", "first", 10))
             .unwrap()
@@ -725,11 +1062,249 @@ mod tests {
     }
 
     #[test]
+    fn claims_prefer_own_prefix_and_leave_other_owners_prefix_until_it_ages() {
+        let both = || HashSet::from(["p".to_string(), "q".to_string()]);
+        let queue = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 60_000,
+            ..Default::default()
+        });
+        let (_a, mut a_claims) = queue
+            .enqueue(both(), HashMap::from([("q".to_string(), 8)]), 10, 10)
+            .unwrap();
+        let (_b, mut b_claims) = queue.enqueue(both(), HashMap::new(), 10, 10).unwrap();
+        let (_c, mut c_claims) = queue
+            .enqueue(both(), HashMap::from([("p".to_string(), 6)]), 10, 10)
+            .unwrap();
+        let mut input = acquire("p", "e", "1", 10);
+        input.max_offered = 3;
+        // C hits p's cache, so it goes before the older B; A is q's prefix.
+        let first = queue.try_acquire(&input).unwrap().unwrap();
+        assert_eq!(c_claims.try_recv().unwrap().id, first.id);
+        input.poll_id = "2".into();
+        let second = queue.try_acquire(&input).unwrap().unwrap();
+        assert_eq!(b_claims.try_recv().unwrap().id, second.id);
+        input.poll_id = "3".into();
+        assert!(queue.try_acquire(&input).unwrap().is_none());
+        let for_q = queue
+            .try_acquire(&acquire("q", "e", "1", 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_claims.try_recv().unwrap().id, for_q.id);
+
+        // Once aged, the owner's claim no longer wins: plain FIFO.
+        let queue = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 0,
+            ..Default::default()
+        });
+        let (_a, mut a_claims) = queue
+            .enqueue(both(), HashMap::from([("q".to_string(), 8)]), 10, 10)
+            .unwrap();
+        let (_c, _) = queue
+            .enqueue(both(), HashMap::from([("p".to_string(), 6)]), 10, 10)
+            .unwrap();
+        let aged = queue
+            .try_acquire(&acquire("p", "e", "1", 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_claims.try_recv().unwrap().id, aged.id);
+    }
+
+    #[tokio::test]
+    async fn long_poll_claims_when_another_workers_affinity_wait_ends() {
+        // The request is q's prefix; p must get it once the 50 ms wait ends,
+        // not when its own 5 s long poll does.
+        let queue = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 50,
+            ..Default::default()
+        });
+        let both = HashSet::from(["p".to_string(), "q".to_string()]);
+        let (_lease, _claims) = queue
+            .enqueue(both, HashMap::from([("q".to_string(), 8)]), 10, 10)
+            .unwrap();
+        let mut input = acquire("p", "e", "1", 10);
+        input.wait_ms = 5_000;
+        let started = Instant::now();
+        let claimed = tokio::time::timeout(Duration::from_secs(2), async {
+            // acquire() also waits for D to publish; observe the claim itself.
+            let waiting = queue.acquire(&input);
+            tokio::pin!(waiting);
+            loop {
+                tokio::select! {
+                    _ = &mut waiting => unreachable!("no offer is ever published"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        let state = queue.state.lock().unwrap();
+                        if state.pending.values().any(|p| p.current.is_some()) {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            claimed.is_ok(),
+            "the claim waited for the long-poll deadline"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn affinity_wakeups_ignore_waits_that_already_ended() {
+        // A request past its wait yet unclaimable (held by starvation or
+        // max_offered) once produced a past instant, so every long poll woke
+        // at once and rescanned the queue until its deadline.
+        let both = || HashSet::from(["p".to_string(), "q".to_string()]);
+        let q_prefix = || HashMap::from([("q".to_string(), 8)]);
+        let ended = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 0,
+            ..Default::default()
+        });
+        let (_ended, _) = ended.enqueue(both(), q_prefix(), 10, 10).unwrap();
+        assert!(ended
+            .affinity_expiry(&acquire("p", "e", "1", 10), Instant::now())
+            .is_none());
+        let pending = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 60_000,
+            ..Default::default()
+        });
+        let (_pending, _) = pending.enqueue(both(), q_prefix(), 10, 10).unwrap();
+        let now = Instant::now();
+        assert!(pending
+            .affinity_expiry(&acquire("p", "e", "1", 10), now)
+            .is_some_and(|at| at > now));
+    }
+
+    #[test]
+    fn a_claim_that_skips_for_affinity_always_gets_a_wakeup() {
+        // Judged at two instants, a wait ending between them was skipped by the
+        // claim and dropped by the wake-up, so the poll slept to its deadline.
+        let queue = PullQueue::new(PullConfig {
+            affinity_max_wait_ms: 50,
+            ..Default::default()
+        });
+        let both = HashSet::from(["p".to_string(), "q".to_string()]);
+        let (_lease, _) = queue
+            .enqueue(both, HashMap::from([("q".to_string(), 8)]), 10, 10)
+            .unwrap();
+        let input = acquire("p", "e", "1", 10);
+        let start = queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .values()
+            .next()
+            .unwrap()
+            .enqueued;
+        for offset_ms in [0, 25, 49] {
+            let now = start + Duration::from_millis(offset_ms);
+            assert!(queue.try_acquire_at(&input, now).unwrap().is_none());
+            assert!(
+                queue
+                    .affinity_expiry(&input, now)
+                    .is_some_and(|at| at > now),
+                "skipped at +{offset_ms}ms without a wake-up"
+            );
+        }
+        let aged = start + Duration::from_millis(60);
+        assert!(queue.try_acquire_at(&input, aged).unwrap().is_some());
+    }
+
+    #[test]
+    fn starved_long_request_holds_back_younger_ones_only_if_it_can_fit() {
+        let queue = PullQueue::new(PullConfig {
+            starvation_ms: 0,
+            ..Default::default()
+        });
+        // p has reported room for 100 tokens before.
+        assert!(queue
+            .try_acquire(&acquire("p", "e", "0", 100))
+            .unwrap()
+            .is_none());
+        let (_long, mut long_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 80, 10)
+            .unwrap();
+        let (_short, mut short_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        // The short one fits a 20-token grant but must wait behind the long one.
+        assert!(queue
+            .try_acquire(&acquire("p", "e", "1", 20))
+            .unwrap()
+            .is_none());
+        assert!(short_claims.try_recv().is_err());
+        let long = queue
+            .try_acquire(&acquire("p", "e", "2", 80))
+            .unwrap()
+            .unwrap();
+        assert_eq!(long_claims.try_recv().unwrap().id, long.id);
+
+        // Longer than any grant this worker ever reported: it must not block p.
+        let queue = PullQueue::new(PullConfig {
+            starvation_ms: 0,
+            ..Default::default()
+        });
+        let (_huge, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 500, 10)
+            .unwrap();
+        let (_short, mut short_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        let short = queue
+            .try_acquire(&acquire("p", "e", "1", 20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(short_claims.try_recv().unwrap().id, short.id);
+    }
+
+    #[test]
+    fn metrics_count_each_assignment_transition_once() {
+        let queue = PullQueue::new(PullConfig {
+            max_requests: 1,
+            ..Default::default()
+        });
+        let (lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        assert!(queue.enqueue(HashSet::new(), HashMap::new(), 1, 1).is_err());
+        let first = queue
+            .try_acquire(&acquire("p", "e", "1", 10))
+            .unwrap()
+            .unwrap();
+        // A repeated reject is idempotent and must not count a second expiry.
+        first.reject();
+        first.reject();
+        queue.requeue(&lease);
+        let _second = queue
+            .try_acquire(&acquire("p", "e", "2", 10))
+            .unwrap()
+            .unwrap();
+        // The client going away cancels the live offer.
+        drop(lease);
+        let text = queue.render_metrics();
+        for line in [
+            "sgl_router_pull_enqueued_total 1",
+            "sgl_router_pull_queue_full_total 1",
+            "sgl_router_pull_assignments_total{phase=\"offered\"} 2",
+            "sgl_router_pull_assignments_total{phase=\"expired\"} 1",
+            "sgl_router_pull_assignments_total{phase=\"cancelled\"} 1",
+            "sgl_router_pull_assignments_total{phase=\"committed\"} 0",
+            "sgl_router_pull_requests{state=\"waiting\"} 0",
+            "sgl_router_pull_requests{state=\"claimed\"} 0",
+        ] {
+            assert!(text.contains(line), "missing `{line}` in:\n{text}");
+        }
+    }
+
+    #[test]
     fn rejected_request_keeps_its_original_fifo_position_without_duplicates() {
         let queue = PullQueue::new(PullConfig::default());
-        let (first, _) = queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
-        let (_second, mut second_claims) =
-            queue.enqueue(HashSet::from(["p".into()]), 10, 10).unwrap();
+        let (first, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        let (_second, mut second_claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
         let a = queue
             .try_acquire(&acquire("p", "e", "first", 10))
             .unwrap()

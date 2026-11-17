@@ -494,10 +494,14 @@ async def lifespan(fast_api_app: FastAPI):
             )
             prefill_pull_agent = PrefillPullAgent(
                 PrefillPullAgentConfig(
-                    router_url=get_disagg().prefill_pull_router,
+                    router_urls=tuple(
+                        url.strip()
+                        for url in get_disagg().prefill_pull_router.split(",")
+                    ),
                     worker_url=get_disagg().prefill_pull_worker_url,
                     local_url=server_args.url(),
                     max_inflight=get_disagg().prefill_pull_max_requests,
+                    claim_concurrency=get_disagg().prefill_pull_concurrent_claims,
                     api_key=get_serving().api_key,
                     router_api_key=get_disagg().prefill_pull_router_api_key,
                     local_ssl=local_ssl,
@@ -2470,6 +2474,12 @@ def _execute_server_warmup(server_args: ServerArgs):
     url = server_args.url()
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
+    if get_disagg().prefill_pull_router is not None:
+        from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+            pull_warmup_headers,
+        )
+
+        headers.update(pull_warmup_headers())
 
     ssl_verify = ssl_verify_of(server_args)
 

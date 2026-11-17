@@ -31,7 +31,10 @@ from sglang.srt.managers.scheduler_components.prefill_work_admission import (
     PrefillPullBudgetClient,
     PrefillWorkAdmission,
     SchedulerPrefillWorkAdmission,
+    PULL_WARMUP_HEADER,
+    pending_prefill_tokens,
     prepare_prefill_pull_request,
+    pull_warmup_headers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -41,12 +44,18 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-def _request(*, allocated=0, row=None, metadata=-1, finished=False, sender=None):
+def _request(
+    *, allocated=0, row=None, metadata=-1, finished=False, sender=None, seqlen=0
+):
     return SimpleNamespace(
         kv=SimpleNamespace(kv_allocated_len=allocated, req_pool_idx=row),
         metadata_buffer_index=metadata,
         disagg_kv_sender=sender,
         finished=lambda: finished,
+        seqlen=seqlen,
+        num_matched_prefix_tokens=0,
+        storage_prefetch_last_match_len=None,
+        cache_request_handle=None,
     )
 
 
@@ -185,6 +194,7 @@ class TestPrefillPullAdmission(CustomTestCase):
                     request_id="rid",
                     tokens=2,
                     now=now,
+                    capacity=self.capacity,
                 )
                 executing = _request(sender=object())
 
@@ -216,7 +226,7 @@ class TestPrefillPullAdmission(CustomTestCase):
             capacity=capacity or self.capacity,
         )
 
-    def bind(self, tokens=16, now=1):
+    def bind(self, tokens=16, now=1, capacity=None):
         return self.ledger.control(
             action="bind",
             reservation_id="r",
@@ -224,6 +234,7 @@ class TestPrefillPullAdmission(CustomTestCase):
             assignment_id="a",
             request_id="rid",
             tokens=tokens,
+            capacity=capacity or self.capacity,
         )
 
     def consume(self, tokens=16, now=2, **changes):
@@ -237,13 +248,54 @@ class TestPrefillPullAdmission(CustomTestCase):
         args.update(changes)
         return self.ledger.consume(**args)
 
-    def test_reservations_compete_before_any_request_exists(self):
-        """A stale idle observation must not grant the same work budget twice."""
-        self.assertEqual(self.reserve()["data"]["max_tokens"], 64)
-        self.assertFalse(self.reserve("second")["success"])
-        self.assertTrue(self.bind(tokens=16)["success"])
-        self.assertEqual(self.reserve("second")["data"]["max_tokens"], 48)
-        self.assertFalse(self.reserve("third")["success"])
+    def test_peek_sizes_a_poll_without_holding_a_slot(self):
+        """Long polls size their claim with peek; a peek that held a slot would
+        let an idle router's poll block the only slot from busy routers."""
+        ledger = PrefillWorkAdmission(max_tokens=64, max_requests=1, page_size=4)
+        for poll in ("idle-router", "busy-router"):
+            peek = ledger.control(
+                action="peek", reservation_id=poll, now=0, capacity=self.capacity
+            )
+            self.assertEqual(peek["data"]["max_tokens"], 124)
+        self.assertEqual(ledger.reservations, {})
+        self.assertTrue(
+            ledger.control(
+                action="reserve", reservation_id="r", now=0, capacity=self.capacity
+            )["success"]
+        )
+        self.assertEqual(
+            ledger.control(
+                action="peek", reservation_id="p", now=0, capacity=self.capacity
+            )["error"],
+            "no_capacity",
+        )
+
+    def test_concurrent_reservations_cannot_overcommit_at_bind(self):
+        """Reserving holds only a request slot, so concurrent claims see the same
+        grant; the later bind re-checks the KV the earlier one already took."""
+        small = PrefillCapacity(tokens=40, requests=2, metadata=2)
+        self.assertEqual(self.reserve(capacity=small)["data"]["max_tokens"], 36)
+        self.assertEqual(
+            self.reserve("second", capacity=small)["data"]["max_tokens"], 36
+        )
+        self.assertFalse(self.reserve("third", capacity=small)["success"])
+        self.assertTrue(self.bind(tokens=16, capacity=small)["success"])
+
+        def bind_second(tokens):
+            return self.ledger.control(
+                action="bind",
+                reservation_id="second",
+                now=1,
+                assignment_id="b",
+                request_id="rid-b",
+                tokens=tokens,
+                capacity=small,
+            )
+
+        # 40 free, less 20 promised to the first (16 + 1 output, page rounded)
+        # and one page of slack, leaves 16 for the second.
+        self.assertEqual(bind_second(20)["error"], "no_capacity")
+        self.assertTrue(bind_second(16)["success"])
         self.assertEqual(self.reserve()["error"], "reservation already bound")
 
     def test_revocation_expiry_and_execution_ownership(self):
@@ -256,7 +308,8 @@ class TestPrefillPullAdmission(CustomTestCase):
         self.ledger.finish_intake("r", failed=False)
         release = self.ledger.control(action="release", reservation_id="r", now=100)
         self.assertFalse(release["success"])
-        self.assertEqual(self.reserve("second", now=100)["data"]["max_tokens"], 48)
+        # The executing request keeps its 20-token KV promise past the timeout.
+        self.assertEqual(self.reserve("second", now=100)["data"]["max_tokens"], 104)
         self.ledger.retire(_request())
         self.assertIn("r", self.ledger.reservations)
         self.ledger.retire(req)
@@ -287,6 +340,7 @@ class TestPrefillPullAdmission(CustomTestCase):
                 request_id="x",
                 tokens=1,
                 now=3,
+                capacity=self.capacity,
             )["success"]
         )
         result = self.ledger.control(action="query", reservation_id="expires", now=12)
@@ -348,7 +402,7 @@ class TestPrefillPullAdmission(CustomTestCase):
         )
         # 128 free tokens, less 3 slots * 2 tokens for the grant's state, less a page.
         granted = reserve("r", PrefillCapacity(128, 4, 4, state_slots=5))
-        self.assertEqual(granted["data"]["max_tokens"], 64)
+        self.assertEqual(granted["data"]["max_tokens"], 118)
         ledger.control(
             action="bind",
             reservation_id="r",
@@ -356,6 +410,7 @@ class TestPrefillPullAdmission(CustomTestCase):
             assignment_id="a",
             request_id="rid",
             tokens=8,
+            capacity=PrefillCapacity(128, 4, 4, state_slots=5),
         )
         # The unbound promise still owns 3 of the 5 slots.
         self.assertFalse(
@@ -367,10 +422,11 @@ class TestPrefillPullAdmission(CustomTestCase):
         req = _request(allocated=8, row=0, metadata=0)
         ledger.attach_request("r", req)
         holds[id(req)] = True
-        # The allocator already took the request's 3 slots out of the 5.
+        # The allocator already took the request's 3 slots out of the 5: only the
+        # new grant's 3 slots are priced (6 tokens), beside 4 unallocated KV and a page.
         second = reserve("second", PrefillCapacity(120, 3, 3, state_slots=3))
         self.assertTrue(second["success"])
-        self.assertEqual(second["data"]["max_tokens"], 56)
+        self.assertEqual(second["data"]["max_tokens"], 106)
 
     def test_static_state_pool_reports_free_and_evictable_slots(self):
         """A hybrid model's grants follow its state pool, not only token space."""
@@ -423,6 +479,58 @@ class TestPrefillPullAdmission(CustomTestCase):
         self.assertTrue(reserve("first").success)
         self.assertEqual(reserve("second").error, "no_capacity")
 
+    def test_intake_runs_no_group_collective(self):
+        """Every generate request reaches intake; a per-request clock broadcast
+        across a multi-node TP group sat on the scheduler's hot path."""
+        adapter = SchedulerPrefillWorkAdmission(
+            max_tokens=64,
+            max_requests=2,
+            safety_margin_tokens=0,
+            pool_stats=SimpleNamespace(
+                get_pool_stats=lambda: _stats(128),
+                storage=SimpleNamespace(
+                    usage=lambda: [SimpleNamespace(metrics="full")]
+                ),
+            ),
+            req_pool=SimpleNamespace(available_size=lambda: 2),
+            metadata_allocator=SimpleNamespace(available_size=lambda: 2),
+            page_size=4,
+            # No process group exists: any collective in intake would raise.
+            cpu_group=None,
+            group_rank=0,
+            group_size=2,
+        )
+        adapter.ledger.control(
+            action="reserve", reservation_id="r", now=0, capacity=self.capacity
+        )
+        adapter.ledger.control(
+            action="bind",
+            reservation_id="r",
+            now=0,
+            assignment_id="a",
+            request_id="rid",
+            tokens=2,
+            capacity=self.capacity,
+        )
+        req = TokenizedGenerateReqInput(
+            rid="rid",
+            input_text=None,
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=1),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            prefill_pull_reservation_id="r",
+            prefill_pull_assignment_id="a",
+        )
+        self.assertIsNone(adapter.authorize(req))
+        self.assertTrue(adapter.ledger.reservations["r"].consumed)
+
     def test_failed_intake_retires_without_releasing_a_started_sender(self):
         self.reserve()
         self.bind()
@@ -430,7 +538,7 @@ class TestPrefillPullAdmission(CustomTestCase):
         req = _request(finished=True)
         self.ledger.attach_request("r", req)
         self.ledger.finish_intake("r", failed=False)
-        self.assertEqual(self.reserve("next")["data"]["max_tokens"], 64)
+        self.assertEqual(self.reserve("next")["data"]["max_tokens"], 124)
 
     def test_internal_probe_occupancy_blocks_new_promises_until_retired(self):
         reservation_id = self.ledger.admit_internal("health-probe", 64)
@@ -438,7 +546,152 @@ class TestPrefillPullAdmission(CustomTestCase):
         self.ledger.attach_request(reservation_id, req)
         self.assertFalse(self.reserve()["success"])
         self.ledger.retire(req)
-        self.assertEqual(self.reserve()["data"]["max_tokens"], 64)
+        self.assertEqual(self.reserve()["data"]["max_tokens"], 124)
+
+    def test_push_dispatch_shares_the_budget_only_when_allowed(self):
+        """In a push/pull rollout a push dispatch must be admitted and charged,
+        so pull grants shrink; without the opt-in it stays rejected."""
+        for allow_push in (False, True):
+            with self.subTest(allow_push=allow_push):
+                adapter = SchedulerPrefillWorkAdmission(
+                    max_tokens=64,
+                    max_requests=4,
+                    safety_margin_tokens=0,
+                    pool_stats=SimpleNamespace(
+                        get_pool_stats=lambda: _stats(1024),
+                        storage=SimpleNamespace(
+                            usage=lambda: [SimpleNamespace(metrics="full")]
+                        ),
+                    ),
+                    req_pool=SimpleNamespace(available_size=lambda: 4),
+                    metadata_allocator=SimpleNamespace(available_size=lambda: 4),
+                    page_size=4,
+                    cpu_group=None,
+                    group_rank=0,
+                    group_size=1,
+                    allow_push=allow_push,
+                )
+                req = TokenizedGenerateReqInput(
+                    rid="push-rid",
+                    input_text=None,
+                    input_ids=array("q", range(64)),
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                )
+                error = adapter.authorize(req)
+                if not allow_push:
+                    self.assertIsNotNone(error)
+                    continue
+                self.assertIsNone(error)
+                adapter.ledger.attach_request(
+                    req.prefill_pull_reservation_id, _request(seqlen=64)
+                )
+                # The push request took the whole 64-token compute budget.
+                grant = adapter.handle_control(
+                    PrefillPullBudgetReq(action="reserve", reservation_id="r"),
+                    paused=False,
+                )
+                self.assertEqual(grant.error, "no_capacity")
+
+    def test_push_charge_follows_the_prompt_expanded_after_intake(self):
+        """Input embeds, multimodal pads and session context reach their final
+        length only in the scheduler; a push request charged by its intake
+        input_ids (0 here) let pull keep claiming large requests beside it."""
+        ledger = PrefillWorkAdmission(max_tokens=64, max_requests=4, page_size=4)
+        capacity = PrefillCapacity(tokens=1024, requests=4, metadata=4)
+        reservation_id = ledger.admit_internal("push-rid", 0, kind="push")
+        req = _request(seqlen=1000)
+        ledger.attach_request(reservation_id, req)
+        peek = ledger.control(
+            action="peek", reservation_id="p", now=0, capacity=capacity
+        )
+        self.assertEqual(peek["error"], "no_capacity")
+        # KV follows the expanded prompt as well: 1024 free less 1004 promised.
+        self.assertEqual(ledger.headroom(capacity, now=0).kv_tokens, 16)
+
+    def test_work_budget_charges_uncached_tokens_until_the_last_chunk(self):
+        """A cache-hit prompt charges only what it still has to prefill, so a
+        prompt longer than max_tokens is admissible; once its last chunk is
+        scheduled it stops charging compute, while its KV stays promised."""
+        pending = {}
+        ledger = PrefillWorkAdmission(
+            max_tokens=64,
+            max_requests=4,
+            page_size=4,
+            reservation_ttl=10,
+            pending_work_tokens=lambda req: pending.get(id(req)),
+        )
+        capacity = PrefillCapacity(tokens=1024, requests=4, metadata=4)
+
+        def reserve(reservation_id):
+            return ledger.control(
+                action="reserve",
+                reservation_id=reservation_id,
+                now=0,
+                capacity=capacity,
+            )
+
+        reserve("a")
+        bound = ledger.control(
+            action="bind",
+            reservation_id="a",
+            now=0,
+            assignment_id="a",
+            request_id="rid",
+            tokens=100,
+            capacity=capacity,
+        )
+        self.assertTrue(bound["success"])
+        # Bound but not yet in the scheduler: no hit is known, the whole prompt counts.
+        self.assertEqual(reserve("b")["error"], "no_capacity")
+        ledger.consume(
+            reservation_id="a", assignment_id="a", request_id="rid", tokens=100
+        )
+        req = _request()
+        ledger.attach_request("a", req)
+        pending[id(req)] = 10
+        self.assertTrue(reserve("b")["success"])
+        ledger.control(action="release", reservation_id="b", now=0)
+        pending[id(req)] = 64
+        self.assertEqual(reserve("c")["error"], "no_capacity")
+        pending[id(req)] = 0
+        # 1024 free, less 104 still promised to the request, less a page.
+        self.assertEqual(reserve("c")["data"]["max_tokens"], 916)
+
+    def test_pending_prefill_tokens_discounts_cache_then_follows_allocation(self):
+        req = SimpleNamespace(
+            seqlen=100,
+            kv=SimpleNamespace(kv_allocated_len=0),
+            num_matched_prefix_tokens=0,
+            storage_prefetch_last_match_len=30,
+        )
+        for hit_end, expected in ((None, 70), (80, 20), (20, 70)):
+            with self.subTest(hit_end=hit_end):
+                # The L3 end is an absolute prefix length: max-ed, never added.
+                self.assertEqual(
+                    pending_prefill_tokens(req, storage_hit_end=lambda r: hit_end),
+                    expected,
+                )
+        # A plain device/host prefix hit, with no L3 involved, discounts too:
+        # charging all 100 tokens raised no_capacity early.
+        req.storage_prefetch_last_match_len = None
+        req.num_matched_prefix_tokens = 90
+        self.assertEqual(
+            pending_prefill_tokens(req, storage_hit_end=lambda r: None), 10
+        )
+        for allocated, expected in ((90, 10), (100, 0)):
+            with self.subTest(allocated=allocated):
+                req.kv.kv_allocated_len = allocated
+                self.assertEqual(
+                    pending_prefill_tokens(req, storage_hit_end=lambda r: 80), expected
+                )
 
     def test_tp_grant_uses_weakest_rank_after_outstanding_promises(self):
         """Consensus includes rank-local debt, not just raw allocator free space."""
@@ -538,9 +791,14 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
         )
 
     def test_health_prefix_and_fake_host_are_not_public_bypasses(self):
-        def http(path, client="127.0.0.1"):
+        """Warmup is trusted by the launcher's process token, not by a loopback
+        client: a server on --host <pod IP> warms itself up from that IP."""
+
+        def http(path, client="127.0.0.1", headers=None):
             return SimpleNamespace(
-                url=SimpleNamespace(path=path), client=SimpleNamespace(host=client)
+                url=SimpleNamespace(path=path),
+                client=SimpleNamespace(host=client),
+                headers=headers or {},
             )
 
         obj = GenerateReqInput(
@@ -554,15 +812,38 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
             prepare_prefill_pull_request(obj, http("/health_generate"), starting=False)
         )
         obj.rid = "warmup"
+        warmup = pull_warmup_headers()
         self.assertTrue(
-            prepare_prefill_pull_request(obj, http("/generate"), starting=True)
+            prepare_prefill_pull_request(
+                obj, http("/generate", "10.0.0.2", warmup), starting=True
+            )
         )
+        for forged in (
+            http("/generate"),
+            http("/generate", headers={PULL_WARMUP_HEADER: "guessed"}),
+            # Non-ASCII made compare_digest raise TypeError, a 500 not a 400.
+            http("/generate", headers={PULL_WARMUP_HEADER: "\xff"}),
+        ):
+            with self.assertRaises(ValueError):
+                prepare_prefill_pull_request(obj, forged, starting=True)
         with self.assertRaises(ValueError):
             prepare_prefill_pull_request(
-                obj, http("/generate", "10.0.0.2"), starting=True
+                obj, http("/generate", headers=warmup), starting=False
             )
+
+    def test_push_opt_in_admits_only_requests_without_pull_identity(self):
+        """A half-forged pull identity must not slip in as a push dispatch."""
+        push = GenerateReqInput(rid="push", input_ids=[1])
+        self.assertFalse(
+            prepare_prefill_pull_request(push, None, starting=False, allow_push=True)
+        )
         with self.assertRaises(ValueError):
-            prepare_prefill_pull_request(obj, http("/generate"), starting=False)
+            prepare_prefill_pull_request(push, None, starting=False)
+        forged = GenerateReqInput(
+            rid="forged", input_ids=[1], prefill_pull_assignment_id="a"
+        )
+        with self.assertRaises(ValueError):
+            prepare_prefill_pull_request(forged, None, starting=False, allow_push=True)
 
     def test_configuration_rejects_unsupported_topologies_and_missing_budgets(self):
         base = dict(
@@ -575,6 +856,14 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
             prefill_pull_max_requests=4,
         )
         validate_prefill_pull(resolving_view(ServerArgs(**base, tp_size=2)))
+        # Several routers, e.g. replicas behind one headless Service.
+        validate_prefill_pull(
+            resolving_view(
+                ServerArgs(
+                    **(base | {"prefill_pull_router": "http://r0:8000, http://r1:8000"})
+                )
+            )
+        )
         # The Kimi-K3.1 prefill shape: DCP within TP and a DFLASH draft.
         validate_prefill_pull(
             resolving_view(
@@ -601,7 +890,10 @@ class TestPrefillPullControlAndInputs(CustomTestCase):
             {"prefill_pull_max_tokens": None},
             {"prefill_pull_max_requests": 0},
             {"prefill_pull_safety_margin_tokens": -1},
+            {"prefill_pull_concurrent_claims": 0},
+            {"prefill_pull_concurrent_claims": 17},
             {"prefill_pull_worker_url": None},
+            {"prefill_pull_router": "http://r0:8000,"},
             {"prefill_pull_router_api_key": None},
             {"prefill_pull_router_api_key": ""},
             {"prefill_pull_router_api_key": "   "},

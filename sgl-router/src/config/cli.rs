@@ -140,6 +140,14 @@ pub struct ServerArgs {
     /// Uncommitted offer lease in milliseconds; expiry permits reassignment.
     #[arg(long, default_value_t = 30_000)]
     pub pull_offer_timeout_ms: u64,
+    /// Milliseconds a pull request waits for the prefill worker holding its
+    /// longest cached prefix before any eligible worker may claim it. 0 is FIFO.
+    #[arg(long, default_value_t = 500)]
+    pub pull_affinity_max_wait_ms: u64,
+    /// Queue age in milliseconds after which a pull request too long for a
+    /// worker's current grant stops that worker from claiming younger requests.
+    #[arg(long, default_value_t = 5_000)]
+    pub pull_starvation_ms: u64,
 
     /// Address to bind the HTTP server to.
     #[arg(long, default_value_t = default_host())]
@@ -737,6 +745,8 @@ impl Cli {
                     max_bytes: self.server.pull_max_bytes,
                     max_tokens: self.server.pull_max_tokens,
                     offer_timeout_ms: self.server.pull_offer_timeout_ms,
+                    affinity_max_wait_ms: self.server.pull_affinity_max_wait_ms,
+                    starvation_ms: self.server.pull_starvation_ms,
                 },
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,

@@ -306,8 +306,11 @@ def validate_prefill_pull(cfg) -> None:
             "--prefill-pull-router-api-key must be explicitly set to a nonempty ASCII key without whitespace"
         )
 
-    for name in ("prefill_pull_router", "prefill_pull_worker_url"):
-        value = getattr(cfg, name)
+    urls = [
+        ("prefill_pull_router", url.strip())
+        for url in cfg.prefill_pull_router.split(",")
+    ] + [("prefill_pull_worker_url", cfg.prefill_pull_worker_url)]
+    for name, value in urls:
         parsed = urlparse(value or "")
         if (
             parsed.scheme not in ("http", "https")
@@ -318,7 +321,7 @@ def validate_prefill_pull(cfg) -> None:
             or parsed.fragment
         ):
             raise ValueError(
-                f"--{name.replace('_', '-')} must be an HTTP(S) URL without credentials, query or fragment"
+                f"--{name.replace('_', '-')} must be HTTP(S) URLs without credentials, query or fragment"
             )
     for name in ("prefill_pull_max_tokens", "prefill_pull_max_requests"):
         value = getattr(cfg, name)
@@ -328,6 +331,8 @@ def validate_prefill_pull(cfg) -> None:
             )
     if cfg.prefill_pull_safety_margin_tokens < 0:
         raise ValueError("--prefill-pull-safety-margin-tokens must be nonnegative")
+    if not 1 <= cfg.prefill_pull_concurrent_claims <= 16:
+        raise ValueError("--prefill-pull-concurrent-claims must be within 1..16")
     unsupported = []
     if cfg.disaggregation_mode != "prefill":
         unsupported.append("modes other than prefill")

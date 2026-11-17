@@ -1,14 +1,16 @@
 """Scheduler-owned admission for request-pull prefill workers.
 
-The ledger charges a prompt until the scheduler's safe retirement boundary,
-including bootstrap and source KV writes. Network timeouts can revoke a grant
-that has not been consumed; they can never release an executing request.
+The ledger charges a prompt's KV until the scheduler's safe retirement
+boundary, including bootstrap and source KV writes, and its uncached compute
+until its last chunk is allocated. Network timeouts can revoke a grant that has
+not been consumed; they can never release an executing request.
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
+import hmac
+import secrets
 import time
 import uuid
 from collections import OrderedDict
@@ -32,15 +34,32 @@ class _Reservation(msgspec.Struct):
     request_id: Optional[str] = None
     consumed: bool = False
     request: Any = None
+    # Push and internal work is unvalidated: input embeds, multimodal pads and
+    # session context extend the prompt after intake, so follow the request.
+    follow_request: bool = False
+
+
+class PrefillHeadroom(msgspec.Struct, frozen=True, array_like=True):
+    """What one more request may still take; TP ranks reduce it field-wise by MIN."""
+
+    # max_tokens minus prompt tokens still to prefill; positive admits one more.
+    work_tokens: int
+    # Longest prompt whose KV, one output token and state still fit.
+    kv_tokens: int
+    requests: int
 
 
 class PrefillWorkAdmission:
     """Serial scheduler ledger; the caller supplies group-consistent snapshots.
 
-    Work tokens count full prompts conservatively, without predicting cache hits
-    or GPU speed. KV promises are page rounded independently of the work cap.
-    Actual allocated KV is already absent from the allocator snapshot, so only
-    the remaining promised allocation is subtracted from it.
+    Work counts prompt tokens still to prefill: a whole prompt until the request
+    reaches the scheduler, then its uncached remainder, then 0 once its last
+    chunk is allocated. KV promises cover whole prompts until retirement,
+    because cache hits occupy KV as well. Allocated KV is already absent from
+    the allocator snapshot, so only the remaining promise is subtracted.
+
+    A reservation holds a request slot only; bind re-checks every budget, so
+    concurrent reservations cannot overcommit.
     """
 
     def __init__(
@@ -54,6 +73,7 @@ class PrefillWorkAdmission:
         fresh_state_slots: int = 0,
         state_slot_cost: int = 0,
         pending_state_slots: Callable[[Any], int] = lambda req: 0,
+        pending_work_tokens: Callable[[Any], Optional[int]] = lambda req: None,
     ):
         if max_tokens <= 0 or max_requests <= 0 or page_size <= 0:
             raise ValueError("Prefill pull requires positive token/request/page limits")
@@ -72,6 +92,9 @@ class PrefillWorkAdmission:
         # state and token pools do not compete for the same bytes.
         self.state_slot_cost = state_slot_cost
         self.pending_state_slots = pending_state_slots
+        # Prompt tokens a scheduler request still has to prefill; None charges
+        # the whole prompt.
+        self.pending_work_tokens = pending_work_tokens
         self.reservations: dict[str, _Reservation] = {}
         # Bounded replay history. Old UUIDs are never reissued by the agent.
         self._terminal: OrderedDict[str, str] = OrderedDict()
@@ -92,36 +115,63 @@ class PrefillWorkAdmission:
         # One output token and page rounding remain covered even at a boundary.
         return ((tokens + 1 + self.page_size - 1) // self.page_size) * self.page_size
 
-    def _remaining_capacity(self, capacity: PrefillCapacity) -> tuple[int, int]:
+    @staticmethod
+    def _prompt_tokens(reservation: _Reservation) -> int:
+        req = reservation.request
+        if reservation.follow_request and req is not None:
+            return max(reservation.tokens, req.seqlen)
+        return reservation.tokens
+
+    def _work_charge(self, reservation: _Reservation) -> int:
+        if reservation.assignment_id is None and not reservation.consumed:
+            return 0
+        tokens = self._prompt_tokens(reservation)
+        req = reservation.request
+        pending = None if req is None else self.pending_work_tokens(req)
+        return tokens if pending is None else min(pending, tokens)
+
+    def _kv_promise(self, reservation: _Reservation) -> int:
+        if reservation.assignment_id is None and not reservation.consumed:
+            return 0
+        req = reservation.request
+        allocated = 0 if req is None else req.kv.kv_allocated_len
+        # Prefix-sharing is deliberately not discounted. A pessimistic
+        # promise cannot over-admit after an eviction or a cache miss.
+        return max(0, self._kv_charge(self._prompt_tokens(reservation)) - allocated)
+
+    def _headroom(
+        self, capacity: PrefillCapacity, *, exclude: Optional[str] = None
+    ) -> PrefillHeadroom:
+        """Budget left for one more request, ignoring reservation `exclude`."""
         work = 0
         promised_kv = 0
         promised_rows = 0
         promised_metadata = 0
         promised_state = 0
-        for reservation in self.reservations.values():
-            work += reservation.tokens
+        held = 0
+        for reservation_id, reservation in self.reservations.items():
+            if reservation_id == exclude:
+                continue
+            held += 1
             req = reservation.request
-            allocated = 0 if req is None else req.kv.kv_allocated_len
-            # Prefix-sharing is deliberately not discounted. A pessimistic
-            # promise cannot over-admit after an eviction or a cache miss.
-            promised_kv += max(0, self._kv_charge(reservation.tokens) - allocated)
+            work += self._work_charge(reservation)
+            promised_kv += self._kv_promise(reservation)
             promised_rows += req is None or req.kv.req_pool_idx is None
             promised_metadata += req is None or req.metadata_buffer_index == -1
             promised_state += (
                 self.fresh_state_slots if req is None else self.pending_state_slots(req)
             )
-        # The new grant's own state slots compete for the token arena as well.
+        # The new request's own state slots compete for the token arena as well.
         state_tokens = (promised_state + self.fresh_state_slots) * self.state_slot_cost
-        tokens = min(
-            self.max_tokens - work,
+        kv_tokens = (
             capacity.tokens
             - promised_kv
             - state_tokens
             - self.safety_margin_tokens
-            - self.page_size,
+            - self.page_size
         )
         requests = min(
-            self.max_requests - len(self.reservations),
+            self.max_requests - held,
             capacity.requests - promised_rows,
             capacity.metadata - promised_metadata,
         )
@@ -130,14 +180,22 @@ class PrefillWorkAdmission:
                 requests,
                 (capacity.state_slots - promised_state) // self.fresh_state_slots,
             )
-        return max(0, tokens), max(0, requests)
+        return PrefillHeadroom(
+            work_tokens=max(0, self.max_tokens - work),
+            kv_tokens=max(0, kv_tokens),
+            requests=max(0, requests),
+        )
 
-    def remaining_capacity(
-        self, capacity: PrefillCapacity, *, now: float
-    ) -> tuple[int, int]:
-        """Return local headroom after expiring unconsumed reservations."""
+    def headroom(
+        self,
+        capacity: PrefillCapacity,
+        *,
+        now: float,
+        exclude: Optional[str] = None,
+    ) -> PrefillHeadroom:
+        """Local headroom after expiring unconsumed reservations."""
         self._expire(now)
-        return self._remaining_capacity(capacity)
+        return self._headroom(capacity, exclude=exclude)
 
     @staticmethod
     def _result(success: bool, data=None, error=None) -> dict:
@@ -150,7 +208,7 @@ class PrefillWorkAdmission:
         reservation_id: str,
         now: float,
         capacity: Optional[PrefillCapacity] = None,
-        capacity_limit: Optional[tuple[int, int]] = None,
+        capacity_limit: Optional[PrefillHeadroom] = None,
         assignment_id: Optional[str] = None,
         tokens: Optional[int] = None,
         request_id: Optional[str] = None,
@@ -159,22 +217,44 @@ class PrefillWorkAdmission:
         if not reservation_id:
             return self._result(False, error="reservation_id is required")
         reservation = self.reservations.get(reservation_id)
+
+        def limit(exclude: Optional[str]) -> Optional[PrefillHeadroom]:
+            # A TP group passes its MIN-reduced headroom; alone, compute it here.
+            if capacity_limit is not None:
+                return capacity_limit
+            if capacity is None:
+                return None
+            return self._headroom(capacity, exclude=exclude)
+
+        if action == "peek":
+            # A long poll's size hint. It holds nothing, so an empty router's
+            # poll cannot keep a request slot from routers that have work.
+            headroom = limit(None)
+            if headroom is None:
+                return self._result(False, error="capacity unavailable")
+            if (
+                headroom.work_tokens <= 0
+                or headroom.kv_tokens <= 0
+                or headroom.requests <= 0
+            ):
+                return self._result(False, error="no_capacity")
+            return self._result(True, {"max_tokens": headroom.kv_tokens})
         if action == "reserve":
             if reservation_id in self._terminal:
                 return self._result(False, error=self._terminal[reservation_id])
             if reservation is None:
-                if capacity is None:
+                headroom = limit(None)
+                if headroom is None:
                     return self._result(False, error="capacity unavailable")
-                available_tokens, available_requests = self._remaining_capacity(
-                    capacity
-                )
-                if capacity_limit is not None:
-                    available_tokens = min(available_tokens, capacity_limit[0])
-                    available_requests = min(available_requests, capacity_limit[1])
-                if available_tokens <= 0 or available_requests <= 0:
+                if (
+                    headroom.work_tokens <= 0
+                    or headroom.kv_tokens <= 0
+                    or headroom.requests <= 0
+                ):
                     return self._result(False, error="no_capacity")
+                # The grant is advisory: bind re-checks against current budgets.
                 reservation = _Reservation(
-                    tokens=available_tokens,
+                    tokens=headroom.kv_tokens,
                     expires_at=now + self.reservation_ttl,
                 )
                 self.reservations[reservation_id] = reservation
@@ -231,6 +311,16 @@ class PrefillWorkAdmission:
             )
         if tokens > reservation.tokens:
             return self._result(False, error="request exceeds reserved tokens")
+        # Other claims may have bound since this grant; admit against now.
+        headroom = limit(reservation_id)
+        if headroom is None:
+            return self._result(False, error="capacity unavailable")
+        if (
+            headroom.work_tokens <= 0
+            or headroom.requests <= 0
+            or tokens > headroom.kv_tokens
+        ):
+            return self._result(False, error="no_capacity")
         reservation.tokens = tokens
         reservation.assignment_id = assignment_id
         reservation.request_id = request_id
@@ -243,9 +333,12 @@ class PrefillWorkAdmission:
         assignment_id: Optional[str],
         request_id: str,
         tokens: int,
-        now: float,
+        now: Optional[float] = None,
     ) -> Optional[str]:
-        self._expire(now)
+        # Without `now`, expiry stays where control actions already ran it on a
+        # group-agreed clock, so intake needs no per-request clock broadcast.
+        if now is not None:
+            self._expire(now)
         reservation = self.reservations.get(reservation_id)
         if reservation is None:
             return "Missing or expired prefill pull reservation"
@@ -270,14 +363,18 @@ class PrefillWorkAdmission:
         if reservation is not None and reservation.consumed:
             reservation.request = req
 
-    def admit_internal(self, request_id: str, tokens: int) -> str:
-        """Account trusted health/warmup work while keeping its startup bypass."""
-        reservation_id = f"internal:{request_id}"
+    def admit_internal(
+        self, request_id: str, tokens: int, *, kind: str = "internal"
+    ) -> str:
+        """Charge work that arrives without a reservation: trusted health/warmup
+        probes, or push dispatches when push and pull share this worker."""
+        reservation_id = f"{kind}:{request_id}"
         self.reservations[reservation_id] = _Reservation(
             tokens=tokens,
             expires_at=float("inf"),
             request_id=request_id,
             consumed=True,
+            follow_request=True,
         )
         return reservation_id
 
@@ -319,7 +416,9 @@ class SchedulerPrefillWorkAdmission:
         group_size,
         token_to_kv_pool_allocator=None,
         tree_cache=None,
+        allow_push: bool = False,
     ):
+        self.allow_push = allow_push
         stats = pool_stats.get_pool_stats()
         metrics = sorted(u.metrics for u in pool_stats.storage.usage())
         if (
@@ -338,11 +437,23 @@ class SchedulerPrefillWorkAdmission:
         if stats.is_hybrid_ssm and state is None:
             raise ValueError("Prefill pull needs the allocator's state slots")
         self.has_state_pool = stats.is_hybrid_ssm
+        storage_hit_end = (
+            (
+                lambda req: tree_cache.get_pending_storage_hit_end(
+                    req.cache_request_handle
+                )
+            )
+            if tree_cache is not None
+            else (lambda req: None)
+        )
         self.ledger = PrefillWorkAdmission(
             max_tokens=max_tokens,
             max_requests=max_requests,
             page_size=page_size,
             safety_margin_tokens=safety_margin_tokens,
+            pending_work_tokens=lambda req: pending_prefill_tokens(
+                req, storage_hit_end=storage_hit_end
+            ),
             **(
                 _state_slot_accounting(
                     allocator=token_to_kv_pool_allocator,
@@ -398,17 +509,25 @@ class SchedulerPrefillWorkAdmission:
         now = self._now()
         capacity = None
         capacity_limit = None
-        if req.action == "reserve":
+        if req.action in ("peek", "reserve", "bind"):
             capacity = self._capacity(paused)
-            capacity_limit = self.ledger.remaining_capacity(capacity, now=now)
+            capacity_limit = self.ledger.headroom(
+                capacity,
+                now=now,
+                exclude=req.reservation_id if req.action == "bind" else None,
+            )
             if self.group_size > 1:
                 import torch
 
-                tensor = torch.tensor(capacity_limit, dtype=torch.int64, device="cpu")
+                tensor = torch.tensor(
+                    msgspec.structs.astuple(capacity_limit),
+                    dtype=torch.int64,
+                    device="cpu",
+                )
                 torch.distributed.all_reduce(
                     tensor, op=torch.distributed.ReduceOp.MIN, group=self.cpu_group
                 )
-                capacity_limit = tuple(tensor.tolist())
+                capacity_limit = PrefillHeadroom(*tensor.tolist())
         result = self.ledger.control(
             action=req.action,
             reservation_id=req.reservation_id,
@@ -422,9 +541,23 @@ class SchedulerPrefillWorkAdmission:
         return PrefillPullBudgetReqOutput(rid=req.rid, **result)
 
     def authorize(self, req) -> Optional[str]:
+        # Until the scheduler request exists, embeds count one token per row;
+        # afterwards the charge follows its final length (see follow_request).
+        intake_tokens = max(len(req.input_ids or ()), len(req.input_embeds or ()))
         if req.prefill_pull_internal:
             req.prefill_pull_reservation_id = self.ledger.admit_internal(
-                req.rid, len(req.input_ids or ())
+                req.rid, intake_tokens
+            )
+            return None
+        if (
+            self.allow_push
+            and req.prefill_pull_reservation_id is None
+            and req.prefill_pull_assignment_id is None
+        ):
+            # A push dispatch cannot be refused without failing an already
+            # paired D; charge it so pull grants shrink around it.
+            req.prefill_pull_reservation_id = self.ledger.admit_internal(
+                req.rid, intake_tokens, kind="push"
             )
             return None
         if (
@@ -443,7 +576,6 @@ class SchedulerPrefillWorkAdmission:
             assignment_id=req.prefill_pull_assignment_id,
             request_id=req.rid,
             tokens=len(req.input_ids or ()),
-            now=self._now(),
         )
 
     def handle_generate_request(
@@ -471,6 +603,25 @@ class SchedulerPrefillWorkAdmission:
             failed = False
         finally:
             self.ledger.finish_intake(req.prefill_pull_reservation_id, failed)
+
+
+def pending_prefill_tokens(
+    req, *, storage_hit_end: Callable[[Any], Optional[int]]
+) -> int:
+    """Prompt tokens `req` still has to prefill, in the unit of the engine's
+    `num_waiting_uncached_tokens`: KV allocation advances with each scheduled
+    chunk; before the first one, the device/host prefix match, the
+    enqueue-time match and the queried L3 hit are discounted (see
+    `SchedulerLoadInquirer._cached_prefix_len`)."""
+    if req.kv.kv_allocated_len > 0:
+        return max(0, req.seqlen - req.kv.kv_allocated_len)
+    cached = max(
+        req.num_matched_prefix_tokens, req.storage_prefetch_last_match_len or 0
+    )
+    hit_end = storage_hit_end(req)
+    if hit_end is not None:
+        cached = max(cached, hit_end)
+    return max(0, req.seqlen - min(cached, req.seqlen))
 
 
 def _state_slot_accounting(*, allocator, req_pool, tree_cache) -> dict:
@@ -524,8 +675,26 @@ class PrefillPullBudgetClient:
             future.set_result(result)
 
 
-def prepare_prefill_pull_request(obj, request, *, starting: bool) -> bool:
-    """Return trusted warmup/health status without adding an HTTP bypass field."""
+PULL_WARMUP_HEADER = "X-SGLang-Prefill-Pull-Warmup"
+# Generated per process: the launcher's warmup runs in this process and posts to
+# its own --host, which need not be loopback. Pull requires one tokenizer
+# worker, so this process also receives the request.
+_PULL_WARMUP_TOKEN = secrets.token_hex(16)
+
+
+def pull_warmup_headers() -> dict[str, str]:
+    """Headers that authorize this process's own startup warmup request."""
+    return {PULL_WARMUP_HEADER: _PULL_WARMUP_TOKEN}
+
+
+def prepare_prefill_pull_request(
+    obj, request, *, starting: bool, allow_push: bool = False
+) -> bool:
+    """Return trusted warmup/health status without adding an HTTP bypass field.
+
+    With `allow_push`, a request carrying no pull identity is a push router's
+    dispatch: it passes here and the scheduler charges it to the ledger.
+    """
     from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
     from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
     from sglang.srt.managers.io_struct import GenerateReqInput
@@ -538,17 +707,19 @@ def prepare_prefill_pull_request(obj, request, *, starting: bool) -> bool:
         and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
         and (request is None or path in ("/health", "/health_generate"))
     )
-    local = request is None
-    if request is not None and request.client is not None:
-        try:
-            local = ipaddress.ip_address(request.client.host).is_loopback
-        except ValueError:
-            pass
+    supplied = "" if request is None else request.headers.get(PULL_WARMUP_HEADER, "")
+    # compare_digest raises TypeError on non-ASCII str; such a value is no token.
+    trusted = request is None or (
+        supplied.isascii() and hmac.compare_digest(supplied, _PULL_WARMUP_TOKEN)
+    )
     # Paused or unhealthy workers are also unready, but must never regain the
     # startup bypass. Only the startup state authorizes the launcher warmup.
-    warmup = starting and local and obj.bootstrap_host == FAKE_BOOTSTRAP_HOST
+    warmup = starting and trusted and obj.bootstrap_host == FAKE_BOOTSTRAP_HOST
     internal = health or warmup
-    if not internal:
+    push = allow_push and not (
+        obj.prefill_pull_reservation_id or obj.prefill_pull_assignment_id
+    )
+    if not internal and not push:
         params = obj.sampling_params or {}
         if (
             not isinstance(params, dict)

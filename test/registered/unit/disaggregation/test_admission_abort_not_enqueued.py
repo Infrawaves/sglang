@@ -159,6 +159,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
             request_id=req.rid,
             tokens=1500,
             now=0,
+            capacity=PrefillCapacity(4096, 1, 1),
         )
         self.assertIsNone(
             ledger.consume(

@@ -3,18 +3,25 @@
 The scheduler owns capacity and admission. This asynchronous agent owns only
 network I/O: reserve capacity, acquire an offer, bind it, obtain a commit, and
 execute the ordinary local /generate endpoint. An offer is never executable.
+
+The agent claims from every configured router at once. Routers keep separate
+queues and never coordinate: the scheduler's ledger re-checks capacity at each
+bind, so concurrent claims from several routers cannot overcommit this worker.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
+import socket
 import ssl
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import msgspec
@@ -23,10 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 class PrefillPullAgentConfig(msgspec.Struct, frozen=True):
-    router_url: str
+    # An http:// hostname is re-resolved and every address is a router, which
+    # tracks a Kubernetes headless Service; https:// and IPs are used as given.
+    router_urls: tuple[str, ...]
     worker_url: str
     local_url: str
     max_inflight: int
+    # Claims in flight at once per router: overlaps round trips with the next.
+    claim_concurrency: int = 1
     api_key: str | None = None
     router_api_key: str | None = None
     local_ssl: ssl.SSLContext | bool = True
@@ -34,12 +45,38 @@ class PrefillPullAgentConfig(msgspec.Struct, frozen=True):
     retry_interval: float = 0.5
     status_interval: float = 1.0
     control_timeout: float = 15.0
+    router_refresh_interval: float = 10.0
+    # Refreshes a router must be missing from DNS before its claims stop, so a
+    # transient lookup gap does not drop outcome reporting.
+    router_missing_refreshes: int = 3
+    # Seconds a router may stay unreachable before its pending outcomes are
+    # dropped, whether or not it is still listed. While it answers, outcomes
+    # keep going however long it drains: its timeout ends the client's wait.
+    router_unreachable_grace: float = 60.0
     max_response_bytes: int = 4 * 1024 * 1024
     max_offer_bytes: int = 16 * 1024 * 1024
 
 
 class PullProtocolError(RuntimeError):
     pass
+
+
+def _expandable(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme != "http" or not parts.hostname:
+        return False
+    try:
+        ipaddress.ip_address(parts.hostname)
+    except ValueError:
+        return True
+    return False
+
+
+def _with_host(url: str, address: str) -> str:
+    parts = urlsplit(url)
+    host = f"[{address}]" if ":" in address else address
+    netloc = f"{host}:{parts.port or 80}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 class PrefillPullAgent:
@@ -57,9 +94,15 @@ class PrefillPullAgent:
         self._ready = ready
         self.worker_epoch = uuid.uuid4().hex
         self._session: aiohttp.ClientSession | None = None
-        self._acquirer: asyncio.Task | None = None
+        # Active router base URL -> its claim loops.
+        self._routers: dict[str, list[asyncio.Task]] = {}
+        # Configured URL -> last resolved router base URLs.
+        self._resolved: dict[str, set[str]] = {}
+        self._missing: dict[str, int] = {}
+        self._refresher: asyncio.Task | None = None
         self._assignments: dict[str, asyncio.Task] = {}
         self._assignment_reservations: dict[str, str] = {}
+        self._assignment_routers: dict[str, str] = {}
         self._stopping = False
 
     async def start(self):
@@ -67,22 +110,36 @@ class PrefillPullAgent:
             raise RuntimeError("Prefill pull agent is already running")
         if self.config.max_inflight < 1:
             raise ValueError("Prefill pull max_inflight must be positive")
+        if not 1 <= self.config.claim_concurrency <= 16:
+            raise ValueError("Prefill pull claim concurrency must be within 1..16")
+        if not self.config.router_urls:
+            raise ValueError("Prefill pull needs at least one router URL")
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
-            connector=aiohttp.TCPConnector(limit=self.config.max_inflight * 2 + 4),
+            connector=aiohttp.TCPConnector(limit=0),
         )
-        self._acquirer = asyncio.create_task(self._acquire_loop())
+        await self._refresh_routers()
+        if any(_expandable(url) for url in self.config.router_urls):
+            self._refresher = asyncio.create_task(self._refresh_loop())
 
     async def close(self):
         self._stopping = True
         assignments = [
-            (assignment_id, self._assignment_reservations[assignment_id], task)
+            (
+                assignment_id,
+                self._assignment_routers[assignment_id],
+                self._assignment_reservations[assignment_id],
+                task,
+            )
             for assignment_id, task in self._assignments.items()
         ]
-        if self._acquirer is not None:
-            self._acquirer.cancel()
-            await asyncio.gather(self._acquirer, return_exceptions=True)
-        tasks = [task for _, _, task in assignments]
+        loops = [task for tasks in self._routers.values() for task in tasks]
+        if self._refresher is not None:
+            loops.append(self._refresher)
+        for task in loops:
+            task.cancel()
+        await asyncio.gather(*loops, return_exceptions=True)
+        tasks = [task for *_, task in assignments]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -90,21 +147,73 @@ class PrefillPullAgent:
         # to revoke the grant. Keep shutdown cleanup with the task's owner too.
         await asyncio.gather(
             *(
-                self._close_assignment(assignment_id, reservation_id)
-                for assignment_id, reservation_id, _ in assignments
+                self._close_assignment(router, assignment_id, reservation_id)
+                for assignment_id, router, reservation_id, _ in assignments
             )
         )
         if self._session is not None:
             await self._session.close()
             self._session = None
 
-    async def _close_assignment(self, assignment_id: str, reservation_id: str):
+    async def _resolve(self, url: str) -> set[str]:
+        if not _expandable(url):
+            return {url.rstrip("/")}
+        parts = urlsplit(url)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            parts.hostname, parts.port or 80, type=socket.SOCK_STREAM
+        )
+        return {_with_host(url, info[4][0]).rstrip("/") for info in infos}
+
+    async def _refresh_routers(self):
+        for url in self.config.router_urls:
+            try:
+                self._resolved[url] = await self._resolve(url)
+            except OSError as exc:
+                # Keep the last answer: a failed lookup is not a removal.
+                logger.warning("Cannot resolve prefill pull router %s: %s", url, exc)
+        current = set().union(*self._resolved.values())
+        for router in current - self._routers.keys():
+            logger.info("Prefill pull claiming from router %s", router)
+            self._routers[router] = [
+                asyncio.create_task(self._acquire_loop(router))
+                for _ in range(self.config.claim_concurrency)
+            ]
+        for router in list(self._routers.keys() - current):
+            self._missing[router] = self._missing.get(router, 0) + 1
+            if self._missing[router] >= self.config.router_missing_refreshes:
+                await self._drop_router(router)
+        for router in current:
+            self._missing.pop(router, None)
+
+    async def _drop_router(self, router: str):
+        """Stop claiming from `router`; outcomes it is owed still go out while
+        it answers (see `_report_outcome`)."""
+        logger.info("Prefill pull router %s is gone; stopping its claims", router)
+        loops = self._routers.pop(router)
+        self._missing.pop(router, None)
+        for task in loops:
+            task.cancel()
+        await asyncio.gather(*loops, return_exceptions=True)
+
+    async def _refresh_loop(self):
+        while not self._stopping:
+            await asyncio.sleep(self.config.router_refresh_interval)
+            try:
+                await self._refresh_routers()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Prefill pull router refresh failed")
+
+    async def _close_assignment(
+        self, router: str, assignment_id: str, reservation_id: str
+    ):
         await self._release(reservation_id)
         # Reject also cancels committed assignments; the router must not keep
         # waiting for an outcome from an agent that has shut down. A committed
         # assignment remains non-replayable even if this notification is lost.
         with contextlib.suppress(aiohttp.ClientError, TimeoutError, PullProtocolError):
-            await self._control("reject", self._identity(assignment_id))
+            await self._control(router, "reject", self._identity(assignment_id))
 
     def _abort_local(self, request_id: str):
         try:
@@ -120,12 +229,14 @@ class PrefillPullAgent:
             "dp_rank": 0,
         }
 
-    async def _control(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def _control(
+        self, router: str, action: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
         headers = {}
         if self.config.router_api_key:
             headers["Authorization"] = f"Bearer {self.config.router_api_key}"
         async with self._session.post(
-            self.config.router_url.rstrip("/") + "/internal/pull/" + action,
+            router + "/internal/pull/" + action,
             json=body,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=self.config.control_timeout),
@@ -165,11 +276,12 @@ class PrefillPullAgent:
             self._budget(**kwargs), timeout=self.config.control_timeout
         )
 
-    async def _acquire_loop(self):
+    async def _acquire_loop(self, router: str):
         while not self._stopping:
+            # Reserved only once an offer arrives (see _run_assignment): a
+            # router with no work must not hold a request slot through its
+            # long poll while another router's queue waits for it.
             reservation_id = uuid.uuid4().hex
-            handed_off = False
-            reservation_requested = False
             try:
                 if (
                     not self._ready()
@@ -177,9 +289,8 @@ class PrefillPullAgent:
                 ):
                     await asyncio.sleep(self.config.retry_interval)
                     continue
-                reservation_requested = True
                 grant = await self._budget_call(
-                    action="reserve", reservation_id=reservation_id
+                    action="peek", reservation_id=reservation_id
                 )
                 if not grant.get("success"):
                     await asyncio.sleep(self.config.retry_interval)
@@ -192,15 +303,17 @@ class PrefillPullAgent:
                     "poll_id": uuid.uuid4().hex,
                     "max_tokens": data["max_tokens"],
                     "max_requests": 1,
+                    # Lets the router hold one uncommitted offer per claim loop.
+                    "max_offered": self.config.claim_concurrency,
                     "wait_ms": self.config.poll_wait_ms,
                 }
                 # Retry the same poll, so a lost offer cannot create another
-                # assignment against this reservation. Abandoning an offer is
-                # safe: without accept, the router cannot commit it.
+                # assignment for this claim. Abandoning an offer is safe:
+                # without accept, the router cannot commit it.
                 offer = None
                 for attempt in range(3):
                     try:
-                        offer = await self._control("acquire", poll)
+                        offer = await self._control(router, "acquire", poll)
                         break
                     except (aiohttp.ClientError, TimeoutError):
                         if attempt == 2:
@@ -213,42 +326,58 @@ class PrefillPullAgent:
                     raise PullProtocolError("Invalid prefill pull offer")
                 if assignment_id in self._assignments:
                     raise PullProtocolError("Duplicate live prefill pull assignment")
-                task = asyncio.create_task(self._run_assignment(reservation_id, offer))
+                # Loops for every router passed the pre-poll check while their
+                # polls were open; admit only as many offers as there is room.
+                # No await between this check and the insertion below.
+                if len(self._assignments) >= self.config.max_inflight:
+                    with contextlib.suppress(
+                        aiohttp.ClientError, TimeoutError, PullProtocolError
+                    ):
+                        await self._control(
+                            router, "reject", self._identity(assignment_id)
+                        )
+                    continue
+                task = asyncio.create_task(
+                    self._run_assignment(router, reservation_id, offer)
+                )
                 self._assignments[assignment_id] = task
                 self._assignment_reservations[assignment_id] = reservation_id
+                self._assignment_routers[assignment_id] = router
                 task.add_done_callback(
                     lambda task, key=assignment_id: self._assignment_done(key, task)
                 )
-                handed_off = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "Prefill pull acquisition failed: %s", exc, exc_info=True
+                    "Prefill pull acquisition from %s failed: %s",
+                    router,
+                    exc,
+                    exc_info=True,
                 )
                 await asyncio.sleep(self.config.retry_interval)
-            finally:
-                if reservation_requested and not handed_off:
-                    await self._release(reservation_id)
 
     def _assignment_done(self, assignment_id: str, task: asyncio.Task):
         self._assignments.pop(assignment_id, None)
         self._assignment_reservations.pop(assignment_id, None)
+        self._assignment_routers.pop(assignment_id, None)
         if not task.cancelled() and task.exception() is not None:
             logger.error("Prefill pull assignment failed: %s", task.exception())
 
-    async def _commit(self, identity: dict[str, Any]) -> bool:
+    async def _commit(self, router: str, identity: dict[str, Any]) -> bool:
         try:
-            result = await self._control("accept", identity)
+            result = await self._control(router, "accept", identity)
         except (aiohttp.ClientError, TimeoutError, PullProtocolError):
             # A timeout does not tell us whether the router committed. Query
             # this assignment; do not execute speculatively or acquire a retry.
-            result = await self._control("status", identity)
+            result = await self._control(router, "status", identity)
             if result.get("status") == "offered":
-                result = await self._control("accept", identity)
+                result = await self._control(router, "accept", identity)
         return result.get("status") == "committed"
 
-    async def _run_assignment(self, reservation_id: str, offer: dict[str, Any]):
+    async def _run_assignment(
+        self, router: str, reservation_id: str, offer: dict[str, Any]
+    ):
         assignment_id = offer["assignment_id"]
         identity = self._identity(assignment_id)
         request_id = offer.get("request_id")
@@ -257,6 +386,14 @@ class PrefillPullAgent:
         committed = False
         try:
             body = self._execution_body(offer, reservation_id)
+            # The peek before polling held nothing; another claim may have
+            # taken the slot since, in which case the offer goes back.
+            granted = await self._budget_call(
+                action="reserve", reservation_id=reservation_id
+            )
+            if not granted.get("success"):
+                await self._control(router, "reject", identity)
+                return
             bound = await self._budget_call(
                 action="bind",
                 reservation_id=reservation_id,
@@ -265,15 +402,15 @@ class PrefillPullAgent:
                 request_id=request_id,
             )
             if not bound.get("success"):
-                await self._control("reject", identity)
+                await self._control(router, "reject", identity)
                 return
-            committed = await self._commit(identity)
+            committed = await self._commit(router, identity)
             if not committed:
                 return
             execution = asyncio.create_task(
                 self._execute(body, offer.get("headers", {}))
             )
-            monitor = asyncio.create_task(self._monitor(identity))
+            monitor = asyncio.create_task(self._monitor(router, identity))
             done, _ = await asyncio.wait(
                 [execution, monitor], return_when=asyncio.FIRST_COMPLETED
             )
@@ -293,7 +430,7 @@ class PrefillPullAgent:
             monitor.cancel()
             await asyncio.gather(monitor, return_exceptions=True)
             await self._release(reservation_id)
-            await self._report_outcome(identity, status_code, response_body)
+            await self._report_outcome(router, identity, status_code, response_body)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -309,7 +446,10 @@ class PrefillPullAgent:
             # Accept may have committed before a transport failure. Reporting
             # failure resolves that attempt; it never authorizes replay.
             await self._report_outcome(
-                identity, 502, json.dumps({"error": "Prefill pull execution failed"})
+                router,
+                identity,
+                502,
+                json.dumps({"error": "Prefill pull execution failed"}),
             )
         finally:
             await self._release(reservation_id)
@@ -361,6 +501,13 @@ class PrefillPullAgent:
             headers=headers,
             ssl=self.config.local_ssl,
         ) as response:
+            if 200 <= response.status < 300:
+                # The router judges a successful prefill by status alone and
+                # the client's output comes from D; logprobs or hidden states
+                # can make this body arbitrarily large, so it is not relayed.
+                async for _ in response.content.iter_chunked(65536):
+                    pass
+                return response.status, "{}"
             payload = await self._read_limited(response, self.config.max_response_bytes)
             body = payload.decode("utf-8", errors="replace")
             # Replacement characters can expand malformed upstream bytes. The
@@ -369,12 +516,12 @@ class PrefillPullAgent:
                 raise PullProtocolError("Decoded prefill response exceeds size limit")
             return response.status, body
 
-    async def _monitor(self, identity: dict[str, Any]):
+    async def _monitor(self, router: str, identity: dict[str, Any]):
         failures = 0
         while True:
             await asyncio.sleep(self.config.status_interval)
             try:
-                status = (await self._control("status", identity)).get("status")
+                status = (await self._control(router, "status", identity)).get("status")
                 failures = 0
                 if status != "committed":
                     return
@@ -385,20 +532,43 @@ class PrefillPullAgent:
                     # cancellation does not make this attempt safe to replay.
                     return
 
-    async def _report_outcome(self, identity, status_code: int, body: str):
+    async def _report_outcome(self, router: str, identity, status_code: int, body: str):
+        # A router that still answers, even one removed from DNS and draining
+        # its clients, is owed the outcome. One that stays unreachable is given
+        # up on: retrying it forever would pin this in-flight slot.
+        clock = asyncio.get_running_loop()
+        unreachable_since = None
+        terminal = ("completed", "cancelled", "expired")
         while not self._stopping:
             try:
                 result = await self._control(
-                    "outcome", {**identity, "status_code": status_code, "body": body}
+                    router,
+                    "outcome",
+                    {**identity, "status_code": status_code, "body": body},
                 )
-                if result.get("status") in ("completed", "cancelled", "expired"):
+                if result.get("status") in terminal:
                     return
                 raise PullProtocolError("Router did not acknowledge prefill outcome")
             except (aiohttp.ClientError, TimeoutError, PullProtocolError):
-                await asyncio.sleep(self.config.retry_interval)
-                with contextlib.suppress(
-                    aiohttp.ClientError, TimeoutError, PullProtocolError
+                pass
+            await asyncio.sleep(self.config.retry_interval)
+            try:
+                result = await self._control(router, "status", identity)
+                unreachable_since = None
+                if result.get("status") in terminal:
+                    return
+            except (aiohttp.ClientError, TimeoutError, PullProtocolError):
+                if unreachable_since is None:
+                    unreachable_since = clock.time()
+                # Any router, listed or not: a fixed IP or https URL is never
+                # removed, so waiting for removal let one dead router pin the
+                # in-flight slots every healthy router needs.
+                if (
+                    clock.time() - unreachable_since
+                    >= self.config.router_unreachable_grace
                 ):
-                    result = await self._control("status", identity)
-                    if result.get("status") in ("completed", "cancelled", "expired"):
-                        return
+                    logger.warning(
+                        "Dropping prefill pull outcome for unreachable router %s",
+                        router,
+                    )
+                    return

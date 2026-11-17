@@ -53,10 +53,6 @@ impl Config {
                 "pull requires a non-empty --worker-api-key without whitespace"
             );
             ensure!(
-                matches!(self.discovery, DiscoveryBackend::StaticUrls(_)),
-                "pull requires a fixed static worker pool"
-            );
-            ensure!(
                 self.server.grpc_port.is_none(),
                 "pull does not support gRPC"
             );

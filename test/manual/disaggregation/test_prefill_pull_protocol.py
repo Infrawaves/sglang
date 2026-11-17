@@ -203,7 +203,7 @@ class TestPrefillPullProtocol(unittest.IsolatedAsyncioTestCase, CustomTestCase):
 
         self.agent = PrefillPullAgent(
             PrefillPullAgentConfig(
-                router_url=self.router_url,
+                router_urls=(self.router_url,),
                 worker_url=self.p_url,
                 local_url=self.p_url,
                 api_key="pull-test-secret",

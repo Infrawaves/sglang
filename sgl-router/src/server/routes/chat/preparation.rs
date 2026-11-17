@@ -665,6 +665,29 @@ impl PreparedRequest {
         Some(rid.as_str().map_or_else(|| rid.to_string(), str::to_owned))
     }
 
+    /// Replaces a single `text` prompt with the router's ids, overriding
+    /// `--disable-input-ids-forwarding`. Pull admission rejects an engine count
+    /// above the router's, so both sides must count the same ids.
+    pub(super) fn forward_prompt_ids(&mut self) -> Result<(), ApiError> {
+        let Some(tokens) = &self.tokens else {
+            return Ok(());
+        };
+        let mut value = match self.parsed_body.take() {
+            Some(value) => value,
+            None => serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
+        };
+        let fields = value.as_object_mut().ok_or_else(invalid_request)?;
+        if fields.get("text").is_some_and(Value::is_string) {
+            fields.remove("text");
+            fields.insert("input_ids".into(), json!(tokens.ids));
+            self.body = serde_json::to_vec(&value)
+                .map_err(|error| ApiError::Internal(error.into()))?
+                .into();
+        }
+        self.parsed_body = Some(value);
+        Ok(())
+    }
+
     /// The body key carrying the engine request ID.
     fn request_id_key(&self) -> &'static str {
         match self.path {
