@@ -2592,6 +2592,54 @@ class TestTheTopologyIdentities(CustomTestCase):
                 exercised.add((size_name, group_name))
         self.assertEqual(exercised, set(_WIDTH_AND_GROUP))
 
+    # Prefill CP with DCP on the square's rank 3: one CP group of four ranks,
+    # attention TP 1, and the DCP group laid over the CP group.
+    _PREFILL_CP_WITH_DCP = dict(
+        attn_tp_size=1,
+        attn_dp_size=1,
+        attn_cp_size=4,
+        attn_dp_rank=0,
+        attn_cp_rank=3,
+        attn_tp_rank=0,
+        dcp_size=4,
+        attn_dcp_size=4,
+        dcp_rank=3,
+        attn_dcp_rank=3,
+    )
+
+    def test_prefill_cp_with_dcp_on_one_group_is_quiet(self):
+        from sglang.srt.runtime_context import decode_attn_head_shards
+
+        self._publish_square()
+        self.assertEqual(decode_attn_head_shards(), 2)
+        with get_parallel().override(**self._PREFILL_CP_WITH_DCP):
+            # Decode slices the replicated heads per CP rank before the gather.
+            self.assertEqual(decode_attn_head_shards(), 4)
+
+    def test_prefill_cp_with_dcp_refuses_a_dcp_rank_off_the_cp_rank(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                **{**self._PREFILL_CP_WITH_DCP, "dcp_rank": 2, "attn_dcp_rank": 2}
+            ):
+                pass
+        self.assertIn("dcp_rank == attn_cp_rank", str(caught.exception))
+
+    def test_prefill_cp_with_dcp_refuses_a_dcp_narrower_than_cp(self):
+        self._publish_square()
+        narrower = dict(dcp_size=2, attn_dcp_size=2, dcp_rank=1, attn_dcp_rank=1)
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(**{**self._PREFILL_CP_WITH_DCP, **narrower}):
+                pass
+        self.assertIn("dcp_size == attn_cp_size", str(caught.exception))
+
+    def test_an_attention_dcp_rank_at_its_width_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(attn_dcp_rank=1):
+                pass
+        self.assertIn("0 <= attn_dcp_rank < attn_dcp_size", str(caught.exception))
+
     def test_a_group_built_at_the_configured_width_is_quiet(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 

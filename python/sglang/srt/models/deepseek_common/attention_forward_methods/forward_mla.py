@@ -94,6 +94,12 @@ def _select_local_dcp_heads_for_autotune(
 ) -> torch.Tensor:
     """Select this rank's head shard without communicating dummy outputs."""
     rank = get_parallel().attn_dcp_rank
+    # Under prefill CP with DCP, num_local_heads must be the per-CP-rank decode
+    # slice; the full head count would select past the gathered heads.
+    assert (rank + 1) * num_local_heads <= attn_output.shape[1], (
+        f"DCP rank {rank} selects {num_local_heads} heads of "
+        f"{attn_output.shape[1]} gathered decode heads"
+    )
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 

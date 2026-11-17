@@ -247,6 +247,7 @@ _RANK_AND_WIDTH = (
     ("attn_tp_rank", "attn_tp_size"),
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
+    ("attn_dcp_rank", "attn_dcp_size"),
     ("moe_ep_rank", "moe_ep_size"),
 )
 
@@ -257,6 +258,7 @@ _WIDTH_AND_GROUP = (
     ("pp_size", "pp_group"),
     ("attn_tp_size", "attn_tp_group"),
     ("attn_cp_size", "attn_cp_group"),
+    ("dcp_size", "dcp_group"),
     ("moe_ep_size", "moe_ep_group"),
 )
 
@@ -326,6 +328,24 @@ def _validate_parallel(parallel, source: str) -> None:
                 " * attn_tp_size + attn_tp_rank\n"
                 f"  {tp_rank} != ({r_dp} * {w_cp} + {r_cp})"
                 f" * {w_tp} + {r_tp} (= {laid_out})"
+            )
+
+    # Prefill CP with DCP: the DCP group is the attention-CP group, so a
+    # token's KV owner is the rank that computed the token.
+    cp_dcp_terms = ("dcp_size", "attn_cp_size", "attn_tp_size")
+    w_dcp, w_cp, w_tp = (read(n) for n in cp_dcp_terms)
+    if _UNREADABLE not in (w_dcp, w_cp) and w_dcp > 1 and w_cp > 1:
+        if w_dcp != w_cp or w_tp not in (_UNREADABLE, 1):
+            problems.append(
+                "prefill CP with DCP: dcp_size == attn_cp_size and "
+                "attn_tp_size == 1\n"
+                f"  dcp_size={w_dcp}, attn_cp_size={w_cp}, attn_tp_size={w_tp}"
+            )
+        r_dcp, r_cp = read("dcp_rank"), read("attn_cp_rank")
+        if _UNREADABLE not in (r_dcp, r_cp) and r_dcp != r_cp:
+            problems.append(
+                "prefill CP with DCP: dcp_rank == attn_cp_rank\n"
+                f"  dcp_rank={r_dcp}, attn_cp_rank={r_cp}"
             )
 
     for size_name, group_name in _WIDTH_AND_GROUP:
@@ -489,6 +509,18 @@ def linear_attn_tp_size() -> int:
 def linear_attn_tp_rank() -> int:
     """This rank's index in ``linear_attn_parallel_group()``."""
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
+def decode_attn_head_shards() -> int:
+    """How many ranks one decode step splits the attention heads over before
+    the DCP gather: attention TP, or the attention-CP group as well under
+    prefill CP with DCP, where decode slices the replicated attention per CP
+    rank. Decode heads seen after the gather are
+    ``num_heads // decode_attn_head_shards() * attn_dcp_size``."""
+    parallel = get_parallel()
+    if parallel.attn_cp_size > 1 and parallel.attn_dcp_size > 1:
+        return parallel.attn_tp_size * parallel.attn_cp_size
+    return parallel.attn_tp_size
 
 
 def draft_attn_parallel_group() -> str:
@@ -1606,7 +1638,8 @@ def _configure_context(
         placement["dp_rank"] = ranks.dp_rank
         placement["launch_world_rank"] = ranks.world_rank
         placement.update(_attention_ranks(parallel, placement["tp_rank"]))
-        # DCP groups are contiguous slices of a TP group.
+        # DCP groups are contiguous slices of a TP group. Under prefill CP with
+        # DCP the slice is the whole TP group, so dcp_rank == attn_cp_rank.
         if parallel.dcp_enabled:
             placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
         placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
