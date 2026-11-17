@@ -69,6 +69,7 @@ mod tests {
             services: Default::default(),
         };
         let profile = EngineProfile {
+            capabilities: Default::default(),
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,

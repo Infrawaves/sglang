@@ -64,6 +64,13 @@ pub(crate) fn render(
     for (key, value) in defaults {
         kwargs.entry(key).or_insert_with(|| value.clone());
     }
+    // A request or server `chat_template` replaces the checkpoint's encoder; the
+    // engine renders it, or rejects it without --trust-request-chat-template.
+    if kwargs.contains_key("chat_template") {
+        return Err(RenderError::Declined(
+            "chat_template_kwargs.chat_template".into(),
+        ));
+    }
     // Kimi's `apply_chat_template` and `build_chat_segments` take these as their
     // own arguments: SGLang truncates or pads the ids, or fails on a duplicate argument.
     if TOKENIZER_ARGS.iter().any(|arg| kwargs.contains_key(*arg)) {
@@ -366,5 +373,28 @@ impl OAIChatLikeRequest for KimiRequest {
 
     fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
         Some(&self.args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A template from the request or the server's defaults is not the
+    /// checkpoint's encoder, so the router must not render it as one.
+    #[test]
+    fn a_chat_template_kwarg_is_declined() {
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let request = json!({"messages": messages, "chat_template_kwargs": {"chat_template": "x"}});
+        assert!(matches!(
+            render(request, &HashMap::new()),
+            Err(RenderError::Declined(_))
+        ));
+        let defaults = HashMap::from([("chat_template".to_owned(), json!("x"))]);
+        assert!(matches!(
+            render(json!({"messages": messages}), &defaults),
+            Err(RenderError::Declined(_))
+        ));
+        assert!(render(json!({"messages": messages}), &HashMap::new()).is_ok());
     }
 }

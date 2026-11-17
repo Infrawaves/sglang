@@ -4,15 +4,20 @@
 pub mod adapter;
 pub mod chat_formatter;
 mod kimi;
+pub mod kimi_k3;
+pub mod options;
 pub mod stats;
 
-use anyhow::Result;
+use crate::server::metrics::{EncoderMetrics, EncoderQueueGuard};
+use anyhow::{Context, Result};
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use options::ChatEncodingOptions;
 use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Which chats may carry router-rendered `input_ids`, by how well the model's
 /// renderer is verified against SGLang.
@@ -56,7 +61,6 @@ impl ChatFormatterEntry {
     }
 }
 
-#[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
     /// Per-model chat formatter, present only when the model's prompt format is
@@ -70,6 +74,15 @@ pub struct TokenizerRegistry {
     openai: Option<Arc<dyn OpenAiTokenizer>>,
     /// The model config SGLang's OpenAI chat layer reads.
     chat_model: ChatModel,
+    kimi_encoders: DashMap<String, Arc<kimi_k3::KimiK3Pool>>,
+    pub(crate) kimi_encode_slots: Arc<Semaphore>,
+    pub(crate) kimi_encode_timeout: std::time::Duration,
+}
+
+impl Default for TokenizerRegistry {
+    fn default() -> Self {
+        Self::with_options(&ChatEncodingOptions::default())
+    }
 }
 
 /// `get_context_length` over the model's text config.
@@ -122,12 +135,85 @@ impl std::fmt::Debug for TokenizerRegistry {
 }
 
 impl TokenizerRegistry {
+    fn with_options(options: &ChatEncodingOptions) -> Self {
+        Self {
+            inner: DashMap::new(),
+            formatters: DashMap::new(),
+            stats: Arc::default(),
+            prompt_affixes: None,
+            openai: None,
+            chat_model: ChatModel::default(),
+            kimi_encoders: DashMap::new(),
+            kimi_encode_slots: Arc::new(Semaphore::new(0)),
+            kimi_encode_timeout: std::time::Duration::from_secs(options.tokenizer_timeout_secs),
+        }
+    }
+
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let mut me = TokenizerRegistry::default();
+        Self::load_with_options(cfg, ChatEncodingOptions::default())
+    }
+
+    pub fn load_with_options(
+        cfg: &crate::config::Config,
+        options: ChatEncodingOptions,
+    ) -> Result<Self> {
+        if !options.is_kimi_k3() {
+            let ignored = options.non_default_kimi_only_flags();
+            anyhow::ensure!(
+                ignored.is_empty(),
+                "{} require --chat-encoder kimi-k3",
+                ignored.join(", ")
+            );
+        }
+        let m = &cfg.model;
+        if options.is_kimi_k3() {
+            if let Some(path) = m.tokenizer_path.as_deref() {
+                anyhow::ensure!(
+                    !std::path::Path::new(path).is_dir(),
+                    "--chat-encoder kimi-k3 takes --tokenizer-path as the checkpoint's \
+                     tiktoken.model or an HF repo id, not a directory; the encoder reads \
+                     config.json beside that file"
+                );
+            }
+        }
+        let mut me = Self::with_options(&options);
+        match (&options.tokenizer_revision, m.tokenizer_path.as_deref()) {
+            // An HF repo id at the encoder's revision; local paths have none.
+            (Some(revision), Some(repo)) if options.is_kimi_k3() && !adapter::is_local(repo) => {
+                let mut pinned = cfg.clone();
+                pinned.model.tokenizer_path = Some(adapter::snapshot_tokenizer(repo, revision)?);
+                me.load_rust(&pinned)?;
+            }
+            _ => me.load_rust(cfg)?,
+        }
+        if options.is_kimi_k3() {
+            let tokenizer_path = m.tokenizer_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--chat-encoder kimi-k3 cannot be combined with --no-tokenizer")
+            })?;
+            let pool = kimi_k3::KimiK3Pool::new_with_metrics(
+                &kimi_k3::encoder_source(tokenizer_path),
+                &options,
+                serde_json::to_value(&m.default_chat_template_kwargs)?,
+                EncoderMetrics::new(&m.id),
+            )?;
+            let count = options
+                .tokenizer_workers
+                .map_or(1, std::num::NonZeroUsize::get);
+            me.kimi_encoders.insert(m.id.clone(), Arc::new(pool));
+            me.kimi_encode_slots = Arc::new(Semaphore::new(count));
+            tracing::info!(model = %m.id, workers = count,
+                "Kimi-K3/K3.1 text and image chats encode in persistent Python processes");
+        }
+        Ok(me)
+    }
+
+    /// The Rust tokenizer and chat formatter, as every `--chat-encoder` uses.
+    fn load_rust(&mut self, cfg: &crate::config::Config) -> Result<()> {
+        let me = self;
         let m = &cfg.model;
         let Some(tokenizer_path) = &m.tokenizer_path else {
             tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
-            return Ok(me);
+            return Ok(());
         };
         let (t, stats) = adapter::load_with(tokenizer_path, m.tokenizer)?;
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
@@ -213,7 +299,7 @@ impl TokenizerRegistry {
                 ForwardingScope::Never => {}
             }
         }
-        Ok(me)
+        Ok(())
     }
 
     pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
@@ -257,6 +343,89 @@ impl TokenizerRegistry {
         self.formatters
             .get(model_id)
             .is_some_and(|e| e.formatter.is_minimax_m31())
+    }
+
+    pub fn has_kimi_encoder(&self, model_id: &str) -> bool {
+        self.kimi_encoders.contains_key(model_id)
+    }
+
+    /// Whether `fingerprint` is the Kimi-K3 encoder's rendering digest.
+    pub(crate) fn kimi_fingerprint_is(&self, model_id: &str, fingerprint: &str) -> bool {
+        self.kimi_encoders
+            .get(model_id)
+            .is_some_and(|pool| pool.fingerprint() == fingerprint)
+    }
+
+    pub(crate) fn kimi_metrics(&self, model_id: &str) -> Option<Arc<EncoderMetrics>> {
+        self.kimi_encoders.get(model_id).map(|pool| pool.metrics())
+    }
+
+    pub(crate) fn render_kimi_metrics(&self) -> String {
+        let mut pools: Vec<_> = self
+            .kimi_encoders
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        pools.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let snapshots: Vec<_> = pools
+            .into_iter()
+            .map(|(_, pool)| (pool.metrics(), pool.process_counts()))
+            .collect();
+        EncoderMetrics::render(&snapshots)
+    }
+
+    /// Encode a Chat Completions body with the Kimi-K3 pool by `deadline`:
+    /// wait for an encoder slot, then encode on a blocking thread. A caller
+    /// that gives up leaves the job running until it releases its process.
+    pub(crate) async fn encode_kimi_chat(
+        self: &Arc<Self>,
+        model_id: &str,
+        request: serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(serde_json::Value, Vec<u32>), kimi_k3::EncodeError> {
+        let metrics = self
+            .kimi_metrics(model_id)
+            .with_context(|| format!("Kimi-K3 encoder missing for model {model_id}"))?;
+        let tokio_deadline = tokio::time::Instant::from_std(deadline);
+        let queue = metrics.queue();
+        let encoding_started = queue.encoding_started();
+        let permit = tokio::time::timeout_at(
+            tokio_deadline,
+            Arc::clone(&self.kimi_encode_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| kimi_k3::EncodeError::QueueTimeout)?
+        .context("Kimi-K3 encoder admission closed")?;
+        let registry = Arc::clone(self);
+        let model_id = model_id.to_owned();
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let ids = registry.encode_kimi_request(&model_id, &request, deadline, queue)?;
+            Ok((request, ids))
+        });
+        match tokio::time::timeout_at(tokio_deadline, job).await {
+            Ok(joined) => joined.context("Kimi-K3 encode job failed")?,
+            Err(_) if encoding_started.load(Ordering::Relaxed) => Err(
+                kimi_k3::EncodeError::Timeout(anyhow::anyhow!("deadline elapsed while encoding")),
+            ),
+            // A job that starts after the deadline returns without taking a process.
+            Err(_) => Err(kimi_k3::EncodeError::QueueTimeout),
+        }
+    }
+
+    fn encode_kimi_request(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        deadline: std::time::Instant,
+        queue: EncoderQueueGuard,
+    ) -> std::result::Result<Vec<u32>, kimi_k3::EncodeError> {
+        let pool = self
+            .kimi_encoders
+            .get(model_id)
+            .map(|entry| Arc::clone(&*entry))
+            .ok_or_else(|| anyhow::anyhow!("Kimi-K3 encoder missing for model {model_id}"))?;
+        pool.encode_queued(request, deadline, queue)
     }
 
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {

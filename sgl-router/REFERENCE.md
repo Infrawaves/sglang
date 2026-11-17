@@ -460,6 +460,109 @@ backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
 
+### Kimi-K3 and K3.1 Python chat encoder
+
+`--chat-encoder kimi-k3` enables a persistent Python process pool for
+`/v1/chat/completions`. It uses the same prompt preparation as the Python serving
+worker, including K3.1's `medium` thinking tier. The router still loads its Rust
+tokenizer as without this flag; the pool takes only the chats whose IDs it can
+forward, and every other request is handled as without the flag. The Rust
+tokenizer loads K3.1 (`model_type: kimi_k31`) on K3's tiktoken pattern, which
+dynamo-tokenizers does not yet map.
+
+Add these flags to the existing router command, keeping its worker discovery and
+P/D settings:
+
+```bash
+--tokenizer-path /models/kimi-k31/tiktoken.model \
+--chat-encoder kimi-k3 \
+--tokenizer-python /opt/sglang/bin/python \
+--trust-remote-code \
+--tokenizer-workers 4
+```
+
+Here `--tokenizer-path` is the checkpoint's `tiktoken.model` or a Hugging Face
+repository, as without the flag; the Rust tokenizer loads it, and the encoder
+loads the file's directory (`.` for a bare file name), which must hold the
+checkpoint's `config.json`, or the same repository. A directory is rejected.
+With a repository, `--tokenizer-revision` pins both tokenizers to that snapshot. Startup checks that the configuration
+resolves to Kimi-K3/K3.1 before warming the tokenizer.
+
+The Python executable must import this SGLang checkout and the checkpoint's
+tokenizer dependencies. The default router Docker image is distroless and does
+not include Python; use an environment or a custom image with the Python package
+installed for this mode. Match the workers' model configuration, tokenizer files,
+`--tokenizer-revision`, and `--default-chat-template-kwargs`. Pin the same snapshot
+on both sides. Each encoder process loads its own tokenizer; size the pool for
+the router's CPU and memory budget.
+
+Text and image chats are encoded once and sent to both P/D workers in
+`kimi_k3_input_ids`, beside the original messages. This field distinguishes
+router encoding from caller-provided `input_ids`, so K3/K3.1 output budgets and
+usage still account for the generation stub. For image chats the workers still
+load and preprocess the images and expand their placeholders. Placeholder IDs
+are not final KV tokens, so image requests do not use them for prefix matching
+or exact sequence lengths; the router retains its media workload estimate.
+
+Workers advertise `kimi_k3_input_ids_version: 1` in `/server_info`, with
+`kimi_k3_input_ids_fingerprint`, a digest of their tokenizer's vocabulary and
+implementation, their SGLang version and encoder source, and their rendering of a
+fixed probe,
+and `kimi_k3_input_ids_media` when their K3 image processor expands image
+placeholders; `/server_info` also reports their `--default-chat-template-kwargs`.
+A worker receives IDs only when it advertises the version, its digest equals the
+encoder's (the same checkpoint, such as K3 or K3.1, and tokenizer snapshot), its
+defaults equal the router's, since the encoder applied the
+router's, and, for an image chat, it expands image placeholders; the first
+mismatch is logged. The router checks this before encoding and again for the
+selected workers on every dispatch, including retries; otherwise the chat takes
+the Rust path below. Deploy compatible workers before enabling router encoding to
+realize the offload benefit.
+
+Workers trust `kimi_k3_input_ids` as the router's own rendering, so the router
+rejects a chat that sets it with 400. A client that reaches a worker directly is
+not checked, so do not expose workers to clients, or put them behind
+`--api-key`.
+
+Audio, video, request chat templates (including
+`chat_template_kwargs.chat_template`), caller-provided IDs,
+`--disable-input-ids-forwarding`, and fleets with no worker that accepts the IDs
+bypass the Python encoder: those chats take the Rust path, with its routing
+tokens and forwarding, as without the flag. Neither path forwards chat IDs to a
+worker that reports `--default-chat-template-kwargs` other than the router's,
+and while any registered worker, healthy or not, reports a digest other than the
+encoder's, native chat, `/generate`, embeddings and classify keep their original
+text. Every dispatch checks the actual selected workers again, including retries
+and newly registered workers. An incompatible worker restores the original
+request; P/D restores it on both legs, and lowered OpenAI requests return to their
+original endpoint. Native gRPC text calls also retain their original text for this
+fallback. Python IDs may still go to compatible selected workers. Request templates remain subject to
+the worker's `--trust-request-chat-template` setting. Responses, completions,
+`/generate`, native gRPC, `/v1/messages/count_tokens`, `/v1/tokenize` and
+`/v1/detokenize` also use the Rust tokenizer as without the flag; K3.1, which has
+no Rust chat formatter, counts `/v1/messages/count_tokens` with the pool, each
+image as its one placeholder. `--no-tokenizer`
+cannot be combined with this encoder.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--chat-encoder` | `auto` | Use `kimi-k3` to enable the Python pool. |
+| `--tokenizer-python` | `python3` | Interpreter in the SGLang environment. |
+| `--tokenizer-revision` | unset | Tokenizer/model snapshot revision matching the workers. |
+| `--trust-remote-code` | false | Permit checkpoint tokenizer code, as on the workers. |
+| `--tokenizer-workers` | 1 | Number of persistent encoder processes. |
+| `--tokenizer-timeout-secs` | 300 | One deadline for request preparation, queueing, and encoding. |
+| `--tokenizer-startup-timeout-secs` | 300 | Deadline for initial and replacement process startup. |
+
+Invalid encoder requests return 400. Encoder failures and timeouts return 503
+with code `encoder_unavailable` before inference dispatch. Failed processes are
+replaced in the background; a request that times out while waiting does not
+consume a healthy encoder process. Monitor `sgl_router_encoder_requests_total`,
+`sgl_router_encoder_waiting_requests`, queue/encode duration histograms, process
+states, and restart outcomes to size the pool and identify failures. Worker
+fallbacks use the `ineligible_worker_capability` outcome of
+`sgl_router_input_ids_forwarding_total`.
+
 ## Native `/generate`
 
 `/generate` (`POST` or `PUT`) has the engine's interface: the same
@@ -604,7 +707,9 @@ through `/generate`; thinking follows the template's `enable_thinking` (on by de
 
 Kimi-K3 renders through `rust/sglang-processor` (dynamo-render's XTML formatter
 with SGLang's request semantics) and is tokenized with the checkpoint's chunked
-tiktoken encoding; shapes the formatter renders differently go to the worker.
+tiktoken encoding; shapes the formatter renders differently go to the worker,
+including a `chat_template` key in `chat_template_kwargs` (from the request or
+`--default-chat-template-kwargs`), which replaces the checkpoint's encoder.
 `--tokenizer-backend fast` applies to its `tiktoken.model` and encodes about 15x
 faster than the default tiktoken-rs backend.
 `--tokenizer-path` accepts a

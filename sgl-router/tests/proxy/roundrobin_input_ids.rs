@@ -441,8 +441,6 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
     assert!(captured(&mock).get("input_ids").is_some());
 }
 
-#[path = "../fixtures/kimi_k3.rs"]
-mod kimi_fixture;
 
 #[tokio::test]
 async fn generate_kimi_ids_preserve_engine_chunk_boundaries() {
@@ -454,7 +452,7 @@ async fn generate_kimi_ids_preserve_engine_chunk_boundaries() {
 /// Raw `/generate` text takes Kimi's chunked encoding on either tiktoken engine.
 async fn generate_kimi_ids_preserve_engine_chunk_boundaries_on(backend: TokenizerBackend) {
     let mock = MockWorker::start(vec![]).await;
-    let fixture = kimi_fixture::tokenizer();
+    let fixture = crate::kimi_fixture::tokenizer();
     let mut cfg = config();
     cfg.model.tokenizer_path = Some(fixture.path().join("tiktoken.model").display().to_string());
     cfg.model.tokenizer.backend = backend;
@@ -485,7 +483,7 @@ async fn generate_kimi_ids_preserve_engine_chunk_boundaries_on(backend: Tokenize
 #[tokio::test]
 async fn kimi_ids_forward_with_engine_rendering_fallback() {
     let mock = MockWorker::start(vec![]).await;
-    let fixture = kimi_fixture::tokenizer();
+    let fixture = crate::kimi_fixture::tokenizer();
     let mut cfg = config();
     let path = fixture.path().join("tiktoken.model");
     cfg.model.tokenizer_path = Some(path.display().to_string());
@@ -516,7 +514,7 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
 #[tokio::test]
 async fn kimi_chat_lowers_to_generate() {
     let mock = MockWorker::start(vec![]).await;
-    let fixture = kimi_fixture::tokenizer();
+    let fixture = crate::kimi_fixture::tokenizer();
     let mut cfg = config();
     let path = fixture.path().join("tiktoken.model");
     cfg.model.tokenizer_path = Some(path.display().to_string());

@@ -606,6 +606,7 @@ async fn register_one(
     // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
     let profile = EngineProfile {
         protocol,
+        capabilities: info.capabilities,
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,

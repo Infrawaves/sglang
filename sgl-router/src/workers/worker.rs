@@ -4,6 +4,7 @@
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::workers::cold_ratio::ColdRatioEstimator;
+use serde::Deserialize;
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -42,10 +43,28 @@ pub enum WireProtocol {
     H2c,
 }
 
+/// Versioned request semantics advertised by the worker. Missing or unknown
+/// versions leave prompt encoding on the worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WorkerCapabilities {
+    /// Version 1 renders from router K3 IDs in `kimi_k3_input_ids`, apart from
+    /// caller-owned `input_ids`, so K3/K3.1 generation-stub accounting holds.
+    #[serde(default)]
+    pub kimi_k3_input_ids_version: Option<u32>,
+    /// The worker's rendering digest of a fixed probe, which identifies its
+    /// checkpoint, tokenizer snapshot and rendering rules.
+    #[serde(default)]
+    pub kimi_k3_input_ids_fingerprint: Option<String>,
+    /// The worker's K3 image processor expands the IDs' image placeholders.
+    #[serde(default)]
+    pub kimi_k3_input_ids_media: bool,
+}
+
 /// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineProfile {
     pub protocol: WireProtocol,
+    pub capabilities: WorkerCapabilities,
     /// `dp_size * attn_dp_size`; 0 is treated as 1.
     pub dp_ranks: u32,
     /// The engine's OpenAI-layer server args; `None` if unread.
@@ -59,6 +78,7 @@ impl From<WireProtocol> for EngineProfile {
         Self {
             protocol,
             dp_ranks: 1,
+            capabilities: WorkerCapabilities::default(),
             openai: None,
             grpc_port: None,
         }
@@ -263,6 +283,9 @@ pub struct Worker {
     /// Forwarding wire protocol, resolved from `/server_info` before this
     /// worker was constructed. Immutable: see [`WireProtocol`].
     protocol: WireProtocol,
+    capabilities: WorkerCapabilities,
+    /// [`Self::default_chat_template_kwargs_match`], computed once per registration.
+    default_kwargs_match: std::sync::OnceLock<Option<bool>>,
     /// Reaches the engine's native gRPC server, for requests that arrived over gRPC.
     grpc: Option<SglangServiceClient<tonic::transport::Channel>>,
     pub model_ids: Vec<ModelId>,
@@ -274,6 +297,7 @@ pub struct Worker {
     /// Shared across re-registration so in-flight selectors keep the same estimator.
     cold_ratio: Arc<Mutex<ColdRatioEstimator>>,
     warned_no_input_tokens: AtomicBool,
+    warned_kimi_k3_rendering: AtomicBool,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -314,6 +338,7 @@ impl Worker {
     ) -> Self {
         let EngineProfile {
             protocol,
+            capabilities,
             dp_ranks,
             openai,
             grpc_port,
@@ -331,6 +356,8 @@ impl Worker {
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
             protocol,
+            capabilities,
+            default_kwargs_match: std::sync::OnceLock::new(),
             grpc,
             model_ids: spec.model_ids,
             breaker,
@@ -338,6 +365,7 @@ impl Worker {
             slots,
             cold_ratio: Arc::new(Mutex::new(ColdRatioEstimator::new())),
             warned_no_input_tokens: AtomicBool::new(false),
+            warned_kimi_k3_rendering: AtomicBool::new(false),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
@@ -347,6 +375,46 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
+    }
+
+    /// Whether this worker preserves the semantics of router-generated K3 IDs.
+    pub fn supports_kimi_k3_input_ids(&self) -> bool {
+        self.capabilities.kimi_k3_input_ids_version == Some(1)
+    }
+
+    /// The worker's rendering digest; IDs go only to workers that render as the router's encoder.
+    pub fn kimi_k3_input_ids_fingerprint(&self) -> Option<&str> {
+        self.capabilities.kimi_k3_input_ids_fingerprint.as_deref()
+    }
+
+    /// Whether the engine's reported `--default-chat-template-kwargs` equal
+    /// `router`'s, the defaults the router renders with; `None` when its
+    /// `/server_info` reported no OpenAI settings. Settings are fixed for a
+    /// registration and the router's for the process, so this is computed once.
+    pub fn default_chat_template_kwargs_match(
+        &self,
+        router: &HashMap<String, serde_json::Value>,
+    ) -> Option<bool> {
+        *self.default_kwargs_match.get_or_init(|| {
+            self.openai.as_ref().map(|settings| {
+                let engine = settings.default_chat_template_kwargs.iter().flatten();
+                engine.clone().count() == router.len()
+                    && engine
+                        .into_iter()
+                        .all(|(key, value)| router.get(key) == Some(value))
+            })
+        })
+    }
+
+    /// True on the first call only, so a worker excluded from router K3 IDs is
+    /// logged once per registration.
+    pub(crate) fn first_kimi_k3_rendering_warning(&self) -> bool {
+        !self.warned_kimi_k3_rendering.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether the worker expands the image placeholders in router K3 IDs.
+    pub fn accepts_kimi_k3_media_input_ids(&self) -> bool {
+        self.capabilities.kimi_k3_input_ids_media
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {

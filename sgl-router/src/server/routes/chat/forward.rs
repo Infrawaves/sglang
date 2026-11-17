@@ -178,6 +178,8 @@ async fn dispatch<T: Transport>(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
+    let allow_router_input_ids =
+        request.prepare_dispatch(ctx, &workers.prefill, workers.decode.as_deref());
     let SelectedWorkers {
         prefill,
         decode,
@@ -238,6 +240,7 @@ async fn dispatch<T: Transport>(
     // Read before `outgoing_body`, which consumes the cached parse.
     let caller_rid = pd.as_ref().and_then(|_| request.caller_rid());
     let additions = Additions {
+        allow_router_input_ids,
         rid: engine_rid.clone(),
         bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
             bootstrap_host: bootstrap.host.clone(),

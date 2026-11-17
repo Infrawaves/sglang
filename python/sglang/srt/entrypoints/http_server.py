@@ -351,6 +351,11 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager, _global_state.template_manager
         )
     )
+    # Before serving: the sgl-router reads /server_info only when it registers
+    # the worker, so a digest missing then stays missing until it re-registers.
+    await asyncio.to_thread(
+        fast_api_app.state.openai_serving_chat.kimi_k3_input_ids_fingerprint
+    )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -910,17 +915,17 @@ async def model_info():
 
 
 @app.get("/get_server_info")
-async def get_server_info():
+async def get_server_info(raw_request: Request = None):
     """Get the server information (deprecated - use /server_info instead)."""
     logger.warning(
         "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
         "Please use '/server_info' instead."
     )
-    return await server_info()
+    return await server_info(raw_request)
 
 
 @app.get("/server_info")
-async def server_info():
+async def server_info(raw_request: Request = None):
     """The startup configuration, plus live scheduler state.
 
     Two surfaces, deliberately both: the field values are the resolution
@@ -938,6 +943,20 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
+    # Read by the sgl-router before it forwards router-rendered K3 prompt IDs.
+    kimi_k3 = {}
+    if raw_request is not None:
+        chat = raw_request.app.state.openai_serving_chat
+        fingerprint = await asyncio.to_thread(chat.kimi_k3_input_ids_fingerprint)
+        if fingerprint is not None:
+            kimi_k3 = {
+                "kimi_k3_input_ids_version": 1,
+                "kimi_k3_input_ids_fingerprint": fingerprint,
+                "kimi_k3_input_ids_media": chat.expands_kimi_k3_media_placeholders(
+                    chat.tokenizer_manager.model_config.is_multimodal
+                ),
+            }
+
     return msgspec_to_builtins(
         redact_watermark_secrets(
             {
@@ -946,6 +965,8 @@ async def server_info():
                 "internal_states": internal_states,
                 "version": __version__,
                 "frontend": "python",
+                "kimi_k3_input_ids_version": None,
+                **kimi_k3,
             }
         )
     )

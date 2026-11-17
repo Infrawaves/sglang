@@ -24,6 +24,7 @@ use crate::server::routes::chat::{
     chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
 };
 use crate::server::routes::tokenize::tokenizer_for;
+use crate::tokenizer::kimi_k3;
 
 /// Upstream replies are buffered up to the same cap as requests.
 const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
@@ -63,6 +64,11 @@ pub(crate) async fn count_tokens(
             return adapt(e.into_response(), None).await;
         }
     }
+    // Kimi-K3.1 has no Rust chat formatter (its effort tiers differ from K3's);
+    // its Python encoder renders as the chat route does.
+    if !ctx.tokenizers.has_chat_formatter(model) && ctx.tokenizers.has_kimi_encoder(model) {
+        return count_with_kimi_encoder(&ctx, model, converted.chat).await;
+    }
     // No raw-text fallback: a count without template and tool overhead is wrong.
     match ctx.tokenizers.encode_chat(model, &converted.chat) {
         Some(ids) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
@@ -75,6 +81,28 @@ pub(crate) async fn count_tokens(
             ),
         )
             .into_response(),
+    }
+}
+
+/// Each image counts as its one unexpanded placeholder.
+async fn count_with_kimi_encoder(
+    ctx: &Arc<AppContext>,
+    model: &str,
+    chat: serde_json::Value,
+) -> Response<Body> {
+    if !kimi_k3::is_supported_request(&chat) {
+        let error =
+            ApiError::BadRequest("the Kimi-K3 encoder counts only text and image content".into());
+        return adapt(error.into_response(), None).await;
+    }
+    let deadline = std::time::Instant::now().checked_add(ctx.tokenizers.kimi_encode_timeout);
+    let encoded = match deadline {
+        Some(deadline) => ctx.tokenizers.encode_kimi_chat(model, chat, deadline).await,
+        None => Err(anyhow::anyhow!("Kimi-K3 encoder timeout is too large").into()),
+    };
+    match encoded {
+        Ok((_, ids)) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
+        Err(error) => adapt(ApiError::from(error).into_response(), None).await,
     }
 }
 

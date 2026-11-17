@@ -94,6 +94,36 @@ class FailingTokenizerManager(TokenizerManager):
 
 
 class TestHelpers(CustomTestCase):
+    def test_router_ids_convert_in_process(self):
+        """A child has no MM processor to accept router image IDs with."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        handler = object()
+        pre = prp.ProcessRequestPreprocessor.__new__(prp.ProcessRequestPreprocessor)
+        pre._ready = True
+        pre._disabled_reason = None
+        pre._handler_classes = (object,)
+        pre._warned = set()
+        routed = _chat_request(kimi_k3_input_ids=[81, 82])
+        plain = _chat_request()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pre._pool = pool
+
+            # Stand in for the child transport, which still serves other requests.
+            def child_convert(handler_cls, request, headers):
+                return (
+                    "ok",
+                    SimpleNamespace(input_ids=None),
+                    None,
+                    ("object", "child"),
+                )
+
+            with mock.patch.object(prp, "_child_convert", child_convert):
+                self.assertIsNone(asyncio.run(pre.convert(handler, routed, None)))
+                self.assertEqual(
+                    asyncio.run(pre.convert(handler, plain, None))[1], "child"
+                )
+
     def test_token_ids_round_trip(self):
         long_ids = list(range(1000))
         self.assertEqual(prp.pack_token_ids(long_ids)[0], "array")

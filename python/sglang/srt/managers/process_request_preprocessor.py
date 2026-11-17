@@ -563,6 +563,15 @@ class ProcessRequestPreprocessor:
         Conversion errors are re-raised here with the same type the in-process
         path would raise (ValueError, HTTPException, ...).
         """
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and request.kimi_k3_input_ids is not None
+        ):
+            # Router IDs need no rendering, and a child has no multimodal
+            # processor to accept image IDs with, so convert in-process.
+            return None
         pool = self._pool
         if pool is None or not self.accepts(handler):
             if pool is not None and type(handler) in self._handler_classes:

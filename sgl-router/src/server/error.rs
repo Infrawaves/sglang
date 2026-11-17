@@ -78,6 +78,9 @@ pub enum ApiError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("prompt encoder unavailable: {0:#}")]
+    EncoderUnavailable(#[source] anyhow::Error),
+
     /// A request refused by the fleet-wide sampling contract
     /// (`--override-sampling-params` under `--sampling-param-conflict
     /// reject`).
@@ -206,6 +209,7 @@ impl ApiError {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
+            ApiError::EncoderUnavailable(_) => ErrorClass::NoTarget,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } | ApiError::PrefillFailed { .. } => {
                 ErrorClass::Upstream
@@ -236,6 +240,7 @@ impl ApiError {
             // contract rejections separately from malformed client requests.
             ApiError::SamplingContract { .. } => "sampling_contract_violation",
             ApiError::ModelNotFound(_) => "model_not_found",
+            ApiError::EncoderUnavailable(_) => "encoder_unavailable",
             ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
             // Mid-body drop: headers (incl. a status) arrived, then the body
             // didn't. We surface a 502 but echo the worker's status in
@@ -269,6 +274,7 @@ impl ApiError {
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
+            | ApiError::EncoderUnavailable(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
             | ApiError::NoHealthyWorkers { .. }
@@ -333,6 +339,26 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Encoder request errors are the client's; transport and internal failures
+/// return 503 without dispatching to the workers.
+impl From<crate::tokenizer::kimi_k3::EncodeError> for ApiError {
+    fn from(error: crate::tokenizer::kimi_k3::EncodeError) -> Self {
+        use crate::tokenizer::kimi_k3::EncodeError;
+        match error {
+            EncodeError::Request(message) => ApiError::BadRequest(message),
+            EncodeError::Internal(message) => {
+                ApiError::EncoderUnavailable(anyhow::anyhow!(message))
+            }
+            EncodeError::QueueTimeout => ApiError::EncoderUnavailable(anyhow::anyhow!(
+                "Kimi-K3 encoder deadline elapsed waiting for a process"
+            )),
+            EncodeError::Timeout(error) | EncodeError::Unavailable(error) => {
+                ApiError::EncoderUnavailable(error)
+            }
+        }
+    }
+}
+
 impl ApiError {
     /// What a gRPC client receives: an engine's status unchanged, otherwise the
     /// error's class as a gRPC code, with the HTTP path's message and error code.
@@ -355,6 +381,10 @@ impl ApiError {
     /// which are logged here instead.
     fn client_message(&self) -> String {
         match self {
+            ApiError::EncoderUnavailable(error) => {
+                tracing::error!("prompt encoder unavailable: {error:#}");
+                "prompt encoder unavailable".to_string()
+            }
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -704,6 +734,13 @@ mod tests {
         // (label, error, expected status, expected x-router-error-code,
         //  expected x-router-upstream-status)
         let cases: Vec<(&str, ApiError, StatusCode, &str, Option<&str>)> = vec![
+            (
+                "encoder unavailable",
+                ApiError::EncoderUnavailable(anyhow::anyhow!("private process error")),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "encoder_unavailable",
+                None,
+            ),
             (
                 "mid-body drop preserves worker status",
                 ApiError::UpstreamStatus {

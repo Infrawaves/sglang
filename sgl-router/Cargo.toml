@@ -28,11 +28,15 @@ dynamo-tokenizers = "=3.1.0"
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
 dynamo-renderer = "=7.1.1"
+# Kills the Kimi-K3 encoder's process group, wrapper children included.
+libc = "0.2"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
 sglang-processor = { path = "../rust/sglang-processor", default-features = false, features = ["render", "openai"] }
 
+# Private, randomly named staging for the Kimi-K3.1 tokenizer.
+tempfile = "3"
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
 # http2 on both sides: axum serves cleartext h2c on the inbound listener, reqwest
@@ -129,7 +133,6 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
 # The hand-rolled mock engine in tests/proxy/grpc_routing.rs.

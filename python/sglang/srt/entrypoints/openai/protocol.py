@@ -1219,6 +1219,26 @@ class ChatCompletionRequest(PDRoutingFields):
     # and tool_call_constraint.
     input_ids: Optional[List[int]] = None
 
+    # Internal router-worker protocol v1: the sgl-router's rendering of these
+    # messages, with one unexpanded placeholder per image. Unlike caller
+    # input_ids, they keep K3's generation-stub usage accounting. Workers that do
+    # not advertise kimi_k3_input_ids_version ignore the field.
+    kimi_k3_input_ids: Optional[List[int]] = None
+
+    @field_validator("kimi_k3_input_ids", mode="before")
+    @classmethod
+    def validate_kimi_k3_router_input_ids(cls, value):
+        if value is not None and (
+            not isinstance(value, list)
+            or not value
+            or any(
+                type(token) is not int or not 0 <= token <= 0xFFFFFFFF
+                for token in value
+            )
+        ):
+            raise ValueError("Kimi-K3 router input IDs must be a nonempty uint32 array")
+        return value
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification

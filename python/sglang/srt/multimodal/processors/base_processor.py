@@ -243,6 +243,9 @@ class BaseMultimodalProcessor(ABC):
     # process shares its GPU with the scheduler).
     retry_on_cpu_after_gpu_oom = False
     prefer_tokenized_input = False
+    # The sgl-router kimi_k3_input_ids version whose unexpanded image
+    # placeholders this processor expands; None when it expands none.
+    kimi_k3_input_ids_version: Optional[int] = None
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
