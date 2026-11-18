@@ -46,7 +46,12 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    THINK_CLOSE,
+    TOOLS_CLOSE,
+    TOOLS_OPEN,
+)
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_json_response_structural_tag,
 )
@@ -746,7 +751,8 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_json_response_format_constraints(self):
         """json_object stays prompt-guided; a strict json_schema is constrained
-        inside the K3 response block, so its markers stay admissible."""
+        inside the K3 response block, so its markers stay admissible, and stops
+        on the message close a model trapped in a JSON string would write."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -767,6 +773,7 @@ class ServingChatTestCase(CustomTestCase):
                     model="x",
                     messages=[{"role": "user", "content": "Return JSON"}],
                     response_format=response_format,
+                    stop=["END"],
                 )
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
@@ -776,6 +783,10 @@ class ServingChatTestCase(CustomTestCase):
                 tag = params.get("structural_tag")
                 self.assertEqual(
                     json.loads(tag) if tag is not None else None, expected_tag
+                )
+                self.assertIn("END", params["stop"])
+                self.assertEqual(
+                    MESSAGE_CLOSE in params["stop"], expected_tag is not None
                 )
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(
