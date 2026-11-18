@@ -283,6 +283,32 @@ def test_streaming_skipped_think_ignores_delayed_think_close(
     assert content == _SKIPPED_THINK_REPLY
 
 
+_JSON_ANSWER = '{"a": 1}'
+
+
+@pytest.mark.parametrize(
+    ("force_reasoning", "text", "reasoning"),
+    [
+        (
+            True,
+            f"plan{THINK_CLOSE}{RESPONSE_OPEN}{_JSON_ANSWER}{RESPONSE_CLOSE}",
+            "plan",
+        ),
+        (False, f"{_JSON_ANSWER}{RESPONSE_CLOSE}", ""),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+def test_json_answer_trimmed_at_message_close(
+    force_reasoning: bool, text: str, reasoning: str, chunk_size: int
+) -> None:
+    """JSON answers stop on MESSAGE_CLOSE, which is trimmed from the output; the
+    response close before it still frames the content."""
+    result = KimiK3Detector(force_reasoning=force_reasoning).detect_and_parse(text)
+    assert (result.reasoning_text, result.normal_text) == (reasoning, _JSON_ANSWER)
+    detector = KimiK3Detector(force_reasoning=force_reasoning)
+    assert _stream(detector, _chunks(text, chunk_size)) == (reasoning, _JSON_ANSWER)
+
+
 def test_reasoning_parser_registration() -> None:
     assert isinstance(ReasoningParser("kimi_k3").detector, KimiK3Detector)
 

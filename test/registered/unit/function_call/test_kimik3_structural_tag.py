@@ -24,12 +24,14 @@ from sglang.srt.function_call.kimik3_format import (
     CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
+    get_kimik3_json_response_structural_tag,
     get_kimik3_structural_tag,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -277,6 +279,51 @@ def test_required_rejects_message_close_before_tools():
     ):
         assert not _accepts(grammar, response + near_miss)
     assert not _accepts(grammar, "<|open|>response<|sep|>Hi" + TOOLS_CLOSE)
+
+
+_JSON_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {"a": {"type": "integer"}},
+    "required": ["a"],
+    "additionalProperties": False,
+}
+
+
+def _json_response_grammar(**kwargs):
+    return xgr.Grammar.from_structural_tag(
+        get_kimik3_json_response_structural_tag(_JSON_ANSWER_SCHEMA, **kwargs)
+    )
+
+
+def test_json_response_is_written_as_the_response_block():
+    """A bare JSON grammar masks the markers around K3's answer; the model, kept
+    from opening the block, drifts onto whitespace or into a string it cannot
+    leave and generates until max_tokens."""
+    grammar = _json_response_grammar()
+    answer = '{"a": 1}'
+
+    # After reasoning the model opens the block itself.
+    assert _accepts(grammar, RESPONSE_OPEN + answer + RESPONSE_CLOSE + MESSAGE_CLOSE)
+    assert _accepts(grammar, RESPONSE_OPEN + answer + RESPONSE_CLOSE)
+    # Without reasoning the generation prompt already opened it.
+    assert _accepts(grammar, answer + RESPONSE_CLOSE)
+    assert not _accepts(grammar, RESPONSE_OPEN + '{"a": "x"}' + RESPONSE_CLOSE)
+    assert not _accepts(grammar, RESPONSE_OPEN + answer)
+    assert not _accepts(grammar, RESPONSE_OPEN + answer + RESPONSE_CLOSE + "a")
+
+
+def test_json_response_frames_reasoning_and_caps_whitespace():
+    answer = RESPONSE_OPEN + '{"a": 1}' + RESPONSE_CLOSE
+
+    with_reasoning = _json_response_grammar(thinking_mode=True)
+    assert _accepts(with_reasoning, "Plan the answer." + THINK_CLOSE + answer)
+    assert not _accepts(with_reasoning, answer)
+
+    capped = _json_response_grammar(max_whitespace_cnt=4)
+    assert _accepts(capped, RESPONSE_OPEN + '{"a":  1}' + RESPONSE_CLOSE)
+    assert not _accepts(
+        capped, RESPONSE_OPEN + '{"a":' + " " * 8 + "1}" + RESPONSE_CLOSE
+    )
 
 
 def test_tool_choice_none_rejects_tools_section():

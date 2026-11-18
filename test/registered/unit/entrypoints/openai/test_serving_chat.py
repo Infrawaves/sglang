@@ -53,8 +53,16 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
-from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    THINK_CLOSE,
+    TOOLS_CLOSE,
+    TOOLS_OPEN,
+)
+from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_json_response_structural_tag,
+    get_kimik3_structural_tag,
+)
 from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -3301,6 +3309,50 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 self.assertNotIn("json_schema", adapted.sampling_params)
                 self.assertIn("structural_tag", adapted.sampling_params)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(
+                    kwargs["response_format"]["type"], response_format["type"]
+                )
+
+    def test_kimi_k3_json_response_format_constraints(self):
+        """json_object stays prompt-guided; a strict json_schema is constrained
+        inside the K3 response block, so its markers stay admissible, and stops
+        on the message close a model trapped in a JSON string would write."""
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+        cases = (
+            ({"type": "json_object"}, None),
+            (
+                {"type": "json_schema", "json_schema": {"name": "a", "schema": schema}},
+                get_kimik3_json_response_structural_tag(schema).model_dump(
+                    by_alias=True
+                ),
+            ),
+        )
+        for response_format, expected_tag in cases:
+            with self.subTest(response_format=response_format["type"]):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Return JSON"}],
+                    response_format=response_format,
+                    stop=["END"],
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIsNone(params.get("json_schema"))
+                tag = params.get("structural_tag")
+                self.assertEqual(
+                    json.loads(tag) if tag is not None else None, expected_tag
+                )
+                self.assertIn("END", params["stop"])
+                self.assertEqual(
+                    MESSAGE_CLOSE in params["stop"], expected_tag is not None
+                )
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
