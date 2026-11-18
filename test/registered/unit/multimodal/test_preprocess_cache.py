@@ -244,6 +244,37 @@ class TestMediaIdentity(unittest.TestCase):
         self.assertNotEqual(base, changed_config)
         self.assertEqual(base, same_again)
 
+    def test_processor_fingerprint_separates_feature_dtypes(self):
+        # A processor that emits model-ready features puts its output dtype in
+        # the payload, which makes torch.dtype the only non-str/dict value in
+        # there. A cached fp32 feature is not interchangeable with a bf16 one,
+        # so a lossy canonicalization of dtype would let a bf16 deployment
+        # reuse an fp32 artifact under the same key.
+        class Processor:
+            def __init__(self, output_dtype):
+                self.output_dtype = output_dtype
+
+            def preprocess_fingerprint_payload(self):
+                return {"output_dtype": self.output_dtype}
+
+        class Config:
+            def to_dict(self):
+                return {"model_type": "vlm", "architectures": ["VLM"]}
+
+        config = Config()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+        fp32 = build_processor_fingerprint(Processor(torch.float32), config)
+        bf16 = build_processor_fingerprint(Processor(torch.bfloat16), config)
+        fp16 = build_processor_fingerprint(Processor(torch.float16), config)
+        unset = build_processor_fingerprint(Processor(None), config)
+
+        self.assertEqual(4, len({fp32, bf16, fp16, unset}))
+        self.assertEqual(
+            bf16, build_processor_fingerprint(Processor(torch.bfloat16), config)
+        )
+
     def test_item_hash_namespace_covers_identity_and_processor_output(self):
         digest = snapshot_media(b"image").content_digest
         first = build_artifact_key(
