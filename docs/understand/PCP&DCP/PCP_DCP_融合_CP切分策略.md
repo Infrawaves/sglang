@@ -1,6 +1,6 @@
 # PCP + DCP 融合（方案 A）：CP 切分策略修改方案
 
-> 状态：草案，待人工评审
+> 状态：P3 已实现（§11），待 GPU 验证
 > 代码基线：`yhz/test/v0.5.23-k31` 分支（行号在该分支上核对过）
 > 关联文档：`PCP_DCP_方案A_计划二.md` §3.3、§4.3；`方案A计划问题汇总.md` §3、§4
 > 文中代码片段只是改法示意，**没有运行验证**。标"（推断）"的条目确定性较低。
@@ -288,16 +288,16 @@ P3 如果开启 graph，有两处要处理：
 
 | # | 文件 | 行号 | 改动 | 阶段 |
 |---|---|---|---|---|
-| 1 | `layers/cp/interleave.py` | 190-215 | `build_metadata` 增加按位置分支，生成 `gather_index`/`local_index`；步长和物理分片长度对齐 | P3 |
-| 2 | `layers/cp/interleave.py` | 217-225 | `shard_hidden_states`/`shard_position_ids` 按 `local_index` 取行 | P3 |
-| 3 | `layers/cp/interleave.py` | 227-253 | `shard_local_tokens` 增加 `forward_batch` 参数 | P3 |
-| 4 | `layers/cp/interleave.py` | 244-250 | `local_q_indices` 返回 `local_index` | P3（建议） |
-| 5 | `layers/cp/interleave.py` | 255-279 | `shard_per_request` 增加前缀长度，按位置计算 | P3 |
-| 6 | `kernels/ops/attention/dsa/cp_split.py` | 11-47 | 新增按位置计算的 kernel，注意向零取整的问题 | P3 |
-| 7 | `layers/attention/dsa_backend.py` | 1622-1636 | 调用方传入前缀长度和 `forward_batch` | P3 |
-| 8 | `layers/cp/utils.py` | 387-395 | `cp_interleave_input_ids` 按 `gather_index` 重排 | P3 |
-| 9 | `layers/cp/utils.py` | 303-304 | P3 新增"本卡写入位置"，不覆盖 `out_cache_loc` | P3 |
-| 10 | `layers/cp/interleave.py` | 418-427 | `interleave_rows_per_request` 在 DCP 生效时断言 | P3 |
+| 1 | `layers/cp/interleave.py` | 190-215 | `build_metadata` 增加按位置分支，生成 `gather_index`/`local_index`；步长和物理分片长度对齐 | P3，已实现（§11.1） |
+| 2 | `layers/cp/interleave.py` | 217-225 | `shard_hidden_states`/`shard_position_ids` 按 `local_index` 取行 | P3，已实现 |
+| 3 | `layers/cp/interleave.py` | 227-253 | `shard_local_tokens` 增加 `forward_batch` 参数 | P3，已实现 |
+| 4 | `layers/cp/interleave.py` | 244-250 | `local_q_indices` 返回 `local_index` | P3，已实现 |
+| 5 | `layers/cp/interleave.py` | 255-279 | `shard_per_request` 增加前缀长度，按位置计算 | P3，已实现（§11.1） |
+| 6 | `kernels/ops/attention/dsa/cp_split.py` | 11-47 | 新增按位置计算的 kernel，注意向零取整的问题 | P3，已实现 |
+| 7 | `layers/attention/dsa_backend.py` | 1622-1636 | 调用方传入前缀长度和 `forward_batch` | P3，已实现（另有一处调用点，§11.1） |
+| 8 | `layers/cp/utils.py` | 387-395 | `cp_interleave_input_ids` 按 `gather_index` 重排 | P3，已实现 |
+| 9 | `layers/cp/utils.py` | 303-304 | P3 新增"本卡写入位置"，不覆盖 `out_cache_loc` | P3，已实现（见 KV 写入策略 §9） |
+| 10 | `layers/cp/interleave.py` | 418-427 | `interleave_rows_per_request` 在 DCP 生效时断言 | P3，已实现 |
 | — | `layers/cp/base.py` | 255-332 | **不改**，不用 `register_cp_kv_layout`（§4） | — |
 | — | `layers/layer_boundary/`、`kimi_k3.py:1977` | — | **不改**，只做验证（§5） | — |
 | — | `model_executor/runner/eager_runner.py` | 120-124、211 | **不改**，只核对（§6） | — |
@@ -309,3 +309,58 @@ P3 如果开启 graph，有两处要处理：
 2. **往返一致：** `cp_sequence_to_interleave_order` 后再做 `cp_interleave_to_sequence_order`，结果等于原序列。用 `shard_hidden_states` 的结果模拟每个 rank 的分片，按 rank 拼接后，用 `gather_index` 取出来，要等于原序列。
 3. **每请求计数：** §1.5 的 Python 公式和 §2 的 kernel 公式，在 `p` 为 0、`p < r` 这类边界值上结果一致。CPU 上可以直接比较 Python 公式和逐 token 计数的结果。
 4. **非 DCP 不变：** 关闭 DCP 时，`build_metadata`、`shard_per_request` 和 `cp_interleave_input_ids` 的输出和修改前完全相同。
+
+## 11. P3 已实现的改动
+
+本节记录 §1–§3 的实际实现。行号对应实现后的代码。所有改动都只在 DCP 生效时（`attn_dcp_size > 1`）走新分支；参数校验只允许 K3.1 + 方案 A 同时开 prefill CP 和 DCP，所以其他模型和普通 PCP 的行为不变。
+
+### 11.1 改动清单
+
+| 文件 | 位置 | 改动 |
+|---|---|---|
+| `layers/cp/padding.py` | 34-37 行 | 新增 `physical_rank_len`，`pad_logical_token_to_physical` 改为调用它。`build_metadata` 用同一个函数算 `gather_index` 的步长，保证步长等于物理分片长度（§1.1 的注意事项） |
+| `layers/cp/interleave.py` | 88-95 行 | `InterleaveContextParallelMetadata` 新增 `local_sequence_rows`、`prefix_lens_cpu`、`prefix_lens`、`local_out_cache_loc` 四个字段 |
+| `layers/cp/interleave.py` | 104-131 行 | 新增 `writes_owned_kv_only`（是否按位置切分）、`owned_kv_rows`、`owned_kv_write`（本卡写入位置和本卡分片的有效前缀）。后续所有分支都用 `writes_owned_kv_only` 判断，判断条件只有一处 |
+| `layers/cp/interleave.py` | 230-316 行 | `build_metadata` 在 DCP 生效时先算出每个请求的前缀长度，再调用新的 `_build_position_owner_metadata`。位置 `p` 归 `p % N` 号卡；`gather_index = owner * stride + slot`；`local_sequence_rows` 是本卡的序列行，升序 |
+| `layers/cp/interleave.py` | 318-327 行 | 新增 `_local_rows`：有 `local_sequence_rows` 时按它取行，否则走原来的 `_interleave_shard`。`shard_hidden_states`、`shard_position_ids`、`shard_local_tokens` 都改为调用它 |
+| `layers/cp/interleave.py` | 345-348 行 | `local_q_indices` 返回 `local_sequence_rows` |
+| `layers/cp/interleave.py` | 356-406 行 | `shard_local_tokens`、`shard_per_request` 增加 `forward_batch` 参数。按位置切分时 `shard_per_request` 走 `_shard_per_request_by_position`，前缀长度从 metadata 读 |
+| `layers/cp/interleave.py` | 544-561 行 | 新增 `position_owned_rows_per_request`（§1.5 的 Python 公式）；`interleave_rows_per_request` 加断言，DCP 生效时不允许调用 |
+| `layers/cp/base.py` | 163-173 行 | 基类的 `shard_per_request`、`shard_local_tokens` 签名同步加上 `forward_batch` |
+| `kernels/ops/attention/dsa/cp_split.py` | 50-93 行 | 新增 `_dsa_cp_owner_q_seqs_kernel` 和 `dsa_cp_owner_q_seqs`。两个分子都先加 `cp_size`，避免 Triton 向零取整 |
+| `kernels/ops/attention/__init__.py` | 202 行 | 把 `dsa_cp_owner_q_seqs` 登记进 kernel 清单 |
+| `layers/cp/utils.py` | 397-411 行 | `cp_interleave_input_ids` 在非 a2a 路径下，按位置切分时调用 `cp_sequence_to_interleave_order` 生成 rank 优先的行 |
+| `layers/attention/dsa_backend.py` | 1663-1670、1938-1943 行 | 两处调用点都传 `forward_batch`。第二处（`_cal_indexer_k_start_end` 里切 `ks`/`ke`/`token_to_batch_idx`）计划二和本文前面都没有列出 |
+
+### 11.2 和 §1–§3 设想的不同之处
+
+1. **没有复用 `local_index` 字段。** V4 的 `local_index` 是"tail 的元数据行，包含 padding"（`deepseek_v4_backend.py:1744`、3035、3099 都在读它）。方案 A 需要的是"本卡的序列行，不含 padding"，语义不同，所以新增了 `local_sequence_rows`。`gather_index` 两边语义相同（序列行到 rank 优先槽位），继续共用。
+2. **`shard_per_request` 不新增前缀长度参数，改为传 `forward_batch`。** 前缀长度在 `build_metadata` 里已经算过，存进 metadata（CPU 列表和设备张量各一份），`shard_per_request` 直接读。这样切分和计数用的是同一份前缀长度。
+3. **`_local_rows` 断言输入行数等于 `total_seq_lens`。** 原来的 `_interleave_shard` 能接受任意长度；按位置取行时，长度不对会直接取错行，所以加了断言。`prepare_cp_forward` 传的 `num_tokens` 是 `sum(extend_seq_lens_cpu)`，正常情况下不会有尾部 padding。
+
+### 11.3 测试
+
+新增 `test/registered/unit/cp/test_interleave_dcp_owner_layout.py`，注册在 `base-a-test-cpu`，用 N=4 和 4 个请求（前缀 3、0、64、7，覆盖前缀不对齐、请求短于 N）：
+
+| 用例 | 检查内容 |
+|---|---|
+| `test_each_rank_holds_exactly_the_positions_it_owns` | 每个 rank 的行都满足 `pos % N == rank`，行号升序，所有 rank 合起来正好覆盖全部行（§10 第 1 条） |
+| `test_gather_index_restores_sequence_order_from_rank_major_shards` | 按 rank 拼接各卡分片后，`cp_interleave_to_sequence_order` 还原出原序列；`cp_sequence_to_interleave_order` 得到同样的拼接结果；`gather_index` 是双射且不越界（§10 第 2 条） |
+| `test_per_request_counts_match_the_shard` | `position_owned_rows_per_request` 和逐 token 计数一致，总数等于本卡行数（§10 第 3 条） |
+| `test_input_ids_global_follow_the_boundary_rows` | 非 a2a 路径的 `input_ids_global` 等于各卡分片按 rank 拼接的结果（§3.1） |
+| `test_local_kv_writes_land_on_the_owner` | 在"slot 和位置模 N 同余"的前提下，本卡写入位置都满足 `slot % N == rank`，所有 rank 合起来覆盖全部 slot |
+| `test_concatenated_index_split_is_unchanged` | 关闭 DCP 时不生成 `gather_index`/`local_sequence_rows`，每卡行数和原来相同（§10 第 4 条） |
+
+Triton kernel 在 CPU 上跑不了，`dsa_cp_owner_q_seqs` 和 Python 公式是否一致只能在 GPU 上确认。
+
+```bash
+python -m pytest test/registered/unit/cp/test_interleave_dcp_owner_layout.py -q
+```
+
+这些测试和代码都还没有实际运行过：开发机没有 torch，只做了语法编译检查。
+
+### 11.4 GPU 上要确认的点
+
+1. `dsa_cp_owner_q_seqs` 和 `position_owned_rows_per_request` 在 `p=0`、`p<rank` 等边界值上输出相同。
+2. 某个 rank 分到 0 行的情况：所有请求的 extend 都短于 N、而且位置集中时可能出现。这时本卡的写入位置是空张量，要确认 `store_mla` 和 indexer 的融合 store 能接受 0 行输入。
+3. §5 的层边界验证：随机前缀和多请求下，KDA 输入的序列顺序和 TP8 完全一致。

@@ -164,12 +164,13 @@ class ContextParallelStrategy(ABC):
         self,
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
+        forward_batch: ForwardBatch,
     ) -> Tuple[List[int], Any, List[int], Any]:
         raise NotImplementedError(
             f"{self.name} strategy does not support per-request sharding"
         )
 
-    def shard_local_tokens(self, input_: Any) -> Any:
+    def shard_local_tokens(self, input_: Any, forward_batch: ForwardBatch) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support local-token sharding"
         )

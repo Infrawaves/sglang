@@ -167,6 +167,7 @@ if _use_aiter:
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import owned_kv_write, writes_owned_kv_only
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k, get_dcp_lens
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1072,7 +1073,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif self.alt_stream is not None and is_cp_active(forward_batch):
+        elif (
+            self.alt_stream is not None
+            and is_cp_active(forward_batch)
+            and not writes_owned_kv_only(forward_batch)
+        ):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1090,8 +1095,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query = self._maybe_rotate(query)
             key = self._maybe_rotate(key)
 
-        # allgather+rerrange
-        if is_cp_active(forward_batch):
+        # allgather+rerrange. Scoring reads index-K back from the cache; a rank
+        # that writes only its own index-K keeps the local key for that write.
+        if is_cp_active(forward_batch) and not writes_owned_kv_only(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
         return query, key, weights_raw
 
@@ -2455,6 +2461,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 forward_batch=forward_batch,
             )
 
+            store_loc = None
+            store_key = key
+            if writes_owned_kv_only(forward_batch):
+                store_loc, store_key = owned_kv_write(forward_batch, key)
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -2464,8 +2474,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
                         layer_id=layer_id,
-                        key=key,
+                        key=store_key,
                         act_quant=act_quant,
+                        out_cache_loc=store_loc,
                     )
                 current_stream.wait_stream(self.alt_stream)
             elif not in_piecewise_or_breakable_cuda_graph:
@@ -2473,8 +2484,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key=key,
+                    key=store_key,
                     act_quant=act_quant,
+                    out_cache_loc=store_loc,
                 )
             else:
                 # Graph paths not handled by the full DSA indexer split op

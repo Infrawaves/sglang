@@ -1,6 +1,6 @@
 # PCP + DCP 融合（方案 A）：KV 写入策略修改方案
 
-> 状态：草案，待人工评审
+> 状态：P1、P3 已实现（§8、§9），待 GPU 验证
 > 代码基线：`yhz/test/v0.5.23-k31` 分支（行号已在该分支上核对过）
 > 关联文档：`PCP_DCP_方案A_计划二.md` §3.4、§4.4；`方案A计划问题汇总.md` §4；`PCP_DCP_融合_CP切分策略.md`
 > 文中的代码片段只是改法示意，**没有运行验证**。标"（推断）"的条目确定性较低。
@@ -236,12 +236,12 @@ dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
 | # | 文件 | 行号 | 改动 | 阶段 |
 |---|---|---|---|---|
 | 1 | `mem_cache/kv/alloc/id_space.py` | 163-185 | **不改**；新增 CPU 单元测试：每个 slot 恰好被一个 rank 写入，而且这个 rank 就是 `slot % N`（§1.3） | P1 |
-| 2 | `layers/attention/dsa/dsa_indexer.py` | 1081-1083、1094-1095 | P1 不改；P3 在 DCP 生效时跳过 `materialize_full_indexer_k_cache` | P3 |
-| 3 | `layers/attention/dsa/dsa_indexer.py` | 2457-2470 | P3 调用 `_store_index_k_cache` 时传入 `cp_local_out_cache_loc`，并断言行数一致 | P3 |
-| 4 | `layers/attention/dsa_backend.py` | 161-166 | P3 在 `prepare_kv_for_attention` 里跳过 `materialize_full_mla_kv` | P3 |
-| 5 | `layers/cp/interleave.py` | 452-471 | P3 让 `_can_overlap` 在 `dsa_shards_index_k()` 为真时返回 False | P3 |
-| 6 | `layers/attention/dsa_backend.py` | 2609-2618、3015-3024、4573 | P3 的 `store_mla` 改用 `cp_local_out_cache_loc`；trtllm 路径以后再改 | P3 |
-| 7 | `layers/cp/utils.py` + `model_executor/forward_batch_info.py` | 303-304 | P3 新增 `cp_local_out_cache_loc`，不覆盖 `out_cache_loc` | P3 |
+| 2 | `layers/attention/dsa/dsa_indexer.py` | 1081-1083、1094-1095 | P1 不改；P3 在 DCP 生效时跳过 `materialize_full_indexer_k_cache` | P3，已实现 |
+| 3 | `layers/attention/dsa/dsa_indexer.py` | 2457-2470 | P3 调用 `_store_index_k_cache` 时传入 `cp_local_out_cache_loc`，并断言行数一致 | P3，已实现 |
+| 4 | `layers/attention/dsa_backend.py` | 161-166 | P3 在 `prepare_kv_for_attention` 里跳过 `materialize_full_mla_kv` | P3，已实现 |
+| 5 | `layers/cp/interleave.py` | 452-471 | P3 让 `_can_overlap` 在 `dsa_shards_index_k()` 为真时返回 False | P3，已实现 |
+| 6 | `layers/attention/dsa_backend.py` | 2609-2618、3015-3024、4573 | P3 的 `store_mla` 改用 `cp_local_out_cache_loc`；trtllm 路径以后再改 | P3，已实现（§9.2 第 3、4 条） |
+| 7 | `layers/cp/utils.py` + `model_executor/forward_batch_info.py` | 303-304 | P3 新增 `cp_local_out_cache_loc`，不覆盖 `out_cache_loc` | P3，已实现（字段放在 CP metadata 上，§9.2 第 1 条） |
 | 8 | `layers/dcp/planner.py` | 113 | **不改逻辑**；可选加前缀对齐断言 | P1（可选） |
 | 9 | 参数校验 | — | 可选：要求 `page_size % dcp_size == 0` | P1（可选） |
 | — | `layers/cp/interleave.py` 的三个 gather 入口 | 360-363、401-415、539-604 | **函数本身不改**，P3 在调用方跳过 | — |
@@ -284,3 +284,47 @@ python -m pytest test/registered/unit/mem_cache/test_full_loc_fast_path.py test/
 ```
 
 这些测试还没有实际运行过。开发机上只有 Python 3.9，没有装 torch，只做过语法解析检查。
+
+## 9. P3 已实现的改动
+
+前提是按位置取模的切分已经实现（`PCP_DCP_融合_CP切分策略.md` §11）。所有分支都用 `writes_owned_kv_only(forward_batch)` 判断（`layers/cp/interleave.py:104-110`）：当前是 interleave 的 CP extend，并且 metadata 里有 `local_sequence_rows`。只有 prefill CP + DCP 才会满足这个条件。
+
+### 9.1 改动清单
+
+| 文件 | 位置 | 改动 |
+|---|---|---|
+| `layers/cp/utils.py` | `prepare_cp_forward`，305-315 行 | 按位置切分时，把 `out_cache_loc.index_select(0, local_sequence_rows)` 存到 `metadata.local_out_cache_loc`。`forward_batch.out_cache_loc` 本身不改 |
+| `layers/cp/interleave.py` | 113-131 行 | `owned_kv_write(forward_batch, *rows)`：返回本卡写入位置，以及每个本卡张量的有效前缀（本卡分片被补齐到物理长度，尾部是 padding）。断言写入位置的行数等于本卡的逻辑行数 |
+| `layers/attention/dsa_backend.py` | `prepare_kv_for_attention`，154-179 行 | 按位置切分时直接返回本卡的 `k_nope`、`k_pe`，不调用 `materialize_full_mla_kv` |
+| `layers/attention/dsa_backend.py` | `forward_extend`，2679-2680 行 | `store_mla` 前，按位置切分时用 `owned_kv_write` 换成本卡写入位置和有效行 |
+| `layers/attention/dsa_backend.py` | `_forward_trtllm`，4639-4643 行 | 不走 fused-rope 分支时同样改写本卡行（见 §9.2 第 4 条） |
+| `layers/cp/interleave.py` | `_can_overlap`，593 行起 | 按位置切分时返回 False，不再走"KV gather 与 indexer 重叠"的路径 |
+| `layers/attention/dsa/dsa_indexer.py` | `_get_q_k_bf16`，1076-1102 行 | 两处 `materialize_full_indexer_k_cache` 在按位置切分时都跳过，返回本卡的 key |
+| `layers/attention/dsa/dsa_indexer.py` | `forward_cuda`，2464-2490 行 | 两处 extend 路径的 `_store_index_k_cache` 改传 `owned_kv_write` 得到的写入位置和本卡 key |
+
+### 9.2 和 §2–§4 设想的不同之处
+
+1. **写入位置放在 CP metadata 上，不加 `ForwardBatch` 字段。** 字段名是 `InterleaveContextParallelMetadata.local_out_cache_loc`。它和 `local_sequence_rows` 同时生成、同时失效：`eager_runner.py:328` 和 `bcg.py:190` 在每次前向后把 `attn_cp_metadata` 置空，这个字段跟着一起清掉，不会残留到下一次前向。加在 `ForwardBatch` 上就需要另外处理清理。
+2. **判断条件用 `writes_owned_kv_only`，不用 `dsa_shards_index_k()`。** 两者在方案 A 下等价，但前者直接表达"本卡只算自己拥有的 token"，这才是能跳过 gather 的原因。MLA KV、indexer K 和 overlap 三处共用这一个判断。
+3. **`dsa_backend.py` 的 3075 行（文档原写 3015-3024）没有改。** 它在 `forward_decode` 里，decode 不走 CP 切分。
+4. **trtllm 路径也做了最小处理。** `_forward_trtllm` 的 fused-rope 分支自己做 gather（`all_gather_dsa_trtllm_fp8_kv`），写完整的 `out_cache_loc`，结果仍然正确，所以不改。但另一个分支原本依赖 `prepare_kv_for_attention` 已经 gather 过 KV，现在 KV 是本卡的，所以这个分支也改成写本卡行，否则行数和写入位置会对不上。方案 A 第一期只用 flashmla_kv，这条路径不会执行到。
+
+### 9.3 为什么去掉 gather 后结果不变（逐项核对）
+
+§3.3 末尾标了"推断：需要逐个核对 `k_nope`/`k_rope` 返回之后的所有使用点"。实现时核对的结果：
+
+| 使用点 | 位置 | 结论 |
+|---|---|---|
+| MLA 的 `store_mla` 之后 | `dsa_backend.py:2705-2709` | DCP 下 MLA 路径从 cache 读 KV，再用 `dcp_gather_kv_cache` 收齐整条序列，不使用传入的 `k` |
+| MHA_ONE_SHOT 分支 | `dsa_backend.py:2688-2701`、4953-4967 | 会直接使用 `k`，但开启 prefill CP 时 `use_mha` 恒为 False（`not is_dsa_enable_prefill_cp()`） |
+| DCP extend 的 KV gather | `forward_mla.py:884-891` | DSA 模型不调用 `bcg_dcp_extend_kv_gather` |
+| decode 提前写 KV | `forward_mla.py:540-611` | 只在 decode/verify 下执行 |
+| indexer 打分 | `dsa_indexer.py:1719-1727` | DCP 下从 cache 读 `_dcp_gather_index_k`，不使用 gather 出来的 key |
+| indexer 的 k-only 快速路径 | `dsa_indexer.py:2325` | 开启 prefill CP 时不走（`not self.dsa_enable_prefill_cp`） |
+| indexer 的融合 store 路径 | `dsa_indexer.py:2373-2390` | CP 生效时不走（`attn_cp_metadata is None` / `not is_cp_active`） |
+
+### 9.4 测试
+
+CPU 测试在 `test/registered/unit/cp/test_interleave_dcp_owner_layout.py`。其中 `test_local_kv_writes_land_on_the_owner` 对应 §7 的 P3 CPU 测试：在"slot 和位置模 N 同余"（§1.2）的前提下，各卡的写入位置都满足 `slot % N == rank`，并且所有卡合起来正好覆盖全部 slot。运行方式见 `PCP_DCP_融合_CP切分策略.md` §11.3。这些测试还没有运行过。
+
+§7 的 P3 GPU 测试（去掉 gather 前后 cache 内容逐字节一致）还没有做。
