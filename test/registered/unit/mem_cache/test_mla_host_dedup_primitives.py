@@ -42,6 +42,32 @@ class _FakeStream:
 
 
 class TestMLAHostDedupPrimitives(unittest.TestCase):
+    def test_zero_row_indexer_skips_only_its_own_broadcast(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((4, 3)), torch.zeros((4, 3))],
+            kv_cache_dim=3,
+        )
+        broadcaster.kv_staging = torch.empty(12)
+        broadcaster.idx_bufs = [torch.empty((0, 8)), torch.zeros((2, 8))]
+        broadcaster.idx_staging = torch.empty(16)
+        broadcaster.idx_elem = 8
+        indices, pages = torch.arange(4), torch.arange(2)
+        with mock.patch.object(broadcaster, "_bcast_layer") as broadcast:
+            broadcaster.broadcast_loaded_layer(0, (indices, pages))
+            self.assertEqual(broadcast.call_count, 1)
+            self.assertIs(
+                broadcast.call_args.args[0], broadcaster.device_pool.kv_buffer
+            )
+            broadcast.reset_mock()
+            broadcaster.broadcast_loaded_layer(1, (indices, pages))
+            self.assertEqual(broadcast.call_count, 2)
+            self.assertIs(
+                broadcast.call_args_list[0].args[0], broadcaster.device_pool.kv_buffer
+            )
+            self.assertIs(broadcast.call_args_list[1].args[0], broadcaster.idx_bufs)
+            self.assertIs(broadcast.call_args_list[1].args[2], pages)
+
     def test_disabled_flag_is_a_noop(self):
         with mock.patch(
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"

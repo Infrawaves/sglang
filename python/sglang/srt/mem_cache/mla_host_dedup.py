@@ -167,7 +167,9 @@ class MLAHostDedupBroadcaster:
             self.device_pool.kv_cache_dim,
             layer_id,
         )
-        if self.idx_bufs is not None:
+        # A layer that reuses the previous layer's top-k (skip_topk_layers) keeps
+        # a 0-row index placeholder: nothing to broadcast.
+        if self.idx_bufs is not None and self.idx_bufs[layer_id].shape[0] > 0:
             assert page_idx is not None
             self._bcast_layer(
                 self.idx_bufs,
