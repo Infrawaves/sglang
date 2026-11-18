@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from array import array
@@ -12,6 +13,7 @@ from enum import Enum, auto
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import psutil
 import torch
 
 from sglang.srt.managers.cache_controller import (
@@ -2060,8 +2062,8 @@ class HybridCacheController(BaseHiCacheController):
         return pool_hits
 
     _warned_node_mamba_shape = False
-    # Ops whose node ranks named different checkpoints; read by the rate limiter.
-    _node_key_mismatches = 0
+    # Set once the launcher has been asked to stop the server (see below).
+    _node_out_of_step = False
 
     @classmethod
     def _node_mamba_ticket(cls, transfer: Optional[PoolTransfer]) -> tuple[int, int]:
@@ -2111,16 +2113,18 @@ class HybridCacheController(BaseHiCacheController):
             return None
         if any(fingerprint != ticket[1] for _, fingerprint in tickets):
             # Writing under this key would mix other requests' state into it.
-            # Once out of step every later op mismatches too, so log sparsely.
-            cls._node_key_mismatches += 1
-            if cls._node_key_mismatches % 1000 == 1:
+            # Once out of step every later op mismatches too, and nothing in
+            # the storage threads can realign the node, so stop the server.
+            if not cls._node_out_of_step:
+                cls._node_out_of_step = True
                 logger.error(
                     "KDA node aggregation: node ranks disagree on the checkpoint "
-                    "key (fingerprints %s); skipping. Node-rank collectives are "
-                    "out of step; KDA L3 stays off until restart (%d ops so far).",
+                    "key (fingerprints %s); node-rank collectives are out of "
+                    "step. Stopping the server.",
                     [fingerprint for _, fingerprint in tickets],
-                    cls._node_key_mismatches,
                 )
+                # Same path as a scheduler crash: the launcher kills the tree.
+                psutil.Process().parent().send_signal(signal.SIGQUIT)
             return None
         return [slot for slot, _ in tickets]
 

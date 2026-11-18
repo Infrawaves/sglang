@@ -1,5 +1,6 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
+import signal
 import tempfile
 import threading
 import unittest
@@ -1309,31 +1310,50 @@ class TestKDANodeAggregatedRead(CustomTestCase):
         self.assertEqual(pool_hits, {PoolName.MAMBA: 0})
         self.assertEqual(operation.skip_reason, "node_peer_skip")
 
-    def test_ranks_naming_different_checkpoints_skip_instead_of_mixing(self):
+    def _out_of_step(self):
+        """Peer names another checkpoint; the launcher signal is captured."""
+        module = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        patches = [
+            patch(f"{module}.psutil.Process"),
+            patch.object(HybridCacheController, "_node_out_of_step", False),
+        ]
+        process = patches[0].start()
+        patches[1].start()
+        for p in patches:
+            self.addCleanup(p.stop)
+        return process.return_value.parent.return_value.send_signal
+
+    def test_ranks_naming_different_checkpoints_skip_and_stop_the_server(self):
         """Out-of-step node collectives pair this op with a peer's other op;
-        the leader must not read one key into slots of different requests."""
+        the leader must not read one key into slots of different requests,
+        and the server must stop since nothing can realign the node."""
+        send_signal = self._out_of_step()
         ctrl, operation = self._setup()
         with (
-            patch.object(HybridCacheController, "_node_key_mismatches", 0),
             _FakeNodeCollectives(peer_ticket=[5, 12345]),
             self.assertLogs(level="ERROR"),
         ):
             pool_hits = ctrl._page_transfer_sidecar(operation, 2)
         ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
         self.assertEqual(pool_hits, {PoolName.MAMBA: 0})
+        send_signal.assert_called_once_with(signal.SIGQUIT)
 
-    def test_out_of_step_node_logs_sparsely(self):
-        """Once out of step every op mismatches; one error per 1000 ops."""
+    def test_out_of_step_node_signals_the_launcher_once(self):
+        """Every later op mismatches too until the tree is killed; it must
+        keep skipping without re-signalling or re-logging."""
+        send_signal = self._out_of_step()
         ctrl, _ = self._setup()
         with (
-            patch.object(HybridCacheController, "_node_key_mismatches", 0),
             _FakeNodeCollectives(peer_ticket=[5, 12345]),
             self.assertLogs(level="ERROR") as logs,
         ):
             for _ in range(3):
                 _, operation = self._setup()
-                ctrl._page_transfer_sidecar(operation, 2)
+                self.assertEqual(
+                    ctrl._page_transfer_sidecar(operation, 2), {PoolName.MAMBA: 0}
+                )
         self.assertEqual(len(logs.records), 1)
+        send_signal.assert_called_once_with(signal.SIGQUIT)
 
     def test_locally_skipped_rank_still_joins_the_exchange(self):
         """A rank whose KV read fell short must still run the exchange once,
