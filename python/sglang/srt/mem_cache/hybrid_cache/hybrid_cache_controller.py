@@ -354,6 +354,10 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
     return extra_info
 
 
+# (host slot, key fingerprint) a node rank sends when it has no checkpoint.
+_NODE_SKIP_TICKET = (-1, 0)
+
+
 def _find_pool_transfer(
     transfers: list[PoolTransfer], name: PoolName
 ) -> Optional[PoolTransfer]:
@@ -2016,8 +2020,9 @@ class HybridCacheController(BaseHiCacheController):
             local_skip = operation.skip_reason is not None
             if node is not None:
                 mamba = _find_pool_transfer(transfers_nonkv, PoolName.MAMBA)
+                ticket = self._node_mamba_ticket(mamba)
                 exchanged = True
-                slots = self._exchange_node_slots(node.prefetch_group, mamba)
+                slots = self._exchange_node_slots(node.prefetch_group, ticket)
                 transfers_nonkv = self._get_node_aggregated_mamba(
                     operation, mamba, slots, transfers_nonkv, results
                 )
@@ -2025,7 +2030,7 @@ class HybridCacheController(BaseHiCacheController):
             if node is not None and not exchanged:
                 # A failed preparation still joins the exchange as a skip, so
                 # node-rank collectives stay in step.
-                self._exchange_node_slots(node.prefetch_group, None)
+                self._exchange_node_slots(node.prefetch_group, _NODE_SKIP_TICKET)
         if not local_skip:
             try:
                 for extra_info, transfers in _trailing_chain_groups(
@@ -2055,12 +2060,14 @@ class HybridCacheController(BaseHiCacheController):
         return pool_hits
 
     _warned_node_mamba_shape = False
+    # Ops whose node ranks named different checkpoints; read by the rate limiter.
+    _node_key_mismatches = 0
 
     @classmethod
     def _node_mamba_ticket(cls, transfer: Optional[PoolTransfer]) -> tuple[int, int]:
         """(host slot, key fingerprint) of this rank's checkpoint; slot -1 skips."""
         if transfer is None or not transfer.keys:
-            return -1, 0
+            return _NODE_SKIP_TICKET
         if (
             len(transfer.keys) != 1
             or transfer.host_indices is None
@@ -2077,7 +2084,7 @@ class HybridCacheController(BaseHiCacheController):
                     if transfer.host_indices is None
                     else transfer.host_indices.numel(),
                 )
-            return -1, 0
+            return _NODE_SKIP_TICKET
         digest = hashlib.blake2b(transfer.keys[0].encode(), digest_size=8).digest()
         return (
             int(transfer.host_indices.item()),
@@ -2086,15 +2093,12 @@ class HybridCacheController(BaseHiCacheController):
 
     @classmethod
     def _exchange_node_slots(
-        cls,
-        group: torch.distributed.ProcessGroup,
-        transfer: Optional[PoolTransfer],
+        cls, group: torch.distributed.ProcessGroup, ticket: tuple[int, int]
     ) -> Optional[list[int]]:
         """Every node rank's host slot for this op in node-rank order, or None when
         a rank skips or the ranks name different checkpoints.
 
         Collective over ``group``: every node rank calls it exactly once per op."""
-        ticket = cls._node_mamba_ticket(transfer)
         gathered = [
             torch.empty(2, dtype=torch.int64)
             for _ in range(torch.distributed.get_world_size(group=group))
@@ -2107,11 +2111,16 @@ class HybridCacheController(BaseHiCacheController):
             return None
         if any(fingerprint != ticket[1] for _, fingerprint in tickets):
             # Writing under this key would mix other requests' state into it.
-            logger.error(
-                "KDA node aggregation: node ranks disagree on the checkpoint key "
-                "(fingerprints %s); skipping. Node-rank collectives are out of step.",
-                [fingerprint for _, fingerprint in tickets],
-            )
+            # Once out of step every later op mismatches too, so log sparsely.
+            cls._node_key_mismatches += 1
+            if cls._node_key_mismatches % 1000 == 1:
+                logger.error(
+                    "KDA node aggregation: node ranks disagree on the checkpoint "
+                    "key (fingerprints %s); skipping. Node-rank collectives are "
+                    "out of step; KDA L3 stays off until restart (%d ops so far).",
+                    [fingerprint for _, fingerprint in tickets],
+                    cls._node_key_mismatches,
+                )
             return None
         return [slot for slot, _ in tickets]
 
@@ -2265,7 +2274,7 @@ class HybridCacheController(BaseHiCacheController):
         node = self.kda_node_aggregate
         mamba = None
         mamba_ok = False
-        exchanged = False
+        exchanged = synced = False
         results = {}
         try:
             if backup_transfers:
@@ -2275,8 +2284,10 @@ class HybridCacheController(BaseHiCacheController):
             if node is not None:
                 # Runs on every op, with or without Mamba: peers wait on it.
                 mamba = _find_pool_transfer(backup_transfers, PoolName.MAMBA)
+                ticket = self._node_mamba_ticket(mamba)
                 exchanged = True
-                slots = self._exchange_node_slots(node.backup_group, mamba)
+                slots = self._exchange_node_slots(node.backup_group, ticket)
+                synced = True
                 mamba_ok = self._set_node_aggregated_mamba(operation, mamba, slots)
                 storage_transfers = [t for t in backup_transfers if t is not mamba]
             if backup_transfers:
@@ -2302,11 +2313,15 @@ class HybridCacheController(BaseHiCacheController):
             if node is not None:
                 if not exchanged:
                     # A failed preparation still joins the exchange as a skip.
-                    self._exchange_node_slots(node.backup_group, None)
-                # After the KV write, so TP0's MLA write overlaps the leader's KDA
-                # write. One flag per op whatever this rank holds, so every rank
-                # reduces alike.
-                mamba_ok = self._min_reduce_flag(node.backup_group, mamba_ok)
+                    self._exchange_node_slots(node.backup_group, _NODE_SKIP_TICKET)
+                    synced = True
+                # Skipped when the exchange itself raised: the group is broken
+                # and the MIN would only wait out another timeout.
+                if synced:
+                    # After the KV write, so TP0's MLA write overlaps the
+                    # leader's KDA write. One flag per op whatever this rank
+                    # holds, so every rank reduces alike.
+                    mamba_ok = self._min_reduce_flag(node.backup_group, mamba_ok)
         if mamba is not None:
             results[PoolName.MAMBA] = [mamba_ok] * len(mamba.keys or [])
         if backup_transfers:
