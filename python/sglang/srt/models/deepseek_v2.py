@@ -2340,6 +2340,10 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
+    def _decode_attn_tp_modules(self) -> list:
+        """The linears CP decode attention TP slices to this rank's heads."""
+        return [self.q_b_proj, self.o_proj]
+
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         if self.q_lora_rank is None:
@@ -2354,7 +2358,7 @@ class DeepseekV2AttentionMLA(
         ctx = get_cp_decode_attn_tp_ctx()
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
-            [self.q_b_proj, self.o_proj],
+            self._decode_attn_tp_modules(),
             tensor_attrs=tensor_attrs,
             radix_attn=self.attn_mqa,
             defer_all_reduce=self.defer_cp_decode_attn_tp,

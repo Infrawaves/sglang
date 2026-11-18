@@ -340,6 +340,13 @@ def _validate_prefill_cp_with_dcp(server_args: Any, cfg: Any) -> None:
             "--dcp-size > 1 with --enable-prefill-cp requires "
             f"--dcp-kv-layout token, got {cfg.dcp_kv_layout!r}."
         )
+    # Not enabled implicitly: it also rejects online weight updates.
+    if not cfg.enable_cp_decode_attn_tp:
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp requires "
+            "--enable-cp-decode-attn-tp: decode slices the replicated attention "
+            "per CP rank before the DCP gather."
+        )
 
 
 def handle_data_parallelism(server_args: Any):
