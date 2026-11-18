@@ -24,7 +24,9 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    MESSAGE_CLOSE,
     RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -489,6 +491,22 @@ def _auto_suffix(
     )
 
 
+def _response(content: Format) -> OrFormat:
+    # Without thinking the prompt already opens the response channel, so the
+    # output starts inside it; after reasoning the model opens it itself.
+    return OrFormat(
+        elements=[
+            TagFormat(begin=RESPONSE_OPEN, content=content, end=RESPONSE_CLOSE),
+            TagFormat(begin="", content=content, end=RESPONSE_CLOSE),
+        ]
+    )
+
+
+# K3 emits MESSAGE_CLOSE before EOS, and EOS is masked until the grammar
+# completes, so a grammar ending at the response close must still admit it.
+_OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
+
+
 def _with_reasoning(suffix: Format, thinking_mode: bool) -> Format:
     if not thinking_mode:
         return suffix
@@ -583,6 +601,26 @@ def get_kimik3_auto_tool_call_structural_tag(
         _tool_calls_tag(call_tags, parallel_tool_calls), parallel_tool_calls
     )
     return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
+
+
+def get_kimik3_json_response_structural_tag(
+    json_schema: Union[bool, Dict[str, Any]],
+    thinking_mode: bool = False,
+    max_whitespace_cnt: Optional[int] = None,
+) -> StructuralTag:
+    """JSON output written as the K3 response block.
+
+    A bare JSON grammar rejects the markers that open and close the block, so a
+    model about to open it is pushed onto whitespace or into a string it cannot
+    leave, and generates until max_tokens."""
+    answer = _response(
+        JSONSchemaFormat(json_schema=json_schema, max_whitespace_cnt=max_whitespace_cnt)
+    )
+    return StructuralTag(
+        format=_with_reasoning(
+            SequenceFormat(elements=[answer, _OPTIONAL_MESSAGE_CLOSE]), thinking_mode
+        )
+    )
 
 
 def _select_tools(

@@ -507,6 +507,24 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_json_object_constraint_gated_on_renderer(self):
+        """JSON mode is prompt-guided once the renderer states it in the prompt."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={"type": "json_object"},
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
 
 class TestAudioContentParts(unittest.TestCase):
     """Test audio content parts and the input_audio conversion"""
