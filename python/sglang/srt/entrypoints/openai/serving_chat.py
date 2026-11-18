@@ -2891,10 +2891,30 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
+    @staticmethod
+    def _physical_cache_headers(meta_info: Dict[str, Any]) -> Dict[str, str]:
+        """Expose prefill reuse, excluding decode-local radix reuse in PD."""
+        finish_reason = meta_info.get("finish_reason")
+        reason = (
+            finish_reason.get("type")
+            if isinstance(finish_reason, dict)
+            else finish_reason
+        )
+        if reason in ("abort", "error"):
+            return {}
+        if get_disagg().disaggregation_mode == "decode":
+            # Missing is unknown, not zero; never substitute max(P, D).
+            cached_tokens = meta_info.get("prefill_cached_tokens")
+        else:
+            cached_tokens = meta_info.get("cached_tokens", 0) or 0
+        if cached_tokens is None:
+            return {}
+        return {"X-Sgl-Cached-Tokens": str(cached_tokens)}
+
     def _usage_headers(
         self, meta_info: Dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> Dict[str, str]:
-        """Return fixed cache-write headers and optional K3 prompt/read headers.
+        """Return prefill cache hits, cache-write and optional K3 usage headers.
 
         Streaming uses the first engine event so prompt-side accounting is
         available even if the stream ends before the final usage frame.
@@ -2919,6 +2939,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     f"{prefix}-Cached-Tokens": str(cached),
                 }
             )
+        # This name is reserved for prefill reuse, including when the
+        # configurable prefix would otherwise expose the Redis read count.
+        if prefix.lower() == "x-sgl":
+            headers.pop(f"{prefix}-Cached-Tokens", None)
+        headers.update(self._physical_cache_headers(meta_info))
         return headers
 
     async def _handle_streaming_request(
@@ -3005,6 +3030,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids: dict[int, list[int]] = {}
 
         stream_started = False
+        usage_headers_set = False
         error_aborted = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -3147,7 +3173,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Fill the accounting headers as soon as the first
                 # engine event's meta_info arrives (before any byte is yielded;
                 # _handle_streaming_request awaits the first chunk).
-                if usage_headers is not None and not usage_headers:
+                if usage_headers is not None and not usage_headers_set:
                     usage_headers.update(
                         self._usage_headers(
                             content["meta_info"],
@@ -3158,6 +3184,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                    usage_headers_set = True
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -3491,17 +3518,16 @@ class OpenAIServingChat(OpenAIServingBase):
             int(time.time()),
         )
 
-        # Non-streaming responses carry the same usage headers.
-        usage_headers = self._usage_headers(
-            ret[0]["meta_info"],
-            generation_stub_tokens=(
-                self._KIMI_K3_GENERATION_STUB_TOKENS
-                if request.input_ids is None
-                else 0
-            ),
-        )
-        if usage_headers and isinstance(response, ChatCompletionResponse):
-            return ORJSONResponse(content=response.model_dump(), headers=usage_headers)
+        # Keep the model for internal callers; the HTTP endpoint attaches headers.
+        if isinstance(response, ChatCompletionResponse):
+            response._response_headers = self._usage_headers(
+                ret[0]["meta_info"],
+                generation_stub_tokens=(
+                    self._KIMI_K3_GENERATION_STUB_TOKENS
+                    if request.input_ids is None
+                    else 0
+                ),
+            )
 
         return response
 

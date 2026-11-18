@@ -2,13 +2,14 @@ import contextlib
 import threading
 import time
 import unittest
+from array import array
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from disagg_test_utils import make_decode_kv_manager
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -27,17 +28,28 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    ReqToMetadataIdxAllocator,
+)
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
@@ -207,6 +219,88 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_handoff_preserves_original_prefill_hits_across_rebootstrap(self):
+        """Decode reuse and a second handoff must not replace the original P
+        measurement; fake-PD has no such measurement, including when it is zero."""
+        for prefill_hits, fake in ((0, False), (256, False), (0, True)):
+            with self.subTest(prefill_hits=prefill_hits, fake=fake):
+                params = SamplingParams()
+                params.normalize(None)
+                req = Req(
+                    "cache-handoff",
+                    "",
+                    array("q", range(1024)),
+                    params,
+                    bootstrap_host=FAKE_BOOTSTRAP_HOST if fake else "prefill",
+                    bootstrap_room=7,
+                    vocab_size=2048,
+                )
+                self.assertIsNone(req.prefill_cached_tokens)
+                processor = SchedulerBatchResultProcessor.__new__(
+                    SchedulerBatchResultProcessor
+                )
+                object.__setattr__(
+                    processor,
+                    "model_config",
+                    SimpleNamespace(self_opened_think_start_ids=[]),
+                )
+                queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                queue.scheduler = SimpleNamespace(
+                    kv_checksum_computer=None, batch_result_processor=processor
+                )
+                queue.spec_algorithm = SpeculativeAlgorithm.NONE
+                counts = torch.tensor([prefill_hits, prefill_hits, 0, 0, 0, 0, 0])
+                queue.metadata_buffers = SimpleNamespace(
+                    get_buf=lambda idx: (
+                        torch.tensor([11]),
+                        counts,
+                        *([None] * 11),
+                        torch.tensor([7]),
+                    ),
+                    get_customized_info=lambda idx: None,
+                )
+                transfer = DecodeRequest(req, FakeReceiver(), metadata_buffer_index=0)
+                queue._commit_transfer_to_req(transfer)
+                expected = None if fake else prefill_hits
+                self.assertEqual(req.prefill_cached_tokens, expected)
+                self.assertEqual(
+                    (req.cached_tokens, req.already_computed),
+                    (prefill_hits, prefill_hits),
+                )
+                self.assertEqual(len(req.output_ids), 1)
+
+                # Decode can reuse more of the prefix, then rebootstrap with a
+                # later P snapshot. Neither replaces the request's original P.
+                req.kv.req_pool_idx = 0
+                req.prefix_len = 768
+                req.extend_end = 1024
+                batch = SimpleNamespace(
+                    reqs=[req],
+                    device="cpu",
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(1024).reshape(1, -1)
+                    ),
+                    return_logprob=False,
+                    model_config=SimpleNamespace(vocab_size=2048),
+                )
+                with patch(
+                    "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+                    "SamplingBatchInfo.from_schedule_batch",
+                    return_value=None,
+                ):
+                    ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+                self.assertEqual(req.cached_tokens, 768)
+                self.assertEqual(req.prefill_cached_tokens, expected)
+                counts[0] = 1024
+                transfer.is_rebootstrap = True
+                transfer.kv_receiver = FakeReceiver()
+                queue._commit_transfer_to_req(transfer)
+                self.assertEqual(req.prefill_cached_tokens, expected)
+                self.assertEqual(
+                    (req.cached_tokens, req.already_computed), (1024, 1024)
+                )
+                self.assertEqual(len(req.output_ids), 1)
 
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
@@ -1160,7 +1254,6 @@ class TestAdmissionOverlap(CustomTestCase):
                     scheduler.forward_stream
                 )
                 scheduler.forward_stream.wait_stream.assert_not_called()
-
 
 
 class TestParallelInfoFetchEpoch(CustomTestCase):

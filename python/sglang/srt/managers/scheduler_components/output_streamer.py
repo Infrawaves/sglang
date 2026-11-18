@@ -184,6 +184,7 @@ class SchedulerOutputStreamer:
         return RequestOutputStats(
             prompt_tokens=len(req.origin_input_ids),
             cached_tokens=req.cached_tokens,
+            prefill_cached_tokens=req.prefill_cached_tokens,
             cached_tokens_details=self.get_cached_tokens_details(req),
             retraction_count=req.retraction_count,
             image_tokens=image_tokens,

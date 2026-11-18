@@ -324,9 +324,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
-    ) -> Union[
-        AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse, StreamingResponse
-    ]:
+    ) -> Union[ResponsesResponse, ORJSONResponse, StreamingResponse]:
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -505,6 +503,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Responses does not pass through OpenAIServingBase.handle_request.
             raw_request.state.cache_identity = cache_params.get("cache_user_id")
         cache_context: Optional[dict[str, Any]] = {} if cache_params else None
+        physical_usage_headers: dict[str, str] = {}
 
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
@@ -688,6 +687,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         raw_request=raw_request,
                         priority=request.priority,
                         cache_context=cache_context,
+                        physical_usage_headers=physical_usage_headers,
                     )
                     generators.append(generator)
             except ValueError as e:
@@ -768,38 +768,35 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return response
 
             if request.stream:
-                if cache_params:
+                try:
+                    first_result = await anext(result_generator)
+                except HTTPException as e:
+                    await result_generator.aclose()
+                    return self.create_error_response(
+                        str(e.detail), status_code=e.status_code
+                    )
+                except ValueError as e:
+                    await result_generator.aclose()
+                    return self.create_error_response(str(e))
+                except StopAsyncIteration:
+                    await result_generator.aclose()
+                    return self.create_error_response(
+                        "The engine returned no output.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                except BaseException:
+                    await result_generator.aclose()
+                    raise
+
+                async def replay_first_result():
                     try:
-                        first_result = await anext(result_generator)
-                    except HTTPException as e:
+                        yield first_result
+                        async for item in result_generator:
+                            yield item
+                    finally:
                         await result_generator.aclose()
-                        return self.create_error_response(
-                            str(e.detail), status_code=e.status_code
-                        )
-                    except ValueError as e:
-                        await result_generator.aclose()
-                        return self.create_error_response(str(e))
-                    except StopAsyncIteration:
-                        await result_generator.aclose()
-                        return self.create_error_response(
-                            "The engine returned no output.",
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    except BaseException:
-                        await result_generator.aclose()
-                        raise
 
-                    async def replay_first_result():
-                        try:
-                            yield first_result
-                            async for item in result_generator:
-                                yield item
-                        finally:
-                            await result_generator.aclose()
-
-                    stream_results = replay_first_result()
-                else:
-                    stream_results = result_generator
+                stream_results = replay_first_result()
                 if self.use_harmony:
                     stream = self.responses_stream_generator(
                         request,
@@ -824,8 +821,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tool_adapter=tool_adapter,
                         cache_context=cache_context,
                     )
-                if not cache_params:
-                    return stream
 
                 async def close_stream():
                     try:
@@ -837,7 +832,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         await result_generator.aclose()
 
                 headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
-                if cache_context.get("usage") is not None:
+                if cache_context is not None and cache_context.get("usage") is not None:
                     snapshot = self._reported_cache_usage(
                         {
                             "prompt_tokens": cache_context.get("prompt_tokens", 0),
@@ -845,6 +840,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         }
                     )
                     headers.update(snapshot.response_headers())
+                headers.update(physical_usage_headers)
                 try:
                     return StreamingResponse(
                         close_stream(),
@@ -874,6 +870,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_adapter=tool_adapter,
                     cache_context=cache_context,
                 )
+                if isinstance(result, ResponsesResponse) and physical_usage_headers:
+                    result._response_headers.update(physical_usage_headers)
                 return result
             except HTTPException as e:
                 return self.create_error_response(
@@ -3374,6 +3372,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         raw_request: Optional[Request] = None,
         priority: Optional[int] = None,
         cache_context: Optional[dict[str, Any]] = None,
+        physical_usage_headers: Optional[dict[str, str]] = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
@@ -3386,6 +3385,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
         completed_usage = None
+        capture_physical_usage = physical_usage_headers is not None
 
         while True:
             # Generate using SGLang's tokenizer manager
@@ -3398,6 +3398,19 @@ class OpenAIServingResponses(OpenAIServingChat):
             turn_usage = None
             try:
                 async for res in generator:
+                    if physical_usage_headers is not None and capture_physical_usage:
+                        # Even a failed or malformed first event freezes the
+                        # snapshot; later tool turns cannot supply HTTP headers.
+                        capture_physical_usage = False
+                        meta_info = (
+                            res.get("meta_info") if isinstance(res, dict) else None
+                        )
+                        if isinstance(meta_info, dict):
+                            # HTTP headers describe the initial engine turn;
+                            # built-in tool continuations cannot replace them.
+                            physical_usage_headers.update(
+                                self._physical_cache_headers(meta_info)
+                            )
                     if cache_context is not None and isinstance(res, dict):
                         meta = res.get("meta_info") or {}
                         for name in turn_counts:

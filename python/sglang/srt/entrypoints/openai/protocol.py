@@ -1652,6 +1652,9 @@ class ChatCompletionResponseChoice(BaseModel):
 
 
 class ChatCompletionResponse(BaseModel):
+    # Transport metadata stays out of the JSON body; serving still returns a model.
+    _response_headers: Dict[str, str] = PrivateAttr(default_factory=dict)
+
     id: str
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -2598,6 +2601,8 @@ class PromptTokenUsageInfo(BaseModel):
 
 class ResponsesResponse(BaseModel):
     """Response body for v1/responses endpoint."""
+
+    _response_headers: Dict[str, str] = PrivateAttr(default_factory=dict)
 
     id: str = Field(default_factory=lambda: f"resp_{time.time()}")
     object: Literal["response"] = "response"
