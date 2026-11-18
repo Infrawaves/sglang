@@ -102,6 +102,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_json_response_structural_tag,
 )
@@ -1512,6 +1513,16 @@ class OpenAIServingChat(OpenAIServingBase):
             tag.model_dump(by_alias=True)
         )
         del sampling_params["json_schema"]
+        # Inside a JSON string the block's markers are plain text, so a model
+        # that ends the turn there never leaves the grammar and runs to
+        # max_tokens; stopping on the message close ends it at once. The
+        # response close is not a stop: trimming it would hide the marker the
+        # reasoning parser uses to recognize an answer that skipped thinking.
+        stop = sampling_params.get("stop") or []
+        stop = [stop] if isinstance(stop, str) else list(stop)
+        if MESSAGE_CLOSE not in stop:
+            stop.append(MESSAGE_CLOSE)
+        sampling_params["stop"] = stop
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
