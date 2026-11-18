@@ -47,6 +47,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_json_response_structural_tag,
+)
 from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -740,6 +743,44 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.cache_salt, "tenant-a")
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
+
+    def test_kimi_k3_json_response_format_constraints(self):
+        """json_object stays prompt-guided; a strict json_schema is constrained
+        inside the K3 response block, so its markers stay admissible."""
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+        cases = (
+            ({"type": "json_object"}, None),
+            (
+                {"type": "json_schema", "json_schema": {"name": "a", "schema": schema}},
+                get_kimik3_json_response_structural_tag(schema).model_dump(
+                    by_alias=True
+                ),
+            ),
+        )
+        for response_format, expected_tag in cases:
+            with self.subTest(response_format=response_format["type"]):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Return JSON"}],
+                    response_format=response_format,
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIsNone(params.get("json_schema"))
+                tag = params.get("structural_tag")
+                self.assertEqual(
+                    json.loads(tag) if tag is not None else None, expected_tag
+                )
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(
+                    kwargs["response_format"]["type"], response_format["type"]
+                )
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
