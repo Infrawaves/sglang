@@ -2868,6 +2868,7 @@ class TestHiCacheArgs(CustomTestCase):
             ),
             ({"hicache_storage_backend": "file"}, "mooncake"),
             ({**mooncake(False), "enable_hierarchical_cache": False}, "hierarchical"),
+            ({**mooncake(False), "disaggregation_mode": "decode"}, "PD decode"),
         )
         for overrides, error in cases:
             with self.subTest(overrides=overrides):

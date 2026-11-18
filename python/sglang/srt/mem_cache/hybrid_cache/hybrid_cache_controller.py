@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -351,6 +352,12 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
     if span_id:
         extra_info["span_id"] = span_id
     return extra_info
+
+
+def _find_pool_transfer(
+    transfers: list[PoolTransfer], name: PoolName
+) -> Optional[PoolTransfer]:
+    return next((t for t in transfers if t.name == name), None)
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -1982,31 +1989,43 @@ class HybridCacheController(BaseHiCacheController):
             operation.skip_reason = "terminated"
         elif kv_completed_pages != len(operation.hash_value):
             operation.skip_reason = "kv_short"
+        node = self.kda_node_aggregate
+        exchanged = False
         transfers_nonkv = []
         sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
-        if operation.skip_reason is None:
-            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
-            # Only handle non-KV-derived sidecar pools here.
-            transfers_nonkv = [
-                transfer
-                for transfer in operation.pool_transfers
-                if transfer.indices_from_pool != PoolName.KV
-            ]
-            sidecar_hit_pages = (
-                operation.sidecar_hit_pages
-                if operation.sidecar_hash_values is not None
-                else kv_completed_pages
-            )
-            self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            operation.sidecar_ts = time.monotonic()
-        local_skip = operation.skip_reason is not None
         results = {}
-        if self.kda_node_aggregate is not None:
-            # Runs even when this rank skipped: peers wait on the exchange.
-            transfers_nonkv = self._get_node_aggregated_mamba(
-                operation, transfers_nonkv, results
-            )
+        try:
+            if operation.skip_reason is None:
+                # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
+                # Only handle non-KV-derived sidecar pools here.
+                transfers_nonkv = [
+                    transfer
+                    for transfer in operation.pool_transfers
+                    if transfer.indices_from_pool != PoolName.KV
+                ]
+                sidecar_hit_pages = (
+                    operation.sidecar_hit_pages
+                    if operation.sidecar_hash_values is not None
+                    else kv_completed_pages
+                )
+                self._sync_trailing_keys(
+                    transfers_nonkv, sidecar_hashes, sidecar_hit_pages
+                )
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+                operation.sidecar_ts = time.monotonic()
+            local_skip = operation.skip_reason is not None
+            if node is not None:
+                mamba = _find_pool_transfer(transfers_nonkv, PoolName.MAMBA)
+                exchanged = True
+                slots = self._exchange_node_slots(node.prefetch_group, mamba)
+                transfers_nonkv = self._get_node_aggregated_mamba(
+                    operation, mamba, slots, transfers_nonkv, results
+                )
+        finally:
+            if node is not None and not exchanged:
+                # A failed preparation still joins the exchange as a skip, so
+                # node-rank collectives stay in step.
+                self._exchange_node_slots(node.prefetch_group, None)
         if not local_skip:
             try:
                 for extra_info, transfers in _trailing_chain_groups(
@@ -2035,19 +2054,66 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return pool_hits
 
-    @staticmethod
-    def _exchange_node_slot(
-        group: torch.distributed.ProcessGroup, slot: int
-    ) -> list[int]:
-        """Each node rank's host slot in node-rank order; -1 means that rank skips."""
+    _warned_node_mamba_shape = False
+
+    @classmethod
+    def _node_mamba_ticket(cls, transfer: Optional[PoolTransfer]) -> tuple[int, int]:
+        """(host slot, key fingerprint) of this rank's checkpoint; slot -1 skips."""
+        if transfer is None or not transfer.keys:
+            return -1, 0
+        if (
+            len(transfer.keys) != 1
+            or transfer.host_indices is None
+            or transfer.host_indices.numel() != 1
+        ):
+            # One checkpoint per op; anything else makes the node skip together.
+            if not cls._warned_node_mamba_shape:
+                cls._warned_node_mamba_shape = True
+                logger.warning(
+                    "KDA node aggregation skips a Mamba transfer with %d keys and "
+                    "%s host slots; only one checkpoint per op is supported.",
+                    len(transfer.keys),
+                    None
+                    if transfer.host_indices is None
+                    else transfer.host_indices.numel(),
+                )
+            return -1, 0
+        digest = hashlib.blake2b(transfer.keys[0].encode(), digest_size=8).digest()
+        return (
+            int(transfer.host_indices.item()),
+            int.from_bytes(digest, "little", signed=True),
+        )
+
+    @classmethod
+    def _exchange_node_slots(
+        cls,
+        group: torch.distributed.ProcessGroup,
+        transfer: Optional[PoolTransfer],
+    ) -> Optional[list[int]]:
+        """Every node rank's host slot for this op in node-rank order, or None when
+        a rank skips or the ranks name different checkpoints.
+
+        Collective over ``group``: every node rank calls it exactly once per op."""
+        ticket = cls._node_mamba_ticket(transfer)
         gathered = [
-            torch.empty(1, dtype=torch.int64)
+            torch.empty(2, dtype=torch.int64)
             for _ in range(torch.distributed.get_world_size(group=group))
         ]
         torch.distributed.all_gather(
-            gathered, torch.tensor([slot], dtype=torch.int64), group=group
+            gathered, torch.tensor(ticket, dtype=torch.int64), group=group
         )
-        return [int(value.item()) for value in gathered]
+        tickets = [tuple(value.tolist()) for value in gathered]
+        if any(slot < 0 for slot, _ in tickets):
+            return None
+        if any(fingerprint != ticket[1] for _, fingerprint in tickets):
+            # Writing under this key would mix other requests' state into it.
+            logger.error(
+                "KDA node aggregation: node ranks disagree on the checkpoint key "
+                "(fingerprints %s); skipping. Node-rank collectives are out of step.",
+                [fingerprint for _, fingerprint in tickets],
+            )
+            return None
+        return [slot for slot, _ in tickets]
 
     @staticmethod
     def _min_reduce_flag(group: torch.distributed.ProcessGroup, flag: bool) -> bool:
@@ -2057,42 +2123,28 @@ class HybridCacheController(BaseHiCacheController):
         )
         return bool(packed.item())
 
-    @staticmethod
-    def _node_mamba_slot(transfer: Optional[PoolTransfer]) -> int:
-        # One checkpoint per op; anything else is -1 so the node skips together.
-        if (
-            transfer is None
-            or not transfer.keys
-            or len(transfer.keys) != 1
-            or transfer.host_indices is None
-            or transfer.host_indices.numel() != 1
-        ):
-            return -1
-        return int(transfer.host_indices.item())
-
     def _get_node_aggregated_mamba(
         self,
         operation: PrefetchOperation,
+        mamba: Optional[PoolTransfer],
+        slots: Optional[list[int]],
         transfers: list[PoolTransfer],
         results: dict,
     ) -> list[PoolTransfer]:
-        """Fill ``results`` for MAMBA and return the other transfers.
-
-        Every node rank calls this once per prefetch operation, skipped or not.
-        """
-        ctx = self.kda_node_aggregate
-        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
-        slots = self._exchange_node_slot(
-            ctx.prefetch_group, self._node_mamba_slot(mamba)
-        )
+        """Fill ``results`` for MAMBA from the node object; return the other
+        transfers. ``slots`` comes from this op's prefetch exchange."""
         if mamba is None:
             return transfers
-        num_keys = len(mamba.keys or [])
-        if -1 in slots:
+        num_keys = len(mamba.keys)
+        if slots is None:
             operation.skip_reason = operation.skip_reason or "node_peer_skip"
             ok = [False] * num_keys
-        elif not ctx.is_leader:
-            # Placeholder; prefetch_sync_thread's MIN takes the leader's result.
+        elif not self.kda_node_aggregate.is_leader:
+            # Placeholder: the pool_hits MIN in _reduce_prefetch_ack takes the
+            # leader's result. That MIN also keeps this rank's host slot alive
+            # until the leader's read into it is done: the completed_req ACK
+            # queues behind the pool_hits ACK, and the MIN waits for the leader's
+            # ACK, sent after its read. Never release or reuse the slot earlier.
             ok = [True] * num_keys
         else:
             # No collective follows, so an IO error can propagate: the caller
@@ -2112,45 +2164,33 @@ class HybridCacheController(BaseHiCacheController):
     def _set_node_aggregated_mamba(
         self,
         operation: StorageOperation,
-        transfers: list[PoolTransfer],
-        results: dict,
-    ) -> list[PoolTransfer]:
-        """Fill ``results`` for MAMBA and return the other transfers.
-
-        Every node rank calls this once per backup operation.
-        """
-        ctx = self.kda_node_aggregate
-        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
-        slots = self._exchange_node_slot(ctx.backup_group, self._node_mamba_slot(mamba))
-        ok = False
-        if -1 in slots:
-            pass
-        elif not ctx.is_leader:
-            # Placeholder; the MIN below takes the leader's result.
-            ok = True
-        else:
-            try:
-                ok = all(
-                    self.storage_backend.batch_io_node_aggregated_mamba(
-                        mamba,
-                        [slots],
-                        is_set=True,
-                        extra_info=HiCacheStorageExtraInfo(
-                            extra_info=_storage_trace_extra(
-                                operation, include_request_id=False
-                            )
-                            or None
-                        ),
-                    )
+        mamba: Optional[PoolTransfer],
+        slots: Optional[list[int]],
+    ) -> bool:
+        """This rank's input to the node MIN for one backup op: the leader's
+        write result, a placeholder True on followers, False on a skip."""
+        if slots is None:
+            return False
+        if not self.kda_node_aggregate.is_leader:
+            return True
+        try:
+            return all(
+                self.storage_backend.batch_io_node_aggregated_mamba(
+                    mamba,
+                    [slots],
+                    is_set=True,
+                    extra_info=HiCacheStorageExtraInfo(
+                        extra_info=_storage_trace_extra(
+                            operation, include_request_id=False
+                        )
+                        or None
+                    ),
                 )
-            except Exception:
-                logger.exception("Node-aggregated KDA L3 write failed.")
-        # One flag per op whatever this rank holds, so every rank reduces alike.
-        ok = self._min_reduce_flag(ctx.backup_group, ok)
-        if mamba is None:
-            return transfers
-        results[PoolName.MAMBA] = [ok] * len(mamba.keys or [])
-        return [t for t in transfers if t is not mamba]
+            )
+        except Exception:
+            # Caught so this rank's other sidecar writes still run.
+            logger.exception("Node-aggregated KDA L3 write failed.")
+            return False
 
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;
@@ -2222,37 +2262,58 @@ class HybridCacheController(BaseHiCacheController):
         if needs_backup:
             _init_op_trace(operation, rid=operation.id, role="Backup")
 
+        node = self.kda_node_aggregate
+        mamba = None
+        mamba_ok = False
+        exchanged = False
         results = {}
-        storage_transfers = backup_transfers
+        try:
+            if backup_transfers:
+                self._resolve_sidecar_kv_derived_pool_transfers(operation)
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            storage_transfers = backup_transfers
+            if node is not None:
+                # Runs on every op, with or without Mamba: peers wait on it.
+                mamba = _find_pool_transfer(backup_transfers, PoolName.MAMBA)
+                exchanged = True
+                slots = self._exchange_node_slots(node.backup_group, mamba)
+                mamba_ok = self._set_node_aggregated_mamba(operation, mamba, slots)
+                storage_transfers = [t for t in backup_transfers if t is not mamba]
+            if backup_transfers:
+                # Sidecar backup also carries caller + trace ids so its mooncake
+                # spans correlate to the backup root; no request_id (per-node).
+                for extra_info, transfers in _trailing_chain_groups(
+                    operation.prefix_keys,
+                    operation.hash_value,
+                    storage_transfers,
+                    extra_info=_storage_trace_extra(operation, include_request_id=False)
+                    or None,
+                    start_page=operation.start_page,
+                    grouped=self.storage_page_group > 1,
+                ):
+                    results.update(
+                        self.storage_backend.batch_set_v2(
+                            transfers, extra_info=extra_info
+                        )
+                    )
+            if not self.backup_skip:
+                self._page_backup_kv_with_trace(operation)
+        finally:
+            if node is not None:
+                if not exchanged:
+                    # A failed preparation still joins the exchange as a skip.
+                    self._exchange_node_slots(node.backup_group, None)
+                # After the KV write, so TP0's MLA write overlaps the leader's KDA
+                # write. One flag per op whatever this rank holds, so every rank
+                # reduces alike.
+                mamba_ok = self._min_reduce_flag(node.backup_group, mamba_ok)
+        if mamba is not None:
+            results[PoolName.MAMBA] = [mamba_ok] * len(mamba.keys or [])
         if backup_transfers:
-            self._resolve_sidecar_kv_derived_pool_transfers(operation)
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-        if self.kda_node_aggregate is not None:
-            # Runs on every op, with or without Mamba: peers wait on the exchange.
-            storage_transfers = self._set_node_aggregated_mamba(
-                operation, backup_transfers, results
-            )
-        if backup_transfers:
-            # Sidecar backup also carries caller + trace ids so its mooncake
-            # spans correlate to the backup root; no request_id (per-node).
-            for extra_info, transfers in _trailing_chain_groups(
-                operation.prefix_keys,
-                operation.hash_value,
-                storage_transfers,
-                extra_info=_storage_trace_extra(operation, include_request_id=False)
-                or None,
-                start_page=operation.start_page,
-                grouped=self.storage_page_group > 1,
-            ):
-                results.update(
-                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
-                )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
-            self._page_backup_kv_with_trace(operation)
-        else:
+        if self.backup_skip:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:
                 for transfer in backup_transfers:

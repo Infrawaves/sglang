@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import mmap
 import os
 from typing import TYPE_CHECKING, Callable, Optional
@@ -83,7 +84,7 @@ def synchronize_shared_host_error(
     failures = [message for message in errors if message is not None]
     if failures:
         raise RuntimeError(
-            f"MLA HiCache shared host {operation} failed: " + "; ".join(failures)
+            f"HiCache shared host {operation} failed: " + "; ".join(failures)
         ) from error
 
 
@@ -149,10 +150,10 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
                 os.close(fd)
 
     def _open_shared_fd(self, owner: tuple[int, int] | None) -> int:
-        leader_rank = self.node_ranks[0]
+        owner_rank = self.node_ranks[0]
         if owner is None:
             raise RuntimeError(
-                f"MLA HiCache node leader rank {leader_rank} "
+                f"HiCache node memfd owner rank {owner_rank} "
                 "did not publish a shared host buffer."
             )
         pid, owner_fd = owner
@@ -161,9 +162,9 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
             return os.open(path, os.O_RDWR)
         except OSError as exc:
             raise RuntimeError(
-                f"MLA HiCache cannot reopen node leader rank {leader_rank}'s "
+                f"HiCache cannot reopen node memfd owner rank {owner_rank}'s "
                 f"shared host buffer at {path}: {exc}. Ranks on one node must have "
-                "permission and /proc visibility to the same leader descriptor."
+                "permission and /proc visibility to the same owner descriptor."
             ) from exc
 
 
@@ -424,7 +425,8 @@ class _NodeShardedBuffer(msgspec.Struct, frozen=True):
 
 
 class NodeShardedHostTensorAllocator(HostTensorAllocator):
-    """Map one node-local memfd per allocation; each rank gets its own share."""
+    """One node memfd per allocation laid out ``[rank0 | rank1 | ...]``; each
+    rank gets a view of its own share."""
 
     def __init__(
         self,
@@ -433,65 +435,34 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
         tp_cache_group: torch.distributed.ProcessGroup,
     ):
         super().__init__()
-        # Global ranks of this node; the first one creates the memfds.
         self.node_ranks = node_ranks
         self.tp_cache_group = tp_cache_group
         self.node_rank = node_ranks.index(torch.distributed.get_rank())
+        # Maps and prefaults the whole node buffer; node rank 0 creates it.
+        self._mapper = NodeSharedHostTensorAllocator(
+            node_ranks=node_ranks, tp_cache_group=tp_cache_group
+        )
         self._buffers: list[_NodeShardedBuffer] = []
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         """Collective over tp_cache_group;
         every rank calls it once per buffer, in the same order."""
-        assert device == "cpu", device
         self.dims = dims
         self.dtype = dtype
-        nbytes = _numel(dims) * dtype.itemsize
+        nbytes = math.prod(dims) * dtype.itemsize
+        # Equal page-aligned shares coincide with map_shm's per-rank prefault
+        # split, so each rank faults exactly its own share. Ranks with different
+        # dims map a different total and fail map_shm's size check.
         stride = -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
-        full_dims = (len(self.node_ranks) * stride,)
-        fd = full = error = owner = None
-        try:
-            if self.node_rank == 0:
-                try:
-                    fd = create_shm(full_dims, torch.uint8)
-                    owner = (os.getpid(), fd, stride)
-                except Exception as exc:
-                    error = exc
-            group_ranks = torch.distributed.get_process_group_ranks(self.tp_cache_group)
-            owners = [None] * len(group_ranks)
-            torch.distributed.all_gather_object(
-                owners, owner, group=self.tp_cache_group
-            )
-            try:
-                if error is None:
-                    if self.node_rank != 0:
-                        owner = owners[group_ranks.index(self.node_ranks[0])]
-                        fd = self._open_shared_fd(owner, stride)
-                    # Equal page-aligned shares: each rank faults exactly its own.
-                    full = map_shm(
-                        fd,
-                        full_dims,
-                        torch.uint8,
-                        populate_shard=(self.node_rank, len(self.node_ranks)),
-                    )
-            except Exception as exc:
-                error = exc
-            # Keeps the owner's FD live until every peer reopened it;
-            # no rank may pin its share before all shares are populated.
-            synchronize_shared_host_error(
-                self.tp_cache_group, error, operation="KDA prefault"
-            )
-            start = self.node_rank * stride
-            own = full[start : start + nbytes].view(dtype).view(dims)
-            self._buffers.append(
-                _NodeShardedBuffer(full=full, own=own, stride_bytes=stride)
-            )
-            return own
-        except Exception:
-            full = None
-            raise
-        finally:
-            if fd is not None:
-                os.close(fd)
+        full = self._mapper.allocate(
+            (len(self.node_ranks) * stride,), torch.uint8, device
+        )
+        start = self.node_rank * stride
+        own = full[start : start + nbytes].view(dtype).view(dims)
+        self._buffers.append(
+            _NodeShardedBuffer(full=full, own=own, stride_bytes=stride)
+        )
+        return own
 
     def full_buffers(self) -> list[torch.Tensor]:
         return [buffer.full for buffer in self._buffers]
@@ -508,39 +479,6 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
                     for rank in range(len(self.node_ranks))
                 ]
         raise ValueError("Tensor was not allocated by this node-sharded allocator.")
-
-    def _open_shared_fd(
-        self, owner: Optional[tuple[int, int, int]], stride: int
-    ) -> int:
-        owner_rank = self.node_ranks[0]
-        if owner is None:
-            raise RuntimeError(
-                f"KDA HiCache memfd owner rank {owner_rank} "
-                "did not publish a shared host buffer."
-            )
-        pid, owner_fd, owner_stride = owner
-        if owner_stride != stride:
-            # Peer addresses assume every rank maps the same stride.
-            raise ValueError(
-                f"KDA HiCache share stride {stride} differs from memfd owner "
-                f"rank {owner_rank}'s {owner_stride}."
-            )
-        path = f"/proc/{pid}/fd/{owner_fd}"
-        try:
-            return os.open(path, os.O_RDWR)
-        except OSError as exc:
-            raise RuntimeError(
-                f"KDA HiCache cannot reopen memfd owner rank {owner_rank}'s "
-                f"shared host buffer at {path}: {exc}. Ranks on one node must have "
-                "permission and /proc visibility to the same owner descriptor."
-            ) from exc
-
-
-def _numel(dims: tuple) -> int:
-    count = 1
-    for dim in dims:
-        count *= dim
-    return count
 
 
 # Node rank 0 already does the MLA per-node L3 IO and is the MLA storage writer.

@@ -219,6 +219,10 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         raise ValueError(f"{flag} does not support --enable-dp-attention.")
     if cfg.attn_cp_size > 1:
         raise ValueError(f"{flag} requires --attn-cp-size 1.")
+    if cfg.disaggregation_mode == "decode":
+        # Decode may write per-rank KDA keys in the prefill layout; the node
+        # object keys would hide them from, or mix with, those readers.
+        raise ValueError(f"{flag} does not support PD decode.")
     # Lazy: only node-aggregated launches pay for these imports.
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,

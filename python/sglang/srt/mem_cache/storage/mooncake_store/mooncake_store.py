@@ -1568,19 +1568,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """Leader-only: one object per page spanning every node rank's slot."""
         assert self.kda_node_aggregate is not None and self.kda_node_aggregate.is_leader
         assert len(transfer.keys) == len(node_slots_per_page)
-        with self.request_context(**self._request_context_from_extra_info(extra_info)):
-            return self._node_aggregated_mamba_io(
-                transfer, node_slots_per_page, is_set=is_set, extra_info=extra_info
-            )
-
-    def _node_aggregated_mamba_io(
-        self,
-        transfer: PoolTransfer,
-        node_slots_per_page: List[List[int]],
-        *,
-        is_set: bool,
-        extra_info: Optional[HiCacheStorageExtraInfo],
-    ) -> List[bool]:
         host_pool = self.registered_pools[PoolName.MAMBA]
         pool = str(transfer.name)
         layout = self._object_layout(transfer.keys, transfer)
@@ -1594,57 +1581,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         expected = [_object_nbytes(size) for size in size_list]
         num_pages = len(key_strs)
 
-        if not is_set:
-            start = time.perf_counter()
-            io_results = self._get_batch_zero_copy_impl(
-                key_strs, ptr_list, size_list, pool=pool
-            )
-            self._record_io(
-                pool,
-                "get",
-                objects=num_pages,
-                pages=num_pages,
-                nbytes=sum(res for res in io_results if res > 0),
-                seconds=time.perf_counter() - start,
-            )
-            # A short object leaves part of the node's shares untouched.
-            return [res == size for res, size in zip(io_results, expected)]
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            if not is_set:
+                start = time.perf_counter()
+                io_results = self._get_batch_zero_copy_impl(
+                    key_strs, ptr_list, size_list, pool=pool
+                )
+                self._record_io(
+                    pool,
+                    "get",
+                    objects=num_pages,
+                    pages=num_pages,
+                    nbytes=sum(res for res in io_results if res > 0),
+                    seconds=time.perf_counter() - start,
+                )
+                # A short object leaves part of the node's shares untouched.
+                return [res == size for res, size in zip(io_results, expected)]
 
-        session_id = (
-            (extra_info.extra_info or {}).get("session_id") if extra_info else None
-        )
-        group_ids = (
-            self._expand_group_ids(self._tag_keys(transfer.keys), 1)
-            if self._can_use_group_semantics()
-            else None
-        )
-        exist_result = self._batch_exist(key_strs)
-        self._record_io(pool, "exists", objects=num_pages, pages=num_pages)
-        io_results = [0 if state == 1 else -1 for state in exist_result]
-        missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-        if missing_idx:
-            start = time.perf_counter()
-            put_results = self._put_batch_zero_copy_impl(
-                [key_strs[i] for i in missing_idx],
-                [ptr_list[i] for i in missing_idx],
-                [size_list[i] for i in missing_idx],
-                self._filter_group_ids(group_ids, missing_idx),
-                session_ids=(
-                    [session_id] * len(missing_idx)
-                    if session_id and self._supports_session_ids
-                    else None
-                ),
+            session_id = (
+                (extra_info.extra_info or {}).get("session_id") if extra_info else None
             )
-            self._record_io(
-                pool,
-                "put",
-                objects=len(missing_idx),
-                pages=len(missing_idx),
-                nbytes=sum(expected[i] for i in missing_idx),
-                seconds=time.perf_counter() - start,
+            group_ids = (
+                self._expand_group_ids(self._tag_keys(transfer.keys), 1)
+                if self._can_use_group_semantics()
+                else None
             )
-            for i, res in zip(missing_idx, put_results):
-                io_results[i] = res
+            exist_result = self._batch_exist(key_strs)
+            self._record_io(pool, "exists", objects=num_pages, pages=num_pages)
+            io_results = [0 if state == 1 else -1 for state in exist_result]
+            missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+            if missing_idx:
+                start = time.perf_counter()
+                put_results = self._put_batch_zero_copy_impl(
+                    [key_strs[i] for i in missing_idx],
+                    [ptr_list[i] for i in missing_idx],
+                    [size_list[i] for i in missing_idx],
+                    self._filter_group_ids(group_ids, missing_idx),
+                    session_ids=(
+                        [session_id] * len(missing_idx)
+                        if session_id and self._supports_session_ids
+                        else None
+                    ),
+                )
+                self._record_io(
+                    pool,
+                    "put",
+                    objects=len(missing_idx),
+                    pages=len(missing_idx),
+                    nbytes=sum(expected[i] for i in missing_idx),
+                    seconds=time.perf_counter() - start,
+                )
+                for i, res in zip(missing_idx, put_results):
+                    io_results[i] = res
         return [res == 0 for res in io_results]
 
     def _pools_page_exists(
