@@ -2454,8 +2454,6 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return
-        if self.kda_l3_stats is not None:
-            self._record_kda_l3_write(node_id, spec)
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2480,8 +2478,10 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        if self.kda_l3_stats is not None:
+            self._record_kda_l3_write(node_id, spec, operation_id)
 
-    def _record_kda_l3_write(self, node_id: NodeId, spec) -> None:
+    def _record_kda_l3_write(self, node_id: NodeId, spec, operation_id: int) -> None:
         # Gate before the O(depth) prefix walk: non-logging ranks and nodes
         # without a recorded class never pay for it.
         if not self.kda_l3_stats.wants_write(node_id):
@@ -2494,7 +2494,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 len(self.get_prefix_hash_values(node_id)) + len(spec.hash_value)
             ) * self.page_size
             self.kda_l3_stats.on_storage_write(
-                node_id, mamba_xfers[0].keys[-1], node_end
+                node_id, mamba_xfers[0].keys[-1], node_end, operation_id
             )
         except Exception:
             logger.debug("KDA_L3_WRITE logging failed", exc_info=True)
@@ -3024,6 +3024,13 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
+        if self.kda_l3_stats is not None:
+            kda_l3_stats.log_load(
+                operation,
+                request.rid,
+                self.page_size,
+                dropped=insert_result.host_insert_dropped,
+            )
         logger.info(
             "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d occupied=%d",
             "dropped" if insert_result.host_insert_dropped else "success",
@@ -3811,6 +3818,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                    if self.kda_l3_stats is not None:
+                        self.kda_l3_stats.on_backup_ack(operation.id)
                 if (
                     log_metrics
                     and self.enable_storage_metrics

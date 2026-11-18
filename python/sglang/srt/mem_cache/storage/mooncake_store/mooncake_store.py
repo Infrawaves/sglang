@@ -1579,6 +1579,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # RPC rather than one RPC per hybrid-cache component.
         results: dict = {}
         prepared = []
+        # SGLANG_KDA_L3_STATS: logical page keys of the Mamba pool, by span start.
+        mamba_page_keys: dict = {}
         all_key_strs = []
         all_ptrs = []
         all_sizes = []
@@ -1631,6 +1633,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prepared.append(
                 (transfer.name, key_multiplier, start, len(all_key_strs), len(keys))
             )
+            if is_set and transfer.name == PoolName.MAMBA:
+                mamba_page_keys[start] = keys
 
         if not prepared:
             return results
@@ -1703,6 +1707,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         for name, key_multiplier, start, end, num_pages in prepared:
             pool_results = io_results[start:end]
+            if is_set and start in mamba_page_keys:
+                self._record_kda_put_outcomes(
+                    mamba_page_keys[start],
+                    exist_result[start:end],
+                    pool_results,
+                    key_multiplier,
+                )
             if self.enable_storage_metrics:
                 if is_set:
                     missing = [i for i in range(start, end) if exist_result[i] != 1]
@@ -1746,6 +1757,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     for i in range(0, end - start, key_multiplier)
                 ]
         return results
+
+    @staticmethod
+    def _record_kda_put_outcomes(
+        page_keys: List[str],
+        exist_states: List[int],
+        put_results: List[int],
+        objects_per_page: int,
+    ) -> None:
+        """SGLANG_KDA_L3_STATS: whether each Mamba state was stored by this put
+        or was already present (the put skips objects that exist)."""
+        from sglang.srt.mem_cache import kda_l3_stats
+
+        if not kda_l3_stats.put_outcome_recording_active() or objects_per_page <= 0:
+            return
+        for page, key in enumerate(page_keys):
+            lo, hi = page * objects_per_page, (page + 1) * objects_per_page
+            existed = [state == 1 for state in exist_states[lo:hi]]
+            if not existed:
+                continue
+            if any(res != 0 for res in put_results[lo:hi]):
+                outcome = "failed"
+            elif all(existed):
+                outcome = "exists"
+            elif any(existed):
+                outcome = "partial"
+            else:
+                outcome = "new"
+            kda_l3_stats.record_put_outcome(key, outcome)
 
     def _put_missing_objects(
         self,
