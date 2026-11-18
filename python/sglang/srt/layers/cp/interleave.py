@@ -43,7 +43,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
 )
-from sglang.srt.layers.cp.padding import pad_local_rows
+from sglang.srt.layers.cp.padding import pad_local_rows, physical_rank_len
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     is_allocation_symmetric,
@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_device, get_parallel
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -76,19 +76,59 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
-    # Tail row -> packed all-gather slot; local tail metadata rows include padding.
+    # Sequence row -> rank-major all-gather slot (DSV4 late-layer tail, or the
+    # position layout of prefill CP with DCP). local_index is DSV4's tail rows,
+    # padding included.
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
     # Only sequence-dependent graph segments use this capacity. Eager cache
     # operations and gathers must continue using total_seq_lens (live tokens).
     graph_num_tokens: Optional[int] = None
+    # Prefill CP with DCP shards by sequence position: this rank's sequence rows
+    # (pos % cp_size == cp_rank, ascending), in the order of its local shard.
+    local_sequence_rows: Optional[torch.Tensor] = None
+    # Per-request prefix lengths that position sharding counts from.
+    prefix_lens_cpu: Optional[List[int]] = None
+    prefix_lens: Optional[torch.Tensor] = None
+    # KV write slots of local_sequence_rows; set by prepare_cp_forward.
+    local_out_cache_loc: Optional[torch.Tensor] = None
 
 
 def is_interleave_extend(forward_batch):
     return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
         forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
     )
+
+
+def writes_owned_kv_only(forward_batch) -> bool:
+    """Whether this CP extend computes exactly the tokens whose KV this rank owns
+    under DCP, so its KV writes need no all-gather of the new tokens."""
+    return (
+        is_interleave_extend(forward_batch)
+        and forward_batch.attn_cp_metadata.local_sequence_rows is not None
+    )
+
+
+def owned_kv_rows(forward_batch) -> int:
+    """Live rows of this rank's shard: the KV it writes under writes_owned_kv_only."""
+    metadata = forward_batch.attn_cp_metadata
+    return int(metadata.per_rank_logical_token[get_parallel().attn_cp_rank])
+
+
+def owned_kv_write(forward_batch, *rows):
+    """This rank's KV write slots, and the live prefix of each padded local
+    shard in ``rows``, under writes_owned_kv_only."""
+    cache_loc = forward_batch.attn_cp_metadata.local_out_cache_loc
+    live = owned_kv_rows(forward_batch)
+    assert cache_loc is not None and cache_loc.shape[0] == live, (
+        "position-sharded CP: the local KV write slots do not match this "
+        f"rank's live rows (slots={None if cache_loc is None else cache_loc.shape[0]}, "
+        f"rows={live})"
+    )
+    for x in rows:
+        assert x.shape[0] >= live, (x.shape[0], live)
+    return (cache_loc, *(x[:live] for x in rows))
 
 
 def cp_interleave_to_sequence_order(hidden_states, forward_batch):
@@ -196,12 +236,26 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if extend_seqs_len is None:
             extend_seqs_len = seqs_len or [num_tokens]
         extend_seqs_len = [int(x) for x in extend_seqs_len]
+        # Under DCP the KV of position p lives on rank p % dcp_size, and prefill
+        # CP with DCP runs one group (cp == dcp), so shard by position instead.
+        prefix_lens = None
+        if get_parallel().attn_dcp_size > 1:
+            assert seqs_len is not None and len(seqs_len) == len(extend_seqs_len), (
+                "Prefill CP with DCP shards by position and needs every seq_len"
+            )
+            prefix_lens = [int(s) - e for s, e in zip(seqs_len, extend_seqs_len)]
 
         pad_len = int(num_tokens) - sum(extend_seqs_len)
         if pad_len > 0:
             extend_seqs_len[-1] += pad_len
 
         total_seq_lens = sum(extend_seqs_len)
+        if prefix_lens is not None:
+            return self._build_position_owner_metadata(
+                prefix_lens=prefix_lens,
+                extend_lens=extend_seqs_len,
+                total_seq_lens=total_seq_lens,
+            )
         base_len, extra = divmod(total_seq_lens, self.cp_size)
         per_rank_actual_token = [
             base_len + (rank < extra) for rank in range(self.cp_size)
@@ -214,15 +268,62 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             bs=len(extend_seqs_len),
         )
 
+    def _build_position_owner_metadata(
+        self, *, prefix_lens: List[int], extend_lens: List[int], total_seq_lens: int
+    ) -> InterleaveContextParallelMetadata:
+        """Rank r takes the tokens at positions p with p % cp_size == r.
+
+        Each rank's shard keeps its tokens in sequence order and is padded to
+        one physical length, so gather_index (sequence row -> rank-major slot)
+        uses that length as its stride.
+        """
+        size = self.cp_size
+        owner = torch.cat(
+            [
+                (torch.arange(extend, dtype=torch.int64) + prefix) % size
+                for prefix, extend in zip(prefix_lens, extend_lens)
+            ]
+        )
+        counts = torch.bincount(owner, minlength=size)
+        stride = physical_rank_len(counts.tolist())
+        # Stable: a rank's slots follow sequence order, matching its local rows.
+        order = torch.argsort(owner, stable=True)
+        starts = torch.cumsum(counts, 0) - counts
+        slot = torch.empty_like(owner)
+        slot[order] = torch.arange(total_seq_lens) - starts[owner[order]]
+        device = torch.device(get_device().device)
+        return InterleaveContextParallelMetadata(
+            per_rank_actual_token=counts.tolist(),
+            max_rank_len=[int(counts.max())] * size,
+            total_seq_lens=total_seq_lens,
+            bs=len(extend_lens),
+            gather_index=(owner * stride + slot).to(device),
+            local_sequence_rows=(owner == self.cp_rank).nonzero().squeeze(1).to(device),
+            prefix_lens_cpu=list(prefix_lens),
+            prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32).to(device),
+        )
+
     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
-        local_x = self._interleave_shard(x[: metadata.total_seq_lens])
+        local_x = self._local_rows(x[: metadata.total_seq_lens], metadata)
         return pad_local_rows(local_x, metadata, dim=0)
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
-        local_positions = self._interleave_shard(positions[: metadata.total_seq_lens])
+        local_positions = self._local_rows(
+            positions[: metadata.total_seq_lens], metadata
+        )
         return pad_local_rows(local_positions, metadata, dim=0)
+
+    def _local_rows(self, input_: Any, metadata) -> Any:
+        """This rank's rows of a sequence-ordered tensor, in shard order."""
+        if metadata.local_sequence_rows is None:
+            return self._interleave_shard(input_)
+        assert len(input_) == metadata.total_seq_lens, (
+            f"position-sharded CP expects {metadata.total_seq_lens} sequence rows, "
+            f"got {len(input_)}"
+        )
+        return input_.index_select(0, metadata.local_sequence_rows)
 
     def _interleave_shard(self, input_: Any) -> Any:
         cp_size = self.cp_size
@@ -242,6 +343,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
+        metadata = forward_batch.attn_cp_metadata
+        if metadata is not None and metadata.local_sequence_rows is not None:
+            return metadata.local_sequence_rows
         device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
         if device is None:
             device = torch.device("cpu")
@@ -249,19 +353,25 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
         )
 
-    def shard_local_tokens(self, input_: Any) -> Any:
-        return self._interleave_shard(input_)
+    def shard_local_tokens(self, input_: Any, forward_batch) -> Any:
+        return self._local_rows(input_, forward_batch.attn_cp_metadata)
 
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
+        forward_batch,
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import dsa_cp_interleave_q_seqs
 
         cp_size = self.cp_size
         cp_rank = self.cp_rank
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.local_sequence_rows is not None:
+            return self._shard_per_request_by_position(
+                extend_seqs_cpu, extend_seqs, metadata
+            )
 
         extra_seq = 0
         q_lens_cpu: List[int] = []
@@ -275,6 +385,22 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         q_lens, bs_idx = dsa_cp_interleave_q_seqs(
             extend_seqs, len(bs_idx_cpu), cp_size, cp_rank
+        )
+        return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
+
+    def _shard_per_request_by_position(self, extend_seqs_cpu, extend_seqs, metadata):
+        from sglang.kernels.ops.attention.dsa.cp_split import dsa_cp_owner_q_seqs
+
+        size, rank = self.cp_size, self.cp_rank
+        prefix_lens_cpu = metadata.prefix_lens_cpu
+        assert len(prefix_lens_cpu) == len(extend_seqs_cpu)
+        q_lens_cpu = position_owned_rows_per_request(
+            prefix_lens_cpu, extend_seqs_cpu, rank=rank, size=size
+        )
+        bs_idx_cpu = [i for i, q_len in enumerate(q_lens_cpu) if q_len > 0]
+        q_lens_cpu = [q_lens_cpu[i] for i in bs_idx_cpu]
+        q_lens, bs_idx = dsa_cp_owner_q_seqs(
+            extend_seqs, metadata.prefix_lens, len(bs_idx_cpu), size, rank
         )
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
 
@@ -415,10 +541,25 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return k_nope, k_rope
 
 
+def position_owned_rows_per_request(
+    prefix_lens: List[int], extend_lens: List[int], *, rank: int, size: int
+) -> List[int]:
+    """Rows of each request a rank holds when CP shards by sequence position:
+    positions prefix .. prefix+extend-1 congruent to rank (floor division)."""
+    return [
+        (prefix + extend - 1 - rank) // size - (prefix - 1 - rank) // size
+        for prefix, extend in zip(prefix_lens, extend_lens)
+    ]
+
+
 def interleave_rows_per_request(
     extend_lens: List[int], cp_rank: int, cp_size: int
 ) -> List[int]:
     """Rows of each request a CP rank holds: global token index congruent to cp_rank."""
+    # Prefill CP with DCP shards by position; see position_owned_rows_per_request.
+    assert get_parallel().attn_dcp_size == 1, (
+        "interleave_rows_per_request assumes the concatenated-index split"
+    )
     counts, start = [], 0
     for n in extend_lens:
         end = start + n
@@ -461,6 +602,10 @@ class DSAInterleaveCPIndexerOverlap:
             and is_interleave_extend(self.forward_batch)
             and hasattr(attention.indexer, "topk_output_width")
         ):
+            return False
+        # The overlap hides the new-token KV all-gather, which a rank writing
+        # only the KV it owns no longer runs.
+        if writes_owned_kv_only(self.forward_batch):
             return False
         if not attention._fuse_rope_for_trtllm_mla(self.forward_batch):
             return True

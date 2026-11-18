@@ -118,6 +118,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import owned_kv_write, writes_owned_kv_only
 from sglang.srt.layers.cp.utils import (
     cp_live_store_rows,
     cp_local_rope_positions,
@@ -163,6 +164,9 @@ def prepare_kv_for_attention(
         defer_materialization
         or not dsa_use_prefill_cp(forward_batch)
         or not is_cp_active(forward_batch)
+        # Attention reads the whole sequence from the DCP gather of the cache;
+        # the new rows are needed only for this rank's own KV write.
+        or writes_owned_kv_only(forward_batch)
     ):
         return k_nope, k_pe
     strategy = get_cp_strategy()
@@ -1656,9 +1660,13 @@ class DeepseekSparseAttnBackend(
                         seq_lens_cpu=indexer_seq_lens_cpu,
                     )
                 strategy = get_cp_strategy()
-                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                seqlens_expanded = strategy.shard_local_tokens(
+                    seqlens_expanded, forward_batch
+                )
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                    strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
+                    strategy.shard_per_request(
+                        extend_seq_lens_cpu, extend_seq_lens, forward_batch
+                    )
                 )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
@@ -1927,10 +1935,12 @@ class DeepseekSparseAttnBackend(
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
             assert can_dsa_prefill_cp_interleave(forward_batch)
-            split_per_token = get_cp_strategy().shard_local_tokens
-            ks = split_per_token(ks)
-            ke = split_per_token(ke)
-            token_to_batch_idx = split_per_token(token_to_batch_idx)
+            strategy = get_cp_strategy()
+            ks = strategy.shard_local_tokens(ks, forward_batch)
+            ke = strategy.shard_local_tokens(ke, forward_batch)
+            token_to_batch_idx = strategy.shard_local_tokens(
+                token_to_batch_idx, forward_batch
+            )
         return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -2666,6 +2676,8 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                if writes_owned_kv_only(forward_batch):
+                    cache_loc, k, k_rope = owned_kv_write(forward_batch, k, k_rope)
                 self.kv_layers.layer(layer.layer_id).store_mla(
                     layer,
                     cache_loc,
@@ -4626,6 +4638,8 @@ class DeepseekSparseAttnBackend(
             )
             if cp_store_cache_loc is not None:
                 cache_loc = cp_store_cache_loc
+            elif writes_owned_kv_only(forward_batch):
+                cache_loc, k, k_rope = owned_kv_write(forward_batch, k, k_rope)
             self.kv_layers.layer(layer.layer_id).store_mla(layer, cache_loc, k, k_rope)
 
         k_cache = self.kv_layers.read(layer.layer_id).key()

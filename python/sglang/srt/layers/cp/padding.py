@@ -14,7 +14,7 @@
 
 """Padding helpers shared by context-parallel strategies."""
 
-from typing import Any
+from typing import Any, List
 
 import torch
 
@@ -31,16 +31,19 @@ def get_cp_padding_align_size() -> int:
     return attn_cp_size
 
 
+def physical_rank_len(logical_tokens: List[int]) -> int:
+    """The one padded shard length every CP rank uses for the CP collectives."""
+    align_size = get_cp_padding_align_size()
+    return (max(logical_tokens) + align_size - 1) // align_size * align_size
+
+
 def pad_logical_token_to_physical(metadata: Any) -> None:
     """Align each CP rank's physical token count for CP collectives."""
     logical_tokens = list(metadata.per_rank_actual_token)
-    align_size = get_cp_padding_align_size()
-    physical_rank_len = (
-        (max(logical_tokens) + align_size - 1) // align_size * align_size
-    )
+    rank_len = physical_rank_len(logical_tokens)
     metadata.per_rank_logical_token = logical_tokens
-    metadata.per_rank_actual_token = [physical_rank_len] * len(logical_tokens)
-    metadata.max_rank_len = [physical_rank_len] * len(logical_tokens)
+    metadata.per_rank_actual_token = [rank_len] * len(logical_tokens)
+    metadata.max_rank_len = [rank_len] * len(logical_tokens)
 
 
 def pad_local_rows(x: torch.Tensor, metadata: Any, dim: int) -> torch.Tensor:
