@@ -254,11 +254,28 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
                 for backend in (cfg.dsa_prefill_backend, cfg.dsa_decode_backend)
             )
         ),
+        # These fall back to the inline o_proj sum (can_defer_cp_decode_attn_tp),
+        # which reduces over attn_tp, a single rank under prefill CP with DCP.
+        "layernorm SP with prefill context parallel": prefill_cp_dcp
+        and cfg.enable_layernorm_sp,
+        "LoRA with prefill context parallel": prefill_cp_dcp
+        and bool(cfg.enable_lora or cfg.lora_paths),
+        "two-batch overlap with prefill context parallel": prefill_cp_dcp
+        and cfg.enable_two_batch_overlap,
+        "quantized communications with prefill context parallel": prefill_cp_dcp
+        and bool(cfg.enable_quant_communications),
+        # Every rank already holds all heads; the replica would gather N copies.
+        "--dcp-replicate-q-proj with prefill context parallel": prefill_cp_dcp
+        and cfg.dcp_replicate_q_proj is True,
     }
     rejected = [name for name, on in unsupported.items() if on]
     if rejected:
         raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
-    overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
+    overrides = (
+        {"dcp_replicate_q_proj": False}
+        if prefill_cp_dcp
+        else _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
+    )
     if cfg.speculative_algorithm == "DFLASH":
         overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
         # Target verify runs on the DSA decode impl, which merges the per-rank

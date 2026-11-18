@@ -22,7 +22,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
-from sglang.srt.configs.model_config import is_kimi_k31
+from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -47,6 +47,11 @@ from sglang.srt.layers.communication.k3_shared_weight_stream import (
     SharedWeightStream,
     weight_stream_policy,
 )
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    configure_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -65,6 +70,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -2052,6 +2058,8 @@ class KimiK3DeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.all_reduce_fusion = all_reduce_fusion
+        # KDA weights are never sliced by CP decode attention TP.
+        self.defer_cp_decode_attn_tp = False
         # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
         # hidden_states, so they overlap the wide [q,k,v,g] GEMM on the main
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
@@ -2749,6 +2757,13 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     dsa_decode_absorb_under_indexer = True
     dcp_v_preproject = True
 
+    def _decode_attn_tp_modules(self) -> list:
+        modules = super()._decode_attn_tp_modules()
+        if self.use_output_gate:
+            # The gate multiplies this rank's sliced heads before o_proj.
+            modules.append(self.g_proj)
+        return modules
+
     def __init__(
         self,
         config,
@@ -3130,6 +3145,15 @@ def _stage_facts(
         # partitions them over), which is the prefill-CP group: the layer
         # reads full context and its output sums over TP.
         attn_ops["tp_group"] = SumGroup.TP
+    if (
+        not config.is_kda_layer(layer_idx)
+        and is_deepseek_dsa(config)
+        and config.q_lora_rank is not None
+        and can_defer_cp_decode_attn_tp()
+    ):
+        # Decode slices the replicated MLA per CP rank (prefill CP with DCP);
+        # the stage boundary sums the o_proj partials over TP.
+        attn_ops["ordinary_tp_group"] = SumGroup.TP
     return (
         declare_attn(**attn_ops),
         declare_ffn(
@@ -3281,6 +3305,15 @@ class KimiK3DecoderLayer(nn.Module):
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
         )
+        defer_decode_sum = self.self_attn.defer_cp_decode_attn_tp
+        if (attn.ordinary_tp_group is not None) != defer_decode_sum:
+            raise ValueError(
+                "CP decode attention TP deferral disagrees with the stage declaration"
+            )
+        if defer_decode_sum:
+            # The fused readout sums over ATTN_TP, which is one rank here.
+            assert not self.all_reduce_fusion
+            configure_cp_decode_attn_tp(self.self_attn.o_proj, defer_all_reduce=True)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
@@ -3335,12 +3368,24 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        defer_decode_sum = self.self_attn.defer_cp_decode_attn_tp
+        decode_attn_tp = (
+            self.self_attn.maybe_use_decode_attn_tp(forward_batch)
+            if defer_decode_sum
+            else nullcontext()
         )
+        with decode_attn_tp:
+            if defer_decode_sum:
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
+            result = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
         if isinstance(result, tuple):
             result = result[0]
 
@@ -4099,6 +4144,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if getattr(self_attn, "_dcp_v_weights", None) is not None:
+                # Decode slices w_vc per CP rank under prefill CP with DCP;
+                # a reload here would gather the unsliced heads.
+                assert (
+                    not self_attn.defer_cp_decode_attn_tp
+                ), "weight reload is not supported with CP decode attention TP"
                 self_attn._prepare_dcp_v_weights(get_parallel().dcp_group)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
             if _is_hip and (

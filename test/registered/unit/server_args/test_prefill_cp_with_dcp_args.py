@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
 from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_overrides
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.cp_decode_attn_tp import CP_DECODE_ATTN_TP_SUPPORTED_ARCHS
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -38,6 +39,7 @@ PREFILL_CP_WITH_DCP = dict(
     attn_cp_size=8,
     cp_strategy="interleave",
     dcp_size=8,
+    enable_cp_decode_attn_tp=True,
 )
 
 
@@ -103,6 +105,14 @@ class TestDecodeContextParallelismGate(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--dcp-kv-layout token"):
             self._handle(_args(dcp_kv_layout="page"))
 
+    def test_cp_decode_attn_tp_is_required(self):
+        # Decode attention heads only match once the replicated weights are sliced.
+        with self.assertRaisesRegex(ValueError, "--enable-cp-decode-attn-tp"):
+            self._handle(_args(enable_cp_decode_attn_tp=False))
+
+    def test_kimi_k31_may_enable_cp_decode_attn_tp(self):
+        self.assertIn(KIMI_K31, CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)
+
 
 class TestCpTpGroupSharingWithDcp(CustomTestCase):
     """CP-TP group sharing admits DCP for Kimi-K3.1 alone, and only on the CP
@@ -153,6 +163,11 @@ class TestKimiK31PrefillCpWithDcpOverrides(CustomTestCase):
             attn_cp_size=8,
             dsa_prefill_backend=None,
             dsa_decode_backend=None,
+            enable_layernorm_sp=False,
+            enable_lora=None,
+            lora_paths=None,
+            enable_two_batch_overlap=False,
+            enable_quant_communications=False,
         )
         for name, value in fields.items():
             setattr(cfg, name, value)
@@ -194,6 +209,29 @@ class TestKimiK31PrefillCpWithDcpOverrides(CustomTestCase):
                     self._overrides(
                         dsa_prefill_backend=backend, dsa_decode_backend=backend
                     )
+
+    def test_replicated_q_proj_stays_off(self):
+        # Every rank already holds all heads, so the a2a default must not apply.
+        self.assertEqual(self._overrides(), {"dcp_replicate_q_proj": False})
+        with self.assertRaisesRegex(ValueError, "--dcp-replicate-q-proj"):
+            self._overrides(dcp_replicate_q_proj=True)
+
+    def test_plain_dcp_keeps_the_replicated_q_proj_default(self):
+        overrides = self._overrides(enable_prefill_cp=False, attn_cp_size=None)
+        self.assertEqual(overrides, {"dcp_replicate_q_proj": True})
+
+    def test_features_that_force_the_inline_decode_sum_are_rejected(self):
+        # The inline o_proj sum reduces over attn_tp, a single rank here.
+        for fields, message in (
+            (dict(enable_layernorm_sp=True), "layernorm SP"),
+            (dict(enable_lora=True), "LoRA"),
+            (dict(lora_paths=["adapter"]), "LoRA"),
+            (dict(enable_two_batch_overlap=True), "two-batch overlap"),
+            (dict(enable_quant_communications=True), "quantized communications"),
+        ):
+            with self.subTest(**fields):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._overrides(**fields)
 
     def test_dcp_without_prefill_cp_keeps_trtllm_and_speculation(self):
         # The prefill-CP rules must not narrow plain DCP.
