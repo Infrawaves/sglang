@@ -1544,7 +1544,11 @@ class ChatCompletionRequest(PDRoutingFields):
                     response_format.json_schema.schema_
                 )
         elif response_format and response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
+            # JSON mode asks for any JSON object. A renderer that states it in
+            # the prompt leaves the output unconstrained, as Moonshot's JSON
+            # mode is prompt-guided.
+            if not renderer_handles_response_format:
+                sampling_params["json_schema"] = '{"type": "object"}'
         elif response_format and response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 response_format.model_dump(by_alias=True)
