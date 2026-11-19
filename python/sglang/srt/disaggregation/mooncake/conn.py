@@ -3214,6 +3214,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
+                            page_mismatch = self._same_dcp_page_mismatch(
+                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                                num_dst_pages=len(chunked_dst_kv_indice),
+                                num_src_pages=len(kv_chunk.prefill_kv_indices),
+                            )
+                            if page_mismatch is not None:
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=page_mismatch,
+                                )
+                                break
+
                             # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
                             # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
                             if len(chunked_dst_kv_indice) < len(
@@ -3636,7 +3649,60 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_kv_args.draft_peer_ranks = self._resolve_draft_peer_ranks(
                 decode_kv_args
             )
+        elif decode_kv_args.dst_dcp_size > 1:
+            self._validate_same_dcp_page_layout(decode_kv_args)
         return decode_kv_args
+
+    def _validate_same_dcp_page_layout(self, info: KVArgsRegisterInfo) -> None:
+        # _send_kvcache_generic addresses decode pages with our item_len, so a
+        # geometry mismatch would write every page at a wrong offset silently.
+        if info.dcp_kv_layout != "token":
+            raise RuntimeError(
+                "Same-DCP PD requires decode --dcp-kv-layout token, got "
+                f"{info.dcp_kv_layout}"
+            )
+        src_lens = list(self.kv_args.kv_item_lens)
+        if src_lens and info.dst_kv_item_lens != src_lens:
+            raise RuntimeError(
+                "Same-DCP PD KV page geometry differs: "
+                f"prefill item_lens={src_lens}, decode={info.dst_kv_item_lens}"
+            )
+        src_collapsed = self.kv_args.draft_rows_dcp_collapsed
+        if (
+            self.kv_args.num_draft_entries > 0
+            and src_collapsed != info.dst_draft_rows_dcp_collapsed
+        ):
+            raise RuntimeError(
+                "Same-DCP PD draft KV layout differs: prefill "
+                f"dcp_collapsed={src_collapsed}, "
+                f"decode={info.dst_draft_rows_dcp_collapsed}"
+            )
+
+    def _same_dcp_page_mismatch(
+        self,
+        *,
+        dst_dcp_size: int,
+        decode_prefix_len: int,
+        num_dst_pages: int,
+        num_src_pages: int,
+    ) -> Optional[str]:
+        """Why a same-DCP page-by-page chunk cannot be sent, or None."""
+        if dst_dcp_size <= 1:
+            return None
+        # Page ids are widened DCP pages; a prefix off that grid shifts every page.
+        virtual_page_size = self.kv_args.page_size * dst_dcp_size
+        if decode_prefix_len % virtual_page_size != 0:
+            return (
+                "Same-DCP PD requires decode_prefix_len to align to the DCP "
+                f"virtual page size ({virtual_page_size}), got {decode_prefix_len}"
+            )
+        # Each page holds a distinct owner shard, so truncating would drop KV.
+        if num_dst_pages < num_src_pages:
+            return (
+                "Same-DCP PD page count mismatch: "
+                f"decode={num_dst_pages}, prefill={num_src_pages}"
+            )
+        return None
 
     def start_prefill_thread(self):
         rejected_sessions: Dict[str, str] = {}

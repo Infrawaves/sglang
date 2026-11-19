@@ -245,8 +245,10 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
         and not prefill_cp_dcp,
         "speculative decoding with prefill context parallel": prefill_cp_dcp
         and cfg.speculative_algorithm is not None,
-        "PD disaggregation with prefill context parallel": prefill_cp_dcp
-        and cfg.disaggregation_mode != "null",
+        # A prefill CP + DCP prefill ships pages to a decode of the same DCP;
+        # that decode serves TP + DCP, never prefill CP.
+        "PD decode with prefill context parallel": prefill_cp_dcp
+        and cfg.disaggregation_mode == "decode",
         "a DSA backend other than flashmla_kv with prefill context parallel": (
             prefill_cp_dcp
             and any(
