@@ -433,6 +433,9 @@ class HybridCacheController(BaseHiCacheController):
         self.kda_node_aggregate = getattr(
             getattr(mamba_entry, "host_pool", None), "node_aggregate", None
         )
+        if self._kda_l3_stats_enabled:
+            # Only node leaders put KDA objects, so they log the writes.
+            kda_l3_stats.configure_node_aggregate(self.kda_node_aggregate)
         # Set when the DRAFT sidecar registers a node-shared host pool.
         self.draft_node_merge: Optional[DraftNodeMerge] = None
         self.pp_prefetch_command_group = None

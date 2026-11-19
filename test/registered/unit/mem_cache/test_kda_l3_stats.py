@@ -12,7 +12,27 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 def _logging_rank(value=True):
-    return mock.patch.object(kda_l3_stats, "_is_logging_rank", return_value=value)
+    """Patch both rank roles (read/load and write) for per-rank IO."""
+    return mock.patch.multiple(
+        kda_l3_stats,
+        _is_logging_rank=mock.Mock(return_value=value),
+        _is_write_logging_rank=mock.Mock(return_value=value),
+    )
+
+
+class _RankCase(unittest.TestCase):
+    """Keeps the rank roles patched for the whole test: the tracker reads its
+    role on every call."""
+
+    LOG_RANK = True
+
+    def setUp(self):
+        patcher = _logging_rank(self.LOG_RANK)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        kda_l3_stats._put_outcomes.clear()
+        kda_l3_stats.configure_node_aggregate(None)
+        self.addCleanup(kda_l3_stats.configure_node_aggregate, None)
 
 
 class TestClassify(unittest.TestCase):
@@ -27,13 +47,9 @@ class TestClassify(unittest.TestCase):
             self.assertEqual(kda_l3_stats.classify(32768, False, 20480), "middle")
 
 
-class TestTracker(unittest.TestCase):
-    def setUp(self):
-        kda_l3_stats._put_outcomes.clear()
-
+class TestTracker(_RankCase):
     def _tracker(self):
-        with _logging_rank():
-            return kda_l3_stats.KdaL3StatsTracker()
+        return kda_l3_stats.KdaL3StatsTracker()
 
     def _insert(self, t, node, position=32768, end=False):
         t.on_insert(
@@ -99,9 +115,9 @@ class TestTracker(unittest.TestCase):
             self.assertEqual(len(t._issued), 4)
 
     def test_non_logging_rank_records_nothing(self):
+        t = self._tracker()
         with _logging_rank(False):
-            t = kda_l3_stats.KdaL3StatsTracker()
-        self._insert(t, 1, position=512, end=True)
+            self._insert(t, 1, position=512, end=True)
         self.assertEqual(len(t._pending), 0)
 
 
@@ -143,15 +159,18 @@ class TestPutOutcome(unittest.TestCase):
         self.assertEqual(kda_l3_stats.pop_put_outcome("p1"), "unknown")
 
 
-class TestWriteGate(unittest.TestCase):
+class TestWriteGate(_RankCase):
     """The O(depth) prefix walk runs only on the logging rank for recorded nodes."""
 
     def _cache(self, log_rank):
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        with _logging_rank(log_rank):
-            tracker = kda_l3_stats.KdaL3StatsTracker()
+        if not log_rank:
+            patcher = _logging_rank(False)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        tracker = kda_l3_stats.KdaL3StatsTracker()
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.kda_l3_stats = tracker
         cache.tree_core = SimpleNamespace(page_size=512)
@@ -314,6 +333,102 @@ class TestLoadLog(unittest.TestCase):
         with _logging_rank(False):
             with self.assertNoLogs(kda_l3_stats.logger, level=logging.INFO):
                 kda_l3_stats.log_load(self._op(512), "rid-x", 512, dropped=False)
+
+
+class TestNodeAggregate(unittest.TestCase):
+    """--enable-kda-hicache-node-aggregate: only node leaders put KDA objects."""
+
+    def setUp(self):
+        kda_l3_stats._put_outcomes.clear()
+        self.addCleanup(kda_l3_stats.configure_node_aggregate, None)
+
+    def _node(self, node_rank, node_index, num_nodes=2):
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            KDA_L3_LEADER_NODE_RANK,
+        )
+
+        return SimpleNamespace(
+            node_rank=node_rank,
+            node_index=node_index,
+            num_nodes=num_nodes,
+            is_leader=node_rank == KDA_L3_LEADER_NODE_RANK,
+        )
+
+    def test_roles(self):
+        # (node_rank, node_index) -> (logs writes, logs reads/loads)
+        cases = {(1, 0): (True, True), (1, 1): (True, False), (0, 0): (False, False)}
+        for (node_rank, node_index), (writes, reads) in cases.items():
+            kda_l3_stats.configure_node_aggregate(self._node(node_rank, node_index))
+            with self.subTest(node_rank=node_rank, node_index=node_index):
+                self.assertEqual(kda_l3_stats._is_write_logging_rank(), writes)
+                self.assertEqual(kda_l3_stats._is_logging_rank(), reads)
+
+    def test_follower_tracker_records_nothing(self):
+        kda_l3_stats.configure_node_aggregate(self._node(0, 0))
+        t = kda_l3_stats.KdaL3StatsTracker()
+        t.on_insert(
+            7,
+            rid="r",
+            position=512,
+            prompt_len=1024,
+            is_request_end=True,
+            branching_seqlen=None,
+        )
+        self.assertEqual(len(t._pending), 0)
+
+    def test_leader_write_line_names_its_node(self):
+        # Built before the controller configures aggregation, as in init_hicache.
+        t = kda_l3_stats.KdaL3StatsTracker()
+        kda_l3_stats.configure_node_aggregate(self._node(1, 1))
+        t.on_insert(
+            7,
+            rid="r",
+            position=512,
+            prompt_len=1024,
+            is_request_end=True,
+            branching_seqlen=None,
+        )
+        t.on_storage_write(7, "abc", 512, operation_id=3)
+        with mock.patch.object(kda_l3_stats, "enabled", return_value=True):
+            self.assertTrue(kda_l3_stats.put_outcome_recording_active())
+        kda_l3_stats.record_put_outcome("abc", "exists")
+        with self.assertLogs(kda_l3_stats.logger, level=logging.INFO) as cm:
+            t.on_backup_ack(3)
+        self.assertIn("cls=tail pos=512 prompt_len=1024 stored=exists node=1/2", cm.output[0])
+
+    def test_aggregated_put_records_outcomes(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        kda_l3_stats.configure_node_aggregate(self._node(1, 0))
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.kda_node_aggregate = self._node(1, 0)
+        store.registered_pools = {PoolName.MAMBA: mock.Mock()}
+        store.registered_pools[PoolName.MAMBA].get_node_page_buffer_meta.return_value = (
+            [1],
+            [8],
+        )
+        store._object_layout = mock.Mock(
+            return_value=SimpleNamespace(keys=["t_p1", "t_p2", "t_p3"], objects_per_page=1)
+        )
+        store.request_context = mock.MagicMock()
+        store._request_context_from_extra_info = mock.Mock(return_value={})
+        store._can_use_group_semantics = mock.Mock(return_value=False)
+        store._supports_session_ids = False
+        store._record_io = mock.Mock()
+        store._batch_exist = mock.Mock(return_value=[1, 0, 0])
+        store._put_batch_zero_copy_impl = mock.Mock(return_value=[0, -704])
+        transfer = SimpleNamespace(name=PoolName.MAMBA, keys=["p1", "p2", "p3"])
+        with mock.patch.object(kda_l3_stats, "enabled", return_value=True):
+            ok = store.batch_io_node_aggregated_mamba(
+                transfer, [[0, 1], [2, 3], [4, 5]], is_set=True
+            )
+        self.assertEqual(ok, [True, True, False])
+        self.assertEqual(
+            [kda_l3_stats.pop_put_outcome(k) for k in ("p1", "p2", "p3")],
+            ["exists", "new", "failed"],
+        )
 
 
 if __name__ == "__main__":

@@ -18,8 +18,14 @@ Classes, in precedence order:
           tokens of the prompt (absolute position <= the threshold)
   middle  every other chunk-boundary state
 
-Enabled with ``SGLANG_KDA_L3_STATS=1``; off by default. Only attention TP rank 0
-logs, and nothing here issues RPCs, collectives or device work.
+Enabled with ``SGLANG_KDA_L3_STATS=1``; off by default. Nothing here issues
+RPCs, collectives or device work. Which ranks log:
+
+- per-rank KDA L3 IO: attention TP rank 0 logs every line.
+- ``--enable-kda-hicache-node-aggregate``: only each node's KDA leader touches
+  Mooncake, and each node stores its own object of a state. Every node leader
+  logs KDA_L3_WRITE (with ``node=i/n``) for its own put; the leader of node 0
+  alone logs KDA_L3_READ and KDA_L3_LOAD, whose values are rank-agreed.
 """
 
 from __future__ import annotations
@@ -42,13 +48,44 @@ def enabled() -> bool:
     return envs.SGLANG_KDA_L3_STATS.get()
 
 
-def _is_logging_rank() -> bool:
+# KDANodeAggregateContext when --enable-kda-hicache-node-aggregate is active in
+# this process; set by the hybrid cache controller before any IO.
+_node_aggregate: Optional[Any] = None
+
+
+def configure_node_aggregate(context: Optional[Any]) -> None:
+    global _node_aggregate
+    _node_aggregate = context
+
+
+def _is_attn_tp_rank0() -> bool:
     try:
         from sglang.srt.runtime_context import get_parallel
 
         return get_parallel().attn_tp_rank == 0
     except Exception:
         return False
+
+
+def _is_logging_rank() -> bool:
+    """The one rank that logs KDA_L3_READ / KDA_L3_LOAD."""
+    node = _node_aggregate
+    if node is not None:
+        return node.is_leader and node.node_index == 0
+    return _is_attn_tp_rank0()
+
+
+def _is_write_logging_rank() -> bool:
+    """Ranks that log KDA_L3_WRITE: the ones whose process does the put."""
+    node = _node_aggregate
+    if node is not None:
+        return node.is_leader
+    return _is_attn_tp_rank0()
+
+
+def _node_field() -> str:
+    node = _node_aggregate
+    return "" if node is None else f" node={node.node_index}/{node.num_nodes}"
 
 
 def classify(
@@ -76,7 +113,12 @@ class KdaL3StatsTracker:
         self._pending: OrderedDict[Any, tuple] = OrderedDict()
         # Writes issued to storage, keyed by backup operation id, until the ACK.
         self._issued: OrderedDict[Any, tuple] = OrderedDict()
-        self._log = _is_logging_rank()
+
+    @property
+    def _log(self) -> bool:
+        # Evaluated per call: the tracker is built in init_hicache before the
+        # controller configures node aggregation.
+        return _is_write_logging_rank()
 
     def on_insert(
         self,
@@ -132,12 +174,13 @@ class KdaL3StatsTracker:
             return
         mamba_key, cls, rid, position, prompt_len = entry
         logger.info(
-            "KDA_L3_WRITE key=%s cls=%s pos=%d prompt_len=%d stored=%s rid=%s",
+            "KDA_L3_WRITE key=%s cls=%s pos=%d prompt_len=%d stored=%s%s rid=%s",
             mamba_key,
             cls,
             position,
             prompt_len,
             pop_put_outcome(mamba_key),
+            _node_field(),
             rid,
         )
 
@@ -149,7 +192,7 @@ _put_outcomes_lock = threading.Lock()
 
 
 def put_outcome_recording_active() -> bool:
-    return enabled() and _is_logging_rank()
+    return enabled() and _is_write_logging_rank()
 
 
 def record_put_outcome(key: str, outcome: str) -> None:
