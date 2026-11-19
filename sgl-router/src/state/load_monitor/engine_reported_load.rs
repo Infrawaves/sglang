@@ -100,6 +100,19 @@ pub struct EngineReportedSchedulingLoad {
     pub captured_at: Instant,
 }
 
+/// One worker's waiting uncached prefill tokens, summed over its DP ranks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdTokenReading {
+    /// Every rank reported within the freshness window.
+    Fresh(u64),
+    /// Some rank's last report is older than the freshness window; the sum of
+    /// the reported ranks' last values, a lower bound on the backlog.
+    Stale(u64),
+    /// Every reported rank is fresh but some required rank has never reported,
+    /// as while a new DP worker's ranks come up; the reported ranks' sum.
+    Partial(u64),
+}
+
 /// Immutable fleet-wide view of engine-reported load, captured once at request ingress.
 ///
 /// Keys are worker URLs used for dispatch. Missing, stale, or rank-incomplete
@@ -597,6 +610,62 @@ impl EngineReportedLoadTable {
         }
     }
 
+    /// Per-worker `num_waiting_uncached_tokens` summed over ranks, keeping the
+    /// incomplete workers [`Self::capture_snapshot`] drops; absent until a rank reports.
+    pub fn cold_token_readings(&self, now: Instant) -> HashMap<String, ColdTokenReading> {
+        let mut observed: HashMap<String, HashMap<u32, (u64, bool)>> = HashMap::new();
+        for entry in self.by_rank.iter() {
+            let LoadEntry { load, at, .. } = entry.value();
+            let Some(native) = load.native_cache.as_ref() else {
+                continue;
+            };
+            if load.max_total_num_tokens == 0 || native.max_running_requests == 0 {
+                continue;
+            }
+            let fresh = now.saturating_duration_since(*at) <= self.freshness;
+            observed
+                .entry(entry.key().0.clone())
+                .or_default()
+                .insert(entry.key().1, (native.num_waiting_uncached_tokens, fresh));
+        }
+        let mut expected: HashMap<String, HashSet<u32>> = HashMap::new();
+        for entry in self.expected.iter() {
+            expected
+                .entry(entry.key().0.clone())
+                .or_default()
+                .insert(entry.key().1);
+        }
+        observed
+            .into_iter()
+            .map(|(url, ranks)| {
+                let required: Vec<u32> = match expected.get(&url) {
+                    Some(expected_ranks) => expected_ranks.iter().copied().collect(),
+                    None => ranks.keys().copied().collect(),
+                };
+                let mut tokens = 0u64;
+                let mut any_stale = false;
+                let mut any_missing = false;
+                for rank in required {
+                    // A missing rank must not discard what the others reported.
+                    let Some((rank_tokens, fresh)) = ranks.get(&rank) else {
+                        any_missing = true;
+                        continue;
+                    };
+                    tokens = tokens.saturating_add(*rank_tokens);
+                    any_stale |= !*fresh;
+                }
+                let reading = if any_stale {
+                    ColdTokenReading::Stale(tokens)
+                } else if any_missing {
+                    ColdTokenReading::Partial(tokens)
+                } else {
+                    ColdTokenReading::Fresh(tokens)
+                };
+                (url, reading)
+            })
+            .collect()
+    }
+
     /// Drop every rank entry (and the expected mark) for a worker. Called on
     /// worker removal so a re-added worker does not leave stale load behind.
     pub fn forget_worker(&self, url: &str) {
@@ -828,5 +897,64 @@ mod tests {
             worker.estimated_prefill_queue_ms,
             Some(666.666_666_666_666_6)
         );
+    }
+
+    fn native(cold: u64) -> LoadStat {
+        let mut stat = load(0, 0);
+        stat.max_total_num_tokens = 1;
+        stat.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: cold,
+            num_total_tokens: 0,
+            max_running_requests: 1,
+            total_prefill_uncached_tokens: 0,
+            total_prefill_busy_us: 0,
+            total_prefill_input_tokens: None,
+        });
+        stat
+    }
+
+    #[test]
+    fn cold_token_readings_keep_stale_workers_and_drop_unreported_ones() {
+        let t = EngineReportedLoadTable::with_freshness(Duration::from_secs(5));
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(60);
+        for rank in [0, 1] {
+            t.mark_expected_rank("http://fresh", rank);
+            t.mark_expected_rank("http://stale", rank);
+            t.mark_expected_rank("http://partial", rank);
+            t.mark_expected_rank("http://stale-partial", rank);
+        }
+        t.set("http://fresh", 0, native(100), now);
+        t.set("http://fresh", 1, native(200), now);
+        t.set("http://stale", 0, native(100), now);
+        t.set("http://stale", 1, native(900), stale);
+        t.set("http://partial", 0, native(100), now);
+        t.set("http://stale-partial", 0, native(700), stale);
+        t.set("http://legacy", 0, load(1, 1), now);
+        let mut warming = native(500);
+        warming.max_total_num_tokens = 0;
+        t.set("http://warming", 0, warming, now);
+
+        let readings = t.cold_token_readings(now);
+        assert_eq!(
+            readings.get("http://fresh"),
+            Some(&ColdTokenReading::Fresh(300))
+        );
+        assert_eq!(
+            readings.get("http://stale"),
+            Some(&ColdTokenReading::Stale(1_000))
+        );
+        assert_eq!(
+            readings.get("http://partial"),
+            Some(&ColdTokenReading::Partial(100)),
+            "rank 1 never reported; rank 0's backlog must survive"
+        );
+        assert_eq!(
+            readings.get("http://stale-partial"),
+            Some(&ColdTokenReading::Stale(700)),
+            "a stale rank outranks a missing one"
+        );
+        assert_eq!(readings.get("http://legacy"), None, "no native extension");
+        assert_eq!(readings.get("http://warming"), None, "zero KV capacity");
     }
 }

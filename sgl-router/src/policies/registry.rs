@@ -89,6 +89,8 @@ pub struct PdPoolResolver {
     workers: Arc<WorkerRegistry>,
     /// Workers this request already failed on; never offered as candidates.
     excluded: Vec<WorkerId>,
+    /// Use [`WorkerRegistry::admitting_workers_for`]: no fail-open, no breaker reset.
+    read_only: bool,
 }
 
 impl PdPoolResolver {
@@ -96,12 +98,19 @@ impl PdPoolResolver {
         Self {
             workers,
             excluded: Vec::new(),
+            read_only: false,
         }
     }
 
     /// Leave `excluded` out of every pool, so a retry lands on another worker.
     pub fn excluding(mut self, excluded: &[WorkerId]) -> Self {
         self.excluded = excluded.to_vec();
+        self
+    }
+
+    /// For observers, which must not reset a breaker.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
         self
     }
 
@@ -119,7 +128,11 @@ impl PdPoolResolver {
     /// eligible workers were all excluded (retries) or are awaiting a
     /// bootstrap port.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
-        let mut all = self.workers.healthy_workers_for(model);
+        let mut all = if self.read_only {
+            self.workers.admitting_workers_for(model)
+        } else {
+            self.workers.healthy_workers_for(model)
+        };
         all.retain(|w| !self.excluded.contains(&w.id));
         if all.is_empty() {
             // No healthy workers — distinguish "model never registered"

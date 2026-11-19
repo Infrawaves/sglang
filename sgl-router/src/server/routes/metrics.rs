@@ -17,6 +17,7 @@ use crate::state::kv_events::bootstrap::{
     BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
 };
 use crate::state::kv_events::{KvIndexMetrics, ReplayOutcome, Tiers, ACCOUNTING_REASONS};
+use crate::state::load_monitor::cold_pressure::ColdPressureSample;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use axum::extract::State;
@@ -67,6 +68,16 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
         .collect();
     let mut body = ctx.metrics.render_with_workers(&workers);
     body.push_str(&ctx.tokenizers.stats().render());
+    // A stale sample is dropped, as GET /prefill_pressure does: Prometheus
+    // would stamp a frozen value with each scrape's time.
+    let interval_secs = ctx.config.server.cold_pressure.sample_interval_secs;
+    if let Some(sample) = ctx
+        .cold_pressure
+        .latest()
+        .filter(|sample| !sample.is_stale(interval_secs, Instant::now()))
+    {
+        body.push_str(&render_cold_pressure(&sample));
+    }
     // Pull-on-scrape, like the worker gauges above: the tree and the tally
     // own the numbers, so a worker that goes away stops emitting series
     // without anything having to reset a pushed counter.
@@ -175,6 +186,51 @@ fn render_kv_bootstrap(tracker: &BootstrapTracker, tree_nodes: usize) -> String 
         "result",
         SweepOutcome::ALL.map(SweepOutcome::as_label),
         &tracker.sweep_result_counts(),
+    );
+    out
+}
+
+/// The latest fresh `/prefill_pressure` sample. The ratio gauges are omitted
+/// while `GET /prefill_pressure` answers 503 for lack of data.
+fn render_cold_pressure(sample: &ColdPressureSample) -> String {
+    let mut out = String::new();
+    if sample.has_data() {
+        push_gauge(
+            &mut out,
+            "sgl_router_cold_pressure",
+            "Waiting uncached prefill tokens over --per-prefill-cold-tokens times the healthy prefill workers past their first report or the reporting grace, as served by GET /prefill_pressure. Can exceed 1.",
+            sample.pressure,
+        );
+        push_gauge(
+            &mut out,
+            "sgl_router_cold_tokens",
+            "Numerator of sgl_router_cold_pressure: engine-reported waiting uncached prefill tokens; stale workers count at no less than full capacity, and workers silent past the reporting grace at full capacity.",
+            sample.cold_tokens,
+        );
+        push_gauge(
+            &mut out,
+            "sgl_router_cold_capacity_tokens",
+            "Denominator of sgl_router_cold_pressure: --per-prefill-cold-tokens times the healthy prefill workers past their first report or the reporting grace.",
+            sample.capacity_tokens,
+        );
+    }
+    push_gauge(
+        &mut out,
+        "sgl_router_cold_pressure_stale_workers",
+        "Healthy prefill workers with a DP rank stale, or never reported 30s after joining, counted at no less than full capacity.",
+        sample.stale_workers,
+    );
+    push_gauge(
+        &mut out,
+        "sgl_router_cold_pressure_unreported_workers",
+        "Healthy prefill workers that joined within the reporting grace and have not reported engine load yet, excluded from both sides of the ratio.",
+        sample.unreported_workers,
+    );
+    push_gauge(
+        &mut out,
+        "sgl_router_cold_pressure_overdue_workers",
+        "Healthy prefill workers that have never reported engine load although they joined more than the reporting grace ago, counted at full capacity.",
+        sample.overdue_workers,
     );
     out
 }

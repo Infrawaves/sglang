@@ -14,14 +14,16 @@ use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_max_chat_body_bytes,
     default_port, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
-    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig,
-    LoadBasedMetric, LoadBasedTokenGate, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig,
-    StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
+    ColdPressureConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LoadBasedMetric, LoadBasedTokenGate, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_COLD_PRESSURE_SAMPLE_INTERVAL_SECS, DEFAULT_FUSE,
     DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
     DEFAULT_LOAD_BASED_TOKEN_SLACK, DEFAULT_LOAD_BASED_TOKEN_TIE_BAND,
+    DEFAULT_PER_PREFILL_COLD_TOKENS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -196,6 +198,23 @@ pub struct ServerArgs {
     /// after streaming starts, it aborts the body without changing the HTTP status.
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+
+    /// Waiting uncached prefill tokens one healthy prefill worker may hold before
+    /// GET /prefill_pressure reports 1.0. Plain workers count as prefill without PD.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PER_PREFILL_COLD_TOKENS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub per_prefill_cold_tokens: u64,
+
+    /// Seconds between GET /prefill_pressure samples.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_COLD_PRESSURE_SAMPLE_INTERVAL_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub cold_pressure_interval_secs: u64,
 
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -674,6 +693,10 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                cold_pressure: ColdPressureConfig {
+                    per_prefill_cold_tokens: self.server.per_prefill_cold_tokens,
+                    sample_interval_secs: self.server.cold_pressure_interval_secs,
+                },
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,

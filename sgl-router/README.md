@@ -106,6 +106,7 @@ every flag.
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
 | `GET /healthz`, `/readyz` | Liveness and readiness |
+| `GET /prefill_pressure` | Cluster cold-token pressure for gateway rate limiting: waiting uncached prefill tokens over `--per-prefill-cold-tokens` times the healthy prefill workers that have reported engine load, sampled every `--cold-pressure-interval-secs`. The pool is the healthy prefill workers paired with a decode in their version group; `--bucket-config` membership is not applied. A worker whose report went stale counts as at least full; one that has not reported yet, or only on some DP ranks, is spared that floor for its first 30s. An engine too old to publish the native-cache load extension never reports, so it counts as full. 503 before the first sample, with no routable prefill worker, while none has reported, and once the latest sample is older than three sampling intervals |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
 Both edges speak cleartext HTTP/2 where the peer does; see
