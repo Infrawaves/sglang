@@ -8,10 +8,19 @@ NUMA placement and binding are deployment responsibilities.
 
 Followers keep only dummy slot metadata; the leader restores MLA layers and the
 forward layer-wait hook broadcasts them over NCCL. Only the leader does MLA D2H,
-L3 reads and Mooncake registration; KDA/Mamba stays per rank. The DSA indexer
-(Kimi-K3.1) shares a node buffer the same way when the broadcast carries it
+L3 reads and Mooncake registration. The DSA indexer (Kimi-K3.1) shares a node
+buffer the same way when the broadcast carries it
 (NodeLeaderMLAContext.shares_dsa_indexer); otherwise it stays per rank. An MHA
 draft sidecar can share a node buffer too (see hicache_draft_node_merge.py).
+
+KDA/Mamba stays per rank unless --enable-kda-hicache-node-aggregate is set: then
+each Mamba host buffer is one node-shared memfd laid out as
+``[rank0 share | rank1 share | ...]`` with an equal, page-aligned stride. Every
+rank keeps a view of its own share, so H2D/D2H and slot allocation are
+unchanged. Node rank 0 creates the memfds; node rank 1 is the KDA L3 leader,
+keeping that IO off the rank that already does MLA L3 IO. Only the KDA leader
+registers the full buffers with Mooncake and moves one multi-buffer object per
+checkpoint spanning every rank's slot.
 
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.
@@ -21,6 +30,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
+import mmap
 import os
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -73,7 +84,7 @@ def synchronize_shared_host_error(
     failures = [message for message in errors if message is not None]
     if failures:
         raise RuntimeError(
-            f"MLA HiCache shared host {operation} failed: " + "; ".join(failures)
+            f"HiCache shared host {operation} failed: " + "; ".join(failures)
         ) from error
 
 
@@ -139,10 +150,10 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
                 os.close(fd)
 
     def _open_shared_fd(self, owner: tuple[int, int] | None) -> int:
-        leader_rank = self.node_ranks[0]
+        owner_rank = self.node_ranks[0]
         if owner is None:
             raise RuntimeError(
-                f"MLA HiCache node leader rank {leader_rank} "
+                f"HiCache node memfd owner rank {owner_rank} "
                 "did not publish a shared host buffer."
             )
         pid, owner_fd = owner
@@ -151,9 +162,9 @@ class NodeSharedHostTensorAllocator(HostTensorAllocator):
             return os.open(path, os.O_RDWR)
         except OSError as exc:
             raise RuntimeError(
-                f"MLA HiCache cannot reopen node leader rank {leader_rank}'s "
+                f"HiCache cannot reopen node memfd owner rank {owner_rank}'s "
                 f"shared host buffer at {path}: {exc}. Ranks on one node must have "
-                "permission and /proc visibility to the same leader descriptor."
+                "permission and /proc visibility to the same owner descriptor."
             ) from exc
 
 
@@ -400,5 +411,143 @@ def maybe_create_node_leader_context(
         node_ranks,
         "follower" if is_follower else "leader",
         context.capacity_multiplier,
+    )
+    return context
+
+
+# ===== KDA/Mamba node aggregation =====
+
+
+class _NodeShardedBuffer(msgspec.Struct, frozen=True):
+    full: torch.Tensor
+    own: torch.Tensor
+    stride_bytes: int
+
+
+class NodeShardedHostTensorAllocator(HostTensorAllocator):
+    """One node memfd per allocation laid out ``[rank0 | rank1 | ...]``; each
+    rank gets a view of its own share."""
+
+    def __init__(
+        self,
+        *,
+        node_ranks: list[int],
+        tp_cache_group: torch.distributed.ProcessGroup,
+    ):
+        super().__init__()
+        self.node_ranks = node_ranks
+        self.tp_cache_group = tp_cache_group
+        self.node_rank = node_ranks.index(torch.distributed.get_rank())
+        # Maps and prefaults the whole node buffer; node rank 0 creates it.
+        self._mapper = NodeSharedHostTensorAllocator(
+            node_ranks=node_ranks, tp_cache_group=tp_cache_group
+        )
+        self._buffers: list[_NodeShardedBuffer] = []
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        """Collective over tp_cache_group;
+        every rank calls it once per buffer, in the same order."""
+        self.dims = dims
+        self.dtype = dtype
+        nbytes = math.prod(dims) * dtype.itemsize
+        # Equal page-aligned shares coincide with map_shm's per-rank prefault
+        # split, so each rank faults exactly its own share. Ranks with different
+        # dims map a different total and fail map_shm's size check.
+        stride = -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
+        full = self._mapper.allocate(
+            (len(self.node_ranks) * stride,), torch.uint8, device
+        )
+        start = self.node_rank * stride
+        own = full[start : start + nbytes].view(dtype).view(dims)
+        self._buffers.append(
+            _NodeShardedBuffer(full=full, own=own, stride_bytes=stride)
+        )
+        return own
+
+    def full_buffers(self) -> list[torch.Tensor]:
+        return [buffer.full for buffer in self._buffers]
+
+    def peer_base_ptrs(self, own_tensor: torch.Tensor) -> list[int]:
+        """Base address of every rank's share of ``own_tensor``'s buffer,
+        in node-rank order, in this process's address space."""
+        ptr = own_tensor.data_ptr()
+        for buffer in self._buffers:
+            if buffer.own.data_ptr() == ptr:
+                base = buffer.full.data_ptr()
+                return [
+                    base + rank * buffer.stride_bytes
+                    for rank in range(len(self.node_ranks))
+                ]
+        raise ValueError("Tensor was not allocated by this node-sharded allocator.")
+
+
+# Node rank 0 already does the MLA per-node L3 IO and is the MLA storage writer.
+# maybe_create_kda_node_aggregate_context only activates with >= 2 ranks per node.
+KDA_L3_LEADER_NODE_RANK = 1
+
+
+class KDANodeAggregateContext(msgspec.Struct, frozen=True):
+    node_rank: int
+    node_size: int
+    node_index: int
+    num_nodes: int
+    # One Gloo group per storage thread so their collectives never interleave.
+    backup_group: torch.distributed.ProcessGroup
+    prefetch_group: torch.distributed.ProcessGroup
+    allocator: NodeShardedHostTensorAllocator
+
+    @property
+    def is_leader(self) -> bool:
+        return self.node_rank == KDA_L3_LEADER_NODE_RANK
+
+
+def maybe_create_kda_node_aggregate_context(
+    *, tp_cache_group: torch.distributed.ProcessGroup
+) -> Optional[KDANodeAggregateContext]:
+    """Call on every WORLD rank before Mamba host allocation;
+    it runs WORLD collectives when enabled."""
+    if not get_memory().enable_kda_hicache_node_aggregate:
+        return None
+    group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+    node_groups = split_ranks_by_node(group_ranks, ranks_per_host())
+    rank = torch.distributed.get_rank()
+    node_index, node_ranks = next(
+        (index, sorted(ranks))
+        for index, ranks in enumerate(node_groups)
+        if rank in ranks
+    )
+    # WORLD-collective: every rank must join before any rank returns.
+    backup_group = create_custom_parallel_group(group_ranks=node_ranks, backend="gloo")
+    prefetch_group = create_custom_parallel_group(
+        group_ranks=node_ranks, backend="gloo"
+    )
+    if min(len(ranks) for ranks in node_groups) <= 1:
+        # Every rank returns here together, so each drops only its own handles.
+        torch.distributed.destroy_process_group(prefetch_group)
+        torch.distributed.destroy_process_group(backup_group)
+        logger.info(
+            "KDA HiCache node aggregation inactive: "
+            "the smallest node in this cache group has one rank."
+        )
+        return None
+    context = KDANodeAggregateContext(
+        node_rank=node_ranks.index(rank),
+        node_size=len(node_ranks),
+        node_index=node_index,
+        num_nodes=len(node_groups),
+        backup_group=backup_group,
+        prefetch_group=prefetch_group,
+        allocator=NodeShardedHostTensorAllocator(
+            node_ranks=node_ranks, tp_cache_group=tp_cache_group
+        ),
+    )
+    logger.info(
+        "KDA HiCache node aggregation enabled: node_ranks=%s, leader=%d, role=%s, "
+        "node %d/%d",
+        node_ranks,
+        node_ranks[KDA_L3_LEADER_NODE_RANK],
+        "leader" if context.is_leader else "follower",
+        node_index,
+        len(node_groups),
     )
     return context

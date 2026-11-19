@@ -693,6 +693,22 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
             }
         return self._backend.batch_set_v2(transfers, extra_info)
 
+    def batch_io_node_aggregated_mamba(
+        self,
+        transfer: PoolTransfer,
+        node_slots_per_page: List[List[int]],
+        *,
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_io_node_aggregated_mamba"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(transfer.keys)
+        return self._backend.batch_io_node_aggregated_mamba(
+            transfer, node_slots_per_page, is_set=is_set, extra_info=extra_info
+        )
+
     def batch_get_v1(
         self,
         keys: List[str],

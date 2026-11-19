@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import numpy as np
 import torch
@@ -20,6 +20,9 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.mla_host_node_leader import KDANodeAggregateContext
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -79,6 +82,8 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    # Set when the buffers are node-shared shares (--enable-kda-hicache-node-aggregate).
+    node_aggregate: Optional[KDANodeAggregateContext] = None
 
     def __init__(
         self,
@@ -92,6 +97,7 @@ class MambaPoolHost(HostKVCache):
         allocator_type: str = "default",
         layout: str = "layer_first",
         mtp_draft_buffer_infos: Sequence[MambaStateBufferInfo] = (),
+        node_aggregate: Optional[KDANodeAggregateContext] = None,
     ):
         buffer_info.validate()
         self.buffer_info = buffer_info
@@ -117,7 +123,12 @@ class MambaPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.node_aggregate = node_aggregate
+        self.allocator = (
+            get_allocator_from_storage(allocator_type)
+            if node_aggregate is None
+            else node_aggregate.allocator
+        )
         self.num_mamba_layers = buffer_info.temporal.shape[0] + len(
             self.mtp_draft_buffer_infos
         )
@@ -161,6 +172,11 @@ class MambaPoolHost(HostKVCache):
             buf for info in buffer_infos for buf in info.extra_checkpoint_buffers
         ]
         self.slot_state_buffers = []
+        if node_aggregate is not None and self.slot_state_device_tensors:
+            raise ValueError(
+                "--enable-kda-hicache-node-aggregate does not carry registered "
+                "slot side states."
+            )
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
@@ -971,6 +987,42 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+        return ptr_list, element_size_list
+
+    def get_node_page_buffer_meta(
+        self, node_slots: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Buffers of one checkpoint across the node, for one storage object.
+
+        ``node_slots`` holds each node rank's host slot, in node-rank order;
+        pointers are in this (leader) process's view of the shared buffers.
+        """
+        assert self.layout in ["page_first", "page_first_direct"], self.layout
+        allocator = self.node_aggregate.allocator
+        # Same component order as get_page_buffer_meta, repeated per rank.
+        components = []
+        if self.temporal_state_elem_size > 0:
+            components.append(
+                (
+                    allocator.peer_base_ptrs(self.temporal_buffer),
+                    self.num_mamba_layers
+                    * self.temporal_state_elem_size
+                    * self.temporal_dtype.itemsize,
+                )
+            )
+        for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
+            components.append(
+                (
+                    allocator.peer_base_ptrs(buf),
+                    self.num_mamba_layers * elem_size * self.conv_dtype.itemsize,
+                )
+            )
+        ptr_list = []
+        element_size_list = []
+        for node_rank, slot in enumerate(node_slots):
+            for peer_bases, slot_bytes in components:
+                ptr_list.append(peer_bases[node_rank] + slot * slot_bytes)
+                element_size_list.append(slot_bytes)
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
