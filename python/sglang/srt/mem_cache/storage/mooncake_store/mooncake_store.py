@@ -1633,6 +1633,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
+            # SGLANG_KDA_L3_STATS: one object per page on this path.
+            self._record_kda_put_outcomes(transfer.keys, exist_result, io_results, 1)
         return [res == 0 for res in io_results]
 
     def _pools_page_exists(
