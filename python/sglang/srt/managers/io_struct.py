@@ -1649,6 +1649,8 @@ class RequestOutputStats(
     video_tokens: int
     # None when metrics are off, for embedding, or when the request's own are off.
     time_stats: Optional[SchedulerOutputTimeStats]
+    # Appended to preserve existing array-like IPC field positions.
+    prefill_cached_tokens: Optional[int] = None
 
 
 def flat_top_logprobs_layout(

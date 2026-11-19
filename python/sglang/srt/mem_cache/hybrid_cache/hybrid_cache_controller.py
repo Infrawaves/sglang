@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from array import array
@@ -11,6 +13,7 @@ from enum import Enum, auto
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import psutil
 import torch
 
 from sglang.srt.managers.cache_controller import (
@@ -30,6 +33,7 @@ from sglang.srt.managers.cache_controller import (
     check_dcp_l3_extra_pool,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache import kda_l3_stats
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_draft_node_merge import (
     DraftNodeMerge,
@@ -53,6 +57,7 @@ from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPoo
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_page_group import batch_spans
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -63,7 +68,10 @@ from sglang.srt.observability.trace import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
+    from sglang.srt.mem_cache.mla_host_node_leader import (
+        KDANodeAggregateContext,
+        NodeLeaderMLABroadcast,
+    )
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -190,9 +198,7 @@ def _trailing_chain_groups(
         (
             HiCacheStorageExtraInfo(
                 prefix_keys=(
-                    None
-                    if prefix_keys is None
-                    else prefix_keys + span_hashes[:covered]
+                    None if prefix_keys is None else prefix_keys + span_hashes[:covered]
                 ),
                 extra_info=extra_info,
                 start_page=start_page + covered,
@@ -272,6 +278,7 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        self.agreed_restorable_pages: Optional[list[int]] = None
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
         # Observability only, all on the IO / prefetch threads' monotonic clock:
@@ -350,8 +357,22 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
     return extra_info
 
 
+# (host slot, key fingerprint) a node rank sends when it has no checkpoint.
+_NODE_SKIP_TICKET = (-1, 0)
+
+
+def _find_pool_transfer(
+    transfers: list[PoolTransfer], name: PoolName
+) -> Optional[PoolTransfer]:
+    return next((t for t in transfers if t.name == name), None)
+
+
 class HybridCacheController(BaseHiCacheController):
     is_kv_sharded: bool = False
+    # Class default so controllers built without __init__ keep per-rank Mamba IO.
+    kda_node_aggregate: Optional[KDANodeAggregateContext] = None
+    # SGLANG_KDA_L3_STATS, read once at import: log each L3 Mamba hit query.
+    _kda_l3_stats_enabled: bool = kda_l3_stats.enabled()
 
     def _register_thread_trace_info(self, thread_label: str) -> None:
         """Register the storage thread's caller and rank attribution."""
@@ -407,6 +428,14 @@ class HybridCacheController(BaseHiCacheController):
             and anchor_host_pool.host_buffer_read_only
         )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        # Set before the storage attach below, which registers the Mamba pool.
+        mamba_entry = getattr(mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
+        self.kda_node_aggregate = getattr(
+            getattr(mamba_entry, "host_pool", None), "node_aggregate", None
+        )
+        if self._kda_l3_stats_enabled:
+            # Only node leaders put KDA objects, so they log the writes.
+            kda_l3_stats.configure_node_aggregate(self.kda_node_aggregate)
         # Set when the DRAFT sidecar registers a node-shared host pool.
         self.draft_node_merge: Optional[DraftNodeMerge] = None
         self.pp_prefetch_command_group = None
@@ -415,6 +444,10 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
         self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
+        if node_leader_broadcast is not None:
+            node_leader_broadcast.device_translate = (
+                mem_pool_host.anchor_entry.device_translate
+            )
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -1037,9 +1070,25 @@ class HybridCacheController(BaseHiCacheController):
         else:
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
-        if alloc_len >= min_tokens:
+        alloc_len = self._floor_to_restorable(operation, alloc_len)
+        if alloc_len > 0 and alloc_len >= min_tokens:
             host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
         return host_indices, alloc_len
+
+    def _floor_to_restorable(self, operation: StorageOperation, alloc_len: int) -> int:
+        if self.storage_page_group == 1 or not isinstance(operation, PrefetchOperation):
+            return alloc_len
+        pages = operation.agreed_restorable_pages
+        if pages is None:
+            return alloc_len
+        # The agreed endpoints are relative to the original query, before any
+        # device-resident head is trimmed from the host transfer.
+        offset = operation.prefetch_kv_page_offset
+        limit = offset + alloc_len // self.page_size
+        return (
+            max((p - offset for p in pages if offset < p <= limit), default=0)
+            * self.page_size
+        )
 
     def free_prefetch_host_buffers(
         self, operation: StorageOperation, host_indices: torch.Tensor
@@ -1122,6 +1171,11 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 continue
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            if entry.host_pool.host_buffer_read_only:
+                # A node-shared side pool (the DSA indexer under per-node MLA):
+                # the leader owns the host copy and its broadcast restores the
+                # device rows, like the anchor above.
+                continue
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
@@ -1724,14 +1778,14 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
-        if any(
+        if self.storage_page_group > 1 or any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
         ):
             # A trailing state can exist at 512 and 1024 but not at 768. Taking
-            # MIN of each rank's longest hit would choose a missing checkpoint,
-            # so reduce one restorable flag per prefix length instead. Use the
-            # request span (identical on every rank) for the collective shape,
+            # MIN of the longest hits can land inside a grouped object or at
+            # a missing checkpoint. Reduce one flag per restorable prefix.
+            # Use the request span (identical on every rank) for the shape,
             # including when one rank skipped its query due to cancellation.
             hits = [0] * (len(operation.token_ids) // self.page_size + 1)
             hits[0] = 1
@@ -1754,9 +1808,7 @@ class HybridCacheController(BaseHiCacheController):
         # The flag is read once at init, so every rank packs the same shape.
         spread = [-storage_hit_count] if self.enable_diagnostic_metrics else []
         packed = torch.tensor(
-            hits
-            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            + spread,
+            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools] + spread,
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1765,7 +1817,16 @@ class HybridCacheController(BaseHiCacheController):
             self.prefetch_hits_sync_groups,
         )
         reduced = packed.tolist()
-        storage_hit_count = int(reduced[0])
+        if len(hits) == 1:
+            operation.agreed_restorable_pages = None
+            storage_hit_count = int(reduced[0])
+        else:
+            operation.agreed_restorable_pages = [
+                i for i, ok in enumerate(reduced[: len(hits)]) if ok and i > 0
+            ]
+            storage_hit_count = (
+                max(operation.agreed_restorable_pages, default=0) * self.page_size
+            )
         if storage_hit_count == 0:
             # A miss is never sent to the transfer worker, so finish its span here.
             _finish_op_trace(operation)
@@ -1779,10 +1840,12 @@ class HybridCacheController(BaseHiCacheController):
         if spread:
             # Cross-rank spread of the raw storage hit (observability only).
             operation.query_rank_spread = -reduced[-1] - storage_hit_count
-        if len(hits) == 1:
-            return storage_hit_count
-        restorable = reduced[: len(hits)]
-        return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+        if self._kda_l3_stats_enabled and any(
+            transfer.name == PoolName.MAMBA
+            for transfer in operation.pool_transfers or []
+        ):
+            kda_l3_stats.log_hit_query(operation, storage_hit_count, self.page_size)
+        return storage_hit_count
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1890,10 +1953,15 @@ class HybridCacheController(BaseHiCacheController):
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
         trace_extra = _storage_trace_extra(operation, include_request_id=True)
-        extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=extra_info.prefix_keys,
-            extra_info=trace_extra or None,
-        )
+        extra_info = replace(extra_info, extra_info=trace_extra or None)
+        # A node-shared side pool is read into by the node leader only, like the
+        # MLA anchor (_page_get_shared_by_leader); the cache-group MIN takes its
+        # hits.
+        kv_derived_transfers = [
+            transfer
+            for transfer in kv_derived_transfers
+            if not self._is_read_only_host_pool(transfer.name)
+        ]
         return super()._page_transfer_kv_batch(
             operation,
             batch_hashes,
@@ -1901,6 +1969,10 @@ class HybridCacheController(BaseHiCacheController):
             extra_info,
             kv_derived_transfers,
         )
+
+    def _is_read_only_host_pool(self, name: PoolName) -> bool:
+        entry = self.mem_pool_host.entry_map.get(name)
+        return entry is not None and entry.host_pool.host_buffer_read_only
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
@@ -1934,25 +2006,46 @@ class HybridCacheController(BaseHiCacheController):
             operation.skip_reason = "terminated"
         elif kv_completed_pages != len(operation.hash_value):
             operation.skip_reason = "kv_short"
-        if operation.skip_reason is None:
-            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
-            # Only handle non-KV-derived sidecar pools here.
-            transfers_nonkv = [
-                transfer
-                for transfer in operation.pool_transfers
-                if transfer.indices_from_pool != PoolName.KV
-            ]
-            sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
-            sidecar_hit_pages = (
-                operation.sidecar_hit_pages
-                if operation.sidecar_hash_values is not None
-                else kv_completed_pages
-            )
-            self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            operation.sidecar_ts = time.monotonic()
+        node = self.kda_node_aggregate
+        exchanged = False
+        transfers_nonkv = []
+        sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
+        results = {}
+        try:
+            if operation.skip_reason is None:
+                # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
+                # Only handle non-KV-derived sidecar pools here.
+                transfers_nonkv = [
+                    transfer
+                    for transfer in operation.pool_transfers
+                    if transfer.indices_from_pool != PoolName.KV
+                ]
+                sidecar_hit_pages = (
+                    operation.sidecar_hit_pages
+                    if operation.sidecar_hash_values is not None
+                    else kv_completed_pages
+                )
+                self._sync_trailing_keys(
+                    transfers_nonkv, sidecar_hashes, sidecar_hit_pages
+                )
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+                operation.sidecar_ts = time.monotonic()
+            local_skip = operation.skip_reason is not None
+            if node is not None:
+                mamba = _find_pool_transfer(transfers_nonkv, PoolName.MAMBA)
+                ticket = self._node_mamba_ticket(mamba)
+                exchanged = True
+                slots = self._exchange_node_slots(node.prefetch_group, ticket)
+                transfers_nonkv = self._get_node_aggregated_mamba(
+                    operation, mamba, slots, transfers_nonkv, results
+                )
+        finally:
+            if node is not None and not exchanged:
+                # A failed preparation still joins the exchange as a skip, so
+                # node-rank collectives stay in step.
+                self._exchange_node_slots(node.prefetch_group, _NODE_SKIP_TICKET)
+        if not local_skip:
             try:
-                results = {}
                 for extra_info, transfers in _trailing_chain_groups(
                     operation.prefix_keys,
                     sidecar_hashes,
@@ -1979,6 +2072,150 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return pool_hits
 
+    _warned_node_mamba_shape = False
+    # Set once the launcher has been asked to stop the server (see below).
+    _node_out_of_step = False
+
+    @classmethod
+    def _node_mamba_ticket(cls, transfer: Optional[PoolTransfer]) -> tuple[int, int]:
+        """(host slot, key fingerprint) of this rank's checkpoint; slot -1 skips."""
+        if transfer is None or not transfer.keys:
+            return _NODE_SKIP_TICKET
+        if (
+            len(transfer.keys) != 1
+            or transfer.host_indices is None
+            or transfer.host_indices.numel() != 1
+        ):
+            # One checkpoint per op; anything else makes the node skip together.
+            if not cls._warned_node_mamba_shape:
+                cls._warned_node_mamba_shape = True
+                logger.warning(
+                    "KDA node aggregation skips a Mamba transfer with %d keys and "
+                    "%s host slots; only one checkpoint per op is supported.",
+                    len(transfer.keys),
+                    None
+                    if transfer.host_indices is None
+                    else transfer.host_indices.numel(),
+                )
+            return _NODE_SKIP_TICKET
+        digest = hashlib.blake2b(transfer.keys[0].encode(), digest_size=8).digest()
+        return (
+            int(transfer.host_indices.item()),
+            int.from_bytes(digest, "little", signed=True),
+        )
+
+    @classmethod
+    def _exchange_node_slots(
+        cls, group: torch.distributed.ProcessGroup, ticket: tuple[int, int]
+    ) -> Optional[list[int]]:
+        """Every node rank's host slot for this op in node-rank order, or None when
+        a rank skips or the ranks name different checkpoints.
+
+        Collective over ``group``: every node rank calls it exactly once per op."""
+        gathered = [
+            torch.empty(2, dtype=torch.int64)
+            for _ in range(torch.distributed.get_world_size(group=group))
+        ]
+        torch.distributed.all_gather(
+            gathered, torch.tensor(ticket, dtype=torch.int64), group=group
+        )
+        tickets = [tuple(value.tolist()) for value in gathered]
+        if any(slot < 0 for slot, _ in tickets):
+            return None
+        if any(fingerprint != ticket[1] for _, fingerprint in tickets):
+            # Writing under this key would mix other requests' state into it.
+            # Once out of step every later op mismatches too, and nothing in
+            # the storage threads can realign the node, so stop the server.
+            if not cls._node_out_of_step:
+                cls._node_out_of_step = True
+                logger.error(
+                    "KDA node aggregation: node ranks disagree on the checkpoint "
+                    "key (fingerprints %s); node-rank collectives are out of "
+                    "step. Stopping the server.",
+                    [fingerprint for _, fingerprint in tickets],
+                )
+                # Same path as a scheduler crash: the launcher kills the tree.
+                psutil.Process().parent().send_signal(signal.SIGQUIT)
+            return None
+        return [slot for slot, _ in tickets]
+
+    @staticmethod
+    def _min_reduce_flag(group: torch.distributed.ProcessGroup, flag: bool) -> bool:
+        packed = torch.tensor([int(flag)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            packed, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        return bool(packed.item())
+
+    def _get_node_aggregated_mamba(
+        self,
+        operation: PrefetchOperation,
+        mamba: Optional[PoolTransfer],
+        slots: Optional[list[int]],
+        transfers: list[PoolTransfer],
+        results: dict,
+    ) -> list[PoolTransfer]:
+        """Fill ``results`` for MAMBA from the node object; return the other
+        transfers. ``slots`` comes from this op's prefetch exchange."""
+        if mamba is None:
+            return transfers
+        num_keys = len(mamba.keys)
+        if slots is None:
+            operation.skip_reason = operation.skip_reason or "node_peer_skip"
+            ok = [False] * num_keys
+        elif not self.kda_node_aggregate.is_leader:
+            # Placeholder: the pool_hits MIN in _reduce_prefetch_ack takes the
+            # leader's result. That MIN also keeps this rank's host slot alive
+            # until the leader's read into it is done: the completed_req ACK
+            # queues behind the pool_hits ACK, and the MIN waits for the leader's
+            # ACK, sent after its read. Never release or reuse the slot earlier.
+            ok = [True] * num_keys
+        else:
+            # No collective follows, so an IO error can propagate: the caller
+            # reports no sidecar hits and every rank still sends its ACK.
+            ok = self.storage_backend.batch_io_node_aggregated_mamba(
+                mamba,
+                [slots],
+                is_set=False,
+                extra_info=HiCacheStorageExtraInfo(
+                    extra_info=_storage_trace_extra(operation, include_request_id=True)
+                    or None
+                ),
+            )
+        results[PoolName.MAMBA] = ok
+        return [t for t in transfers if t is not mamba]
+
+    def _set_node_aggregated_mamba(
+        self,
+        operation: StorageOperation,
+        mamba: Optional[PoolTransfer],
+        slots: Optional[list[int]],
+    ) -> bool:
+        """This rank's input to the node MIN for one backup op: the leader's
+        write result, a placeholder True on followers, False on a skip."""
+        if slots is None:
+            return False
+        if not self.kda_node_aggregate.is_leader:
+            return True
+        try:
+            return all(
+                self.storage_backend.batch_io_node_aggregated_mamba(
+                    mamba,
+                    [slots],
+                    is_set=True,
+                    extra_info=HiCacheStorageExtraInfo(
+                        extra_info=_storage_trace_extra(
+                            operation, include_request_id=False
+                        )
+                        or None
+                    ),
+                )
+            )
+        except Exception:
+            # Caught so this rank's other sidecar writes still run.
+            logger.exception("Node-aggregated KDA L3 write failed.")
+            return False
+
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;
         trailing sidecars keep the untrimmed hit endpoint."""
@@ -2004,15 +2241,21 @@ class HybridCacheController(BaseHiCacheController):
     def _page_backup_kv_with_trace(self, operation):
         """Write the main KV pool with hybrid RPC context."""
         prefix_keys = operation.prefix_keys
-        for start in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[start : start + STORAGE_BATCH_SIZE]
+        for start, batch_end in batch_spans(
+            operation.start_page,
+            len(operation.hash_value),
+            self.storage_page_group,
+            STORAGE_BATCH_SIZE,
+        ):
+            batch_hashes = operation.hash_value[start:batch_end]
             batch_host_indices = operation.host_indices[
-                start * self.page_size : (start + len(batch_hashes)) * self.page_size
+                start * self.page_size : batch_end * self.page_size
             ]
             trace_extra = _storage_trace_extra(operation, include_request_id=False)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
                 extra_info=trace_extra or None,
+                start_page=operation.start_page + start,
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
@@ -2043,30 +2286,64 @@ class HybridCacheController(BaseHiCacheController):
         if needs_backup:
             _init_op_trace(operation, rid=operation.id, role="Backup")
 
+        node = self.kda_node_aggregate
+        mamba = None
+        mamba_ok = False
+        exchanged = synced = False
+        results = {}
+        try:
+            if backup_transfers:
+                self._resolve_sidecar_kv_derived_pool_transfers(operation)
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            storage_transfers = backup_transfers
+            if node is not None:
+                # Runs on every op, with or without Mamba: peers wait on it.
+                mamba = _find_pool_transfer(backup_transfers, PoolName.MAMBA)
+                ticket = self._node_mamba_ticket(mamba)
+                exchanged = True
+                slots = self._exchange_node_slots(node.backup_group, ticket)
+                synced = True
+                mamba_ok = self._set_node_aggregated_mamba(operation, mamba, slots)
+                storage_transfers = [t for t in backup_transfers if t is not mamba]
+            if backup_transfers:
+                # Sidecar backup also carries caller + trace ids so its mooncake
+                # spans correlate to the backup root; no request_id (per-node).
+                for extra_info, transfers in _trailing_chain_groups(
+                    operation.prefix_keys,
+                    operation.hash_value,
+                    storage_transfers,
+                    extra_info=_storage_trace_extra(operation, include_request_id=False)
+                    or None,
+                    start_page=operation.start_page,
+                    grouped=self.storage_page_group > 1,
+                ):
+                    results.update(
+                        self.storage_backend.batch_set_v2(
+                            transfers, extra_info=extra_info
+                        )
+                    )
+            if not self.backup_skip:
+                self._page_backup_kv_with_trace(operation)
+        finally:
+            if node is not None:
+                if not exchanged:
+                    # A failed preparation still joins the exchange as a skip.
+                    self._exchange_node_slots(node.backup_group, _NODE_SKIP_TICKET)
+                    synced = True
+                # Skipped when the exchange itself raised: the group is broken
+                # and the MIN would only wait out another timeout.
+                if synced:
+                    # After the KV write, so TP0's MLA write overlaps the
+                    # leader's KDA write. One flag per op whatever this rank
+                    # holds, so every rank reduces alike.
+                    mamba_ok = self._min_reduce_flag(node.backup_group, mamba_ok)
+        if mamba is not None:
+            results[PoolName.MAMBA] = [mamba_ok] * len(mamba.keys or [])
         if backup_transfers:
-            self._resolve_sidecar_kv_derived_pool_transfers(operation)
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            # Sidecar backup also carries caller + trace ids so its mooncake
-            # spans correlate to the backup root; no request_id (per-node).
-            results = {}
-            for extra_info, transfers in _trailing_chain_groups(
-                operation.prefix_keys,
-                operation.hash_value,
-                backup_transfers,
-                extra_info=_storage_trace_extra(operation, include_request_id=False)
-                or None,
-                start_page=operation.start_page,
-                grouped=self.storage_page_group > 1,
-            ):
-                results.update(
-                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
-                )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
-            self._page_backup_kv_with_trace(operation)
-        else:
+        if self.backup_skip:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:
                 for transfer in backup_transfers:
@@ -2099,6 +2376,10 @@ class HybridCacheController(BaseHiCacheController):
             and self.storage_backend_type == "mooncake"
         ):
             return self.draft_node_merge.is_leader
+        if self._is_read_only_host_pool(transfer.name):
+            # No host copy on this rank. TP0 is the first node's leader, so this
+            # never drops the cache group's writer.
+            return False
         if not self.backup_skip:
             return True
 

@@ -923,6 +923,10 @@ class HiCacheController:
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
             storage_page_group=self.storage_page_group,
+            # getattr: older stubs of the memory config predate this flag.
+            storage_bundle_pools=getattr(
+                get_memory(), "hicache_storage_bundle_pools", False
+            ),
         )
 
     def _build_unified_plan(

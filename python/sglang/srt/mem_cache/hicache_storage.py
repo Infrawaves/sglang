@@ -57,6 +57,8 @@ class HiCacheStorageConfig:
 
     # HiCache pages per L3 object for the KV and draft pools (see storage_page_group).
     storage_page_group: int = 1
+    # Store eligible KV-derived pools inside the KV object (--hicache-storage-bundle-pools).
+    storage_bundle_pools: bool = False
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -708,6 +710,22 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 for transfer in transfers
             }
         return self._backend.batch_set_v2(transfers, extra_info)
+
+    def batch_io_node_aggregated_mamba(
+        self,
+        transfer: PoolTransfer,
+        node_slots_per_page: List[List[int]],
+        *,
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_io_node_aggregated_mamba"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(transfer.keys)
+        return self._backend.batch_io_node_aggregated_mamba(
+            transfer, node_slots_per_page, is_set=is_set, extra_info=extra_info
+        )
 
     def batch_get_v1(
         self,

@@ -16,6 +16,7 @@ import logging
 import math
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from http import HTTPStatus
@@ -1005,6 +1006,38 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
 
+def _release_preprocess_cache(*, threshold_bytes: int) -> None:
+    if not torch.cuda.is_initialized():
+        return
+    stats = torch.cuda.memory_stats()
+    reserved = stats["reserved_bytes.all.current"]
+    # Free blocks in a segment that still holds a live block cannot be released.
+    releasable = (
+        reserved
+        - stats["allocated_bytes.all.current"]
+        - stats["inactive_split_bytes.all.current"]
+    )
+    # A smaller leftover stays cached for the next request instead of paying
+    # cudaFree and cudaMalloc again.
+    if releasable <= threshold_bytes:
+        return
+    # The caching allocator keeps freed preprocessing memory reserved; the
+    # scheduler sharing this GPU can only use it once it is back with the driver.
+    start = time.perf_counter()
+    torch.cuda.empty_cache()
+    # Wall time of the caller's stall: cudaFree also waits for this process's
+    # pending GPU work.
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    remaining = torch.cuda.memory_reserved()
+    logger.info(
+        "Kimi-K3 preprocess: released %.2f GiB of cached GPU memory in %.1f ms, "
+        "%.2f GiB still reserved",
+        (reserved - remaining) / 2**30,
+        elapsed_ms,
+        remaining / 2**30,
+    )
+
+
 class KimiK3ImageProcessor(
     KimiGridMMDataMixin,
     MediaArtifactCacheMixin,
@@ -1068,6 +1101,9 @@ class KimiK3ImageProcessor(
         self.media_proc_cfg = _apply_k3_video_config_overrides(
             dict(_processor.media_processor.media_proc_cfg)
         )
+        self._preprocess_release_threshold_bytes = (
+            envs.SGLANG_K3_PREPROCESS_RELEASE_THRESHOLD_MB.get() * 1024 * 1024
+        )
 
         # "auto" GPU budget, shared by every request this tokenizer worker is
         # preprocessing. Workers in other tokenizer processes share the same
@@ -1088,9 +1124,15 @@ class KimiK3ImageProcessor(
             # may now land on either; see artifact_feature_hash_is_backend_stable.
             self.artifact_feature_hash_is_backend_stable = False
 
+        chunk_override = envs.SGLANG_MM_PREPROCESS_CHUNK_MB.get()
+        chunk_mb = (
+            self.mm_preprocess_chunk_mb if chunk_override is None else chunk_override
+        )
         logger.info(
             "Kimi-K3 image preprocessing mode=%s (jpeg_decode=%s, "
-            "gpu_budget=%s, feature_transport=%s, processor_workers=%d, "
+            "gpu_budget=%s, configured_gpu_budget_mib=%d, tokenizer_workers=%d, "
+            "chunk_budget_mib=%d, chunking_enabled=%s, detailed_logging=%s, "
+            "feature_transport=%s, processor_workers=%d, "
             "io_workers=%d, preprocess_cache=%s). Video always preprocesses "
             "on the GPU.",
             self._image_preprocess_mode,
@@ -1100,6 +1142,11 @@ class KimiK3ImageProcessor(
                 if self._gpu_preprocess_budget_bytes is None
                 else f"{self._gpu_preprocess_budget_bytes / 2**20:.0f}MiB"
             ),
+            budget_mb,
+            worker_num,
+            chunk_mb,
+            chunk_mb > 0,
+            self._log_preprocess_backend,
             self.mm_feature_transport,
             self.mm_processor_worker_num,
             self.mm_io_worker_num,
@@ -1239,7 +1286,9 @@ class KimiK3ImageProcessor(
             )
         return modalities
 
-    def _reserve_gpu_preprocess(self, images) -> tuple[Optional[bool], int]:
+    def _reserve_gpu_preprocess(
+        self, images, *, batch_id: str = "uncached"
+    ) -> tuple[Optional[bool], int]:
         """Pick this batch's backend under the "auto" GPU budget.
 
         Returns ``(use_gpu, reserved_bytes)``. ``use_gpu`` is None when no
@@ -1249,35 +1298,81 @@ class KimiK3ImageProcessor(
         tensor keeps the GPU, since the CPU processor never received tensors
         before this switch existed. The caller must release ``reserved_bytes``.
         """
-        if self._gpu_preprocess_budget_bytes is None or not images:
-            return None, 0
-        if any(isinstance(image, torch.Tensor) for image in images):
-            return True, 0
         budget = self._gpu_preprocess_budget_bytes
-        estimate = _estimate_gpu_preprocess_bytes(
-            images, self._processor.preprocess_config
+        bypass = budget is None or not images
+        has_tensor = any(isinstance(image, torch.Tensor) for image in images)
+        if not self._log_preprocess_backend:
+            if bypass:
+                return None, 0
+            if has_tensor:
+                return True, 0
+        estimate = (
+            _estimate_gpu_preprocess_bytes(images, self._processor.preprocess_config)
+            if self._log_preprocess_backend or (not bypass and not has_tensor)
+            else 0
         )
         with self._gpu_preprocess_lock:
             inflight = self._gpu_preprocess_inflight_bytes
-            use_gpu = inflight + estimate <= budget
-            if use_gpu:
-                self._gpu_preprocess_inflight_bytes += estimate
+            if bypass:
+                use_gpu, reserved = None, 0
+                reason = "budget_disabled" if budget is None else "empty_batch"
+            elif has_tensor:
+                use_gpu, reserved = True, 0
+                reason = "already_decoded_tensor"
+            else:
+                use_gpu = inflight + estimate <= budget
+                reserved = estimate if use_gpu else 0
+                reason = "within_budget" if use_gpu else "budget_exceeded"
+            self._gpu_preprocess_inflight_bytes += reserved
+            remaining = (
+                budget - self._gpu_preprocess_inflight_bytes
+                if budget is not None
+                else None
+            )
+            inflight_after = self._gpu_preprocess_inflight_bytes
+        # Only a budget rejection represents lost GPU capacity. Empty batches,
+        # disabled budgets, and already-decoded tensors do not compete for it.
+        budget_lost = estimate if reason == "budget_exceeded" else 0
         if self._log_preprocess_backend:
             logger.info(
-                "Kimi-K3 preprocess budget: backend=%s items=%d "
-                "estimate=%.0fMiB inflight=%.0fMiB budget=%.0fMiB",
-                "gpu" if use_gpu else "cpu",
+                "Kimi-K3 preprocess budget: batch=%s mode=%s backend=%s reason=%s "
+                "items=%d estimate_mib=%.2f inflight_before_mib=%.2f "
+                "reserved_mib=%.2f budget_lost_mib=%.2f inflight_after_mib=%.2f "
+                "budget_mib=%s remaining_after_mib=%s "
+                "(logical reservation, not free device memory)",
+                batch_id,
+                self._image_preprocess_mode,
+                "gpu" if self._processor._use_gpu(images, use_gpu) else "cpu",
+                reason,
                 len(images),
                 estimate / 2**20,
                 inflight / 2**20,
-                budget / 2**20,
+                reserved / 2**20,
+                budget_lost / 2**20,
+                inflight_after / 2**20,
+                f"{budget / 2**20:.2f}" if budget is not None else "off",
+                f"{remaining / 2**20:.2f}" if remaining is not None else "off",
             )
-        return use_gpu, estimate if use_gpu else 0
+        return use_gpu, reserved
 
     def _release_gpu_preprocess(self, reserved_bytes: int) -> None:
         if reserved_bytes:
             with self._gpu_preprocess_lock:
                 self._gpu_preprocess_inflight_bytes -= reserved_bytes
+                inflight_after = self._gpu_preprocess_inflight_bytes
+            if self._log_preprocess_backend:
+                logger.info(
+                    "Kimi-K3 preprocess budget: released_mib=%.2f "
+                    "inflight_after_mib=%.2f budget_mib=%s "
+                    "(logical reservation returned)",
+                    reserved_bytes / 2**20,
+                    inflight_after / 2**20,
+                    (
+                        f"{self._gpu_preprocess_budget_bytes / 2**20:.2f}"
+                        if self._gpu_preprocess_budget_bytes is not None
+                        else "off"
+                    ),
+                )
 
     async def _decode_images_for_backend(self, images, use_gpu: Optional[bool]):
         """Decode any ``_K3EncodedImage`` on the IO pool with the chosen backend."""
@@ -1319,7 +1414,8 @@ class KimiK3ImageProcessor(
 
     async def _run_preprocess_and_build_artifact_batch(self, entries):
         use_gpu, reserved = self._reserve_gpu_preprocess(
-            [entry.media for entry in entries]
+            [entry.media for entry in entries],
+            batch_id=entries[0].artifact_key[:16] if entries else "empty",
         )
         try:
             decoded = await self._decode_images_for_backend(
@@ -1922,6 +2018,11 @@ class KimiK3ImageProcessor(
             self._resolve_visual_modalities(
                 request_obj, expected_image_count, len(video_data)
             )
+        # Features kept on the GPU until dispatch outlive their own request's
+        # release below; free them before this request's allocations pin them.
+        _release_preprocess_cache(
+            threshold_bytes=self._preprocess_release_threshold_bytes
+        )
         if (
             video_data
             or any(self._is_preprocessed_input(item) for item in image_data)
@@ -1929,16 +2030,21 @@ class KimiK3ImageProcessor(
         ):
             # 1. keep video, preprocessed inputs, and cache-off requests on the
             # uncached path. Image artifacts remain image-only.
-            return await self._process_mm_data_uncached(
+            output = await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )
-
-        # 2. resolve per-image artifacts before composing the current prompt
-        artifacts = await self.prepare_media_artifacts(
-            image_data,
-            content_hashes=request_obj.mm_content_hashes,
+        else:
+            # 2. resolve per-image artifacts before composing the current prompt
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=request_obj.mm_content_hashes,
+            )
+            output = self.compose_request(input_text, artifacts)
+        # Under CPU transport no GPU tensor of this request is alive any more.
+        _release_preprocess_cache(
+            threshold_bytes=self._preprocess_release_threshold_bytes
         )
-        return self.compose_request(input_text, artifacts)
+        return output
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)

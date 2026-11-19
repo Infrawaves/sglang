@@ -1,5 +1,6 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
+import signal
 import tempfile
 import threading
 import unittest
@@ -26,7 +27,12 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageFailureInjector,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -1208,6 +1214,266 @@ class TestPrefetchRankSpread(CustomTestCase):
         op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
         self.assertEqual(op.storage_hit_count, 128)
         self.assertFalse(hasattr(op, "query_rank_spread"))
+
+
+class _FakeNodeCollectives:
+    """Two node ranks: the test runs node rank 0, ``peer_ticket`` plays rank 1.
+    ``peer_ticket=None`` mirrors this rank's key with host slot 5."""
+
+    def __init__(self, peer_ticket=None, peer_flag=1, gather_error=None):
+        self.peer_ticket = peer_ticket
+        self.peer_flag = peer_flag
+        self.gather_error = gather_error
+        self.calls = []
+
+    def all_gather(self, out, tensor, group):
+        self.calls.append(("gather", group, tensor.tolist()))
+        if self.gather_error is not None:
+            raise self.gather_error
+        out[0].copy_(tensor)
+        peer = self.peer_ticket or [5, int(tensor[1])]
+        out[1].copy_(torch.tensor(peer, dtype=tensor.dtype))
+
+    def all_reduce(self, tensor, op, group):
+        self.calls.append(("min", group, tensor.tolist()))
+        tensor.fill_(min(int(tensor.item()), self.peer_flag))
+
+    def __enter__(self):
+        self._patches = [
+            patch("torch.distributed.all_gather", self.all_gather),
+            patch("torch.distributed.all_reduce", self.all_reduce),
+            patch("torch.distributed.get_world_size", return_value=2),
+        ]
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._patches:
+            p.stop()
+
+
+class TestKDANodeAggregatedRead(CustomTestCase):
+    def _setup(self, *, is_leader=True):
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.kda_node_aggregate = SimpleNamespace(
+            is_leader=is_leader, prefetch_group="pg"
+        )
+        ctrl.storage_backend = Mock()
+        ctrl.storage_backend.batch_get_v2.return_value = {}
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.return_value = [True]
+        ctrl.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=SimpleNamespace(page_size=1))
+            }
+        )
+        ctrl.storage_page_group = 1
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["__placeholder__"],
+            host_indices=torch.tensor([3]),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        operation = SimpleNamespace(
+            request_id="r",
+            is_terminated=lambda: False,
+            hash_value=["h0", "h1"],
+            skip_reason=None,
+            pool_transfers=[mamba],
+            prefix_keys=None,
+            sidecar_hash_values=None,
+            sidecar_hit_pages=0,
+            sidecar_ts=None,
+            start_page=0,
+            storage_plans=None,
+        )
+        return ctrl, operation
+
+    def test_leader_reads_one_object_with_every_rank_slot(self):
+        ctrl, operation = self._setup()
+        with _FakeNodeCollectives() as node:
+            pool_hits = ctrl._page_transfer_sidecar(operation, 2)
+        self.assertEqual(len(node.calls), 1)
+        args = ctrl.storage_backend.batch_io_node_aggregated_mamba.call_args
+        self.assertEqual(args.args[1], [[3, 5]])
+        self.assertEqual(pool_hits, {PoolName.MAMBA: 1})
+
+    def test_peer_skip_stops_leader_io_and_reports_no_mamba_hit(self):
+        """A peer without a slot cannot receive the leader's write into its
+        share, so the leader must not read the node object and the node must
+        report a Mamba miss instead of restoring stale state on that rank."""
+        ctrl, operation = self._setup()
+        with _FakeNodeCollectives(peer_ticket=[-1, 0]) as node:
+            pool_hits = ctrl._page_transfer_sidecar(operation, 2)
+        self.assertEqual(node.calls[0][2][0], 3)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        self.assertEqual(pool_hits, {PoolName.MAMBA: 0})
+        self.assertEqual(operation.skip_reason, "node_peer_skip")
+
+    def _out_of_step(self):
+        """Peer names another checkpoint; the launcher signal is captured."""
+        module = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        patches = [
+            patch(f"{module}.psutil.Process"),
+            patch.object(HybridCacheController, "_node_out_of_step", False),
+        ]
+        process = patches[0].start()
+        patches[1].start()
+        for p in patches:
+            self.addCleanup(p.stop)
+        return process.return_value.parent.return_value.send_signal
+
+    def test_ranks_naming_different_checkpoints_skip_and_stop_the_server(self):
+        """Out-of-step node collectives pair this op with a peer's other op;
+        the leader must not read one key into slots of different requests,
+        and the server must stop since nothing can realign the node."""
+        send_signal = self._out_of_step()
+        ctrl, operation = self._setup()
+        with (
+            _FakeNodeCollectives(peer_ticket=[5, 12345]),
+            self.assertLogs(level="ERROR"),
+        ):
+            pool_hits = ctrl._page_transfer_sidecar(operation, 2)
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        self.assertEqual(pool_hits, {PoolName.MAMBA: 0})
+        send_signal.assert_called_once_with(signal.SIGQUIT)
+
+    def test_out_of_step_node_signals_the_launcher_once(self):
+        """Every later op mismatches too until the tree is killed; it must
+        keep skipping without re-signalling or re-logging."""
+        send_signal = self._out_of_step()
+        ctrl, _ = self._setup()
+        with (
+            _FakeNodeCollectives(peer_ticket=[5, 12345]),
+            self.assertLogs(level="ERROR") as logs,
+        ):
+            for _ in range(3):
+                _, operation = self._setup()
+                self.assertEqual(
+                    ctrl._page_transfer_sidecar(operation, 2), {PoolName.MAMBA: 0}
+                )
+        self.assertEqual(len(logs.records), 1)
+        send_signal.assert_called_once_with(signal.SIGQUIT)
+
+    def test_locally_skipped_rank_still_joins_the_exchange(self):
+        """A rank whose KV read fell short must still run the exchange once,
+        or its node peers block in the collective forever."""
+        ctrl, operation = self._setup()
+        with _FakeNodeCollectives() as node:
+            pool_hits = ctrl._page_transfer_sidecar(operation, 1)
+        self.assertEqual([c[2] for c in node.calls], [[-1, 0]])
+        ctrl.storage_backend.batch_io_node_aggregated_mamba.assert_not_called()
+        ctrl.storage_backend.batch_get_v2.assert_not_called()
+        self.assertEqual(pool_hits, {})
+        self.assertEqual(operation.skip_reason, "kv_short")
+
+    def test_failed_preparation_still_joins_the_exchange_as_a_skip(self):
+        """An error before the exchange must not drop this rank's collective,
+        or every later op on the node pairs with the wrong peer op."""
+        ctrl, operation = self._setup()
+        with (
+            _FakeNodeCollectives() as node,
+            patch.object(
+                ctrl,
+                "_resolve_sidecar_nonkv_derived_pool_transfers",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                ctrl._page_transfer_sidecar(operation, 2)
+        self.assertEqual([c[2] for c in node.calls], [[-1, 0]])
+
+    def test_failed_ticket_still_joins_the_exchange_as_a_skip(self):
+        """Computing this rank's ticket happens before the collective, so its
+        failure must be covered by the skip exchange too."""
+        ctrl, operation = self._setup()
+        with (
+            _FakeNodeCollectives() as node,
+            patch.object(ctrl, "_node_mamba_ticket", side_effect=RuntimeError("t")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "t"):
+                ctrl._page_transfer_sidecar(operation, 2)
+        self.assertEqual([c[2] for c in node.calls], [[-1, 0]])
+
+
+class TestKDANodeAggregatedBackup(CustomTestCase):
+    def _setup(self):
+        """Node rank 0 = TP0: a KDA follower that also writes the MLA KV."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.kda_node_aggregate = SimpleNamespace(is_leader=False, backup_group="bg")
+        ctrl.storage_config = SimpleNamespace(is_storage_writer=True)
+        ctrl.storage_page_group = 1
+        ctrl.storage_backend = Mock()
+        ctrl.storage_backend.batch_set_v2.return_value = {}
+        ctrl.should_backup = lambda transfer: True
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA, keys=["h0"], host_indices=torch.tensor([3])
+        )
+        operation = SimpleNamespace(
+            id="b",
+            pool_transfers=[mamba],
+            prefix_keys=None,
+            hash_value=["h0"],
+            start_page=0,
+            pool_storage_result=Mock(),
+        )
+        module = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        self._trace = [
+            patch(f"{module}._init_op_trace"),
+            patch(f"{module}._finish_op_trace"),
+        ]
+        for p in self._trace:
+            p.start()
+            self.addCleanup(p.stop)
+        return ctrl, operation
+
+    def test_node_min_runs_after_the_kv_write(self):
+        """TP0's MLA write must not wait for the leader's KDA write."""
+        ctrl, operation = self._setup()
+        with _FakeNodeCollectives() as node:
+            ctrl._page_backup_kv_with_trace = Mock(
+                side_effect=lambda op: node.calls.append(("kv",))
+            )
+            ctrl._page_backup_with_stable_layout(operation)
+        self.assertEqual([c[0] for c in node.calls], ["gather", "kv", "min"])
+
+    def test_node_min_runs_when_the_kv_write_fails(self):
+        """Peers block in the MIN unless this rank joins it on every op."""
+        ctrl, operation = self._setup()
+        with _FakeNodeCollectives() as node:
+            ctrl._page_backup_kv_with_trace = Mock(side_effect=RuntimeError("kv"))
+            with self.assertRaisesRegex(RuntimeError, "kv"):
+                ctrl._page_backup_with_stable_layout(operation)
+        self.assertEqual([c[0] for c in node.calls], ["gather", "min"])
+
+    def test_no_node_min_after_the_exchange_itself_fails(self):
+        """A broken exchange leaves the group out of step; the MIN would only
+        wait out another timeout."""
+        ctrl, operation = self._setup()
+        ctrl._page_backup_kv_with_trace = Mock()
+        with _FakeNodeCollectives(gather_error=RuntimeError("gloo")) as node:
+            with self.assertRaisesRegex(RuntimeError, "gloo"):
+                ctrl._page_backup_with_stable_layout(operation)
+        self.assertEqual([c[0] for c in node.calls], ["gather"])
+
+
+class TestKDANodeAggregatedFailureInjector(CustomTestCase):
+    def test_injector_forwards_and_fails_the_aggregated_io(self):
+        """Test-only fault injection must cover the node-aggregated KDA path:
+        a zero-probability wrapper forwards it, a certain failure skips IO."""
+        transfer = PoolTransfer(name=PoolName.MAMBA, keys=["h0"])
+        for prob, expected in ((0.0, [True]), (1.0, [False])):
+            with self.subTest(prob=prob):
+                backend = Mock()
+                backend.batch_io_node_aggregated_mamba.return_value = [True]
+                wrapper = HiCacheStorageFailureInjector(backend, 0.0, prob)
+                result = wrapper.batch_io_node_aggregated_mamba(
+                    transfer, [[3, 5]], is_set=True
+                )
+                self.assertEqual(result, expected)
+                self.assertEqual(
+                    backend.batch_io_node_aggregated_mamba.called, prob == 0.0
+                )
 
 
 if __name__ == "__main__":
