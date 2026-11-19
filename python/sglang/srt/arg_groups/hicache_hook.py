@@ -262,10 +262,17 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         return
     # Runs before handle_context_parallelism declares CP-TP group sharing, so
     # only the configured CP flags tell the prefill-CP-with-DCP layout apart.
-    if cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
+    # Only these L3 backends key each DCP shard; the others share one object
+    # across the shards of a page.
+    if (
+        cfg.enable_prefill_cp
+        and cfg.attn_cp_size > 1
+        and cfg.hicache_storage_backend not in (None, "file", "mooncake")
+    ):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 and --enable-prefill-cp is not "
-            "supported yet."
+            "HiCache with --dcp-size > 1 and --enable-prefill-cp supports only "
+            "the file and mooncake L3 backends, got "
+            f"{cfg.hicache_storage_backend}."
         )
     if (
         cfg.hicache_storage_backend is not None

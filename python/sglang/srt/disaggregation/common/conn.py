@@ -189,6 +189,9 @@ class PrefillServerInfo:
     prefill_http_port: Optional[int] = None
 
     supports_dcp_page: bool = False
+    # A DCP>1 prefill stores 1/dcp of every widened page, so decode must shard
+    # its KV the same way.
+    dcp_size: int = 1
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -1603,7 +1606,7 @@ class CommonKVManager(BaseKVManager):
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}&"
-                "include_dcp_page_support=1"
+                "include_dcp_page_support=1&include_dcp_topology=1"
             )
             response = _get_bootstrap_session(bootstrap_addr).get(
                 url, timeout=_bootstrap_http_timeout()
@@ -1764,6 +1767,22 @@ class CommonKVManager(BaseKVManager):
                 raise RuntimeError(
                     "PD decode DCP does not support a prefill with "
                     "--enable-kv-cache-sharding."
+                )
+
+        if info.dcp_size > 1:
+            # A DCP>1 prefill ships its owner rows page by page; any other decode
+            # DCP is rejected per session in requires_dcp_relayout, so fail here.
+            if self.dcp_size != info.dcp_size:
+                raise RuntimeError(
+                    f"PD with a DCP-{info.dcp_size} prefill requires decode "
+                    f"--dcp-size {info.dcp_size}, got {self.dcp_size}."
+                )
+            # Each prefill rank owns a distinct 1/dcp of the KV, so no prefill
+            # rank may become a dummy sender in _resolve_rank_mapping.
+            if self.attn_tp_size != info.attn_tp_size:
+                raise RuntimeError(
+                    f"PD with a DCP-{info.dcp_size} prefill requires decode "
+                    f"attention TP {info.attn_tp_size}, got {self.attn_tp_size}."
                 )
 
         if self.dcp_kv_layout == "page" and info.supports_dcp_page is not True:
@@ -1965,6 +1984,7 @@ class CommonKVManager(BaseKVManager):
                 get_disagg().disaggregation_transfer_backend == "mooncake"
                 and self.dcp_size == 1
             ),
+            "dcp_size": self.dcp_size,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -3688,6 +3708,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.supports_dcp_page: Optional[bool] = None
+        self.dcp_size: Optional[int] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3765,11 +3786,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        # Older prefills omit it; they ran with DCP 1.
+        dcp_size = int(data.get("dcp_size", 1))
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,
+            )
+        if self._registered_count and self.dcp_size != dcp_size:
+            return web.Response(
+                text="DCP size differs across prefill ranks", status=400
             )
         policy = data.get("decode_allocation_policy", "early")
         if self._registered_count and self.decode_allocation_policy != policy:
@@ -3803,6 +3830,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.supports_dcp_page is None and supports_dcp_page is not None:
             self.supports_dcp_page = supports_dcp_page
+
+        if self.dcp_size is None:
+            self.dcp_size = dcp_size
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -3897,6 +3927,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
                 supports_dcp_page=self.supports_dcp_page,
+                dcp_size=self.dcp_size or 1,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
@@ -3906,6 +3937,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             # Older decode servers reject unknown PrefillServerInfo fields.
             if request.query.get("include_dcp_page_support") != "1":
                 payload.pop("supports_dcp_page")
+            if request.query.get("include_dcp_topology") != "1":
+                payload.pop("dcp_size")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
