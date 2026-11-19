@@ -35,6 +35,79 @@ def _hybrid_ctrl(page_size=2):
 
 
 class TestHybridCacheControllerRequestId(unittest.TestCase):
+    def test_grouped_read_preserves_plan_and_absolute_start(self):
+        ctrl = _hybrid_ctrl()
+        ctrl.page_get_func = MagicMock(return_value=3)
+        plans = {PoolName.KV: object()}
+        extra = HiCacheStorageExtraInfo(
+            prefix_keys=["prefix"], start_page=5, storage_plans=plans
+        )
+        op = SimpleNamespace(request_id="grouped", trace_ctx=object())
+        with mock.patch.object(
+            hybrid_cc_module, "get_thread_caller_info", return_value=None
+        ):
+            count = ctrl._page_transfer_kv_batch(
+                op, ["a", "b", "c"], list(range(6)), extra, []
+            )
+        forwarded = ctrl.page_get_func.call_args.args[3]
+        self.assertEqual(count, 3)
+        self.assertEqual(forwarded.start_page, 5)
+        self.assertIs(forwarded.storage_plans, plans)
+        self.assertEqual(forwarded.prefix_keys, ["prefix"])
+        self.assertEqual(forwarded.extra_info, {"request_id": "grouped"})
+        self.assertIsNone(extra.extra_info)
+
+    def test_grouped_backup_batches_end_at_absolute_group_edges(self):
+        ctrl = _hybrid_ctrl()
+        ctrl.storage_page_group = 4
+        ctrl.page_set_func = MagicMock(return_value=True)
+        op = SimpleNamespace(
+            prefix_keys=["prefix"],
+            start_page=3,
+            hash_value=[str(i) for i in range(10)],
+            host_indices=list(range(20)),
+            completed_tokens=0,
+            trace_ctx=object(),
+        )
+        with mock.patch.object(hybrid_cc_module, "STORAGE_BATCH_SIZE", 8):
+            ctrl._page_backup_kv_with_trace(op)
+        calls = ctrl.page_set_func.call_args_list
+        self.assertEqual([c.args[2].start_page for c in calls], [3, 8])
+        self.assertEqual(
+            [c.args[0] for c in calls], [op.hash_value[:5], op.hash_value[5:]]
+        )
+        self.assertEqual(
+            [c.args[1] for c in calls], [list(range(10)), list(range(10, 20))]
+        )
+        self.assertEqual(calls[1].args[2].prefix_keys, ["prefix"] + op.hash_value[:5])
+        self.assertEqual(op.completed_tokens, 20)
+
+    def test_grouped_hit_sync_intersects_endpoints_and_partial_allocation(self):
+        ctrl = _hybrid_ctrl()
+        ctrl.storage_page_group = 4
+        ctrl.enable_diagnostic_metrics = False
+        ctrl.prefetch_hits_sync_groups = []
+        op = hybrid_cc_module.PrefetchOperation.__new__(
+            hybrid_cc_module.PrefetchOperation
+        )
+        op.token_ids = list(range(16))
+        op.pool_transfers = []
+        op.query_pool_hit_pages = {}
+        op.pool_storage_result = PoolTransferResult(8, {}, [4, 8])
+        op.prefetch_kv_page_offset = 0
+
+        def reduce_remote_endpoints(packed, *args):
+            # The other rank can restore 4 and 6 pages; scalar MIN would pick 6.
+            packed[8] = 0
+
+        ctrl._all_reduce = reduce_remote_endpoints
+        self.assertEqual(ctrl._sync_prefetch_hit_query(op, 16), 8)
+        self.assertEqual(op.agreed_restorable_pages, [4])
+        self.assertEqual(ctrl._floor_to_restorable(op, 6), 0)
+        self.assertEqual(ctrl._floor_to_restorable(op, 12), 8)
+        op.prefetch_kv_page_offset = 1
+        self.assertEqual(ctrl._floor_to_restorable(op, 8), 6)
+
     def test_thread_trace_info_registers_storage_config_ranks(self):
         """Hybrid storage threads read rank placement from storage_config."""
         ctrl = _hybrid_ctrl()
@@ -260,6 +333,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             hash_value=["h0", "h1", "h2"],
             host_indices=list(range(6)),
             completed_tokens=0,
+            start_page=0,
             id=7,
             trace_ctx=object(),
         )
@@ -291,6 +365,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             hash_value=["h0", "h1", "h2"],
             host_indices=list(range(6)),
             completed_tokens=0,
+            start_page=0,
             trace_ctx=object(),
             trace_id="0" * 31 + "1",
             span_id="0" * 15 + "2",

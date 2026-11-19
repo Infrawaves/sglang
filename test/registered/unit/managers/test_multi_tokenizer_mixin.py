@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
 
+import msgspec
 import numpy as np
 import torch
 
@@ -249,12 +250,18 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
     def test_batch_str_output_keeps_request_stats_per_request(self):
         output = _make_batch_str_output()
-
-        single_output = _handle_output_by_index(output, 1)
-
-        self.assertEqual(single_output.rids, ["rid-1"])
-        self.assertEqual(single_output.request_stats, [_REQUEST_STATS_1])
-        self.assertEqual(_handle_output_by_index(output, 0).request_stats, [None])
+        for prefill_hits in (None, 0, 2):
+            with self.subTest(prefill_hits=prefill_hits):
+                stats = msgspec.structs.replace(
+                    _REQUEST_STATS_1, prefill_cached_tokens=prefill_hits
+                )
+                output.request_stats = [None, stats]
+                single_output = _handle_output_by_index(output, 1)
+                self.assertEqual(single_output.rids, ["rid-1"])
+                self.assertEqual(single_output.request_stats, [stats])
+                self.assertEqual(
+                    _handle_output_by_index(output, 0).request_stats, [None]
+                )
 
     def test_batch_str_output_keeps_weight_versions_nested_per_request(self):
         """Per-request segment lists stay one level nested after the split."""

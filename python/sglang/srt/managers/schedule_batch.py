@@ -758,6 +758,9 @@ class Req(ReqDllmMixin):
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+        # Original prefill-side reuse, before decode-side cache accounting.
+        # None means no real PD handoff has supplied this measurement.
+        self.prefill_cached_tokens: Optional[int] = None
 
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)

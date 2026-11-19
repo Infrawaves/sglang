@@ -758,6 +758,26 @@ def get_kimik3_auto_tool_call_structural_tag(
     return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
 
 
+def get_kimik3_json_response_structural_tag(
+    json_schema: Union[bool, Dict[str, Any]],
+    thinking_mode: bool = False,
+    max_whitespace_cnt: Optional[int] = None,
+) -> StructuralTag:
+    """JSON output written as the K3 response block.
+
+    A bare JSON grammar rejects the markers that open and close the block, so a
+    model about to open it is pushed onto whitespace or into a string it cannot
+    leave, and generates until max_tokens."""
+    answer = _response(
+        JSONSchemaFormat(json_schema=json_schema, max_whitespace_cnt=max_whitespace_cnt)
+    )
+    return StructuralTag(
+        format=_with_reasoning(
+            SequenceFormat(elements=[answer, _OPTIONAL_MESSAGE_CLOSE]), thinking_mode
+        )
+    )
+
+
 def _select_tools(
     tools: List[Tool],
     tool_choice: Union[ToolChoice, AllowedToolChoice, Literal["auto", "required"]],

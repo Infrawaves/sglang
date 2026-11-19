@@ -39,6 +39,16 @@ def handle_hicache(server_args: Any):
         validate_hicache_draft_node_merge(server_args)
     if cfg.hicache_storage_page_size is not None:
         validate_hicache_storage_page_size(server_args)
+    if cfg.hicache_storage_bundle_pools:
+        validate_hicache_storage_bundle_pools(server_args)
+    if cfg.enable_kda_hicache_node_aggregate and (
+        not cfg.enable_hierarchical_cache or cfg.hicache_storage_backend != "mooncake"
+    ):
+        # Checked before the early returns below, which skip the full validation.
+        raise ValueError(
+            "--enable-kda-hicache-node-aggregate requires --enable-hierarchical-cache "
+            "with --hicache-storage-backend mooncake."
+        )
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -108,6 +118,10 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+    if cfg.enable_kda_hicache_node_aggregate:
+        # After step 2: the layout check needs the resolved layout.
+        validate_kda_hicache_node_aggregate(server_args)
 
 
 def validate_mla_hicache_per_node(server_args: Any):
@@ -187,14 +201,57 @@ def validate_hicache_draft_node_merge_layout(server_args: Any):
         )
 
 
+def validate_kda_hicache_node_aggregate(server_args: Any):
+    cfg = resolving_view(server_args)
+    flag = "--enable-kda-hicache-node-aggregate"
+    if cfg.hicache_mem_layout not in ("page_first", "page_first_direct"):
+        raise ValueError(
+            f"{flag} requires --hicache-mem-layout page_first or "
+            f"page_first_direct, got {cfg.hicache_mem_layout!r}."
+        )
+    if cfg.hicache_host_memory_mode == "buffer_only":
+        raise ValueError(
+            f"{flag} does not support --hicache-host-memory-mode buffer_only."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(f"{flag} requires --pp-size 1.")
+    if cfg.enable_dp_attention:
+        raise ValueError(f"{flag} does not support --enable-dp-attention.")
+    if cfg.attn_cp_size > 1:
+        raise ValueError(f"{flag} requires --attn-cp-size 1.")
+    if cfg.disaggregation_mode == "decode":
+        # Decode may write per-rank KDA keys in the prefill layout; the node
+        # object keys would hide them from, or mix with, those readers.
+        raise ValueError(f"{flag} does not support PD decode.")
+    # Lazy: only node-aggregated launches pay for these imports.
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStoreConfig,
+    )
+
+    extra_config = HybridCacheController.parse_storage_backend_extra_config(
+        cfg.hicache_storage_backend_extra_config
+    )[0]
+    if MooncakeStoreConfig.load(extra_config).standalone_storage:
+        raise ValueError(
+            f"{flag} is incompatible with Mooncake standalone_storage=True, "
+            "which requires MooncakeHostTensorAllocator."
+        )
+
+
 def validate_hicache_storage_page_size(server_args: Any):
     # Pool-level limits (standalone_storage, split heads) are checked by Mooncake.
     cfg = resolving_view(server_args)
-    size, page_size = cfg.hicache_storage_page_size, cfg.page_size
+    size = cfg.hicache_storage_page_size
+    # Under DCP the HiCache page is the widened one (the allocator's
+    # page_size x dcp_size), which the controller groups by.
+    page_size = cfg.page_size * (cfg.dcp_size if cfg.dcp_size > 1 else 1)
     if size <= 0 or size % page_size != 0:
         raise ValueError(
             f"--hicache-storage-page-size ({size}) must be a positive multiple "
-            f"of --page-size ({page_size})."
+            f"of the HiCache page ({page_size} tokens: --page-size x --dcp-size)."
         )
     group = size // page_size
     if group == 1:
@@ -202,7 +259,7 @@ def validate_hicache_storage_page_size(server_args: Any):
     # STORAGE_BATCH_SIZE pages per L3 batch; a group must not straddle two.
     if 128 % group != 0:
         raise ValueError(
-            "--hicache-storage-page-size / --page-size must divide 128, "
+            "--hicache-storage-page-size / HiCache page must divide 128, "
             f"got {group}."
         )
     unsupported = {
@@ -211,7 +268,6 @@ def validate_hicache_storage_page_size(server_args: Any):
             cfg.hicache_storage_backend != "mooncake"
         ),
         "--pp-size > 1": cfg.pp_size > 1,
-        "--dcp-size > 1": cfg.dcp_size > 1,
         "PD decode": cfg.disaggregation_mode == "decode",
         # Buffer mode writes staged spans without a radix node position.
         "--hicache-host-memory-mode buffer_only": (
@@ -223,6 +279,25 @@ def validate_hicache_storage_page_size(server_args: Any):
         raise ValueError(
             "--hicache-storage-page-size larger than --page-size is not "
             "supported when: " + ", ".join(reasons) + "."
+        )
+
+
+def validate_hicache_storage_bundle_pools(server_args: Any):
+    # Which pools join the KV object is decided by the Mooncake store once the
+    # host pools are registered; only the deployment-level limits live here.
+    cfg = resolving_view(server_args)
+    unsupported = {
+        "--enable-hierarchical-cache is off": not cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend is not mooncake": (
+            cfg.hicache_storage_backend != "mooncake"
+        ),
+    }
+    reasons = [reason for reason, hit in unsupported.items() if hit]
+    if reasons:
+        raise ValueError(
+            "--hicache-storage-bundle-pools is not supported when: "
+            + ", ".join(reasons)
+            + "."
         )
 
 

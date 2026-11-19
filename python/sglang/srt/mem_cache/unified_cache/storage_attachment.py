@@ -39,10 +39,25 @@ _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
 
 
 def validate_runtime_storage_update() -> None:
-    if get_memory().enable_mla_hicache_per_node:
+    memory = get_memory()
+    # Both keep node-shared host buffers registered with the Mooncake store
+    # built at launch, and read/write through it; another backend cannot serve
+    # them.
+    startup_only = [
+        flag
+        for flag, enabled in (
+            ("--enable-mla-hicache-per-node", memory.enable_mla_hicache_per_node),
+            (
+                "--enable-kda-hicache-node-aggregate",
+                memory.enable_kda_hicache_node_aggregate,
+            ),
+        )
+        if enabled
+    ]
+    if startup_only:
         raise ValueError(
             "HiCache L3 configuration is startup-only when "
-            "--enable-mla-hicache-per-node is set; runtime attach, detach, "
+            f"{' / '.join(startup_only)} is set; runtime attach, detach, "
             "and policy updates are not supported. Configure storage at launch."
         )
 

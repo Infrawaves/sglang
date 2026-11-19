@@ -364,6 +364,29 @@ class TestRequestStatsRoundTrip(CustomTestCase):
                     decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
                 )
 
+    def test_prefill_hits_keep_none_and_zero_through_ipc(self):
+        """Sparse stats and real P=0 must survive both IPC hops; older
+        short-array senders have no P measurement."""
+        # The first eight wire slots predate the optional P measurement.
+        old_payload = msgspec.msgpack.encode([7, 3, None, 0, 0, 0, 0, None])
+        old = msgspec.msgpack.decode(old_payload, type=RequestOutputStats)
+        self.assertIsNone(old.prefill_cached_tokens)
+        self.assertEqual((old.prompt_tokens, old.cached_tokens), (7, 3))
+        for prefill_hits in (None, 0, 2):
+            for cls in (BatchTokenIDOutput, BatchStrOutput):
+                with self.subTest(prefill_hits=prefill_hits, type=cls.__name__):
+                    stats = msgspec.structs.replace(
+                        old, prefill_cached_tokens=prefill_hits
+                    )
+                    output = _batch_output(cls, rids=["a", "b"])
+                    output.request_stats = [None, stats]
+                    decoded = _double_hop(output)
+                    self.assertEqual(decoded.request_stats, [None, stats])
+                    self.assertEqual(
+                        decoded.request_stats[1].prefill_cached_tokens, prefill_hits
+                    )
+                    self.assertEqual(decoded.request_stats[1].cached_tokens, 3)
+
 
 class TestDetokenizeRoundTrip(CustomTestCase):
     def test_header_and_row_routes_round_trip(self):

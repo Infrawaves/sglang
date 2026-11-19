@@ -50,6 +50,9 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import SchemaError
 
+from sglang.srt.constrained.json_schema_validation import (
+    validate_xgrammar_json_schema,
+)
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
@@ -117,6 +120,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -158,6 +162,7 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_in_grammar,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
+from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1728,6 +1733,12 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        if self.chat_encoding_spec == "kimi_k3":
+            self._frame_kimi_k3_json_response(
+                sampling_params,
+                processed_messages.tool_call_constraint,
+                processed_messages.require_reasoning,
+            )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
         max_new_tokens = sampling_params["max_new_tokens"]
@@ -1937,6 +1948,44 @@ class OpenAIServingChat(OpenAIServingBase):
                 "cannot enforce automatic tool choice on output that may skip "
                 "the reasoning for this response template"
             )
+
+    def _frame_kimi_k3_json_response(
+        self,
+        sampling_params: dict[str, Any],
+        tool_call_constraint: ToolCallConstraint | None,
+        require_reasoning: bool,
+    ) -> None:
+        """Move a JSON response format into the K3 response block it is
+        written in, so the grammar admits the block's markers."""
+        json_schema = sampling_params.get("json_schema")
+        # A JSON tool-call constraint is the forced call itself, not an answer.
+        if json_schema is None or (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] == "json_schema"
+        ):
+            return
+        schema = json.loads(json_schema)
+        # The structural tag compiles the schema without this check.
+        validate_xgrammar_json_schema(schema)
+        tag = KimiK3Detector().get_json_response_structural_tag(
+            schema,
+            thinking_mode=require_reasoning and self.reasoning_parser is None,
+            max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
+        )
+        sampling_params["structural_tag"] = convert_json_schema_to_str(
+            tag.model_dump(by_alias=True)
+        )
+        del sampling_params["json_schema"]
+        # Inside a JSON string the block's markers are plain text, so a model
+        # that ends the turn there never leaves the grammar and runs to
+        # max_tokens; stopping on the message close ends it at once. The
+        # response close is not a stop: trimming it would hide the marker the
+        # reasoning parser uses to recognize an answer that skipped thinking.
+        stop = sampling_params.get("stop") or []
+        stop = [stop] if isinstance(stop, str) else list(stop)
+        if MESSAGE_CLOSE not in stop:
+            stop.append(MESSAGE_CLOSE)
+        sampling_params["stop"] = stop
 
     def _set_json_grammar_start(
         self,
@@ -2842,10 +2891,30 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
+    @staticmethod
+    def _physical_cache_headers(meta_info: Dict[str, Any]) -> Dict[str, str]:
+        """Expose prefill reuse, excluding decode-local radix reuse in PD."""
+        finish_reason = meta_info.get("finish_reason")
+        reason = (
+            finish_reason.get("type")
+            if isinstance(finish_reason, dict)
+            else finish_reason
+        )
+        if reason in ("abort", "error"):
+            return {}
+        if get_disagg().disaggregation_mode == "decode":
+            # Missing is unknown, not zero; never substitute max(P, D).
+            cached_tokens = meta_info.get("prefill_cached_tokens")
+        else:
+            cached_tokens = meta_info.get("cached_tokens", 0) or 0
+        if cached_tokens is None:
+            return {}
+        return {"X-Sgl-Cached-Tokens": str(cached_tokens)}
+
     def _usage_headers(
         self, meta_info: Dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> Dict[str, str]:
-        """Return fixed cache-write headers and optional K3 prompt/read headers.
+        """Return prefill cache hits, cache-write and optional K3 usage headers.
 
         Streaming uses the first engine event so prompt-side accounting is
         available even if the stream ends before the final usage frame.
@@ -2870,6 +2939,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     f"{prefix}-Cached-Tokens": str(cached),
                 }
             )
+        # This name is reserved for prefill reuse, including when the
+        # configurable prefix would otherwise expose the Redis read count.
+        if prefix.lower() == "x-sgl":
+            headers.pop(f"{prefix}-Cached-Tokens", None)
+        headers.update(self._physical_cache_headers(meta_info))
         return headers
 
     async def _handle_streaming_request(
@@ -2956,6 +3030,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids: dict[int, list[int]] = {}
 
         stream_started = False
+        usage_headers_set = False
         error_aborted = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -3098,7 +3173,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Fill the accounting headers as soon as the first
                 # engine event's meta_info arrives (before any byte is yielded;
                 # _handle_streaming_request awaits the first chunk).
-                if usage_headers is not None and not usage_headers:
+                if usage_headers is not None and not usage_headers_set:
                     usage_headers.update(
                         self._usage_headers(
                             content["meta_info"],
@@ -3109,6 +3184,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                    usage_headers_set = True
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -3442,17 +3518,16 @@ class OpenAIServingChat(OpenAIServingBase):
             int(time.time()),
         )
 
-        # Non-streaming responses carry the same usage headers.
-        usage_headers = self._usage_headers(
-            ret[0]["meta_info"],
-            generation_stub_tokens=(
-                self._KIMI_K3_GENERATION_STUB_TOKENS
-                if request.input_ids is None
-                else 0
-            ),
-        )
-        if usage_headers and isinstance(response, ChatCompletionResponse):
-            return ORJSONResponse(content=response.model_dump(), headers=usage_headers)
+        # Keep the model for internal callers; the HTTP endpoint attaches headers.
+        if isinstance(response, ChatCompletionResponse):
+            response._response_headers = self._usage_headers(
+                ret[0]["meta_info"],
+                generation_stub_tokens=(
+                    self._KIMI_K3_GENERATION_STUB_TOKENS
+                    if request.input_ids is None
+                    else 0
+                ),
+            )
 
         return response
 

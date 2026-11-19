@@ -104,6 +104,7 @@ def _output(sent, rows, *, ipc="worker-a"):
 
 def _detokenizer(capacity=16):
     detok = DetokenizerManager.__new__(DetokenizerManager)
+    detok.output_updates = None
     detok.tokenizer = _Tokenizer()
     detok.vocab_size = None
     detok.detokenize_state_table = DetokenizeStateTable(capacity=capacity)

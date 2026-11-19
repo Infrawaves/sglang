@@ -290,16 +290,24 @@ class Memory(msgspec.Struct):
     ] = False
     enable_mla_hicache_per_node: A[
         bool,
-        "Keep one HiCache host copy of replicated MLA KV per node instead of per rank.",
+        "Keep one HiCache host copy of replicated MLA KV (and its DSA indexer) per node instead of per rank.",
     ] = False
     hicache_draft_node_merge: A[
         bool,
         "Store each page's MHA draft KV as one Mooncake object per node, written and read by the node's last rank. Requires --enable-mla-hicache-per-node.",
     ] = False
+    hicache_storage_bundle_pools: A[
+        bool,
+        "Store each page's KV and the KV-derived pools written by the same ranks (DSA indexer, MLA draft) as one Mooncake object, instead of one object per pool. Pools that need other writers (MHA draft, Mamba/KDA state) keep their own objects, so this is a no-op for models without such pools. With per-node MLA HiCache only pools shared per node like the KV (the DSA indexer) join it. Changes the L3 keys.",
+    ] = False
     hicache_storage_page_size: A[
         Optional[int],
         "Tokens per Mooncake L3 object for the KV and draft pools; a multiple of --page-size whose ratio divides 128. Pages are grouped by absolute position and each radix node writes only its own segments. Unset means --page-size; Mamba/KDA state keeps its per-node objects.",
     ] = None
+    enable_kda_hicache_node_aggregate: A[
+        bool,
+        "Store each KDA/Mamba HiCache L3 checkpoint as one Mooncake object per node, written and read by the node leader from node-shared host memory.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

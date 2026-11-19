@@ -545,6 +545,42 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
 
 class TestStoredRequestStats(CustomTestCase):
+    def test_prefill_hits_survive_sparse_stats_without_fabricating_zero(self):
+        """Original P remains distinct from D across first/intermediate/final
+        outputs, including a measured zero and requests with no P measurement."""
+        for prefill_hits in (None, 0, 2):
+            with self.subTest(prefill_hits=prefill_hits):
+                tm = _make_tokenizer_manager(self)
+                rid = "prefill_cache_stats"
+                state = _make_req_state(rid)
+                state.obj.stream = True
+                tm.rid_to_state[rid] = state
+                first = _request_stats(
+                    prompt_tokens=5,
+                    cached_tokens=3,
+                    prefill_cached_tokens=prefill_hits,
+                )
+                final = _request_stats(
+                    prompt_tokens=5,
+                    cached_tokens=4,
+                    prefill_cached_tokens=prefill_hits,
+                )
+                for stats, reason in (
+                    ([first], _NOT_FINISHED),
+                    (None, _NOT_FINISHED),
+                    ([final], None),
+                ):
+                    output = _make_batch_str_output(rid, reason)
+                    output.request_stats = stats
+                    asyncio.run(tm._handle_batch_output(output))
+                metadata = [out["meta_info"] for out in state.out_list]
+                self.assertEqual([m["cached_tokens"] for m in metadata], [3, 3, 4])
+                for meta in metadata:
+                    if prefill_hits is None:
+                        self.assertNotIn("prefill_cached_tokens", meta)
+                    else:
+                        self.assertEqual(meta["prefill_cached_tokens"], prefill_hits)
+
     def test_rows_without_request_stats_read_the_latest_request_stats(self):
         """A row without request stats reports the latest received, and a row
         before any is dropped."""
@@ -1178,6 +1214,42 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
             self.assertTrue(sibling_closed.is_set())
 
         asyncio.run(drive())
+
+
+class TestReceivedRequestsMetric(CustomTestCase):
+    def test_counts_parallel_samples_and_skips_unlogged_requests(self):
+        """Explicit RID lists must count each parallel sample, not each RID."""
+        from prometheus_client import CollectorRegistry, Counter
+
+        for log_metrics, expected in ((True, 6), (False, 0)):
+            with self.subTest(log_metrics=log_metrics):
+                tm = _make_tm_for_generate(self)
+                tm.enable_metrics = True
+                registry = CollectorRegistry()
+                tm.received_requests = Counter(
+                    "received_requests_total", "Received requests", registry=registry
+                )
+                obj = GenerateReqInput(
+                    text=["hello", "world"],
+                    rid=["a", "b"],
+                    sampling_params={"n": 3},
+                    log_metrics=log_metrics,
+                )
+
+                async def fail_batch(*args):
+                    raise ValueError("processing failed")
+                    yield
+
+                tm._handle_batch_request = fail_batch
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "processing failed"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                self.assertEqual(
+                    registry.get_sample_value("received_requests_total"), expected
+                )
 
 
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
