@@ -1544,7 +1544,11 @@ class ChatCompletionRequest(PDRoutingFields):
                     response_format.json_schema.schema_
                 )
         elif response_format and response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
+            # JSON mode asks for any JSON object. A renderer that states it in
+            # the prompt leaves the output unconstrained, as Moonshot's JSON
+            # mode is prompt-guided.
+            if not renderer_handles_response_format:
+                sampling_params["json_schema"] = '{"type": "object"}'
         elif response_format and response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 response_format.model_dump(by_alias=True)
@@ -1648,6 +1652,9 @@ class ChatCompletionResponseChoice(BaseModel):
 
 
 class ChatCompletionResponse(BaseModel):
+    # Transport metadata stays out of the JSON body; serving still returns a model.
+    _response_headers: Dict[str, str] = PrivateAttr(default_factory=dict)
+
     id: str
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -2594,6 +2601,8 @@ class PromptTokenUsageInfo(BaseModel):
 
 class ResponsesResponse(BaseModel):
     """Response body for v1/responses endpoint."""
+
+    _response_headers: Dict[str, str] = PrivateAttr(default_factory=dict)
 
     id: str = Field(default_factory=lambda: f"resp_{time.time()}")
     object: Literal["response"] = "response"

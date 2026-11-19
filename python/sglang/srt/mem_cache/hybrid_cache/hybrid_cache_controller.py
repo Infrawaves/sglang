@@ -33,6 +33,7 @@ from sglang.srt.managers.cache_controller import (
     check_dcp_l3_extra_pool,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache import kda_l3_stats
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_draft_node_merge import (
     DraftNodeMerge,
@@ -370,6 +371,8 @@ class HybridCacheController(BaseHiCacheController):
     is_kv_sharded: bool = False
     # Class default so controllers built without __init__ keep per-rank Mamba IO.
     kda_node_aggregate: Optional[KDANodeAggregateContext] = None
+    # SGLANG_KDA_L3_STATS, read once at import: log each L3 Mamba hit query.
+    _kda_l3_stats_enabled: bool = kda_l3_stats.enabled()
 
     def _register_thread_trace_info(self, thread_label: str) -> None:
         """Register the storage thread's caller and rank attribution."""
@@ -1834,6 +1837,11 @@ class HybridCacheController(BaseHiCacheController):
         if spread:
             # Cross-rank spread of the raw storage hit (observability only).
             operation.query_rank_spread = -reduced[-1] - storage_hit_count
+        if self._kda_l3_stats_enabled and any(
+            transfer.name == PoolName.MAMBA
+            for transfer in operation.pool_transfers or []
+        ):
+            kda_l3_stats.log_hit_query(operation, storage_hit_count, self.page_size)
         return storage_hit_count
 
     def _move_pool_indices(

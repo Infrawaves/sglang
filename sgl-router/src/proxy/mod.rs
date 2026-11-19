@@ -35,6 +35,7 @@ fn cache_write_response_headers(headers: &HeaderMap) -> HeaderMap {
     for name in [
         "msh-usage-cache-write-tokens-5m",
         "msh-usage-cache-write-tokens-1h",
+        "x-sgl-cached-tokens",
     ] {
         if let Some(value) = headers.get(name) {
             forwarded.insert(HeaderName::from_static(name), value.clone());

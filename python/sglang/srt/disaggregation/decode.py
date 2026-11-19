@@ -3223,6 +3223,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 sampling_mask_logprobs=sampling_mask_logprobs,
             )
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        if (
+            decode_req.req.prefill_cached_tokens is None
+            and not _is_fake_transfer(decode_req.req)
+        ):
+            # Retain the first real prefill measurement across decode reuse and
+            # rebootstrap; later handoffs may include already generated tokens.
+            decode_req.req.prefill_cached_tokens = decode_req.req.cached_tokens
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
         # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
