@@ -198,14 +198,20 @@ fn render_cold_pressure(sample: &ColdPressureSample) -> String {
         push_gauge(
             &mut out,
             "sgl_router_cold_pressure",
-            "Waiting uncached prefill tokens over --per-prefill-cold-tokens times the healthy prefill workers past their first report or the reporting grace, as served by GET /prefill_pressure. Can exceed 1.",
+            "Waiting uncached prefill tokens, each worker's capped at --per-prefill-cold-tokens, over --per-prefill-cold-tokens times the healthy prefill workers past their first report or the reporting grace, as served by GET /prefill_pressure. In [0, 1].",
             sample.pressure,
         );
         push_gauge(
             &mut out,
             "sgl_router_cold_tokens",
-            "Numerator of sgl_router_cold_pressure: engine-reported waiting uncached prefill tokens; stale workers count at no less than full capacity, and workers silent past the reporting grace at full capacity.",
+            "Engine-reported waiting uncached prefill tokens, uncapped; stale workers count at no less than full capacity, and workers silent past the reporting grace at full capacity.",
             sample.cold_tokens,
+        );
+        push_gauge(
+            &mut out,
+            "sgl_router_cold_capped_tokens",
+            "Numerator of sgl_router_cold_pressure: sgl_router_cold_tokens with each worker capped at --per-prefill-cold-tokens.",
+            sample.capped_cold_tokens,
         );
         push_gauge(
             &mut out,

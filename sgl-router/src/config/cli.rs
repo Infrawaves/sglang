@@ -199,8 +199,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
 
-    /// Waiting uncached prefill tokens one healthy prefill worker may hold before
-    /// GET /prefill_pressure reports 1.0. Plain workers count as prefill without PD.
+    /// Waiting uncached prefill tokens at which one healthy prefill worker counts as
+    /// full; GET /prefill_pressure reports 1.0 once every worker is full, and a
+    /// worker's backlog past this is not counted. Plain workers count as prefill without PD.
     #[arg(
         long,
         default_value_t = DEFAULT_PER_PREFILL_COLD_TOKENS,

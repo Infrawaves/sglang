@@ -90,6 +90,7 @@ mod tests {
         ctx.cold_pressure.store(ColdPressureSample {
             pressure: 0.5,
             cold_tokens: 100_000,
+            capped_cold_tokens: 100_000,
             capacity_tokens: 200_000,
             per_worker_capacity_tokens: 20_000,
             healthy_prefill_workers: 10,
@@ -103,6 +104,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["pressure"], 0.5);
         assert_eq!(body["cold_tokens"], 100_000);
+        assert_eq!(body["capped_cold_tokens"], 100_000);
         assert_eq!(body["capacity_tokens"], 200_000);
         assert_eq!(body["per_worker_capacity_tokens"], 20_000);
         assert_eq!(body["healthy_prefill_workers"], 10);
@@ -119,6 +121,7 @@ mod tests {
         ctx.cold_pressure.store(ColdPressureSample {
             pressure: 1.0,
             cold_tokens: 0,
+            capped_cold_tokens: 0,
             capacity_tokens: 0,
             per_worker_capacity_tokens: 20_000,
             healthy_prefill_workers: 3,
@@ -143,6 +146,7 @@ mod tests {
         ctx.cold_pressure.store(ColdPressureSample {
             pressure: 0.5,
             cold_tokens: 100_000,
+            capped_cold_tokens: 100_000,
             capacity_tokens: 200_000,
             per_worker_capacity_tokens: 20_000,
             healthy_prefill_workers: 10,
@@ -191,6 +195,7 @@ mod tests {
             ctx.cold_pressure.store(ColdPressureSample {
                 pressure: 0.25,
                 cold_tokens: 5_000,
+                capped_cold_tokens: 5_000,
                 capacity_tokens: 20_000,
                 per_worker_capacity_tokens: 20_000,
                 healthy_prefill_workers: 1,
@@ -223,6 +228,7 @@ mod tests {
         ctx.cold_pressure.store(ColdPressureSample {
             pressure: 1.0,
             cold_tokens: 0,
+            capped_cold_tokens: 0,
             capacity_tokens: 0,
             per_worker_capacity_tokens: 20_000,
             healthy_prefill_workers: 0,
@@ -245,6 +251,7 @@ mod tests {
         ctx.cold_pressure.store(ColdPressureSample {
             pressure: 0.5,
             cold_tokens: 10_000,
+            capped_cold_tokens: 10_000,
             capacity_tokens: 20_000,
             per_worker_capacity_tokens: 20_000,
             healthy_prefill_workers: 1,

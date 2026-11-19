@@ -15,10 +15,14 @@ use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ColdPressureSample {
-    /// `cold_tokens / capacity_tokens`; can exceed 1.0. Meaningless unless
+    /// `capped_cold_tokens / capacity_tokens`, in [0, 1]. Meaningless unless
     /// [`Self::has_data`].
     pub pressure: f64,
+    /// Uncapped sum, so a backlog past full stays visible.
     pub cold_tokens: u64,
+    /// Each worker's cold tokens capped at its own capacity: one worker's backlog
+    /// does not occupy the idle workers the router can still pick.
+    pub capped_cold_tokens: u64,
     pub capacity_tokens: u64,
     pub per_worker_capacity_tokens: u64,
     pub healthy_prefill_workers: usize,
@@ -95,6 +99,7 @@ pub fn sample<'u>(
     let mut unreported_workers = 0usize;
     let mut overdue_workers = 0usize;
     let mut cold_tokens = 0u64;
+    let mut capped_cold_tokens = 0u64;
     for (url, pooled_for) in workers {
         healthy_prefill_workers += 1;
         let cold = match readings.get(url) {
@@ -115,17 +120,20 @@ pub fn sample<'u>(
             }
         };
         cold_tokens = cold_tokens.saturating_add(cold);
+        capped_cold_tokens =
+            capped_cold_tokens.saturating_add(cold.min(per_worker_capacity_tokens));
     }
     let counted_workers = (healthy_prefill_workers - unreported_workers) as u64;
     let capacity_tokens = per_worker_capacity_tokens.saturating_mul(counted_workers);
     let pressure = if capacity_tokens == 0 {
         1.0
     } else {
-        cold_tokens as f64 / capacity_tokens as f64
+        capped_cold_tokens as f64 / capacity_tokens as f64
     };
     ColdPressureSample {
         pressure,
         cold_tokens,
+        capped_cold_tokens,
         capacity_tokens,
         per_worker_capacity_tokens,
         healthy_prefill_workers,
@@ -171,6 +179,7 @@ pub fn spawn_sampler(
             tracing::debug!(
                 pressure = sample.pressure,
                 cold_tokens = sample.cold_tokens,
+                capped_cold_tokens = sample.capped_cold_tokens,
                 capacity_tokens = sample.capacity_tokens,
                 healthy_prefill_workers = sample.healthy_prefill_workers,
                 stale_workers = sample.stale_workers,
@@ -277,6 +286,7 @@ mod tests {
         );
         assert_eq!(s.stale_workers, 2);
         assert_eq!(s.cold_tokens, 70_000);
+        assert_eq!(s.capped_cold_tokens, 40_000);
         assert_eq!(s.capacity_tokens, 60_000);
         assert!(s.has_data());
     }
@@ -316,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_can_exceed_one() {
+    fn pressure_saturates_at_one_while_cold_tokens_keep_the_overload() {
         let s = sample(
             pool(&["http://a"], SETTLED),
             &readings(&[("http://a", Fresh(30_000))]),
@@ -324,7 +334,27 @@ mod tests {
             Instant::now(),
             0,
         );
-        assert!((s.pressure - 1.5).abs() < 1e-9, "{}", s.pressure);
+        assert_eq!(s.cold_tokens, 30_000);
+        assert_eq!(s.capped_cold_tokens, 20_000);
+        assert!((s.pressure - 1.0).abs() < 1e-9, "{}", s.pressure);
+    }
+
+    /// One huge request on one worker must not read as a saturated pool while
+    /// the router can still send new work to the idle workers.
+    #[test]
+    fn one_overloaded_worker_counts_as_one_full_worker() {
+        let urls: Vec<String> = (0..18).map(|i| format!("http://p{i}")).collect();
+        let entries: Vec<_> = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.as_str(), Fresh(if i == 0 { 400_000 } else { 0 })))
+            .collect();
+        let workers = urls.iter().map(|u| (u.as_str(), SETTLED));
+        let s = sample(workers, &readings(&entries), 20_000, Instant::now(), 0);
+        assert_eq!(s.cold_tokens, 400_000);
+        assert_eq!(s.capped_cold_tokens, 20_000);
+        assert_eq!(s.capacity_tokens, 360_000);
+        assert!((s.pressure - 1.0 / 18.0).abs() < 1e-9, "{}", s.pressure);
     }
 
     #[test]
@@ -380,7 +410,8 @@ mod tests {
             let past_grace = usize::from(pooled_for >= UNREPORTED_GRACE);
             assert_eq!(s.stale_workers, past_grace, "pooled for {pooled_for:?}");
             assert_eq!(s.unreported_workers + s.overdue_workers, 0);
-            assert!((s.pressure - 5.0).abs() < 1e-9, "{}", s.pressure);
+            assert_eq!(s.cold_tokens, 200_000);
+            assert!((s.pressure - 0.5).abs() < 1e-9, "{}", s.pressure);
         }
     }
 
