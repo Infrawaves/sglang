@@ -341,18 +341,6 @@ def _append_stop(sampling_params: dict[str, Any], stop_str: str) -> None:
     sampling_params["stop"] = stop
 
 
-def _client_matched_stop(request: ChatCompletionRequest, matched: Any) -> Any:
-    """The matched stop to report: a K3 stop the server added is hidden unless
-    the client asked for the same string, so no marker reaches the response."""
-    if isinstance(matched, str) and matched in (MESSAGE_CLOSE, THINK_CLOSE):
-        client_stop = request.stop or []
-        if isinstance(client_stop, str):
-            client_stop = [client_stop]
-        if matched not in client_stop:
-            return None
-    return matched
-
-
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
 
@@ -3324,9 +3312,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ):
                     final_finish_reason = "tool_calls"
 
-                matched_stop = _client_matched_stop(
-                    request, finish_reason_data.get("matched")
-                )
+                matched_stop = finish_reason_data.get("matched")
                 # The end frame carries per-choice
                 # usage, independent of stream_options.include_usage.
                 choice_usage = None
@@ -3763,8 +3749,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
-                matched_stop=_client_matched_stop(
-                    request, finish_reason.get("matched") if finish_reason else None
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
