@@ -217,8 +217,16 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         raise ValueError(f"{flag} requires --pp-size 1.")
     if cfg.enable_dp_attention:
         raise ValueError(f"{flag} does not support --enable-dp-attention.")
-    if cfg.attn_cp_size > 1:
-        raise ValueError(f"{flag} requires --attn-cp-size 1.")
+    # CP-TP group sharing (resolved later, in handle_context_parallelism) needs
+    # --attn-cp-size == --tp-size; it shards linear-attention heads over TP, so
+    # each rank's KDA state matches plain TP. Other CP layouts replicate it.
+    if cfg.attn_cp_size > 1 and not (
+        cfg.enable_prefill_cp and cfg.attn_cp_size == cfg.tp_size
+    ):
+        raise ValueError(
+            f"{flag} requires --attn-cp-size 1 or CP-TP group sharing "
+            "(--enable-prefill-cp with --attn-cp-size == --tp-size)."
+        )
     if cfg.disaggregation_mode == "decode":
         # Decode may write per-rank KDA keys in the prefill layout; the node
         # object keys would hide them from, or mix with, those readers.

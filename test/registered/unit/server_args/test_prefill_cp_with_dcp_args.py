@@ -12,7 +12,10 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import parallel_hook
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import resolve_cp_tp_group_sharing
 from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
-from sglang.srt.arg_groups.hicache_hook import resolve_hicache_dcp_compatibility
+from sglang.srt.arg_groups.hicache_hook import (
+    resolve_hicache_dcp_compatibility,
+    validate_kda_hicache_node_aggregate,
+)
 from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
 from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_overrides
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -261,6 +264,35 @@ class TestHiCacheWithPrefillCpAndDcp(CustomTestCase):
 
     def test_dcp_without_prefill_cp_is_admitted(self):
         self._resolve(enable_prefill_cp=False, attn_cp_size=1)
+
+
+class TestKdaNodeAggregateWithPrefillCp(CustomTestCase):
+    """KDA node aggregation runs before CP-TP group sharing resolves, so it reads
+    the CLI widths: attn_cp == tp shards linear-attention heads over TP like
+    plain TP; a narrower CP group replicates each rank's KDA state."""
+
+    @staticmethod
+    def _validate(**fields):
+        args = _args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="mooncake",
+            hicache_mem_layout="page_first_direct",
+            enable_kda_hicache_node_aggregate=True,
+            **fields,
+        )
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store."
+            "MooncakeStoreConfig.load",
+            return_value=SimpleNamespace(standalone_storage=False),
+        ):
+            validate_kda_hicache_node_aggregate(args)
+
+    def test_cp_tp_group_sharing_is_admitted(self):
+        self._validate()
+
+    def test_cp_narrower_than_tp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "CP-TP group sharing"):
+            self._validate(attn_cp_size=4, dcp_size=4)
 
 
 class TestPrefillCudaGraphWithPrefillCpAndDcp(CustomTestCase):
