@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
+    validate_kda_hicache_node_aggregate_cp,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_allowed_backends,
@@ -2884,6 +2885,36 @@ class TestHiCacheArgs(CustomTestCase):
                         handle_hicache(args)
                 else:
                     handle_hicache(args)
+
+    def test_kda_hicache_node_aggregate_prefill_cp_admission(self):
+        """Prefill CP is admitted only under CP-TP group sharing, where CP rank r
+        holds TP rank r's KDA head shard."""
+        mooncake = json.dumps({"client_server_address": "localhost:50052"})
+        cases = (
+            (8, True, None),
+            (8, False, "CP-TP group sharing"),
+            (1, False, None),
+        )
+        for attn_cp_size, sharing, error in cases:
+            with self.subTest(attn_cp_size=attn_cp_size, sharing=sharing):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_kda_hicache_node_aggregate=True,
+                    hicache_storage_backend="mooncake",
+                    hicache_storage_backend_extra_config=mooncake,
+                    hicache_mem_layout="page_first_direct",
+                    tp_size=8,
+                    attn_cp_size=attn_cp_size,
+                    enable_prefill_cp=attn_cp_size > 1,
+                    enable_cp_tp_group_sharing=sharing,
+                )
+                # handle_hicache runs before CP resolution and no longer rejects CP.
+                handle_hicache(args)
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        validate_kda_hicache_node_aggregate_cp(args)
+                else:
+                    validate_kda_hicache_node_aggregate_cp(args)
 
     def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
         """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""

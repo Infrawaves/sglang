@@ -217,8 +217,6 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         raise ValueError(f"{flag} requires --pp-size 1.")
     if cfg.enable_dp_attention:
         raise ValueError(f"{flag} does not support --enable-dp-attention.")
-    if cfg.attn_cp_size > 1:
-        raise ValueError(f"{flag} requires --attn-cp-size 1.")
     if cfg.disaggregation_mode == "decode":
         # Decode may write per-rank KDA keys in the prefill layout; the node
         # object keys would hide them from, or mix with, those readers.
@@ -238,6 +236,20 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         raise ValueError(
             f"{flag} is incompatible with Mooncake standalone_storage=True, "
             "which requires MooncakeHostTensorAllocator."
+        )
+
+
+def validate_kda_hicache_node_aggregate_cp(server_args: Any):
+    """Prefill CP only under CP-TP group sharing, where CP rank r holds the KDA
+    head shard of TP rank r, so the node object matches a CP-1 instance's.
+
+    Runs after handle_context_parallelism, which declares the sharing."""
+    cfg = resolving_view(server_args)
+    if cfg.attn_cp_size > 1 and not cfg.enable_cp_tp_group_sharing:
+        raise ValueError(
+            "--enable-kda-hicache-node-aggregate supports --attn-cp-size > 1 "
+            "only with CP-TP group sharing (--enable-prefill-cp, "
+            "--attn-cp-size == --tp-size)."
         )
 
 

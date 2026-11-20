@@ -78,6 +78,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
+        validate_kda_hicache_node_aggregate_cp,
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
@@ -291,6 +292,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_context_parallelism, server_args)
     if cfg.enable_prefill_cp:
         run_hook(apply_prefill_cp_cuda_graph_default, server_args)
+    if cfg.enable_kda_hicache_node_aggregate:
+        # After CP resolution, which declares CP-TP group sharing.
+        run_hook(validate_kda_hicache_node_aggregate_cp, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.
