@@ -5,7 +5,9 @@ runs one group (cp == dcp == N). Each CP rank must compute exactly the tokens
 it owns, so it can write its own KV without gathering the new tokens.
 """
 
+import random
 import unittest
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +18,13 @@ from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import interleave
 from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp import utils as cp_utils
+from sglang.srt.layers.cp.bcg import interleave_bcg
+from sglang.srt.layers.cp.bcg.interleave_bcg import (
+    InterleaveCPBCGInput,
+    fill_graph_gather_index,
+    position_layout_max_rank_rows,
+    restride_gather_index,
+)
 from sglang.srt.layers.cp.interleave import (
     InterleaveCPStrategy,
     cp_interleave_to_sequence_order,
@@ -172,6 +181,97 @@ class TestPositionOwnerLayout(CustomTestCase):
             self.assertEqual(k_live.shape[0], loc.shape[0])
             written.append(loc)
         self.assertEqual(sorted(torch.cat(written).tolist()), sorted(slots.tolist()))
+
+
+class TestGraphGatherIndex(CustomTestCase):
+    """A breakable-graph replay widens every shard to the captured rows and keeps
+    the captured reorder length; the per-batch gather_index must follow both."""
+
+    @staticmethod
+    def _shards(stride):
+        """Every rank's positions padded to ``stride`` with -1, laid rank-major."""
+        shards = []
+        for rank in range(N):
+            batch, positions = _forward_batch(rank)
+            rows = batch.attn_cp_metadata.local_sequence_rows
+            local = positions.index_select(0, rows)
+            shards.append(torch.cat([local, torch.full((stride - len(local),), -1)]))
+        return torch.cat(shards), batch.attn_cp_metadata, positions
+
+    def test_restrided_index_reads_wider_shards_in_sequence_order(self):
+        metadata = _forward_batch(0)[0].attn_cp_metadata
+        eager_stride = metadata.per_rank_actual_token[0]
+        gathered, metadata, positions = self._shards(eager_stride + N)
+        index = restride_gather_index(
+            metadata.gather_index, old_stride=eager_stride, new_stride=eager_stride + N
+        )
+        self.assertTrue(torch.equal(gathered.index_select(0, index), positions))
+
+    def test_padded_index_reads_padding_and_writes_each_slot_once(self):
+        metadata = _forward_batch(0)[0].attn_cp_metadata
+        eager_stride = metadata.per_rank_actual_token[0]
+        stride = eager_stride + N
+        gathered, metadata, positions = self._shards(stride)
+        live = restride_gather_index(
+            metadata.gather_index, old_stride=eager_stride, new_stride=stride
+        )
+        total = live.shape[0]
+        graph_index = torch.empty(total + 5, dtype=torch.int64)
+        fill_graph_gather_index(
+            graph_index, live, rank_rows=metadata.per_rank_logical_token, stride=stride
+        )
+        # Distinct slots: the captured index_copy_ never writes one twice.
+        self.assertEqual(len(set(graph_index.tolist())), total + 5)
+        sequence = gathered.index_select(0, graph_index)
+        self.assertTrue(torch.equal(sequence[:total], positions))
+        self.assertTrue(torch.all(sequence[total:] == -1))
+        restored = torch.zeros_like(gathered).index_copy_(0, graph_index, sequence)
+        self.assertTrue(torch.equal(restored[live], gathered[live]))
+
+    def test_bucket_without_enough_padding_slots_is_rejected(self):
+        metadata = _forward_batch(0)[0].attn_cp_metadata
+        stride = metadata.per_rank_actual_token[0]
+        with self.assertRaisesRegex(RuntimeError, "padding slots"):
+            fill_graph_gather_index(
+                torch.empty(N * stride + 1, dtype=torch.int64),
+                metadata.gather_index,
+                rank_rows=metadata.per_rank_logical_token,
+                stride=stride,
+            )
+
+
+class TestGraphBucketRowsUnderDcp(CustomTestCase):
+    """Page-aligned prefixes start every short extend on rank 0, so a rank holds
+    more rows than the even split ceil(total / size); a bucket sized by the even
+    split raises at replay instead of falling back to eager."""
+
+    def test_short_extends_after_page_aligned_prefixes(self):
+        extend, prefix = [9] * 20, [64 * (i + 1) for i in range(20)]
+        parallel = SimpleNamespace(attn_cp_size=8, attn_dcp_size=8)
+        with patch.object(interleave_bcg, "get_parallel", lambda: parallel):
+            rows = InterleaveCPBCGInput._max_local_tokens(None, extend, prefix)
+        # Rank 0 holds positions 64k and 64k + 8 of every request; the even
+        # split would claim ceil(180 / 8) = 23.
+        self.assertEqual(rows, 40)
+
+    def test_rows_match_the_positions_each_rank_owns(self):
+        rng = random.Random(0)
+        for _ in range(500):
+            size = rng.choice((2, 4, 8))
+            requests = [
+                (rng.randrange(0, 200), rng.randrange(1, 30))
+                for _ in range(rng.randrange(1, 6))
+            ]
+            prefix, extend = zip(*requests)
+            owned = Counter((p + i) % size for p, e in requests for i in range(e))
+            expected = max(owned.values())
+            self.assertEqual(
+                position_layout_max_rank_rows(extend, prefix, size), expected
+            )
+            # Without prefixes the bound must still cover every placement.
+            self.assertGreaterEqual(
+                position_layout_max_rank_rows(extend, None, size), expected
+            )
 
 
 class TestCpGateUnderDcp(CustomTestCase):

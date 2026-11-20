@@ -93,6 +93,10 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     prefix_lens: Optional[torch.Tensor] = None
     # KV write slots of local_sequence_rows; set by prepare_cp_forward.
     local_out_cache_loc: Optional[torch.Tensor] = None
+    # Graph capture of the position layout: gather_index padded to
+    # graph_num_tokens at a fixed address. Only the captured sequence
+    # reorders read it; eager gathers keep the live gather_index.
+    graph_gather_index: Optional[torch.Tensor] = None
 
 
 def is_interleave_extend(forward_batch):
@@ -146,8 +150,9 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
-    if metadata.gather_index is not None:
-        return hidden_states.index_select(0, metadata.gather_index)
+    gather_index = _sequence_gather_index(metadata)
+    if gather_index is not None:
+        return hidden_states.index_select(0, gather_index)
     size = get_parallel().attn_cp_size
     rows = hidden_states.shape[0] // size
     num_tokens = (
@@ -172,6 +177,14 @@ def _use_interleave_rows(x) -> bool:
     return x.device.type != "cpu" and x.is_contiguous()
 
 
+def _sequence_gather_index(metadata) -> Optional[torch.Tensor]:
+    # A graph segment keeps graph_num_tokens rows at a fixed address; the
+    # live gather_index has total_seq_lens rows and is rebuilt per batch.
+    if metadata.graph_gather_index is not None:
+        return metadata.graph_gather_index
+    return metadata.gather_index
+
+
 def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
     """Restore interleave order after linear attention and before CP attention.
 
@@ -184,13 +197,14 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
     size = get_parallel().attn_cp_size
-    if metadata.gather_index is None and _use_interleave_rows(hidden_states):
+    gather_index = _sequence_gather_index(metadata)
+    if gather_index is None and _use_interleave_rows(hidden_states):
         from sglang.kernels.ops.memory.interleave_rows import interleave_rows
 
         return interleave_rows(hidden_states, size, gathered_rows, to_rank_major=True)
     padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
-    if metadata.gather_index is not None:
-        return padded.index_copy_(0, metadata.gather_index, hidden_states)
+    if gather_index is not None:
+        return padded.index_copy_(0, gather_index, hidden_states)
     padded[: hidden_states.shape[0]] = hidden_states
     return (
         padded.reshape(-1, size, *hidden_states.shape[1:])

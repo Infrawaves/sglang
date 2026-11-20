@@ -15,7 +15,7 @@ class ZigzagCPBCGInput(PrefillCPBCGInput):
     def min_capture_tokens(cp_size: int) -> int:
         return cp_size * 2
 
-    def _max_local_tokens(self, extend_seq_lens) -> int:
+    def _max_local_tokens(self, extend_seq_lens, prefix_lens=None) -> int:
         cp_size = get_cp_strategy().cp_size
         cp_segment_num = cp_size * 2
         per_rank_logical_tokens = [0] * cp_size

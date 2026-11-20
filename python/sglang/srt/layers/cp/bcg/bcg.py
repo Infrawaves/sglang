@@ -124,14 +124,18 @@ class PrefillCPBCGInput:
     def min_capture_tokens(cp_size: int) -> int:
         return cp_size
 
-    def _max_local_tokens(self, extend_seq_lens: Any) -> int:
+    def _max_local_tokens(
+        self, extend_seq_lens: Any, prefix_lens: Optional[Any] = None
+    ) -> int:
         raise NotImplementedError
 
-    def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
+    def required_local_tokens(
+        self, extend_seq_lens: Any, prefix_lens: Optional[Any] = None
+    ) -> Optional[int]:
         """Return the largest aligned local shard, uniformly across CP ranks."""
         if extend_seq_lens is None or len(extend_seq_lens) == 0:
             return None
-        max_local_tokens = self._max_local_tokens(extend_seq_lens)
+        max_local_tokens = self._max_local_tokens(extend_seq_lens, prefix_lens)
         align_size = get_cp_padding_align_size()
         return (max_local_tokens + align_size - 1) // align_size * align_size
 
@@ -165,8 +169,11 @@ class PrefillCPBCGInput:
         extend_seq_lens: Any,
         capture_num_tokens: list[int],
         max_padding_factor: int,
+        prefix_lens: Optional[Any] = None,
     ) -> Optional[int]:
-        required_local_tokens = self.required_local_tokens(extend_seq_lens)
+        required_local_tokens = self.required_local_tokens(
+            extend_seq_lens, prefix_lens
+        )
         if required_local_tokens is None:
             return None
         return self.select_replay_bucket(
