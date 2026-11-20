@@ -48,6 +48,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    _client_matched_stop,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -3612,6 +3613,26 @@ class ServingChatTestCase(CustomTestCase):
                 # The stop follows the channel the encoder was asked to open.
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(stops, not kwargs.get("thinking", True))
+
+    def test_matched_stop_hides_server_added_k3_stops(self):
+        """Stops the server adds for K3 are not reported; the client's are."""
+        cases = (
+            (THINK_CLOSE, None, None),
+            (MESSAGE_CLOSE, ["END"], None),
+            (THINK_CLOSE, [THINK_CLOSE], THINK_CLOSE),
+            (MESSAGE_CLOSE, MESSAGE_CLOSE, MESSAGE_CLOSE),
+            ("END", ["END"], "END"),
+            (163586, None, 163586),
+            (None, None, None),
+        )
+        for matched, stop, expected in cases:
+            with self.subTest(matched=matched, stop=stop):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    stop=stop,
+                )
+                self.assertEqual(_client_matched_stop(request, matched), expected)
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):
