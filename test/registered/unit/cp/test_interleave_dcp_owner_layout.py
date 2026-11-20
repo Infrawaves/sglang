@@ -174,6 +174,36 @@ class TestPositionOwnerLayout(CustomTestCase):
         self.assertEqual(sorted(torch.cat(written).tolist()), sorted(slots.tolist()))
 
 
+class TestCpGateUnderDcp(CustomTestCase):
+    """A batch of at least N new tokens whose positions miss a rank would leave
+    that rank with no query rows; it skips the DCP index-K gather its peers
+    wait in, so such a batch must run without CP."""
+
+    def _can_apply(self, requests, dcp_size=N):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[e for _, e in requests],
+            seq_lens_cpu=torch.tensor([p + e for p, e in requests]),
+        )
+        with _topology(rank=0, dcp_size=dcp_size):
+            return InterleaveCPStrategy(cp_size=N).can_apply(
+                sum(e for _, e in requests), batch
+            )
+
+    def test_batch_missing_a_rank_runs_without_cp(self):
+        # Positions 0..1 twice cover ranks 0..1 only; 63..64 covers ranks 3 and 0.
+        self.assertFalse(self._can_apply([(0, 2), (0, 2)]))
+        self.assertFalse(self._can_apply([(63, 2), (0, 2)]))
+
+    def test_batch_covering_every_rank_keeps_cp(self):
+        self.assertTrue(self._can_apply([(0, 2), (2, 2)]))
+        self.assertTrue(self._can_apply([(5, N)]))
+        self.assertTrue(self._can_apply(REQUESTS))
+
+    def test_without_dcp_only_the_token_count_gates(self):
+        self.assertTrue(self._can_apply([(0, 2), (0, 2)], dcp_size=1))
+
+
 class TestWithoutDcp(CustomTestCase):
     def test_concatenated_index_split_is_unchanged(self):
         total = sum(e for _, e in REQUESTS)
