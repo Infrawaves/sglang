@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
+use crate::policies::registry::PdPoolResolver;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
@@ -13,10 +14,11 @@ use crate::server::metrics::MetricsRegistry;
 use crate::state::kv_events::{
     BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
 };
+use crate::state::load_monitor::cold_pressure::ColdPressure;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
-use crate::workers::{DecodeGate, WorkerRegistry};
+use crate::workers::{DecodeGate, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -70,6 +72,8 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
+    /// Latest cluster cold-token pressure; empty until main starts its sampler.
+    pub cold_pressure: Arc<ColdPressure>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     /// Local KV tree for `--dp-aware` rank selection, under any policy.
@@ -149,6 +153,7 @@ impl AppContext {
             kv_metrics: None,
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
+            cold_pressure: Arc::default(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
@@ -193,6 +198,15 @@ impl AppContext {
     /// cannot be undone, because the process it announces cannot be either.
     pub fn mark_not_ready(&self) {
         self.readiness.store(READINESS_DRAINING, Ordering::Relaxed);
+    }
+
+    /// Breaker-admitted plain workers, or prefill workers with a decode in their
+    /// version group. Read-only, so it never fails open; ignores `--bucket-config`.
+    pub fn routable_prefill_workers(&self) -> Vec<Arc<Worker>> {
+        PdPoolResolver::new(Arc::clone(&self.registry))
+            .read_only()
+            .prefill_candidates(&ModelId(self.config.model.id.clone()))
+            .unwrap_or_default()
     }
 
     /// Whether bootstrap finished — only ONE term of the `/readyz` predicate,
@@ -260,6 +274,7 @@ impl AppContext {
             kv_metrics: None,
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
+            cold_pressure: Arc::default(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
@@ -269,6 +284,80 @@ impl AppContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+
+    fn add(ctx: &AppContext, id: &str, mode: WorkerMode, version_group: Option<&str>) {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: format!("http://{id}"),
+                mode,
+                model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
+                version_group: version_group.map(str::to_owned),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn pool_ids(ctx: &AppContext) -> Vec<String> {
+        let mut ids: Vec<_> = ctx
+            .routable_prefill_workers()
+            .iter()
+            .map(|w| w.id.0.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn routable_prefill_pool_is_plain_workers_without_pd() {
+        let ctx = AppContext::stub();
+        add(&ctx, "a", WorkerMode::Plain, None);
+        assert_eq!(pool_ids(&ctx), ["a"]);
+    }
+
+    /// During a rolling release a prefill whose version group has no decode
+    /// takes no traffic, so it must not add idle capacity to the pool.
+    #[test]
+    fn routable_prefill_pool_skips_prefill_without_a_decode_peer() {
+        let ctx = AppContext::stub();
+        add(&ctx, "p-old", WorkerMode::Prefill, Some("v1"));
+        add(&ctx, "p-new", WorkerMode::Prefill, Some("v2"));
+        add(&ctx, "d-old", WorkerMode::Decode, Some("v1"));
+        assert_eq!(pool_ids(&ctx), ["p-old"]);
+    }
+
+    /// Sampling must not fail open: an all-open pool stays open and empty.
+    #[test]
+    fn routable_prefill_pool_leaves_open_breakers_alone() {
+        use crate::health::circuit_breaker::CircuitBreakerConfig;
+        use crate::workers::WireProtocol;
+        let ctx = AppContext::stub();
+        let cb = CircuitBreakerConfig {
+            threshold: std::num::NonZeroU32::new(1).unwrap(),
+            cool_down: std::time::Duration::from_secs(3600),
+        };
+        ctx.registry
+            .add_with_cb(
+                WorkerSpec {
+                    id: WorkerId("a".into()),
+                    url: "http://a".into(),
+                    mode: WorkerMode::Plain,
+                    model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                    ..Default::default()
+                },
+                Some(cb),
+                WireProtocol::default(),
+            )
+            .unwrap();
+        let worker = ctx.registry.get(&WorkerId("a".into())).unwrap();
+        worker.breaker.record_failure();
+        assert!(!worker.breaker.would_allow());
+
+        assert!(pool_ids(&ctx).is_empty());
+        assert!(!worker.breaker.would_allow(), "sampling reset the breaker");
+    }
 
     #[test]
     fn mark_not_ready_flips_readiness_back_off() {

@@ -356,6 +356,27 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// Sampling behind `GET /prefill_pressure`.
+    pub cold_pressure: ColdPressureConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdPressureConfig {
+    /// Waiting uncached prefill tokens one healthy prefill worker may hold at full pressure.
+    pub per_prefill_cold_tokens: u64,
+    pub sample_interval_secs: u64,
+}
+
+pub const DEFAULT_PER_PREFILL_COLD_TOKENS: u64 = 20_000;
+pub const DEFAULT_COLD_PRESSURE_SAMPLE_INTERVAL_SECS: u64 = 5;
+
+impl Default for ColdPressureConfig {
+    fn default() -> Self {
+        Self {
+            per_prefill_cold_tokens: DEFAULT_PER_PREFILL_COLD_TOKENS,
+            sample_interval_secs: DEFAULT_COLD_PRESSURE_SAMPLE_INTERVAL_SECS,
+        }
+    }
 }
 
 impl ServerConfig {
@@ -387,6 +408,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            cold_pressure: ColdPressureConfig::default(),
         }
     }
 }
