@@ -11,7 +11,9 @@ from sglang.srt.layers.attention.dsa_backend import (
     _apply_q_row_plan,
     _plan_live_rows,
     _restore_live_rows,
+    _flashmla_kv_padded_heads,
     _RowPlan,
+    flashmla_kv_prefill_q_heads,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
@@ -359,6 +361,32 @@ class TestDSABackendDPPadding(CustomTestCase):
         self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
+
+
+class TestFlashMlaPrefillHeadsUnderCpDecodeAttnTp(CustomTestCase):
+    """A prefill too short to shard runs without CP, where CP decode attention TP
+    slices the attention per CP rank; its FlashMLA schedule must be planned for
+    the sliced head count, or sparse_decode_fwd rejects tile_scheduler_metadata."""
+
+    def test_non_cp_prefill_plans_the_sliced_heads(self):
+        heads = flashmla_kv_prefill_q_heads(
+            local_num_q_heads=128,
+            attn_cp_size=8,
+            slices_non_cp_heads=True,
+            cp_active=False,
+        )
+        self.assertEqual(heads, _flashmla_kv_padded_heads(16))
+
+    def test_cp_prefill_and_unsliced_layouts_keep_every_head(self):
+        for slices, cp_active in ((True, True), (False, False)):
+            with self.subTest(slices=slices, cp_active=cp_active):
+                heads = flashmla_kv_prefill_q_heads(
+                    local_num_q_heads=128,
+                    attn_cp_size=8,
+                    slices_non_cp_heads=slices,
+                    cp_active=cp_active,
+                )
+                self.assertEqual(heads, _flashmla_kv_padded_heads(128))
 
 
 if __name__ == "__main__":

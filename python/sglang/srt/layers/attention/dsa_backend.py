@@ -355,6 +355,22 @@ def _flashmla_kv_padded_heads(num_heads: int) -> int:
     return num_heads
 
 
+def flashmla_kv_prefill_q_heads(
+    *,
+    local_num_q_heads: int,
+    attn_cp_size: int,
+    slices_non_cp_heads: bool,
+    cp_active: bool,
+) -> int:
+    """Padded q heads a FlashMLA prefill attends with: the schedule metadata
+    must be planned for the same count the kernel receives."""
+    if slices_non_cp_heads and not cp_active:
+        # Mirrors CpDecodeAttnTpContext.set_decode_attn_tp: the forward slices
+        # the attention per CP rank, so the layer sees heads // attn_cp_size.
+        return _flashmla_kv_padded_heads(local_num_q_heads // attn_cp_size)
+    return _flashmla_kv_padded_heads(local_num_q_heads)
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -894,8 +910,10 @@ class DeepseekSparseAttnBackend(
             )
             self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
-        self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
-            self.local_num_q_heads
+        # CP decode attention TP slices the replicated attention per CP rank on
+        # every forward that skips CP, including prefills too short to shard.
+        self._slices_non_cp_prefill_heads = (
+            get_parallel().enable_cp_decode_attn_tp and get_parallel().attn_cp_size > 1
         )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         # flashmla_kv q with heads padded to flashmla_kv_num_q_heads: pad heads are
@@ -1806,7 +1824,12 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                     num_heads_q=(
-                        self.flashmla_kv_num_q_heads_prefill
+                        flashmla_kv_prefill_q_heads(
+                            local_num_q_heads=self.local_num_q_heads,
+                            attn_cp_size=get_parallel().attn_cp_size,
+                            slices_non_cp_heads=self._slices_non_cp_prefill_heads,
+                            cp_active=is_cp_active(forward_batch),
+                        )
                         if forward_batch.forward_mode.is_extend_without_speculative()
                         else None
                     ),
