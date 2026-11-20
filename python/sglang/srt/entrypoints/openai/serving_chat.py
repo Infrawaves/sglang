@@ -334,24 +334,11 @@ def kimi_k3_thinking_effort(
 
 
 def _append_stop(sampling_params: dict[str, Any], stop_str: str) -> None:
-    """Add a server-side stop string, keeping the client's own stops."""
     stop = sampling_params.get("stop") or []
     stop = [stop] if isinstance(stop, str) else list(stop)
     if stop_str not in stop:
         stop.append(stop_str)
     sampling_params["stop"] = stop
-
-
-def _client_matched_stop(request: ChatCompletionRequest, matched: Any) -> Any:
-    """The matched stop to report: a K3 stop the server added is hidden unless
-    the client asked for the same string, so no marker reaches the response."""
-    if isinstance(matched, str) and matched in (MESSAGE_CLOSE, THINK_CLOSE):
-        client_stop = request.stop or []
-        if isinstance(client_stop, str):
-            client_stop = [client_stop]
-        if matched not in client_stop:
-            return None
-    return matched
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -1755,13 +1742,13 @@ class OpenAIServingChat(OpenAIServingBase):
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
         if self.chat_encoding_spec == "kimi_k3":
+            self._stop_kimi_k3_reasoning_without_thinking(
+                sampling_params, request.chat_template_kwargs
+            )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
-            )
-            self._stop_kimi_k3_reasoning_without_thinking(
-                sampling_params, request.chat_template_kwargs
             )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
@@ -2012,14 +1999,14 @@ class OpenAIServingChat(OpenAIServingBase):
         sampling_params: dict[str, Any],
         chat_template_kwargs: dict[str, Any] | None,
     ) -> None:
-        """Without thinking the prompt opens the response channel, yet the model
-        may still reason there and then close a think block. The official API
-        ends the output at that think close, returning the text before it as
-        content; stopping on the marker does the same, so neither the marker nor
-        the answer after it reaches the client, streaming or not."""
-        # The encoder picks the channel by the kwarg's truthiness and defaults
-        # to thinking, so only a present, falsy value opens the response channel.
+        """Without thinking the model may still reason and close a think block;
+        the official API ends the output there, keeping the text before it."""
+        # The encoder opens the response channel only for a present, falsy kwarg.
         if (chat_template_kwargs or {}).get("thinking", True):
+            return
+        # In a JSON answer the marker can only be text in a string, where stopping
+        # would cut the JSON; run before the K3 framing replaces the json_schema.
+        if sampling_params.get("json_schema"):
             return
         _append_stop(sampling_params, THINK_CLOSE)
 
@@ -3325,9 +3312,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ):
                     final_finish_reason = "tool_calls"
 
-                matched_stop = _client_matched_stop(
-                    request, finish_reason_data.get("matched")
-                )
+                matched_stop = finish_reason_data.get("matched")
                 # The end frame carries per-choice
                 # usage, independent of stream_options.include_usage.
                 choice_usage = None
@@ -3764,8 +3749,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
-                matched_stop=_client_matched_stop(
-                    request, finish_reason.get("matched") if finish_reason else None
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,

@@ -626,8 +626,9 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
     Post-reasoning content is unwrapped from the XTML ``response`` /
     ``message`` markers; a ``tools`` channel is passed through raw for the
-    kimi_k3 tool-call detector, and dropped when no tool-call parser runs, as
-    the official API returns no undeclared calls.
+    kimi_k3 tool-call detector, and dropped when the caller says no tool-call
+    parser runs (``tool_call_parser_active=False``), as the official API
+    returns no undeclared calls.
 
     The model does not always honour the pre-filled think channel: on very long
     prompts (~1M tokens) it sometimes emits a zero-length think section and
@@ -646,7 +647,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
-        tool_call_parser_active: bool = False,
+        tool_call_parser_active: bool = True,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -896,7 +897,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 else 0
             )
             emit = buf[: len(buf) - holdback] if holdback else buf
-            self._buffer = buf[len(emit) :]
+            self._buffer = buf[len(emit) :] if self._keep_tools else ""
             head = emit[:tools_idx]
             tail = emit[tools_idx:]
             for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
@@ -2317,10 +2318,11 @@ class ReasoningParser:
         model_type (str): Type of model to parse reasoning from
         stream_reasoning (bool): If False, accumulates reasoning content until complete.
             If True, streams reasoning content as it arrives.
-        tool_call_parser_active (bool): True when this parser's normal text feeds a
-            function-call parser rather than going straight to the client. Passed on
-            to detectors that accept it (channel-framed formats keep tool framing
-            intact for the downstream detector).
+        tool_call_parser_active (bool | None): True when this parser's normal text
+            feeds a function-call parser rather than going straight to the client;
+            None leaves it to each detector's default. Passed on to detectors that
+            accept it (channel-framed formats keep tool framing intact for the
+            downstream detector).
     """
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
@@ -2371,7 +2373,7 @@ class ReasoningParser:
         force_reasoning: Optional[bool] = None,
         request: ChatCompletionRequest = None,
         tokenizer=None,
-        tool_call_parser_active: bool = False,
+        tool_call_parser_active: bool | None = None,
         prefix: str | None = None,
     ):
         if not model_type:
@@ -2445,10 +2447,10 @@ class ReasoningParser:
             if "tokenizer" in sig.parameters:
                 kwargs["tokenizer"] = tokenizer
 
-        if tool_call_parser_active:
+        if tool_call_parser_active is not None:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
-                kwargs["tool_call_parser_active"] = True
+                kwargs["tool_call_parser_active"] = tool_call_parser_active
 
         if prefix is None:
             prefix = getattr(request, "_response_parser_prefix", "")

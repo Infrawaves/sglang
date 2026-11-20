@@ -1320,9 +1320,14 @@ class KimiK3AdditionalToolsTestCase(CustomTestCase):
         return asyncio.run(respond())
 
     def test_stops_reasoning_written_without_thinking(self):
-        """Responses stops on the think close only when reasoning is off."""
-        for effort, stops in (("none", True), ("high", False)):
-            with self.subTest(effort=effort):
+        """Responses stops on the think close only when reasoning is off and the
+        answer is not JSON."""
+        for effort, text, stops in (
+            ("none", None, True),
+            ("high", None, False),
+            ("none", {"format": {"type": "json_object"}}, False),
+        ):
+            with self.subTest(effort=effort, text=text):
                 captured = {}
 
                 async def generate(internal_request, raw_request):
@@ -1338,6 +1343,7 @@ class KimiK3AdditionalToolsTestCase(CustomTestCase):
                             model="x",
                             input="Hi",
                             reasoning={"effort": effort},
+                            text=text,
                             stop=["END"],
                         )
                     )
