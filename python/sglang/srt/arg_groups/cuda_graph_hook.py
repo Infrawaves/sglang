@@ -141,17 +141,23 @@ def apply_cuda_graph_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
-        # Neither capture holds the prefill-CP-with-DCP metadata, and an
-        # explicit backend would skip the rules below that disable it.
+        # An explicit backend skips the rules below. Prefill CP with DCP keeps
+        # its gathers and attention in breakable-graph breaks, so only that
+        # backend, on the one-group layout, has the per-batch metadata.
+        backend = cfg.cuda_graph_config.prefill.backend
         if (
             cfg.enable_prefill_cp
             and cfg.dcp_size > 1
-            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+            and backend != Backend.DISABLED
+            and not (
+                backend == Backend.BREAKABLE
+                and cfg.dcp_size == cfg.attn_cp_size == cfg.tp_size
+            )
         ):
             raise ValueError(
-                "--dcp-size > 1 with --enable-prefill-cp does not support a "
-                "prefill CUDA graph yet; use --cuda-graph-backend-prefill "
-                "disabled."
+                "--dcp-size > 1 with --enable-prefill-cp supports only "
+                "--cuda-graph-backend-prefill breakable (with --tp-size == "
+                "--attn-cp-size == --dcp-size) or disabled."
             )
         return
 

@@ -1602,6 +1602,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     extend_seq_lens=forward_batch.extend_seq_lens_cpu,
                     capture_num_tokens=self.capture_num_tokens,
                     max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                    prefix_lens=forward_batch.extend_prefix_lens_cpu,
                 )
                 is None
             ):
@@ -1980,6 +1981,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     extend_seq_lens=forward_batch.extend_seq_lens_cpu,
                     capture_num_tokens=self.capture_num_tokens,
                     max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                    prefix_lens=forward_batch.extend_prefix_lens_cpu,
                 )
             )
             if static_num_tokens is None:

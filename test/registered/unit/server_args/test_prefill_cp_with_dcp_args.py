@@ -296,8 +296,9 @@ class TestKdaNodeAggregateWithPrefillCp(CustomTestCase):
 
 
 class TestPrefillCudaGraphWithPrefillCpAndDcp(CustomTestCase):
-    """An explicit prefill graph skips the rules that would disable it, so the
-    combination must be rejected outright."""
+    """An explicit prefill graph skips the rules that would disable it. Only the
+    breakable graph keeps the per-batch DCP gathers and attention eager, so a
+    full graph stays rejected."""
 
     @staticmethod
     def _apply(backend, **fields):
@@ -308,11 +309,16 @@ class TestPrefillCudaGraphWithPrefillCpAndDcp(CustomTestCase):
         args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
         apply_cuda_graph_compatibility(args)
 
-    def test_explicit_prefill_graph_is_rejected(self):
-        for backend in (Backend.BREAKABLE, Backend.FULL):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, "prefill CUDA graph"):
-                    self._apply(backend)
+    def test_explicit_full_graph_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "breakable"):
+            self._apply(Backend.FULL)
+
+    def test_explicit_breakable_graph_is_admitted_on_one_group(self):
+        self._apply(Backend.BREAKABLE)
+
+    def test_explicit_breakable_graph_needs_equal_widths(self):
+        with self.assertRaisesRegex(ValueError, "breakable"):
+            self._apply(Backend.BREAKABLE, attn_cp_size=4, dcp_size=4)
 
     def test_explicit_disabled_is_admitted(self):
         self._apply(Backend.DISABLED)

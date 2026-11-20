@@ -12,7 +12,11 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
-from sglang.srt.layers.cp.interleave import run_indexer_with_kv_gather
+from sglang.srt.layers.cp.interleave import (
+    position_owned_rows_per_request,
+    run_indexer_with_kv_gather,
+)
+from sglang.srt.layers.cp.padding import physical_rank_len
 from sglang.srt.layers.cp.utils import cp_interleave_input_ids
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -58,6 +62,62 @@ def _indexer_with_kv(
 bcg_indexer_with_kv = eager_on_graph(True)(_indexer_with_kv)
 
 
+def position_layout_max_rank_rows(extend_lens, prefix_lens, size: int) -> int:
+    """Most rows one CP rank holds when prefill CP with DCP shards by position.
+
+    Page-aligned prefixes start every extend on rank 0, so short extends pile
+    onto the low ranks and exceed the even split ceil(total / size).
+    """
+    extend = [int(length) for length in extend_lens]
+    if prefix_lens is None:
+        # Upper bound: any rank holds at most ceil(extend / size) of a request.
+        return sum((length + size - 1) // size for length in extend)
+    prefix = [int(length) for length in prefix_lens]
+    return max(
+        sum(position_owned_rows_per_request(prefix, extend, rank=rank, size=size))
+        for rank in range(size)
+    )
+
+
+def restride_gather_index(
+    gather_index: torch.Tensor, *, old_stride: int, new_stride: int
+) -> torch.Tensor:
+    """Re-address rank-major slots (owner * stride + slot) for a wider shard."""
+    if old_stride == new_stride:
+        return gather_index
+    return gather_index // old_stride * new_stride + gather_index % old_stride
+
+
+def fill_graph_gather_index(
+    out: torch.Tensor, live: torch.Tensor, *, rank_rows, stride: int
+) -> None:
+    """Fill a fixed-address graph gather index from the live one.
+
+    Rows past the live tokens point at distinct padding slots (a rank's rows
+    beyond its live count), so the captured index_copy_ never writes a slot
+    twice and the captured index_select reads only padding there.
+    """
+    total = live.shape[0]
+    need = out.shape[0] - total
+    if need < 0:
+        raise RuntimeError(
+            f"Graph gather index holds {out.shape[0]} rows, live batch has {total}"
+        )
+    out[:total].copy_(live)
+    if need == 0:
+        return
+    rows = torch.arange(stride)
+    owned = torch.tensor([int(n) for n in rank_rows])
+    slots = torch.arange(len(rank_rows))[:, None] * stride + rows[None, :]
+    spare = slots[rows[None, :] >= owned[:, None]]
+    if spare.numel() < need:
+        raise RuntimeError(
+            f"Graph gather index needs {need} padding slots, the captured shards "
+            f"have {spare.numel()} (stride={stride}, rank_rows={list(rank_rows)})"
+        )
+    out[total:].copy_(spare[:need])
+
+
 class InterleaveCPBCGInput(PrefillCPBCGInput):
     @classmethod
     def create(cls, runner):
@@ -71,6 +131,13 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         # Graphs must read the live count from the same address on each replay.
         result.moe_local_token_count = torch.zeros(
             (), dtype=torch.int32, device=runner.device
+        )
+        # Prefill CP with DCP reorders by a per-batch gather_index inside the
+        # captured KDA segments; replays copy it here instead of rebinding it.
+        result.graph_gather_index = (
+            torch.zeros(capacity, dtype=torch.int64, device=runner.device)
+            if get_parallel().attn_dcp_size > 1
+            else None
         )
         return result
 
@@ -109,8 +176,10 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
             )
         )
 
-    def _max_local_tokens(self, extend_seq_lens):
+    def _max_local_tokens(self, extend_seq_lens, prefix_lens=None):
         size = get_parallel().attn_cp_size
+        if get_parallel().attn_dcp_size > 1:
+            return position_layout_max_rank_rows(extend_seq_lens, prefix_lens, size)
         return (sum(int(length) for length in extend_seq_lens) + size - 1) // size
 
     def model_positions(self, forward_batch):
@@ -127,6 +196,14 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         # compression, KV writes and the output gather use the live lengths
         # produced by prepare_cp_forward, never the bucket's padded tail.
         metadata.graph_num_tokens = static_num_tokens
+        if metadata.gather_index is not None:
+            # super().prepare widened every shard to the captured rows, so the
+            # rank-major slots must use that stride before anything reads them.
+            metadata.gather_index = restride_gather_index(
+                metadata.gather_index,
+                old_stride=physical_rank_len(metadata.per_rank_logical_token),
+                new_stride=metadata.per_rank_actual_token[0],
+            )
         self.moe_local_token_count.fill_(
             metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
         )
@@ -140,6 +217,16 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         )
         self.input_ids_global[: ids.shape[0]].copy_(ids)
         forward_batch.input_ids_global = self.input_ids_global[: ids.shape[0]]
+        if metadata.gather_index is not None:
+            # After the input-id reorder above, which reads the live index.
+            graph_index = self.graph_gather_index[:static_num_tokens]
+            fill_graph_gather_index(
+                graph_index,
+                metadata.gather_index,
+                rank_rows=metadata.per_rank_logical_token,
+                stride=metadata.per_rank_actual_token[0],
+            )
+            metadata.graph_gather_index = graph_index
 
 
 def cp_interleave_indexer_rows(forward_batch):
