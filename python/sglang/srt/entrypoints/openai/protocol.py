@@ -2109,14 +2109,11 @@ class ResponsesRequest(BaseModel):
         if default_params is None:
             default_params = {}
 
-        # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
             max_tokens = min(self.max_output_tokens, default_max_tokens)
         else:
-            max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+            # Leave BOS/EOS headroom in the server-derived budget.
+            max_tokens = default_max_tokens - 2
 
         temperature = self.temperature
         if temperature is None:
