@@ -604,6 +604,7 @@ class _GenerationStreamAccumulator:
                 if should_output:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
+                    should_output &= not req.is_matching_stop_token_sequence()
             else:
                 should_output = (
                     len(req.output_ids) % self.default_force_stream_interval == 0

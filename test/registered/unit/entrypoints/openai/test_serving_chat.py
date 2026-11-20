@@ -15,6 +15,7 @@ import copy
 import gc
 import itertools
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
@@ -82,6 +83,7 @@ from sglang.srt.runtime_context import get_context, get_disagg, publish, reset_c
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
+    get_request_stop_token_sequences,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -3578,20 +3580,35 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_stops_reasoning_written_without_thinking(self):
         """Only a prompt that opens the response channel stops on a think close,
-        tools or not, and the client's own stops are kept."""
+        and only a request without a tool-call parser stops on a tools open; both
+        stop on the special-token ids, and the client's own stops are kept."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        special = {"<|open|>": 900, "<|close|>": 901, "<|sep|>": 902}
+        names = {"think": 910, "tools": 911, "message": 912}
+
+        def encode(text, add_special_tokens=False):
+            match = re.fullmatch(r"(<\|\w+\|>)(\w+)(<\|sep\|>)", text)
+            if match is None:
+                return []
+            head, name, tail = match.groups()
+            return [special[head], names[name], special[tail]]
+
+        self.tm.tokenizer.encode.side_effect = encode
+        self.tm.tokenizer.convert_tokens_to_ids.side_effect = special.get
         self.chat.chat_encoding_spec = "kimi_k3"
         self.chat.tool_call_parser = "kimi_k3"
         tool = {"type": "function", "function": {"name": "lookup"}}
+        think_close, tools_open = (901, 910, 902), (900, 911, 902)
         cases = (
-            ({}, False),
-            ({"reasoning_effort": "none"}, True),
-            ({"thinking": {"type": "disabled"}}, True),
-            ({"chat_template_kwargs": {"thinking": False}}, True),
-            ({"thinking": {"type": "disabled"}, "tools": [tool]}, True),
+            ({}, False, True),
+            ({"reasoning_effort": "none"}, True, True),
+            ({"thinking": {"type": "disabled"}}, True, True),
+            ({"chat_template_kwargs": {"thinking": False}}, True, True),
+            ({"thinking": {"type": "disabled"}, "tools": [tool]}, True, False),
+            ({"tools": [tool]}, False, False),
         )
-        for fields, stops in cases:
+        for fields, stops_think, stops_tools in cases:
             with self.subTest(fields=fields):
                 request = ChatCompletionRequest(
                     model="x",
@@ -3604,9 +3621,13 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 params = adapted.sampling_params
                 self.assertIn("END", params["stop"])
-                self.assertEqual(THINK_CLOSE in params["stop"], stops)
+                self.assertNotIn(THINK_CLOSE, params["stop"])
+                self.assertNotIn(TOOLS_OPEN, params["stop"])
+                sequences = get_request_stop_token_sequences(params["custom_params"])
+                self.assertEqual(think_close in sequences, stops_think)
+                self.assertEqual(tools_open in sequences, stops_tools)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                self.assertEqual(stops, not kwargs.get("thinking", True))
+                self.assertEqual(stops_think, not kwargs.get("thinking", True))
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):

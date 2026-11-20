@@ -557,6 +557,22 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         }
 
 
+class FINISH_MATCHED_TOKEN_SEQUENCE(BaseFinishReason):
+    """A server-side stop token sequence, already excluded from the output."""
+
+    def __init__(self, matched: Optional[str]):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",
+            "matched": self.matched,
+            # finished_len stops before the sequence; nothing is left to trim.
+            "stop_excluded": True,
+        }
+
+
 class FINISHED_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()

@@ -120,7 +120,11 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
-from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE, THINK_CLOSE
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    THINK_CLOSE,
+    TOOLS_OPEN,
+)
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -158,6 +162,7 @@ from sglang.srt.parser.response_template import (
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
+    append_request_stop_token_sequence,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
 )
@@ -533,6 +538,8 @@ class OpenAIServingChat(OpenAIServingBase):
             get_serving().default_chat_template_kwargs or {}
         )
         self._reasoning_detector = None
+        # K3 marker -> its special-token ids, or None to stop on the text.
+        self._kimi_k3_marker_ids: dict[str, list[int] | None] = {}
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
@@ -1750,6 +1757,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
             )
+            self._stop_kimi_k3_undeclared_tool_calls(
+                sampling_params, self._tool_call_parsing_active(request)
+            )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
         max_new_tokens = sampling_params["max_new_tokens"]
@@ -1992,10 +2002,62 @@ class OpenAIServingChat(OpenAIServingBase):
         # max_tokens; stopping on the message close ends it at once. The
         # response close is not a stop: trimming it would hide the marker the
         # reasoning parser uses to recognize an answer that skipped thinking.
-        _append_stop(sampling_params, MESSAGE_CLOSE)
+        self._append_kimi_k3_marker_stop(sampling_params, MESSAGE_CLOSE)
 
-    @staticmethod
+    def _kimi_k3_marker_stop_ids(self, marker: str) -> list[int] | None:
+        """The special-token ids the model generates for a K3 marker, or None
+        when the tokenizer does not encode it as `<|open|>`/`<|close|>`, name,
+        `<|sep|>`."""
+        if marker in self._kimi_k3_marker_ids:
+            return self._kimi_k3_marker_ids[marker]
+        ids = None
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is not None:
+            encoded = tokenizer.encode(marker, add_special_tokens=False)
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            head = marker[: marker.index("|>") + 2]
+            tail = marker[marker.rindex("<|") :]
+            if (
+                isinstance(encoded, list)
+                and 3 <= len(encoded) <= 8
+                and all(type(token_id) is int for token_id in encoded)
+                and encoded[0] == tokenizer.convert_tokens_to_ids(head)
+                and encoded[-1] == tokenizer.convert_tokens_to_ids(tail)
+            ):
+                ids = encoded
+        if ids is None:
+            logger.warning(
+                "Kimi K3 marker %r is not a special-token sequence; stopping on "
+                "its text instead",
+                marker,
+            )
+        self._kimi_k3_marker_ids[marker] = ids
+        return ids
+
+    def _append_kimi_k3_marker_stop(
+        self, sampling_params: dict[str, Any], marker: str
+    ) -> None:
+        """Stop where the model generates a K3 marker. As a token sequence it
+        excludes the marker, matches only the special tokens and costs no
+        per-step decode; the same text spelled with ordinary tokens does not stop."""
+        ids = self._kimi_k3_marker_stop_ids(marker)
+        if ids is None:
+            _append_stop(sampling_params, marker)
+        else:
+            append_request_stop_token_sequence(sampling_params, ids)
+
+    def _stop_kimi_k3_undeclared_tool_calls(
+        self, sampling_params: dict[str, Any], tool_call_parsing_active: bool
+    ) -> None:
+        """With no tool-call parser to read it, a tools channel is a call to an
+        undeclared tool; the official API returns none and ends there. Stopping
+        at its open marker also spares generating the call."""
+        if not tool_call_parsing_active:
+            self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
+
     def _stop_kimi_k3_reasoning_without_thinking(
+        self,
         sampling_params: dict[str, Any],
         chat_template_kwargs: dict[str, Any] | None,
     ) -> None:
@@ -2008,7 +2070,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # would cut the JSON; run before the K3 framing replaces the json_schema.
         if sampling_params.get("json_schema"):
             return
-        _append_stop(sampling_params, THINK_CLOSE)
+        self._append_kimi_k3_marker_stop(sampling_params, THINK_CLOSE)
 
     def _set_json_grammar_start(
         self,
