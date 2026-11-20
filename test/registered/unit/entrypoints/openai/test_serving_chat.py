@@ -793,7 +793,7 @@ class ServingChatTestCase(CustomTestCase):
                     kwargs["response_format"]["type"], response_format["type"]
                 )
 
-    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+    def test_kimi_k3_usage_counts_assistant_generation_stub_as_output(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
             {
@@ -813,8 +813,27 @@ class ServingChatTestCase(CustomTestCase):
         response = self.chat._build_chat_response(self.basic_req, ret, created=123)
 
         self.assertEqual(response.usage.prompt_tokens, 2072)
-        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.completion_tokens, 4)
+        self.assertEqual(response.usage.total_tokens, 2076)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
+
+    def test_kimi_k3_output_budget_includes_generation_stub(self):
+        """A limit of 16 leaves 13 generated tokens for a templated request."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        for options, expected in (
+            ({"max_tokens": 16}, 13),
+            ({"max_tokens": 16, "max_completion_tokens": 4}, 1),
+            ({"max_completion_tokens": 3}, 3),
+            ({"max_tokens": 16, "input_ids": [1, 2, 3]}, 16),
+        ):
+            with self.subTest(options=options):
+                request = ChatCompletionRequest(
+                    model="x", messages=self.basic_req.messages, **options
+                )
+                adapted, _ = self.chat._convert_to_internal_request(request)
+                self.assertEqual(adapted.sampling_params["max_new_tokens"], expected)
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(

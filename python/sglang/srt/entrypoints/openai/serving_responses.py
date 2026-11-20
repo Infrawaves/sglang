@@ -536,6 +536,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         self.chat_encoding_spec == "kimi_k3"
                         and processed_messages is not None
                     ):
+                        if request.max_output_tokens is not None:
+                            sampling_params["max_new_tokens"] = (
+                                self._k3_generation_budget(
+                                    sampling_params["max_new_tokens"]
+                                )
+                            )
                         self._frame_kimi_k3_json_response(
                             sampling_params,
                             processed_messages.tool_call_constraint,
@@ -760,7 +766,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
                 if cache_context.get("usage") is not None:
-                    headers.update(cache_context["usage"].response_headers())
+                    reported = self._reported_usage_meta(
+                        {**cache_context, "cache_usage": cache_context["usage"]}
+                    )
+                    headers.update(reported["cache_usage"].response_headers())
                 try:
                     return StreamingResponse(
                         close_stream(),
@@ -1036,19 +1045,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Engine meta counters are cumulative within one generation turn.
         # The shared context adds completed built-in turns exactly once.
         counters = cache_context or {}
+        reported = self._reported_usage_meta(
+            {
+                "prompt_tokens": counters.get("prompt_tokens", prompt_tokens),
+                "completion_tokens": counters.get(
+                    "completion_tokens", completion_tokens
+                ),
+                "cached_tokens": counters.get("cached_tokens", cached_tokens),
+                "cache_usage": counters.get("usage"),
+            }
+        )
         return UsageProcessor.calculate_token_usage(
-            prompt_tokens=counters.get("prompt_tokens", prompt_tokens),
-            completion_tokens=counters.get("completion_tokens", completion_tokens),
+            prompt_tokens=reported["prompt_tokens"],
+            completion_tokens=reported["completion_tokens"],
             reasoning_tokens=counters.get("reasoning_tokens", reasoning_tokens),
             cached_tokens=(
-                PromptTokensDetails(
-                    cached_tokens=counters.get("cached_tokens", cached_tokens)
-                )
-                if self.enable_prompt_tokens_details
-                and counters.get("cached_tokens", cached_tokens)
+                PromptTokensDetails(cached_tokens=reported["cached_tokens"])
+                if self.enable_prompt_tokens_details and reported["cached_tokens"]
                 else None
             ),
-            cache_usage=counters.get("usage"),
+            cache_usage=reported["cache_usage"],
         )
 
     @staticmethod
