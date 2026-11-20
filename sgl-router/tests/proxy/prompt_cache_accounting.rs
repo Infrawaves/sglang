@@ -16,7 +16,8 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -139,31 +140,57 @@ fn context(
     if forward_ids {
         assert!(tokenizers.has_chat_formatter(MODEL));
     }
-    let registry = Arc::new(WorkerRegistry::default());
-    registry
-        .add(WorkerSpec {
-            id: WorkerId("prefill-or-plain".into()),
-            url: prefill.url.clone(),
-            mode: if decode.is_some() {
-                WorkerMode::Prefill
-            } else {
-                WorkerMode::Plain
-            },
-            model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: Some(8997),
+    // Workers report OpenAI settings as `/server_info` introspection does, with
+    // a context length for checking `max_tokens`, so the router could serve a
+    // chat it renders through `/generate`, which carries no worker usage headers.
+    // Disabled forwarding must keep chats on the worker's Chat route. Workers in
+    // the router-rendered input_ids cases report no settings, which keeps those
+    // chats on that route as well.
+    let openai = (!forward_ids).then(|| {
+        Arc::new(OpenAiSettings {
+            context_length: Some(131_072),
             ..Default::default()
         })
+    });
+    let registry = Arc::new(WorkerRegistry::default());
+    registry
+        .add_with_cb(
+            WorkerSpec {
+                id: WorkerId("prefill-or-plain".into()),
+                url: prefill.url.clone(),
+                mode: if decode.is_some() {
+                    WorkerMode::Prefill
+                } else {
+                    WorkerMode::Plain
+                },
+                model_ids: vec![ModelId(MODEL.into())],
+                bootstrap_port: Some(8997),
+                ..Default::default()
+            },
+            None,
+            EngineProfile {
+                openai: openai.clone(),
+                ..WireProtocol::default().into()
+            },
+        )
         .unwrap();
     if let Some(decode) = decode {
         registry
-            .add(WorkerSpec {
-                id: WorkerId("decode".into()),
-                url: decode.url.clone(),
-                mode: WorkerMode::Decode,
-                model_ids: vec![ModelId(MODEL.into())],
-                bootstrap_port: None,
-                ..Default::default()
-            })
+            .add_with_cb(
+                WorkerSpec {
+                    id: WorkerId("decode".into()),
+                    url: decode.url.clone(),
+                    mode: WorkerMode::Decode,
+                    model_ids: vec![ModelId(MODEL.into())],
+                    bootstrap_port: None,
+                    ..Default::default()
+                },
+                None,
+                EngineProfile {
+                    openai,
+                    ..WireProtocol::default().into()
+                },
+            )
             .unwrap();
     }
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
