@@ -128,6 +128,15 @@ class ResponsesRequestTestCase(CustomTestCase):
 
 
 class ResponsesSamplingParamsTestCase(CustomTestCase):
+    def test_output_budget_respects_explicit_limit_and_server_cap(self):
+        for requested, expected in ((1, 1), (2, 2), (16, 16), (100, 64), (None, 62)):
+            with self.subTest(requested=requested):
+                request = ResponsesRequest(
+                    model="x", input="hi", max_output_tokens=requested
+                )
+                params = request.to_sampling_params(default_max_tokens=64)
+                self.assertEqual(params["max_new_tokens"], expected)
+
     def test_processed_stop_and_tool_constraint_propagate(self):
         request = ResponsesRequest(model="x", input="call the tool", store=False)
         params = request.to_sampling_params(

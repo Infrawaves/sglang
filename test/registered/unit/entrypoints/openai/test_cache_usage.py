@@ -430,16 +430,6 @@ class TestCacheRequest(unittest.TestCase):
                     request.prompt_cache_options = options
                     self.assertEqual(self.chat._cache_request_params(request), {})
 
-    def test_cache_k3_count_uses_complete_model_input(self):
-        self.chat.chat_encoding_spec = "kimi_k3"
-        self.assertEqual(self.chat._reported_prompt_tokens({"prompt_tokens": 43}), 40)
-        self.assertEqual(
-            self.chat._reported_prompt_tokens(
-                {"prompt_tokens": 43, "cache_usage": SNAPSHOT}
-            ),
-            43,
-        )
-
 
 class TestCacheStream(unittest.IsolatedAsyncioTestCase):
     async def test_empty_completion_omits_role_usage_and_keeps_final_usage(self):
@@ -903,6 +893,32 @@ class TestOpenAIChatCachePath(unittest.IsolatedAsyncioTestCase):
                                 "cache_write_tokens": 0,
                             },
                         )
+
+    async def test_kimi_k3_cache_write_excludes_generation_stub(self):
+        """The cache write in both body and headers fits the reported input."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.accounting_write_tokens = 27  # 16 read + 27 written = 43 model input.
+        header = "Msh-Usage-Cache-Write-Tokens-5m"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                request = self.request("5m", stream=stream)
+                response = await self.chat.handle_request(request, self.raw_request())
+                if stream:
+                    self.assertEqual(response.headers[header], "24")
+                    frames = [frame async for frame in response.body_iterator]
+                    usage = json.loads(frames[-2][6:])["usage"]
+                else:
+                    self.assertEqual(
+                        response.usage.cache_usage.response_headers()[header], "24"
+                    )
+                    usage = response.model_dump()["usage"]
+                self.assertEqual(usage["prompt_tokens"], 40)
+                self.assertEqual(usage["completion_tokens"], 5)
+                self.assertEqual(usage["total_tokens"], 45)
+                self.assertEqual(
+                    usage["prompt_tokens_details"],
+                    {"cached_tokens": 16, "cache_write_tokens": 24},
+                )
 
     async def test_non_streaming_response_carries_cache_usage_for_both_ttls(self):
         for ttl in (None, "5m", "1h"):

@@ -590,6 +590,30 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
 
         return asyncio.run(complete())
 
+    def test_kimi_k3_output_budget_and_usage_include_generation_stub(self):
+        """Both response modes count the stub and preserve tiny generation budgets."""
+        for stream in (False, True):
+            for limit, expected_budget in ((3, 3), (4, 1), (16, 13)):
+                with self.subTest(stream=stream, limit=limit):
+                    request = ResponsesRequest(
+                        model="x",
+                        input="hi",
+                        max_output_tokens=limit,
+                        stream=stream,
+                        store=False,
+                    )
+                    result = self._complete(request, "a")
+                    body = result[-1]["response"] if stream else result.model_dump()
+                    self.assertEqual(
+                        self.internal_request.sampling_params["max_new_tokens"],
+                        expected_budget,
+                    )
+                    usage = body["usage"]
+                    # The fixture reports five prompt tokens and one generated token.
+                    self.assertEqual(usage["input_tokens"], 2)
+                    self.assertEqual(usage["output_tokens"], 4)
+                    self.assertEqual(usage["total_tokens"], 6)
+
     def test_subset_preserves_declarations_and_round_trips_wire_choice(self):
         """Restrict calls without trimming the prompt's tools or echoing auto."""
         for stream in (False, True):

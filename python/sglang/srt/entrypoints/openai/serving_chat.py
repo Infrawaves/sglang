@@ -894,16 +894,46 @@ class OpenAIServingChat(OpenAIServingBase):
             content["meta_info"].get("cached_tokens", 0)
         )
 
-    def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
-        prompt_tokens = meta_info.get("prompt_tokens", 0)
+    def _reported_usage_meta(
+        self, meta_info: dict[str, Any], *, templated: bool = True
+    ) -> dict[str, Any]:
+        """Build the K3 billing view of one raw, cumulative engine snapshot."""
+        if self.chat_encoding_spec != "kimi_k3":
+            return meta_info
+
+        prompt = meta_info.get("prompt_tokens", 0)
+        completion = meta_info.get("completion_tokens", 0)
+        if completion > 0:
+            # Raw input_ids bypass the template, so their prompt stays intact.
+            if templated:
+                prompt = max(0, prompt - self._KIMI_K3_GENERATION_STUB_TOKENS)
+            completion += self._KIMI_K3_GENERATION_STUB_TOKENS
+        reported = {
+            **meta_info,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cached_tokens": min(meta_info.get("cached_tokens") or 0, prompt),
+        }
+        if meta_info.get("cache_usage") is not None:
+            snapshot = CacheUsage.model_validate(meta_info["cache_usage"])
+            # Reads cover the prefix, writes the following suffix.
+            read_tokens = min(snapshot.read_tokens, prompt)
+            reported["cache_usage"] = snapshot.model_copy(
+                update={
+                    "read_tokens": read_tokens,
+                    "write_tokens": min(snapshot.write_tokens, prompt - read_tokens),
+                }
+            )
+        return reported
+
+    def _k3_generation_budget(self, limit: int | None) -> int | None:
         if (
             self.chat_encoding_spec == "kimi_k3"
-            and meta_info.get("cache_usage") is None
+            and limit is not None
+            and limit > self._KIMI_K3_GENERATION_STUB_TOKENS
         ):
-            # K3's three-token assistant generation stub is model input, but the
-            # reference API excludes it from billed/reported prompt tokens.
-            prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
-        return prompt_tokens
+            return limit - self._KIMI_K3_GENERATION_STUB_TOKENS
+        return limit
 
     def _cache_request_params(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -1402,6 +1432,10 @@ class OpenAIServingChat(OpenAIServingBase):
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
         if self.chat_encoding_spec == "kimi_k3":
+            if request.input_ids is None:
+                sampling_params["max_new_tokens"] = self._k3_generation_budget(
+                    sampling_params["max_new_tokens"]
+                )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
@@ -2201,9 +2235,15 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = self._reported_prompt_tokens(
-                    content["meta_info"]
-                )
+                raw_meta = content["meta_info"]
+                if self.chat_encoding_spec == "kimi_k3":
+                    content = {
+                        **content,
+                        "meta_info": self._reported_usage_meta(
+                            raw_meta, templated=request.input_ids is None
+                        ),
+                    }
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
                 )
@@ -2244,7 +2284,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             if finish_reason_type == "abort":
                                 # The abort chunk re-sends the last token plus any coalesced deltas;
                                 # keep only what brings the total up to completion_tokens.
-                                keep = completion_tokens[index] - len(accumulated)
+                                keep = raw_meta.get("completion_tokens", 0) - len(
+                                    accumulated
+                                )
                                 chunk_output_ids = chunk_output_ids[: max(keep, 0)]
                             accumulated.extend(chunk_output_ids)
                         else:
@@ -2523,16 +2565,13 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
+        usage_results = ret
         if self.chat_encoding_spec == "kimi_k3":
-            ret = [
+            usage_results = [
                 {
-                    **item,
-                    "meta_info": {
-                        **item["meta_info"],
-                        "prompt_tokens": self._reported_prompt_tokens(
-                            item["meta_info"]
-                        ),
-                    },
+                    "meta_info": self._reported_usage_meta(
+                        item["meta_info"], templated=request.input_ids is None
+                    )
                 }
                 for item in ret
             ]
@@ -2655,6 +2694,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.return_meta_info
                 else None
             )
+            if choice_meta_info is not None and self.chat_encoding_spec == "kimi_k3":
+                # Keep the reported prompt and the actual sampled completion count.
+                choice_meta_info["prompt_tokens"] = usage_results[idx]["meta_info"][
+                    "prompt_tokens"
+                ]
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
@@ -2697,7 +2741,7 @@ class OpenAIServingChat(OpenAIServingBase):
             for i in range(0, len(ret), request.n)
         )
         usage = UsageProcessor.calculate_response_usage(
-            ret,
+            usage_results,
             n_choices=request.n,
             enable_cache_report=get_serving().enable_cache_report,
             image_tokens=image_tokens,
@@ -3329,7 +3373,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
@@ -3383,7 +3427,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
