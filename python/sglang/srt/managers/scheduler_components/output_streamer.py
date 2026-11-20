@@ -606,8 +606,10 @@ class _GenerationStreamAccumulator:
                     should_output &= not req.check_match_stop_str_prefix()
                     should_output &= not req.is_matching_stop_token_sequence()
             else:
+                # A sequence stop excludes its tokens, so none may be sent yet.
                 should_output = (
                     len(req.output_ids) % self.default_force_stream_interval == 0
+                    and not req.is_matching_stop_token_sequence()
                 )
 
         if not should_output:

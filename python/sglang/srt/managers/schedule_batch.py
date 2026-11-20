@@ -1311,29 +1311,33 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def _is_stop_token(self, token_id: int) -> bool:
+        """Whether token_id ends the request as a stop token or EOS."""
         if self.sampling_params.ignore_eos:
             return False
-
-        # Check stop token ids
-        matched_eos = False
-
-        for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids and (
-                not self.require_reasoning
-                or (
-                    self._is_reasoning_over
-                    and len(self.output_ids) > self.reasoning_tokens
-                )
+        if self.sampling_params.stop_token_ids and (
+            not self.require_reasoning
+            or (
+                self._is_reasoning_over and len(self.output_ids) > self.reasoning_tokens
+            )
+        ):
+            if token_id in self.sampling_params.stop_token_ids:
+                return True
+        if self.eos_token_ids and token_id in self.eos_token_ids:
+            return True
+        if self.tokenizer is not None:
+            if token_id == self.tokenizer.eos_token_id:
+                return True
+            if (
+                self.tokenizer.additional_stop_token_ids
+                and token_id in self.tokenizer.additional_stop_token_ids
             ):
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
-            if matched_eos:
+                return True
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self._is_stop_token(token_id):
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
                 self.finished_len = matched_pos + 1
@@ -1395,7 +1399,12 @@ class Req(ReqDllmMixin):
         if not state:
             return False
         base = len(self.output_ids) - len(new_accepted_tokens)
+        max_new_tokens = self.sampling_params.max_new_tokens
         for i, token in enumerate(new_accepted_tokens):
+            # A stop token, EOS or the length cap reached before the sequence
+            # completes ends the request first; the later checks handle it.
+            if base + i + 1 > max_new_tokens or self._is_stop_token(token):
+                return False
             for entry in state:
                 matcher, matched = entry
                 matched = matcher.advance(matched, token)

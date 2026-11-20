@@ -2014,8 +2014,6 @@ class OpenAIServingChat(OpenAIServingBase):
         tokenizer = self.tokenizer_manager.tokenizer
         if tokenizer is not None:
             encoded = tokenizer.encode(marker, add_special_tokens=False)
-            if hasattr(encoded, "tolist"):
-                encoded = encoded.tolist()
             head = marker[: marker.index("|>") + 2]
             tail = marker[marker.rindex("<|") :]
             if (
