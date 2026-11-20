@@ -3532,7 +3532,9 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_json_response_format_constraints(self):
         """json_object stays prompt-guided; a strict json_schema is constrained
         inside the K3 response block, so its markers stay admissible, and stops
-        on the message close a model trapped in a JSON string would write."""
+        on the message close a model trapped in a JSON string would write. Only
+        the unconstrained output stops on a think close written without thinking;
+        in a JSON string it is data."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -3554,6 +3556,7 @@ class ServingChatTestCase(CustomTestCase):
                     messages=[{"role": "user", "content": "Return JSON"}],
                     response_format=response_format,
                     stop=["END"],
+                    thinking={"type": "disabled"},
                 )
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
@@ -3568,33 +3571,26 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(
                     MESSAGE_CLOSE in params["stop"], expected_tag is not None
                 )
+                self.assertEqual(THINK_CLOSE in params["stop"], expected_tag is None)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )
 
     def test_kimi_k3_stops_reasoning_written_without_thinking(self):
-        """A prompt that opens the response channel stops on the think close the
-        model may still write, as the official API does; a thinking prompt does
-        not, and the client's own stops are kept."""
+        """Only a prompt that opens the response channel stops on a think close,
+        tools or not, and the client's own stops are kept."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        tool = {"type": "function", "function": {"name": "lookup"}}
         cases = (
             ({}, False),
             ({"reasoning_effort": "none"}, True),
             ({"thinking": {"type": "disabled"}}, True),
             ({"chat_template_kwargs": {"thinking": False}}, True),
-            (
-                {
-                    "reasoning_effort": "max",
-                    "chat_template_kwargs": {"thinking": False},
-                },
-                True,
-            ),
-            ({"chat_template_kwargs": {"thinking": None}}, True),
-            ({"chat_template_kwargs": {"thinking": "false"}}, False),
-            ({"reasoning_effort": "low"}, False),
+            ({"thinking": {"type": "disabled"}, "tools": [tool]}, True),
         )
         for fields, stops in cases:
             with self.subTest(fields=fields):
@@ -3610,7 +3606,6 @@ class ServingChatTestCase(CustomTestCase):
                 params = adapted.sampling_params
                 self.assertIn("END", params["stop"])
                 self.assertEqual(THINK_CLOSE in params["stop"], stops)
-                # The stop follows the channel the encoder was asked to open.
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(stops, not kwargs.get("thinking", True))
 

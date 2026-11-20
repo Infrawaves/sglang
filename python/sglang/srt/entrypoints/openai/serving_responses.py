@@ -572,14 +572,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         self.chat_encoding_spec == "kimi_k3"
                         and processed_messages is not None
                     ):
+                        # _make_request left the rendered kwargs on the request.
+                        self._stop_kimi_k3_reasoning_without_thinking(
+                            sampling_params, request.chat_template_kwargs
+                        )
                         self._frame_kimi_k3_json_response(
                             sampling_params,
                             processed_messages.tool_call_constraint,
                             processed_messages.require_reasoning,
-                        )
-                        # _make_request left the rendered kwargs on the request.
-                        self._stop_kimi_k3_reasoning_without_thinking(
-                            sampling_params, request.chat_template_kwargs
                         )
                     # Match Chat's budget including the reported K3 stub;
                     # tiny limits keep their original generation budget.
