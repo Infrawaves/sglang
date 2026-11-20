@@ -1865,9 +1865,6 @@ async def separate_reasoning_request(
             model_type=obj.reasoning_parser,
             request=request,
             tokenizer=get_global_state().tokenizer_manager.tokenizer,
-            # Kimi K3 keeps its tools channel as text, so the output can still
-            # be fed to the function-call parsing endpoint.
-            tool_call_parser_active=obj.reasoning_parser == "kimi_k3",
         )
 
         # 2) Call the non-stream parsing method (non-stream)
