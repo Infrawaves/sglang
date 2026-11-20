@@ -66,7 +66,7 @@ def test_non_stream_tools_channel_passthrough() -> None:
         "<|close|>call<|sep|>"
         f"{TOOLS_CLOSE}"
     )
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     result = detector.detect_and_parse(
         f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{tools_channel}"
     )
@@ -136,7 +136,7 @@ def test_streaming_tools_channel_passthrough() -> None:
         "<|close|>call<|sep|>"
         f"{TOOLS_CLOSE}"
     )
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     text = f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{tools_channel}"
     reasoning, content = _stream(detector, _chunks(text, 5))
     assert reasoning == "thought"
@@ -169,7 +169,7 @@ def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
     model from opening the tools channel first. Splitting on think_end put the
     whole call in reasoning_text, dropping it with no log line.
     """
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     result = detector.detect_and_parse(
         f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
     )
@@ -179,11 +179,36 @@ def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
 
 @pytest.mark.parametrize("chunk_size", [1, 3, 7, 1000])
 def test_streaming_tools_channel_before_think_close(chunk_size: int) -> None:
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     text = f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
     reasoning, content = _stream(detector, _chunks(text, chunk_size))
     assert reasoning == "thought"
     assert TOOLS_OPEN in content
+
+
+@pytest.mark.parametrize(
+    ("text", "reasoning", "content"),
+    [
+        (
+            f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}"
+            f"{_TOOLS_CHANNEL}{MESSAGE_CLOSE}",
+            "thought",
+            "reply",
+        ),
+        (f"thought{THINK_CLOSE}reply{_TOOLS_CHANNEL}", "thought", "reply"),
+        (f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}", "thought", ""),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 1000])
+def test_tools_channel_dropped_without_tool_call_parser(
+    text: str, reasoning: str, content: str, chunk_size: int
+) -> None:
+    """With no tool-call parser to consume it, the tools channel is a call to an
+    undeclared tool; like the official API, no part of it reaches the content."""
+    result = KimiK3Detector(force_reasoning=True).detect_and_parse(text)
+    assert (result.reasoning_text, result.normal_text) == (reasoning, content)
+    detector = KimiK3Detector(force_reasoning=True)
+    assert _stream(detector, _chunks(text, chunk_size)) == (reasoning, content)
 
 
 _SKIPPED_THINK_REPLY = "The TTL is 20 minutes."
