@@ -1384,6 +1384,7 @@ def build_speculative_verify_target_probs(
 
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
+        del scaled_logits
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
