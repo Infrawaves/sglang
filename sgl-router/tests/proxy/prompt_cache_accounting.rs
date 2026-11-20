@@ -16,7 +16,8 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -35,8 +36,12 @@ const SSE_PARTS: [&str; 4] = [
     "data: [DONE]\n\n",
 ];
 const SSE_WITHOUT_USAGE: [&str; 2] = [SSE_PARTS[0], SSE_PARTS[3]];
+// Prompt-side usage a worker sends as headers (SGLANG_USAGE_HEADER_PREFIX).
+const USAGE_HEADERS: [&str; 2] = ["X-Msh-Usage-Prompt-Tokens", "X-Msh-Usage-Cached-Tokens"];
+const DECODE_USAGE: [&str; 2] = ["1000", "200"];
+const PREFILL_USAGE: [&str; 2] = ["9999", "8888"];
 
-fn response_headers(writes: [&str; 2], mixed_case: bool) -> HeaderMap {
+fn response_headers(writes: [&str; 2], usage: [&str; 2], mixed_case: bool) -> HeaderMap {
     let names = if mixed_case {
         [
             "Msh-Usage-Cache-Write-Tokens-5m",
@@ -50,6 +55,12 @@ fn response_headers(writes: [&str; 2], mixed_case: bool) -> HeaderMap {
     };
     let mut headers = HeaderMap::new();
     for (name, value) in names.into_iter().zip(writes) {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    for (name, value) in USAGE_HEADERS.into_iter().zip(usage) {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes()).unwrap(),
             HeaderValue::from_str(value).unwrap(),
@@ -129,31 +140,57 @@ fn context(
     if forward_ids {
         assert!(tokenizers.has_chat_formatter(MODEL));
     }
-    let registry = Arc::new(WorkerRegistry::default());
-    registry
-        .add(WorkerSpec {
-            id: WorkerId("prefill-or-plain".into()),
-            url: prefill.url.clone(),
-            mode: if decode.is_some() {
-                WorkerMode::Prefill
-            } else {
-                WorkerMode::Plain
-            },
-            model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: Some(8997),
+    // Workers report OpenAI settings as `/server_info` introspection does, with
+    // a context length for checking `max_tokens`, so the router could serve a
+    // chat it renders through `/generate`, which carries no worker usage headers.
+    // Disabled forwarding must keep chats on the worker's Chat route. Workers in
+    // the router-rendered input_ids cases report no settings, which keeps those
+    // chats on that route as well.
+    let openai = (!forward_ids).then(|| {
+        Arc::new(OpenAiSettings {
+            context_length: Some(131_072),
             ..Default::default()
         })
+    });
+    let registry = Arc::new(WorkerRegistry::default());
+    registry
+        .add_with_cb(
+            WorkerSpec {
+                id: WorkerId("prefill-or-plain".into()),
+                url: prefill.url.clone(),
+                mode: if decode.is_some() {
+                    WorkerMode::Prefill
+                } else {
+                    WorkerMode::Plain
+                },
+                model_ids: vec![ModelId(MODEL.into())],
+                bootstrap_port: Some(8997),
+                ..Default::default()
+            },
+            None,
+            EngineProfile {
+                openai: openai.clone(),
+                ..WireProtocol::default().into()
+            },
+        )
         .unwrap();
     if let Some(decode) = decode {
         registry
-            .add(WorkerSpec {
-                id: WorkerId("decode".into()),
-                url: decode.url.clone(),
-                mode: WorkerMode::Decode,
-                model_ids: vec![ModelId(MODEL.into())],
-                bootstrap_port: None,
-                ..Default::default()
-            })
+            .add_with_cb(
+                WorkerSpec {
+                    id: WorkerId("decode".into()),
+                    url: decode.url.clone(),
+                    mode: WorkerMode::Decode,
+                    model_ids: vec![ModelId(MODEL.into())],
+                    bootstrap_port: None,
+                    ..Default::default()
+                },
+                None,
+                EngineProfile {
+                    openai,
+                    ..WireProtocol::default().into()
+                },
+            )
             .unwrap();
     }
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
@@ -222,6 +259,9 @@ async fn send(ctx: Arc<AppContext>, body: &Value, writes: [&str; 2]) -> bytes::B
     for (name, expected) in [
         ("Msh-Usage-Cache-Write-Tokens-5m", writes[0]),
         ("MSH-USAGE-CACHE-WRITE-TOKENS-1H", writes[1]),
+        // Decode's prompt-side usage, never prefill's.
+        (USAGE_HEADERS[0], DECODE_USAGE[0]),
+        (USAGE_HEADERS[1], DECODE_USAGE[1]),
     ] {
         assert_eq!(
             response.headers().get(name).and_then(|v| v.to_str().ok()),
@@ -273,7 +313,7 @@ async fn plain_options_survive_sampling_splice_and_input_ids_rebuild() {
     let expected = response_body();
     let worker = MockWorker::start_json_with_response_headers(
         expected.clone(),
-        response_headers(["700", "0"], true),
+        response_headers(["700", "0"], DECODE_USAGE, true),
     )
     .await;
     for reorg in [false, true] {
@@ -296,7 +336,7 @@ async fn plain_options_survive_sampling_splice_and_input_ids_rebuild() {
 async fn unmodified_plain_body_and_stream_usage_pass_through() {
     let worker = MockWorker::start_with_response_headers(
         SSE_PARTS.to_vec(),
-        response_headers(["0", "700"], false),
+        response_headers(["0", "700"], DECODE_USAGE, false),
     )
     .await;
     for reorg in [false, true] {
@@ -322,7 +362,7 @@ async fn pd_preserves_options_and_returns_only_decode_json_or_stream_usage() {
         json!({"usage": {"prompt_tokens_details": {
             "cached_tokens": 9999, "cache_write_tokens": 9999
         }}}),
-        response_headers(["9999", "8888"], true),
+        response_headers(["9999", "8888"], PREFILL_USAGE, true),
     )
     .await;
     for streaming in [false, true] {
@@ -335,13 +375,13 @@ async fn pd_preserves_options_and_returns_only_decode_json_or_stream_usage() {
         let decode = if streaming {
             MockWorker::start_with_response_headers(
                 SSE_PARTS.to_vec(),
-                response_headers(writes, true),
+                response_headers(writes, DECODE_USAGE, true),
             )
             .await
         } else {
             MockWorker::start_json_with_response_headers(
                 expected.clone(),
-                response_headers(writes, false),
+                response_headers(writes, DECODE_USAGE, false),
             )
             .await
         };
@@ -381,7 +421,7 @@ async fn pd_preserves_options_and_returns_only_decode_json_or_stream_usage() {
 async fn write_headers_survive_without_stream_usage_and_ignore_prefill_headers() {
     let prefill = MockWorker::start_json_with_response_headers(
         json!({"prefill": true}),
-        response_headers(["9999", "8888"], true),
+        response_headers(["9999", "8888"], PREFILL_USAGE, true),
     )
     .await;
     for writes in [["0", "0"], ["700", "0"], ["0", "700"]] {
@@ -393,13 +433,13 @@ async fn write_headers_survive_without_stream_usage_and_ignore_prefill_headers()
             let worker = if streaming {
                 MockWorker::start_with_response_headers(
                     SSE_WITHOUT_USAGE.to_vec(),
-                    response_headers(writes, true),
+                    response_headers(writes, DECODE_USAGE, true),
                 )
                 .await
             } else {
                 MockWorker::start_json_with_response_headers(
                     expected.clone(),
-                    response_headers(writes, false),
+                    response_headers(writes, DECODE_USAGE, false),
                 )
                 .await
             };
