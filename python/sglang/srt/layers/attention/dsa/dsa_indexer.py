@@ -1953,9 +1953,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
         )
-        rows = k_fp8.shape[0]
-        k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
-        s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        # A rank owns no rows when the KV is shorter than dcp_size; flatten the
+        # trailing dims, since view(0, -1) cannot infer the width.
+        k_bytes = k_fp8.view(torch.uint8).flatten(1)
+        s_bytes = k_scale.view(torch.uint8).flatten(1)
         gathered = dcp_gather_request_rows(
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )

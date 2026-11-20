@@ -66,5 +66,48 @@ class TestDSAIndexerIdle(unittest.TestCase):
         self.assertTrue(torch.all(result == -1))
 
 
+class TestDSAIndexerDcpGatherEmptyRank(unittest.TestCase):
+    def test_rank_owning_no_index_k_rows_joins_the_gather(self):
+        """A prefill shorter than dcp_size leaves some DCP ranks with no
+        index-K rows; those ranks must still contribute a [0, W] slab to the
+        collective gather instead of raising, or the peer ranks hang in it."""
+        head_dim, scale_bytes, seq_len, dcp_size = 128, 4, 4, 8
+        seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int32)
+        pool = SimpleNamespace(
+            get_index_k_scale_buffer=lambda _layer, _lens, _pages, rows, _max: (
+                torch.zeros((rows, head_dim), dtype=torch.uint8),
+                torch.zeros((rows, scale_bytes), dtype=torch.uint8),
+            )
+        )
+        contributed = []
+
+        def gather(local_rows, lens_cpu):
+            contributed.append(tuple(local_rows.shape))
+            return torch.zeros(
+                (int(lens_cpu.sum()), local_rows.shape[1]), dtype=torch.uint8
+            )
+
+        # Token i lives on rank i % dcp_size, so ranks 4..7 own nothing.
+        for dcp_rank in range(seq_len, dcp_size):
+            parallel = SimpleNamespace(attn_dcp_size=dcp_size, attn_dcp_rank=dcp_rank)
+            with (
+                patch(f"{_INDEXER}.get_parallel", return_value=parallel),
+                patch(f"{_INDEXER}.get_token_to_kv_pool", return_value=pool),
+                patch(f"{_INDEXER}.dcp_gather_request_rows", side_effect=gather),
+            ):
+                k_fp8, k_scale = Indexer._dcp_gather_index_k(
+                    0,
+                    torch.zeros((1, 1), dtype=torch.int32),
+                    seq_lens_cpu.clone(),
+                    seq_lens_cpu,
+                )
+            self.assertEqual(k_fp8.shape, (seq_len, head_dim))
+            self.assertEqual(k_scale.shape, (seq_len, scale_bytes))
+
+        self.assertEqual(
+            contributed, [(0, head_dim + scale_bytes)] * (dcp_size - seq_len)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
