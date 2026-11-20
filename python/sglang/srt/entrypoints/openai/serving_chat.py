@@ -120,7 +120,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
-from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE
+from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE, THINK_CLOSE
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -331,6 +331,15 @@ def kimi_k3_thinking_effort(
         f"Kimi K3 supports reasoning_effort {supported} (the other OpenAI tiers "
         f"map onto them); got {reasoning_effort!r}."
     )
+
+
+def _append_stop(sampling_params: dict[str, Any], stop_str: str) -> None:
+    """Add a server-side stop string, keeping the client's own stops."""
+    stop = sampling_params.get("stop") or []
+    stop = [stop] if isinstance(stop, str) else list(stop)
+    if stop_str not in stop:
+        stop.append(stop_str)
+    sampling_params["stop"] = stop
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -1739,6 +1748,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
             )
+            self._stop_kimi_k3_reasoning_without_thinking(
+                sampling_params, request.chat_template_kwargs
+            )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
         max_new_tokens = sampling_params["max_new_tokens"]
@@ -1981,11 +1993,23 @@ class OpenAIServingChat(OpenAIServingBase):
         # max_tokens; stopping on the message close ends it at once. The
         # response close is not a stop: trimming it would hide the marker the
         # reasoning parser uses to recognize an answer that skipped thinking.
-        stop = sampling_params.get("stop") or []
-        stop = [stop] if isinstance(stop, str) else list(stop)
-        if MESSAGE_CLOSE not in stop:
-            stop.append(MESSAGE_CLOSE)
-        sampling_params["stop"] = stop
+        _append_stop(sampling_params, MESSAGE_CLOSE)
+
+    @staticmethod
+    def _stop_kimi_k3_reasoning_without_thinking(
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Without thinking the prompt opens the response channel, yet the model
+        may still reason there and then close a think block. The official API
+        ends the output at that think close, returning the text before it as
+        content; stopping on the marker does the same, so neither the marker nor
+        the answer after it reaches the client, streaming or not."""
+        # The encoder picks the channel by the kwarg's truthiness and defaults
+        # to thinking, so only a present, falsy value opens the response channel.
+        if (chat_template_kwargs or {}).get("thinking", True):
+            return
+        _append_stop(sampling_params, THINK_CLOSE)
 
     def _set_json_grammar_start(
         self,

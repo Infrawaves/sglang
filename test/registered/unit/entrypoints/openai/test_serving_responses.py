@@ -1319,6 +1319,32 @@ class KimiK3AdditionalToolsTestCase(CustomTestCase):
 
         return asyncio.run(respond())
 
+    def test_stops_reasoning_written_without_thinking(self):
+        """Responses stops on the think close only when reasoning is off."""
+        for effort, stops in (("none", True), ("high", False)):
+            with self.subTest(effort=effort):
+                captured = {}
+
+                async def generate(internal_request, raw_request):
+                    captured["stop"] = internal_request.sampling_params.get("stop")
+                    chunk = engine_chunk("ok")
+                    chunk["meta_info"]["finish_reason"] = {"type": "stop"}
+                    yield chunk
+
+                self.serving.tokenizer_manager.generate_request = generate
+                asyncio.run(
+                    self.serving.create_responses(
+                        ResponsesRequest(
+                            model="x",
+                            input="Hi",
+                            reasoning={"effort": effort},
+                            stop=["END"],
+                        )
+                    )
+                )
+                self.assertIn("END", captured["stop"])
+                self.assertEqual(THINK_CLOSE in captured["stop"], stops)
+
     def test_declares_tools_in_place_and_parses_their_calls(self):
         """Declared tools render at their position and their calls are parsed."""
         before = {"role": "user", "content": "Hi"}
