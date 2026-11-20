@@ -225,7 +225,34 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        return seq_len > 0 and seq_len >= cp_size and cp_size > 1
+        if not (seq_len > 0 and seq_len >= cp_size and cp_size > 1):
+            return False
+        # Under DCP the shard is by position; a rank owning no new position would
+        # skip collectives its peers join, so such a batch runs without CP.
+        if get_parallel().attn_dcp_size > 1:
+            return self._every_rank_owns_a_position(forward_batch)
+        return True
+
+    def _every_rank_owns_a_position(self, forward_batch) -> bool:
+        size = self.cp_size
+        extend_lens = [int(e) for e in forward_batch.extend_seq_lens_cpu]
+        # Any size consecutive positions cover every rank.
+        if max(extend_lens) >= size:
+            return True
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert seq_lens_cpu is not None and len(seq_lens_cpu) == len(extend_lens), (
+            "Prefill CP with DCP shards by position and needs every seq_len"
+        )
+        prefix_lens = [int(s) - e for s, e in zip(seq_lens_cpu, extend_lens)]
+        return all(
+            sum(
+                position_owned_rows_per_request(
+                    prefix_lens, extend_lens, rank=rank, size=size
+                )
+            )
+            > 0
+            for rank in range(size)
+        )
 
     def build_metadata(
         self,
