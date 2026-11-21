@@ -1132,6 +1132,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             num_cached_tokens,
             num_reasoning_tokens,
             cache_context=cache_context,
+            finish_reason=finish_reason,
         )
         request_metadata.final_usage_info = usage
 
@@ -1178,6 +1179,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         total_tokens: Optional[int] = None,
         cache_context: Optional[dict[str, Any]] = None,
+        finish_reason: Optional[dict[str, Any]] = None,
     ) -> UsageInfo:
         counters = cache_context or {}
         cache_usage = counters.get("usage")
@@ -1187,8 +1189,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "prompt_tokens": counters.get("prompt_tokens", prompt_tokens),
                 "completion_tokens": completion_tokens,
                 "cache_usage": cache_usage,
+                "finish_reason": finish_reason,
             }
-            if self.chat_encoding_spec == "kimi_k3" and completion_tokens > 0:
+            if self.chat_encoding_spec == "kimi_k3" and self._k3_generation_started(
+                completion_tokens, finish_reason
+            ):
                 completion_tokens += self._KIMI_K3_GENERATION_STUB_TOKENS
             return UsageProcessor.calculate_token_usage(
                 prompt_tokens=self._reported_prompt_tokens(meta_info),
@@ -1200,12 +1205,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         # boundary, so repeated or missing stream metadata cannot subtract twice.
         if self.chat_encoding_spec == "kimi_k3":
             raw_completion_tokens = completion_tokens
-            if raw_completion_tokens > 0:
+            if self._k3_generation_started(raw_completion_tokens, finish_reason):
                 completion_tokens += self._KIMI_K3_GENERATION_STUB_TOKENS
             prompt_tokens = self._reported_prompt_tokens(
                 {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": raw_completion_tokens,
+                    "finish_reason": finish_reason,
                 }
             )
             cached_tokens = min(cached_tokens, prompt_tokens)
@@ -3343,6 +3349,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_tokens_meta,
             total_tokens=total_tokens_meta,
             cache_context=cache_context,
+            finish_reason=finish_reason,
         )
         request_metadata.final_usage_info = usage
 
