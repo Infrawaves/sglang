@@ -120,7 +120,11 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
-from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    THINK_CLOSE,
+    TOOLS_OPEN,
+)
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -158,6 +162,7 @@ from sglang.srt.parser.response_template import (
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
+    append_request_stop_token_sequence,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
 )
@@ -331,6 +336,14 @@ def kimi_k3_thinking_effort(
         f"Kimi K3 supports reasoning_effort {supported} (the other OpenAI tiers "
         f"map onto them); got {reasoning_effort!r}."
     )
+
+
+def _append_stop(sampling_params: dict[str, Any], stop_str: str) -> None:
+    stop = sampling_params.get("stop") or []
+    stop = [stop] if isinstance(stop, str) else list(stop)
+    if stop_str not in stop:
+        stop.append(stop_str)
+    sampling_params["stop"] = stop
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -525,6 +538,8 @@ class OpenAIServingChat(OpenAIServingBase):
             get_serving().default_chat_template_kwargs or {}
         )
         self._reasoning_detector = None
+        # K3 marker -> its special-token ids, or None to stop on the text.
+        self._kimi_k3_marker_ids: dict[str, list[int] | None] = {}
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
@@ -1011,6 +1026,14 @@ class OpenAIServingChat(OpenAIServingBase):
             cached_tokens=content["meta_info"].get("cached_tokens", 0)
         )
 
+    @staticmethod
+    def _k3_generation_started(completion_tokens: int, finish_reason: Any) -> bool:
+        """Whether generation started, so the K3 stub moves to output: some
+        output, or a stop sequence excluded at the first output token."""
+        return completion_tokens > 0 or (
+            isinstance(finish_reason, dict) and bool(finish_reason.get("stop_excluded"))
+        )
+
     def _reported_prompt_tokens(
         self, meta_info: dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> int:
@@ -1018,7 +1041,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if (
             self.chat_encoding_spec == "kimi_k3"
             and generation_stub_tokens
-            and meta_info.get("completion_tokens", 0) > 0
+            and self._k3_generation_started(
+                meta_info.get("completion_tokens", 0), meta_info.get("finish_reason")
+            )
         ):
             # Transfer the stub only after generation starts; raw input_ids do
             # not imply that the chat template added a K3 generation stub.
@@ -1734,10 +1759,16 @@ class OpenAIServingChat(OpenAIServingBase):
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
         if self.chat_encoding_spec == "kimi_k3":
+            self._stop_kimi_k3_reasoning_without_thinking(
+                sampling_params, request.chat_template_kwargs
+            )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
+            )
+            self._stop_kimi_k3_undeclared_tool_calls(
+                sampling_params, self._tool_call_parsing_active(request)
             )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
@@ -1981,11 +2012,74 @@ class OpenAIServingChat(OpenAIServingBase):
         # max_tokens; stopping on the message close ends it at once. The
         # response close is not a stop: trimming it would hide the marker the
         # reasoning parser uses to recognize an answer that skipped thinking.
-        stop = sampling_params.get("stop") or []
-        stop = [stop] if isinstance(stop, str) else list(stop)
-        if MESSAGE_CLOSE not in stop:
-            stop.append(MESSAGE_CLOSE)
-        sampling_params["stop"] = stop
+        self._append_kimi_k3_marker_stop(sampling_params, MESSAGE_CLOSE)
+
+    def _kimi_k3_marker_stop_ids(self, marker: str) -> list[int] | None:
+        """The special-token ids the model generates for a K3 marker, or None
+        when the tokenizer does not encode it as `<|open|>`/`<|close|>`, name,
+        `<|sep|>`."""
+        if marker in self._kimi_k3_marker_ids:
+            return self._kimi_k3_marker_ids[marker]
+        ids = None
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is not None:
+            encoded = tokenizer.encode(marker, add_special_tokens=False)
+            head = marker[: marker.index("|>") + 2]
+            tail = marker[marker.rindex("<|") :]
+            if (
+                isinstance(encoded, list)
+                and 3 <= len(encoded) <= 8
+                and all(type(token_id) is int for token_id in encoded)
+                and encoded[0] == tokenizer.convert_tokens_to_ids(head)
+                and encoded[-1] == tokenizer.convert_tokens_to_ids(tail)
+            ):
+                ids = encoded
+        if ids is None:
+            logger.warning(
+                "Kimi K3 marker %r is not a special-token sequence; stopping on "
+                "its text instead",
+                marker,
+            )
+        self._kimi_k3_marker_ids[marker] = ids
+        return ids
+
+    def _append_kimi_k3_marker_stop(
+        self, sampling_params: dict[str, Any], marker: str
+    ) -> None:
+        """Stop where the model generates a K3 marker. As a token sequence it
+        excludes the marker, matches only the special tokens and costs no
+        per-step decode; the same text spelled with ordinary tokens does not stop."""
+        ids = self._kimi_k3_marker_stop_ids(marker)
+        if ids is None:
+            _append_stop(sampling_params, marker)
+        else:
+            append_request_stop_token_sequence(sampling_params, ids)
+
+    def _stop_kimi_k3_undeclared_tool_calls(
+        self, sampling_params: dict[str, Any], tool_call_parsing_active: bool
+    ) -> None:
+        """With no tool-call parser to read it, a tools channel is a call to an
+        undeclared tool; the official API returns none and ends there. Stopping
+        at its open marker also spares generating the call. The parser still
+        passes marker text spelled with ordinary tokens through as content."""
+        if not tool_call_parsing_active:
+            self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
+
+    def _stop_kimi_k3_reasoning_without_thinking(
+        self,
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Without thinking the model may still reason and close a think block;
+        the official API ends the output there, keeping the text before it."""
+        # The encoder opens the response channel only for a present, falsy kwarg.
+        if (chat_template_kwargs or {}).get("thinking", True):
+            return
+        # In a JSON answer the marker can only be text in a string, where stopping
+        # would cut the JSON; run before the K3 framing replaces the json_schema.
+        if sampling_params.get("json_schema"):
+            return
+        self._append_kimi_k3_marker_stop(sampling_params, THINK_CLOSE)
 
     def _set_json_grammar_start(
         self,
@@ -3300,6 +3394,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
                         cached_tokens=cached_tokens.get(idx, 0) or 0,
                         cache_usage=cache_usage.get(idx),
+                        finish_reason=finish_reason_data,
                     )
                 yield build_sse_content(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
@@ -3444,6 +3539,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         bool(prompt_tokens.get(index, 0) or tokens)
                         for index, tokens in completion_tokens.items()
                     ),
+                    generation_started=any(
+                        self._k3_generation_started(
+                            completion_tokens.get(index, 0), finish_reason
+                        )
+                        for index, finish_reason in finish_reasons.items()
+                    )
+                    or sum(completion_tokens.values()) > 0,
                     reasoning_tokens=sum(reasoning_tokens.values()),
                     cached_tokens=sum(
                         tok
@@ -3761,11 +3863,17 @@ class OpenAIServingChat(OpenAIServingBase):
             video_tokens=video_tokens,
         )
         # The K3 usage rules cover every usage object, non-streaming responses included.
+        started_choices = sum(
+            self._k3_generation_started(
+                r["meta_info"].get("completion_tokens", 0),
+                r["meta_info"].get("finish_reason"),
+            )
+            for r in ret
+        )
         usage = self._apply_k3_usage_details(
             usage,
-            n_choices=sum(
-                r["meta_info"].get("completion_tokens", 0) > 0 for r in ret
-            ),
+            n_choices=started_choices,
+            generation_started=started_choices > 0,
             reasoning_tokens=sum(
                 r["meta_info"].get("reasoning_tokens", 0) or 0 for r in ret
             ),
@@ -3917,6 +4025,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens: int,
         cached_tokens: int,
         cache_usage: CacheUsage | dict[str, int] | None = None,
+        finish_reason: Any = None,
     ) -> Dict[str, Any]:
         """A complete K3 usage object.
 
@@ -3939,6 +4048,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
             reasoning_tokens=reasoning_tokens,
             cached_tokens=cached_tokens,
+            generation_started=self._k3_generation_started(
+                completion_tokens, finish_reason
+            ),
         ).model_dump()
 
     def _apply_k3_usage_details(
@@ -3948,6 +4060,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens: int,
         cached_tokens: int,
         n_choices: int = 1,
+        generation_started: Optional[bool] = None,
     ) -> UsageInfo:
         """Account for K3's generation stub and fill mandatory token details.
 
@@ -3957,7 +4070,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return usage
         # Each assistant choice reports the prompt's generation stub as output.
         # Keep engine completion counters unchanged for decoding and token IDs.
-        if usage.completion_tokens > 0:
+        if (
+            usage.completion_tokens > 0
+            if generation_started is None
+            else generation_started
+        ):
             stub_tokens = self._KIMI_K3_GENERATION_STUB_TOKENS * n_choices
             usage.completion_tokens += stub_tokens
             usage.total_tokens += stub_tokens
