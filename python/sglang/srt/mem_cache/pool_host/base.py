@@ -302,34 +302,50 @@ class HostKVCache(abc.ABC):
             if self.host_buffer_read_only
             else host_memory_budget_bytes(requested_bytes)
         )
-        if requested_bytes > available_bytes:
-            raise ValueError(
+        budget_error = (
+            ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
+            if requested_bytes > available_bytes
+            else None
+        )
+        budget_group = getattr(self.allocator, "budget_group", None)
+        if budget_group is not None:
+            # Lazy: the node-leader module pulls in distributed state.
+            from sglang.srt.mem_cache.mla_host_node_leader import (
+                synchronize_shared_host_error,
+            )
+
+            # Peers allocate their shares collectively: fail them together
+            # instead of leaving them blocked in the allocation.
+            synchronize_shared_host_error(
+                budget_group, budget_error, operation="host KV budget"
+            )
+        elif budget_error is not None:
+            raise budget_error
+        draft_layer_num = self.layer_num - self.target_layer_num
+        if draft_layer_num > 0:
+            logger.info(
+                "Allocating %s hierarchical KV host pool: %d tokens, "
+                "%.2f GB host memory, packed MTP KV layers: "
+                "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                self.pool_label,
+                self.size,
+                requested_bytes / 1e9,
+                self.target_layer_num,
+                draft_layer_num,
+                self.layer_num,
+            )
         else:
-            draft_layer_num = self.layer_num - self.target_layer_num
-            if draft_layer_num > 0:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, "
-                    "%.2f GB host memory, packed MTP KV layers: "
-                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                    self.pool_label,
-                    self.size,
-                    requested_bytes / 1e9,
-                    self.target_layer_num,
-                    draft_layer_num,
-                    self.layer_num,
-                )
-            else:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                    self.pool_label,
-                    self.size,
-                    requested_bytes / 1e9,
-                )
+            logger.info(
+                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                self.pool_label,
+                self.size,
+                requested_bytes / 1e9,
+            )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)

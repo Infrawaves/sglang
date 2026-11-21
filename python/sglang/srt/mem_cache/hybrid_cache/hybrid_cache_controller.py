@@ -231,6 +231,9 @@ class StorageOperation(BaseStorageOperation):
         )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        # [node_size, pages] host page starts of every node rank, from the
+        # op's node exchange (--enable-mla-hicache-dcp-node-aggregate).
+        self.dcp_node_page_starts: Optional[torch.Tensor] = None
 
 
 class PrefetchOperation(StorageOperation):
@@ -361,6 +364,14 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
 _NODE_SKIP_TICKET = (-1, 0)
 
 
+def _keys_fingerprint(keys: List[str]) -> int:
+    """Names an op's key chain across node ranks. Each page key hashes its
+    predecessor, so the count and the end keys fix the whole chain."""
+    chain = f"{len(keys)}:{keys[0] if keys else ''}:{keys[-1] if keys else ''}"
+    digest = hashlib.blake2b(chain.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)
+
+
 def _find_pool_transfer(
     transfers: list[PoolTransfer], name: PoolName
 ) -> Optional[PoolTransfer]:
@@ -432,6 +443,9 @@ class HybridCacheController(BaseHiCacheController):
         mamba_entry = getattr(mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
         self.kda_node_aggregate = getattr(
             getattr(mamba_entry, "host_pool", None), "node_aggregate", None
+        )
+        self.mla_dcp_node_aggregate = getattr(
+            anchor_host_pool, "dcp_node_aggregate", None
         )
         if self._kda_l3_stats_enabled:
             # Only node leaders put KDA objects, so they log the writes.
@@ -572,7 +586,8 @@ class HybridCacheController(BaseHiCacheController):
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
             )
-            if self.mla_host_read_only:
+            node = self.mla_dcp_node_aggregate
+            if self.mla_host_read_only or (node is not None and not node.is_leader):
                 self.page_get_func = self._page_get_shared_by_leader
         except Exception:
             if self.pp_prefetch_command_group is not None:
@@ -1130,9 +1145,70 @@ class HybridCacheController(BaseHiCacheController):
     def _page_get_shared_by_leader(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        # The node leader reads these pages into the shared host buffer; the
-        # completed-token all_reduce(MIN) takes its count.
+        # The node leader reads these pages into the node-shared host buffer;
+        # the completed-token all_reduce(MIN) takes its count.
         return len(hash_values)
+
+    @property
+    def _writes_kv(self) -> bool:
+        """Whether this rank puts the primary KV objects: its shard's writer,
+        and under DCP node aggregation only the node leader."""
+        node = self.mla_dcp_node_aggregate
+        return not self.backup_skip and (node is None or node.is_leader)
+
+    def _exchange_dcp_node_pages(
+        self, group: torch.distributed.ProcessGroup, operation: StorageOperation
+    ) -> None:
+        """Record every node rank's host page starts for ``operation``, or leave
+        them unset when any rank cannot supply its own.
+
+        Collective over ``group``: every node rank calls it exactly once per op
+        and it never raises, so the op's later collectives stay in step. Ranks
+        allocate host pages on their own threads, so the same op may sit at
+        different host pages per rank."""
+        num_pages = len(operation.hash_value)
+        try:
+            starts = operation.host_indices[:: self.page_size].to(torch.int64)
+            if starts.numel() != num_pages:
+                raise ValueError(
+                    f"{starts.numel()} host pages for {num_pages} page keys"
+                )
+            header = [1, _keys_fingerprint(operation.hash_value)]
+        except Exception:
+            logger.exception("MLA DCP node aggregation: cannot list host pages.")
+            starts = torch.full((num_pages,), -1, dtype=torch.int64)
+            header = [0, 0]
+        local = torch.cat([torch.tensor(header, dtype=torch.int64), starts])
+        gathered = [
+            torch.empty_like(local)
+            for _ in range(torch.distributed.get_world_size(group=group))
+        ]
+        try:
+            torch.distributed.all_gather(gathered, local, group=group)
+        except Exception:
+            # Ranks disagreeing on the op's page count fail here too.
+            logger.exception("MLA DCP node aggregation: host page exchange failed.")
+            return
+        if not all(int(rank[0]) for rank in gathered):
+            return
+        if self._node_fingerprints_agree(
+            [int(rank[1]) for rank in gathered], "MLA DCP node aggregation"
+        ):
+            operation.dcp_node_page_starts = torch.stack([rank[2:] for rank in gathered])
+
+    def _dcp_node_batch_indices(
+        self, operation: StorageOperation, start_page: int, num_pages: int
+    ) -> Optional[list[torch.Tensor]]:
+        """Every node rank's host indices of ``num_pages`` pages from
+        ``start_page``, for the node leader's KV IO."""
+        node = self.mla_dcp_node_aggregate
+        starts = operation.dcp_node_page_starts
+        if node is None or not node.is_leader or starts is None:
+            return None
+        offset = start_page - operation.start_page
+        starts = starts[:, offset : offset + num_pages]
+        rows = torch.arange(self.page_size, dtype=starts.dtype)
+        return [(rank_starts[:, None] + rows).flatten() for rank_starts in starts]
 
     def _l2_transfers(
         self,
@@ -1953,7 +2029,13 @@ class HybridCacheController(BaseHiCacheController):
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
         trace_extra = _storage_trace_extra(operation, include_request_id=True)
-        extra_info = replace(extra_info, extra_info=trace_extra or None)
+        extra_info = replace(
+            extra_info,
+            extra_info=trace_extra or None,
+            node_host_indices=self._dcp_node_batch_indices(
+                operation, extra_info.start_page, len(batch_hashes)
+            ),
+        )
         # A node-shared side pool is read into by the node leader only, like the
         # MLA anchor (_page_get_shared_by_leader); the cache-group MIN takes its
         # hits.
@@ -1975,6 +2057,10 @@ class HybridCacheController(BaseHiCacheController):
         return entry is not None and entry.host_pool.host_buffer_read_only
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
+        if self.mla_dcp_node_aggregate is not None:
+            self._exchange_dcp_node_pages(
+                self.mla_dcp_node_aggregate.prefetch_group, operation
+            )
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -2122,22 +2208,31 @@ class HybridCacheController(BaseHiCacheController):
         tickets = [tuple(value.tolist()) for value in gathered]
         if any(slot < 0 for slot, _ in tickets):
             return None
-        if any(fingerprint != ticket[1] for _, fingerprint in tickets):
-            # Writing under this key would mix other requests' state into it.
-            # Once out of step every later op mismatches too, and nothing in
-            # the storage threads can realign the node, so stop the server.
-            if not cls._node_out_of_step:
-                cls._node_out_of_step = True
-                logger.error(
-                    "KDA node aggregation: node ranks disagree on the checkpoint "
-                    "key (fingerprints %s); node-rank collectives are out of "
-                    "step. Stopping the server.",
-                    [fingerprint for _, fingerprint in tickets],
-                )
-                # Same path as a scheduler crash: the launcher kills the tree.
-                psutil.Process().parent().send_signal(signal.SIGQUIT)
+        if not cls._node_fingerprints_agree(
+            [fingerprint for _, fingerprint in tickets], "KDA node aggregation"
+        ):
             return None
         return [slot for slot, _ in tickets]
+
+    @classmethod
+    def _node_fingerprints_agree(cls, fingerprints: list[int], feature: str) -> bool:
+        """Whether every node rank names the same op; stops the server if not."""
+        if all(fingerprint == fingerprints[0] for fingerprint in fingerprints):
+            return True
+        # Moving data under this op's keys would mix other requests' data in.
+        # Once out of step every later op mismatches too, and nothing in the
+        # storage threads can realign the node, so stop the server.
+        if not cls._node_out_of_step:
+            cls._node_out_of_step = True
+            logger.error(
+                "%s: node ranks disagree on the op's keys (fingerprints %s); "
+                "node-rank collectives are out of step. Stopping the server.",
+                feature,
+                fingerprints,
+            )
+            # Same path as a scheduler crash: the launcher kills the tree.
+            psutil.Process().parent().send_signal(signal.SIGQUIT)
+        return False
 
     @staticmethod
     def _min_reduce_flag(group: torch.distributed.ProcessGroup, flag: bool) -> bool:
@@ -2256,6 +2351,9 @@ class HybridCacheController(BaseHiCacheController):
                 prefix_keys=prefix_keys,
                 extra_info=trace_extra or None,
                 start_page=operation.start_page + start,
+                node_host_indices=self._dcp_node_batch_indices(
+                    operation, operation.start_page + start, len(batch_hashes)
+                ),
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
@@ -2268,6 +2366,10 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def _page_backup_with_stable_layout(self, operation):
+        if self.mla_dcp_node_aggregate is not None:
+            self._exchange_dcp_node_pages(
+                self.mla_dcp_node_aggregate.backup_group, operation
+            )
         # Write primary KV only on its selected shard writer. Rank-sharded
         # sidecars can still need every TP rank.
         backup_transfers = [
@@ -2282,7 +2384,7 @@ class HybridCacheController(BaseHiCacheController):
         # MLA rank with no sidecar issues zero RPCs and must not create an empty
         # Backup span. super() runs only the KV core loop, so no double-init with
         # base _page_backup.
-        needs_backup = bool(backup_transfers) or not self.backup_skip
+        needs_backup = bool(backup_transfers) or self._writes_kv
         if needs_backup:
             _init_op_trace(operation, rid=operation.id, role="Backup")
 
@@ -2322,7 +2424,7 @@ class HybridCacheController(BaseHiCacheController):
                             transfers, extra_info=extra_info
                         )
                     )
-            if not self.backup_skip:
+            if self._writes_kv:
                 self._page_backup_kv_with_trace(operation)
         finally:
             if node is not None:

@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
+    validate_mla_hicache_dcp_node_aggregate,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_allowed_backends,
@@ -2884,6 +2885,52 @@ class TestHiCacheArgs(CustomTestCase):
                         handle_hicache(args)
                 else:
                     handle_hicache(args)
+
+    def test_mla_hicache_dcp_node_aggregate_admission(self):
+        """DCP node aggregation needs HiCache on shared-client Mooncake with
+        TP == DCP token stripes and write-through; each miss fails at launch."""
+        shared = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": False}
+        )
+        standalone = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": True}
+        )
+        base = {
+            "enable_hierarchical_cache": True,
+            "enable_mla_hicache_dcp_node_aggregate": True,
+            "hicache_storage_backend": "mooncake",
+            "hicache_storage_backend_extra_config": shared,
+            "hicache_write_policy": "write_through",
+            "tp_size": 8,
+            "dcp_size": 8,
+            "page_size": 64,
+        }
+        validate_mla_hicache_dcp_node_aggregate(self._make_args(**base))
+        validate_mla_hicache_dcp_node_aggregate(
+            self._make_args(**{**base, "hicache_storage_page_size": 512})
+        )
+        cases = (
+            ({"dcp_size": 1}, "--dcp-size is 1"),
+            ({"tp_size": 16}, "--tp-size differs"),
+            ({"dcp_kv_layout": "page"}, "--dcp-kv-layout page"),
+            ({"hicache_storage_backend": "file"}, "not mooncake"),
+            ({"enable_hierarchical_cache": False}, "hierarchical"),
+            ({"disaggregation_mode": "decode"}, "PD decode"),
+            ({"pp_size": 2}, "--pp-size"),
+            ({"enable_mla_hicache_per_node": True}, "per-node"),
+            ({"hicache_write_policy": "write_back"}, "write_back"),
+            ({"hicache_storage_page_size": 1024}, "storage-page-size"),
+            ({"hicache_host_memory_mode": "buffer_only"}, "buffer_only"),
+            (
+                {"hicache_storage_backend_extra_config": standalone},
+                "standalone_storage=True",
+            ),
+        )
+        for overrides, error in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**{**base, **overrides})
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_mla_hicache_dcp_node_aggregate(args)
 
     def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
         """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""

@@ -22,6 +22,12 @@ keeping that IO off the rank that already does MLA L3 IO. Only the KDA leader
 registers the full buffers with Mooncake and moves one multi-buffer object per
 checkpoint spanning every rank's slot.
 
+Under DCP, --enable-mla-hicache-dcp-node-aggregate lays the MLA KV host pool
+(and a DSA indexer bundled into the KV object) out the same way: each rank keeps
+its own DCP shard rows, and node rank 0 moves one object per page holding every
+node rank's page. Ranks allocate host pages independently, so each storage op
+first exchanges the node ranks' host page starts.
+
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.
 """
@@ -33,7 +39,7 @@ import logging
 import math
 import mmap
 import os
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
 import msgspec
 import torch
@@ -438,6 +444,9 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
         self.node_ranks = node_ranks
         self.tp_cache_group = tp_cache_group
         self.node_rank = node_ranks.index(torch.distributed.get_rank())
+        # Every rank allocates collectively, so a host pool's budget failure
+        # must fail the whole group (HostKVCache._allocate_host_buffer).
+        self.budget_group = tp_cache_group
         # Maps and prefaults the whole node buffer; node rank 0 creates it.
         self._mapper = NodeSharedHostTensorAllocator(
             node_ranks=node_ranks, tp_cache_group=tp_cache_group
@@ -467,6 +476,19 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
     def full_buffers(self) -> list[torch.Tensor]:
         return [buffer.full for buffer in self._buffers]
 
+    def peer_ptr(self, ptr: int, node_rank: int) -> int:
+        """``ptr`` inside this rank's share, at the same offset in ``node_rank``'s
+        share, in this process's address space."""
+        for buffer in self._buffers:
+            own = buffer.own.data_ptr()
+            if own <= ptr < own + buffer.own.nbytes:
+                return (
+                    buffer.full.data_ptr()
+                    + node_rank * buffer.stride_bytes
+                    + (ptr - own)
+                )
+        raise ValueError("Pointer is outside this node-sharded allocator's shares.")
+
     def peer_base_ptrs(self, own_tensor: torch.Tensor) -> list[int]:
         """Base address of every rank's share of ``own_tensor``'s buffer,
         in node-rank order, in this process's address space."""
@@ -481,12 +503,10 @@ class NodeShardedHostTensorAllocator(HostTensorAllocator):
         raise ValueError("Tensor was not allocated by this node-sharded allocator.")
 
 
-# Node rank 0 already does the MLA per-node L3 IO and is the MLA storage writer.
-# maybe_create_kda_node_aggregate_context only activates with >= 2 ranks per node.
-KDA_L3_LEADER_NODE_RANK = 1
+class NodeAggregateContext(msgspec.Struct, frozen=True):
+    """Node ranks of one cache group whose shares of a pool form one L3 object
+    per page, moved by the node's leader rank."""
 
-
-class KDANodeAggregateContext(msgspec.Struct, frozen=True):
     node_rank: int
     node_size: int
     node_index: int
@@ -496,18 +516,31 @@ class KDANodeAggregateContext(msgspec.Struct, frozen=True):
     prefetch_group: torch.distributed.ProcessGroup
     allocator: NodeShardedHostTensorAllocator
 
+    LEADER_NODE_RANK: ClassVar[int] = 0
+
     @property
     def is_leader(self) -> bool:
-        return self.node_rank == KDA_L3_LEADER_NODE_RANK
+        return self.node_rank == self.LEADER_NODE_RANK
 
 
-def maybe_create_kda_node_aggregate_context(
-    *, tp_cache_group: torch.distributed.ProcessGroup
-) -> Optional[KDANodeAggregateContext]:
-    """Call on every WORLD rank before Mamba host allocation;
-    it runs WORLD collectives when enabled."""
-    if not get_memory().enable_kda_hicache_node_aggregate:
-        return None
+class KDANodeAggregateContext(NodeAggregateContext, frozen=True):
+    # Node rank 0 already does the MLA L3 IO and is the MLA storage writer;
+    # activation needs >= 2 ranks per node.
+    LEADER_NODE_RANK: ClassVar[int] = 1
+
+
+class MLADCPNodeAggregateContext(NodeAggregateContext, frozen=True):
+    """MLA KV (and a bundled DSA indexer) under DCP: each rank holds its own DCP
+    shard rows, so a node object concatenates the node ranks' shares of a page."""
+
+
+def _create_node_aggregate_context(
+    cls: type[NodeAggregateContext],
+    *,
+    tp_cache_group: torch.distributed.ProcessGroup,
+    label: str,
+) -> Optional[NodeAggregateContext]:
+    """WORLD-collective on every rank of the cache group."""
     group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
     node_groups = split_ranks_by_node(group_ranks, ranks_per_host())
     rank = torch.distributed.get_rank()
@@ -526,11 +559,10 @@ def maybe_create_kda_node_aggregate_context(
         torch.distributed.destroy_process_group(prefetch_group)
         torch.distributed.destroy_process_group(backup_group)
         logger.info(
-            "KDA HiCache node aggregation inactive: "
-            "the smallest node in this cache group has one rank."
+            "%s inactive: the smallest node in this cache group has one rank.", label
         )
         return None
-    context = KDANodeAggregateContext(
+    context = cls(
         node_rank=node_ranks.index(rank),
         node_size=len(node_ranks),
         node_index=node_index,
@@ -542,12 +574,41 @@ def maybe_create_kda_node_aggregate_context(
         ),
     )
     logger.info(
-        "KDA HiCache node aggregation enabled: node_ranks=%s, leader=%d, role=%s, "
-        "node %d/%d",
+        "%s enabled: node_ranks=%s, leader=%d, role=%s, node %d/%d",
+        label,
         node_ranks,
-        node_ranks[KDA_L3_LEADER_NODE_RANK],
+        node_ranks[cls.LEADER_NODE_RANK],
         "leader" if context.is_leader else "follower",
         node_index,
         len(node_groups),
     )
     return context
+
+
+def maybe_create_kda_node_aggregate_context(
+    *, tp_cache_group: torch.distributed.ProcessGroup
+) -> Optional[KDANodeAggregateContext]:
+    """Call on every WORLD rank before Mamba host allocation;
+    it runs WORLD collectives when enabled."""
+    if not get_memory().enable_kda_hicache_node_aggregate:
+        return None
+    return _create_node_aggregate_context(
+        KDANodeAggregateContext,
+        tp_cache_group=tp_cache_group,
+        label="KDA HiCache node aggregation",
+    )
+
+
+def maybe_create_mla_dcp_node_aggregate_context(
+    *, tp_cache_group: torch.distributed.ProcessGroup
+) -> Optional[MLADCPNodeAggregateContext]:
+    """Call on every WORLD rank before MLA host allocation;
+    it runs WORLD collectives when enabled. Launch validation pins TP == DCP,
+    so the cache group is the DCP group."""
+    if not get_memory().enable_mla_hicache_dcp_node_aggregate:
+        return None
+    return _create_node_aggregate_context(
+        MLADCPNodeAggregateContext,
+        tp_cache_group=tp_cache_group,
+        label="MLA DCP HiCache node aggregation",
+    )

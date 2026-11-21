@@ -308,6 +308,10 @@ class Memory(msgspec.Struct):
         bool,
         "Store each KDA/Mamba HiCache L3 checkpoint as one Mooncake object per node, written and read by the node leader from node-shared host memory.",
     ] = False
+    enable_mla_hicache_dcp_node_aggregate: A[
+        bool,
+        "Under DCP, store each HiCache page's MLA KV shards of one node (and the DSA indexer when bundled by --hicache-storage-bundle-pools) as one Mooncake object, written and read by the node's first rank from node-shared host memory. Requires --tp-size equal to --dcp-size. Changes the L3 keys.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

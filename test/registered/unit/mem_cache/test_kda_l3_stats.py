@@ -344,14 +344,14 @@ class TestNodeAggregate(unittest.TestCase):
 
     def _node(self, node_rank, node_index, num_nodes=2):
         from sglang.srt.mem_cache.mla_host_node_leader import (
-            KDA_L3_LEADER_NODE_RANK,
+            KDANodeAggregateContext,
         )
 
         return SimpleNamespace(
             node_rank=node_rank,
             node_index=node_index,
             num_nodes=num_nodes,
-            is_leader=node_rank == KDA_L3_LEADER_NODE_RANK,
+            is_leader=node_rank == KDANodeAggregateContext.LEADER_NODE_RANK,
         )
 
     def test_roles(self):
