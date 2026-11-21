@@ -186,61 +186,6 @@ def test_streaming_tools_channel_before_think_close(chunk_size: int) -> None:
     assert TOOLS_OPEN in content
 
 
-@pytest.mark.parametrize(
-    ("text", "reasoning", "content"),
-    [
-        (
-            f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}"
-            f"{_TOOLS_CHANNEL}{MESSAGE_CLOSE}",
-            "thought",
-            "reply",
-        ),
-        (f"thought{THINK_CLOSE}reply{_TOOLS_CHANNEL}", "thought", "reply"),
-        (f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}", "thought", ""),
-    ],
-)
-@pytest.mark.parametrize("chunk_size", [1, 3, 7, 1000])
-def test_tools_channel_dropped_without_tool_call_parser(
-    text: str, reasoning: str, content: str, chunk_size: int
-) -> None:
-    """With no tool-call parser to consume it, the tools channel is a call to an
-    undeclared tool; like the official API, no part of it reaches the content."""
-    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=False)
-    result = detector.detect_and_parse(text)
-    assert (result.reasoning_text, result.normal_text) == (reasoning, content)
-    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=False)
-    assert _stream(detector, _chunks(text, chunk_size)) == (reasoning, content)
-
-
-def test_dropped_tools_channel_cut_at_a_marker_token_does_not_leak() -> None:
-    """A dropped tools channel cut off right after a ``<|close|>`` token, arriving
-    in the stream's last chunk, does not leak that token at finish."""
-    detector = KimiK3Detector(
-        force_reasoning=True, stream_reasoning=False, tool_call_parser_active=False
-    )
-    text = f"reply{RESPONSE_CLOSE}{TOOLS_OPEN}<|close|>"
-    assert _stream_with_finish(detector, [text]) == ("", "reply")
-
-
-@pytest.mark.parametrize(
-    ("tool_call_parser_active", "content"),
-    [
-        (None, f"reply{_TOOLS_CHANNEL}"),
-        (False, "reply"),
-    ],
-)
-def test_reasoning_parser_drops_tools_channel_only_when_told(
-    tool_call_parser_active: bool | None, content: str
-) -> None:
-    """Only a caller that says no tool-call parser reads the output drops the
-    tools channel; a caller that does not say keeps the call as text."""
-    parser = ReasoningParser("kimi_k3", tool_call_parser_active=tool_call_parser_active)
-    reasoning, normal = parser.parse_non_stream(
-        f"thought{THINK_CLOSE}reply{_TOOLS_CHANNEL}"
-    )
-    assert (reasoning, normal) == ("thought", content)
-
-
 _SKIPPED_THINK_REPLY = "The TTL is 20 minutes."
 
 

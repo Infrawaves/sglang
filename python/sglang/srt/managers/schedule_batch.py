@@ -1411,6 +1411,14 @@ class Req(ReqDllmMixin):
                 entry[1] = matched
                 if matched == len(matcher):
                     pattern = matcher.pattern
+                    # A client stop string or regex ending no later in this run
+                    # stops first; decode only now that the sequence completed.
+                    if (
+                        self.sampling_params.stop_strs
+                        or self.sampling_params.stop_regex_strs
+                    ) and self._check_str_based_finish(len(new_accepted_tokens)):
+                        if self.finished_len <= base + i + 1:
+                            return True
                     self.finished_reason = FINISH_MATCHED_TOKEN_SEQUENCE(
                         matched=(
                             self.tokenizer.decode(list(pattern))

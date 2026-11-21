@@ -33,7 +33,10 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.req_types import (
+    FINISH_MATCHED_TOKEN_SEQUENCE,
+    BaseFinishReason,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
@@ -788,8 +791,12 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
+                # An excluded stop sequence leaves no logprob for its tokens.
                 logprob_end = (
-                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                    len(output_ids_)
+                    if req.is_retracted
+                    or isinstance(req.finished_reason, FINISH_MATCHED_TOKEN_SEQUENCE)
+                    else max(len(output_ids_), 1)
                 )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[

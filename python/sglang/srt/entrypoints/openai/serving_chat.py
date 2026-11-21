@@ -2050,7 +2050,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> None:
         """With no tool-call parser to read it, a tools channel is a call to an
         undeclared tool; the official API returns none and ends there. Stopping
-        at its open marker also spares generating the call."""
+        at its open marker also spares generating the call. The parser still
+        passes marker text spelled with ordinary tokens through as content."""
         if not tool_call_parsing_active:
             self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
 

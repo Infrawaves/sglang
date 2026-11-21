@@ -86,6 +86,7 @@ class _FakeReq:
         )
         self.finished_output = False
         self.finished_len = None
+        self.cache_input_metadata_sent = False
         self.beam_group = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
@@ -133,6 +134,9 @@ class _FakeReq:
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
     def check_match_stop_str_prefix(self):
+        return False
+
+    def is_matching_stop_token_sequence(self):
         return False
 
 
