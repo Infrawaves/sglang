@@ -110,6 +110,9 @@ class HiCacheStorageExtraInfo:
     start_page: int = 0
     # Pool name -> segment chain from the existence query, for grouped reads.
     storage_plans: Optional[dict] = None
+    # Per node rank, the host indices of the call's pages, in node-rank order
+    # (--enable-mla-hicache-dcp-node-aggregate, node leader only).
+    node_host_indices: Optional[List[torch.Tensor]] = None
 
 
 class PoolName(str, Enum):

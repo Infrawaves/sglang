@@ -41,6 +41,8 @@ def handle_hicache(server_args: Any):
         validate_hicache_storage_page_size(server_args)
     if cfg.hicache_storage_bundle_pools:
         validate_hicache_storage_bundle_pools(server_args)
+    if cfg.enable_mla_hicache_dcp_node_aggregate:
+        validate_mla_hicache_dcp_node_aggregate(server_args)
     if cfg.enable_kda_hicache_node_aggregate and (
         not cfg.enable_hierarchical_cache or cfg.hicache_storage_backend != "mooncake"
     ):
@@ -223,6 +225,57 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         # Decode may write per-rank KDA keys in the prefill layout; the node
         # object keys would hide them from, or mix with, those readers.
         raise ValueError(f"{flag} does not support PD decode.")
+    # Lazy: only node-aggregated launches pay for these imports.
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStoreConfig,
+    )
+
+    extra_config = HybridCacheController.parse_storage_backend_extra_config(
+        cfg.hicache_storage_backend_extra_config
+    )[0]
+    if MooncakeStoreConfig.load(extra_config).standalone_storage:
+        raise ValueError(
+            f"{flag} is incompatible with Mooncake standalone_storage=True, "
+            "which requires MooncakeHostTensorAllocator."
+        )
+
+
+def validate_mla_hicache_dcp_node_aggregate(server_args: Any):
+    cfg = resolving_view(server_args)
+    flag = "--enable-mla-hicache-dcp-node-aggregate"
+    unsupported = {
+        "--enable-hierarchical-cache is off": not cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend is not mooncake": (
+            cfg.hicache_storage_backend != "mooncake"
+        ),
+        "--dcp-size is 1": cfg.dcp_size <= 1,
+        # Replica DCP groups would need one writer group and matching node cuts.
+        "--tp-size differs from --dcp-size": cfg.tp_size != cfg.dcp_size,
+        # The page-interleave host pool wraps the MLA pool; only token stripes.
+        "--dcp-kv-layout page": cfg.dcp_kv_layout != "token",
+        "--enable-dp-attention": cfg.enable_dp_attention,
+        "--attn-cp-size > 1": cfg.attn_cp_size > 1,
+        "--pp-size > 1": cfg.pp_size > 1,
+        "PD decode": cfg.disaggregation_mode == "decode",
+        "--enable-mla-hicache-per-node": cfg.enable_mla_hicache_per_node,
+        "--hicache-host-memory-mode buffer_only": (
+            cfg.hicache_host_memory_mode == "buffer_only"
+        ),
+        "--hicache-storage-page-size larger than the HiCache page": (
+            cfg.hicache_storage_page_size is not None
+            and cfg.hicache_storage_page_size > cfg.page_size * cfg.dcp_size
+        ),
+        # Write-back evictions only wait for this rank's D2H, so the leader could
+        # put a node object before a peer's share of it is written.
+        "--hicache-write-policy write_back": cfg.hicache_write_policy
+        not in ("write_through", "write_through_selective"),
+    }
+    reasons = [reason for reason, hit in unsupported.items() if hit]
+    if reasons:
+        raise ValueError(f"{flag} is not supported when: " + ", ".join(reasons) + ".")
     # Lazy: only node-aggregated launches pay for these imports.
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,

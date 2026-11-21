@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -52,6 +52,9 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.mla_host_node_leader import MLADCPNodeAggregateContext
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -129,11 +132,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_token_capacity: int | None = None,
         host_allocator: Optional[HostTensorAllocator] = None,
         host_buffer_read_only: bool = False,
+        dcp_node_aggregate: Optional[MLADCPNodeAggregateContext] = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
         # This rank does not own the MLA host data; the node leader writes it.
         self.host_buffer_read_only = host_buffer_read_only
+        # This rank's DCP shard lives in a node-shared buffer whose L3 objects
+        # the node leader moves for every node rank.
+        self.dcp_node_aggregate = dcp_node_aggregate
+        if dcp_node_aggregate is not None:
+            assert host_allocator is None
+            host_allocator = dcp_node_aggregate.allocator
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops

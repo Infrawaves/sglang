@@ -51,6 +51,10 @@ def validate_runtime_storage_update() -> None:
                 "--enable-kda-hicache-node-aggregate",
                 memory.enable_kda_hicache_node_aggregate,
             ),
+            (
+                "--enable-mla-hicache-dcp-node-aggregate",
+                memory.enable_mla_hicache_dcp_node_aggregate,
+            ),
         )
         if enabled
     ]

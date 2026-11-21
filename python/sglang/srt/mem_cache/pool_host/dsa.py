@@ -223,12 +223,18 @@ class DSAIndexerPoolHost(HostKVCache):
         self.clear()
 
     def _uses_node_shared_allocator(self) -> bool:
+        """A node memfd allocation: the per-node copy or DCP node shares; both
+        allocate collectively, so a budget failure must fail every rank."""
         # Lazy: the node-leader module pulls in distributed state.
         from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeShardedHostTensorAllocator,
             NodeSharedHostTensorAllocator,
         )
 
-        return isinstance(self.allocator, NodeSharedHostTensorAllocator)
+        return isinstance(
+            self.allocator,
+            (NodeSharedHostTensorAllocator, NodeShardedHostTensorAllocator),
+        )
 
     def _sync_node_shared_budget(self, error: Exception | None) -> None:
         """Collective over the cache group; every rank calls it once, before the

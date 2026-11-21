@@ -1,5 +1,6 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
+import contextlib
 import signal
 import tempfile
 import threading
@@ -1474,6 +1475,85 @@ class TestKDANodeAggregatedFailureInjector(CustomTestCase):
                 self.assertEqual(
                     backend.batch_io_node_aggregated_mamba.called, prob == 0.0
                 )
+
+
+class TestMLADCPNodeAggregatedPages(CustomTestCase):
+    """Node ranks allocate host pages on their own threads, so the leader's KV
+    IO must address each rank's share at that rank's own host pages."""
+
+    PAGE = 4  # logical tokens per HiCache page
+
+    def _setup(self, *, is_leader=True):
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.page_size = self.PAGE
+        ctrl.mla_dcp_node_aggregate = SimpleNamespace(is_leader=is_leader)
+        operation = SimpleNamespace(
+            hash_value=["h0", "h1", "h2"],
+            host_indices=torch.arange(8 * self.PAGE, 11 * self.PAGE),
+            start_page=6,
+            dcp_node_page_starts=None,
+        )
+        return ctrl, operation
+
+    def test_leader_addresses_every_rank_at_its_own_host_pages(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            _keys_fingerprint,
+        )
+
+        ctrl, operation = self._setup()
+        # Rank 1 holds the same op at host pages 20..22.
+        peer = [1, _keys_fingerprint(operation.hash_value), 80, 84, 88]
+        with _FakeNodeCollectives(peer_ticket=peer):
+            ctrl._exchange_dcp_node_pages("bg", operation)
+        self.assertEqual(
+            operation.dcp_node_page_starts.tolist(),
+            [[32, 36, 40], [80, 84, 88]],
+        )
+        rank0, rank1 = ctrl._dcp_node_batch_indices(operation, 7, 2)
+        self.assertEqual(rank0.tolist(), list(range(36, 44)))
+        self.assertEqual(rank1.tolist(), list(range(84, 92)))
+
+    def test_a_rank_without_host_pages_skips_the_op_for_the_node(self):
+        """A rank that cannot list its pages still joins the exchange, and no
+        rank moves the op's node objects."""
+        for broken in ("self", "peer"):
+            with self.subTest(broken=broken):
+                ctrl, operation = self._setup()
+                peer = [1, 0, 80, 84, 88]
+                if broken == "self":
+                    operation.host_indices = None
+                else:
+                    peer = [0, 0, -1, -1, -1]
+                with (
+                    _FakeNodeCollectives(peer_ticket=peer) as node,
+                    self.assertLogs(level="ERROR")
+                    if broken == "self"
+                    else contextlib.nullcontext(),
+                ):
+                    ctrl._exchange_dcp_node_pages("bg", operation)
+                self.assertEqual(len(node.calls), 1)
+                self.assertIsNone(operation.dcp_node_page_starts)
+
+    def test_follower_passes_no_node_indices(self):
+        ctrl, operation = self._setup(is_leader=False)
+        operation.dcp_node_page_starts = torch.tensor([[32, 36, 40], [80, 84, 88]])
+        self.assertIsNone(ctrl._dcp_node_batch_indices(operation, 6, 3))
+
+    def test_ranks_naming_different_ops_leave_no_pages_and_stop_the_server(self):
+        module = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        with (
+            patch(f"{module}.psutil.Process") as process,
+            patch.object(HybridCacheController, "_node_out_of_step", False),
+            _FakeNodeCollectives(peer_ticket=[1, 12345, 0, 0, 0]),
+            self.assertLogs(level="ERROR"),
+        ):
+            ctrl, operation = self._setup()
+            ctrl._exchange_dcp_node_pages("bg", operation)
+        self.assertIsNone(operation.dcp_node_page_starts)
+        self.assertIsNone(ctrl._dcp_node_batch_indices(operation, 6, 3))
+        process.return_value.parent.return_value.send_signal.assert_called_once_with(
+            signal.SIGQUIT
+        )
 
 
 if __name__ == "__main__":
