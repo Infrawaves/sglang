@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -94,6 +94,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.ps = SimpleNamespace(tp_rank=0, pp_rank=0)
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
 
     def _release_aborted_request(self, req):
         if self.enable_hicache_storage:
@@ -335,6 +336,30 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False, None)
     scheduler.send_kv_chunk.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_overlap", [True, False])
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_result_marks_forward_synced_after_copy_done(release_kv_cache, enable_overlap):
+    """Mooncake DCP draft peers read this rank's overlap early-send chunks only
+    once the scheduler signals that the forwards they read have completed."""
+    scheduler = _Scheduler()
+    scheduler.enable_overlap = enable_overlap
+    order = Mock()
+    scheduler.disagg_prefill_bootstrap_queue.kv_manager = order.kv_manager
+    copy_done = order.copy_done if enable_overlap else None
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([11]), copy_done=copy_done
+    )
+
+    scheduler.process_batch_result_disagg_prefill(
+        _batch(_Req(inflight_middle_chunks=0)), result
+    )
+
+    expected = [call.kv_manager.mark_prefill_forward_synced()]
+    if enable_overlap:
+        expected.insert(0, call.copy_done.synchronize())
+    assert order.mock_calls == expected
 
 
 class TestPrefillSourceDrain(CustomTestCase):

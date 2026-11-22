@@ -5,9 +5,15 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    copy_mla_rows_into_pack,
+    copy_rows_into_strided_pack,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.draft_peer_gather import (
+    gather_draft_rows_into_pack,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,6 +46,55 @@ class TestPdDcpGather(CustomTestCase):
         packed1 = pack[split:].view(torch.float16).view(4, 1, 5)
         torch.testing.assert_close(packed0, kv0[row_indices], rtol=0, atol=0)
         torch.testing.assert_close(packed1, kv1[row_indices], rtol=0, atol=0)
+
+    def test_interleaves_head_shards_into_decode_rows(self):
+        """Each source fills its byte range of a wider packed row; entries stay
+        entry-major so one RDMA block per contiguous run covers every shard."""
+        k, src_width, rows = 4, 128, 300
+        shards = [
+            [
+                torch.randint(
+                    0, 255, (512, src_width), dtype=torch.uint8, device="cuda"
+                )
+                for _ in range(k)
+            ]
+            for _ in range(2)
+        ]
+        row_indices = torch.randperm(512, device="cuda")[:rows]
+        pack = StagingBuffer(2 * rows * k * src_width + 64, "cuda:0", 0)
+        packed_ptrs = gather_draft_rows_into_pack(
+            pack_buffer=pack,
+            entry_source_ptrs=[[x.data_ptr() for x in entry] for entry in shards],
+            src_widths=[src_width, src_width],
+            dst_widths=[k * src_width, k * src_width],
+            src_rows=row_indices.cpu().numpy(),
+        )
+        block = rows * k * src_width
+        self.assertEqual(packed_ptrs, [pack.get_ptr(), pack.get_ptr() + block])
+        for entry, sources in enumerate(shards):
+            packed = pack.buffer[entry * block : (entry + 1) * block].view(
+                rows, k * src_width
+            )
+            expected = torch.cat([x[row_indices] for x in sources], dim=1)
+            torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+
+    def test_strided_pack_leaves_gaps_untouched(self):
+        rows, width, stride = 7, 5, 16
+        source = (
+            torch.arange(32 * width, device="cuda")
+            .remainder(251)
+            .to(torch.uint8)
+            .view(32, width)
+        )
+        row_indices = torch.tensor([3, 0, 31, 8, 9, 10, 2], device="cuda")
+        pack = torch.full((rows * stride,), 7, dtype=torch.uint8, device="cuda")
+        copy_rows_into_strided_pack(
+            [(source.data_ptr(), width, 3, width, stride)], row_indices, pack
+        )
+        torch.cuda.synchronize()
+        expected = torch.full((rows, stride), 7, dtype=torch.uint8, device="cuda")
+        expected[:, 3 : 3 + width] = source[row_indices]
+        torch.testing.assert_close(pack.view(rows, stride), expected, rtol=0, atol=0)
 
     def test_packed_tp2_pp2_to_dcp4_preserves_kv(self):
         """Packing must preserve both target rows and draft head shards across PP stages."""

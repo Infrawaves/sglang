@@ -19,10 +19,16 @@ export SGLANG_CUTEDSL_MLA_NUM_KV_SPLITS=4
   `0, 1, 2, 4, 8`; `1` also checks the adapter against the original B128 path.
 - Restart workers for every value. Changing the environment after startup does
   not update captured graph scalars or workspace pointers.
-- Requires `flashinfer-python==0.6.17` or `0.6.18`, no speculative decoding,
-  ordinary one-query-token decode, and no skip-softmax. Other FlashInfer
-  versions fail explicitly when the override is enabled; default `0` does not
-  impose a version check.
+- Requires `flashinfer-python==0.6.17` or `0.6.18` and no skip-softmax.
+  Other FlashInfer versions fail explicitly when the override is enabled;
+  default `0` does not impose a version check.
+- Works with speculative decoding (e.g. DSPARK): target verify passes a dense
+  `[B, num_draft_tokens]` query, and the workspace is planned for that verify
+  width. The fixed split applies to every batch size, so a small batch whose
+  stock planner chose more splits will get fewer; compare against `0` at the
+  batch sizes you serve. Page-layout DCP still rejects multi-query verify, so
+  use token DCP for speculative runs. Check numerics with
+  `bench_cutedsl_mla_splitkv.py --q-len <verify width>` before rollout.
 - Works with DCP (`--dcp-size > 1`, token or page KV layout). The override
   replaces only the planner of the same monolithic DCP call, so the kernel
   still returns the rank-local `(out, lse)` for the cross-rank merge. Each
