@@ -32,6 +32,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
+from sglang.srt.function_call.tool_schema_guard import canonicalize_tool_schema
 
 _JSON_TYPES = (
     "string",
@@ -490,15 +491,73 @@ def _known_argument_format(
     return OrFormat(elements=variants)
 
 
+# Characters an argument key attribute can hold unescaped; `&` and `"` only
+# appear escaped, so a raw key is drawn from the rest.
+_KEY_CLASS_EXCLUDES = r'"& \t\r\n\f\v=<>'
+_KEY_FORBIDDEN_CHARS = frozenset('"& \t\r\n\f\v=<>')
+_ANY_KEY_CHAR = f"[^{_KEY_CLASS_EXCLUDES}]"
+_REGEX_META = frozenset("\\.^$|?*+()[]{}/")
+_CLASS_META = frozenset("\\]^-[")
+
+
+def _attribute_key_regex(excluded_keys) -> str:
+    """Regex for a dynamic argument key that is none of ``excluded_keys``.
+
+    Keys declared under ``properties`` go through their own typed tags; letting
+    the additionalProperties path spell them too would let a declared argument
+    escape its schema (``type="number"`` for a string property) or repeat. The
+    complement of a finite set is built over its trie: at each prefix the key
+    may diverge onto a character no declared key continues with, follow a
+    declared key one more character, or stop if the prefix is itself undeclared.
+
+    Only ASCII names are excluded: XGrammar's negated character classes do not
+    exclude a multi-byte character, so a non-ASCII name keeps the old behaviour
+    (such names already drop to a bare type constraint, see
+    _declares_non_ascii_property).
+    """
+    names = {
+        key
+        for key in excluded_keys
+        if isinstance(key, str)
+        and key
+        and key.isascii()
+        and not (_KEY_FORBIDDEN_CHARS & set(key))
+    }
+    if not names:
+        return _ANY_KEY_CHAR + "+"
+
+    trie: Dict[Optional[str], Any] = {}
+    for name in names:
+        node = trie
+        for char in name:
+            node = node.setdefault(char, {})
+        node[None] = True
+
+    def build(node: Dict[Optional[str], Any], is_root: bool) -> str:
+        children = sorted(char for char in node if char is not None)
+        diverge = "".join("\\" + c if c in _CLASS_META else c for c in children)
+        alternatives = [f"[^{_KEY_CLASS_EXCLUDES}{diverge}]{_ANY_KEY_CHAR}*"]
+        for char in children:
+            literal = "\\" + char if char in _REGEX_META else char
+            alternatives.append(literal + build(node[char], False))
+        group = "(" + "|".join(alternatives) + ")"
+        # The empty key is not a key; a declared name may not stop here.
+        return group if is_root or None in node else group + "?"
+
+    return build(trie, True)
+
+
 def _dynamic_argument_format(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
     loose_strings: bool = False,
+    excluded_keys=(),
 ) -> Format:
+    key_pattern = _attribute_key_regex(excluded_keys)
     variants = [
         SequenceFormat(
             elements=[
-                RegexFormat(pattern=r'[^"& \t\r\n\f\v=<>]+'),
+                RegexFormat(pattern=key_pattern),
                 ConstStringFormat(
                     value=(f'" type="{_JSON_TO_XTML_TYPE[json_type]}"<|sep|>')
                 ),
@@ -552,11 +611,14 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
         )
 
     additional = parameters.get("additionalProperties", True)
-    if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
-    elif isinstance(additional, dict):
+    if additional is True or isinstance(additional, dict):
+        # additionalProperties governs only undeclared keys.
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            StarFormat(
+                content=_dynamic_argument_format(
+                    additional, parameters, excluded_keys=properties.keys()
+                )
+            )
         )
     elif additional is not False:
         raise ValueError(
@@ -582,6 +644,11 @@ def _tool_arguments_format(tool: Tool) -> Format:
         raise ValueError(
             f"Kimi K3 strict tool {tool.function.name!r} must define parameters"
         )
+    # Walle's canonical form, not the raw schema: what walle repairs (undeclared
+    # `required`, min > max bounds, an enum with no value of its type) would
+    # otherwise raise here -- swallowed by get_structure_constraint into an
+    # unconstrained call -- or fail to compile in XGrammar.
+    parameters = canonicalize_tool_schema(parameters)
     schema_types = _schema_types(parameters, parameters)
     if "object" not in schema_types:
         raise ValueError(
