@@ -3143,13 +3143,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     ):
                         if self.chat_encoding_spec == "kimi_k3":
                             code = finish_reason["status_code"]
-                            if not stream_started and code < 500:
-                                # A client error found before any byte
-                                # is sent is a plain HTTP error, not a stream.
+                            if not stream_started:
+                                # An abort found before any byte is sent is a
+                                # plain HTTP error with a JSON body (spec P0.17),
+                                # never a stream whose first frame is the end
+                                # frame: the role frame would be missing, and a
+                                # 200 keeps the router and the gateway from
+                                # retrying elsewhere. A server error does not
+                                # echo its message, which can name ranks, rids
+                                # and peer addresses; the engine has logged it.
                                 raise HTTPException(
                                     status_code=code.value,
-                                    detail=finish_reason.get(
-                                        "message", "Generation aborted."
+                                    detail=(
+                                        finish_reason.get(
+                                            "message", "Generation aborted."
+                                        )
+                                        if code < 500
+                                        else code.phrase
                                     ),
                                 )
                             # A mid-stream failure may only be expressed

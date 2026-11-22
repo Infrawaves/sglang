@@ -8115,16 +8115,20 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "grammar failed")
 
-    def test_server_abort_before_first_token_stays_server_interrupted(self):
-        response = self._abort_before_first_token(HTTPStatus.SERVICE_UNAVAILABLE)
-        self.assertIsInstance(response, StreamingResponse)
-
-        async def _drain():
-            return [chunk async for chunk in response.body_iterator]
-
-        frames = self._frames(get_or_create_event_loop().run_until_complete(_drain()))
-        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
-        self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
+    def test_server_abort_before_first_token_is_an_http_error(self):
+        """A 5xx abort before any byte is sent (e.g. a PD KV transfer that
+        timed out) is an HTTP error as well: a 200 whose only frame is the end
+        frame lacks the role frame and cannot be retried elsewhere. The client
+        gets the status phrase, not the engine's internal message."""
+        for status in (
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        ):
+            with self.subTest(status=status):
+                with self.assertRaises(HTTPException) as ctx:
+                    self._abort_before_first_token(status)
+                self.assertEqual(ctx.exception.status_code, status.value)
+                self.assertEqual(ctx.exception.detail, status.phrase)
 
     def test_other_encodings_still_emit_the_abort_error_frame(self):
         """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
