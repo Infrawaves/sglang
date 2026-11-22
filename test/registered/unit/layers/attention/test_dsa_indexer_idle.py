@@ -108,6 +108,40 @@ class TestDSAIndexerDcpGatherEmptyRank(unittest.TestCase):
             contributed, [(0, head_dim + scale_bytes)] * (dcp_size - seq_len)
         )
 
+    def test_one_token_gather_returns_tma_aligned_rows(self):
+        """A one-token prefill (the /health probe sends input_ids=[0]) gathers a
+        single row; DeepGEMM's fp8_mqa_logits needs a 16-byte-aligned row
+        stride, which a one-row split of the [K | scale] slab does not have."""
+        head_dim, scale_bytes, dcp_size = 128, 4, 8
+        seq_lens_cpu = torch.tensor([1], dtype=torch.int32)
+        pool = SimpleNamespace(
+            get_index_k_scale_buffer=lambda _layer, _lens, _pages, rows, _max: (
+                torch.zeros((rows, head_dim), dtype=torch.uint8),
+                torch.zeros((rows, scale_bytes), dtype=torch.uint8),
+            )
+        )
+
+        def gather(local_rows, lens_cpu):
+            return torch.zeros(
+                (int(lens_cpu.sum()), local_rows.shape[1]), dtype=torch.uint8
+            )
+
+        parallel = SimpleNamespace(attn_dcp_size=dcp_size, attn_dcp_rank=0)
+        with (
+            patch(f"{_INDEXER}.get_parallel", return_value=parallel),
+            patch(f"{_INDEXER}.get_token_to_kv_pool", return_value=pool),
+            patch(f"{_INDEXER}.dcp_gather_request_rows", side_effect=gather),
+        ):
+            k_fp8, k_scale = Indexer._dcp_gather_index_k(
+                0,
+                torch.zeros((1, 1), dtype=torch.int32),
+                seq_lens_cpu.clone(),
+                seq_lens_cpu,
+            )
+        self.assertEqual(k_fp8.shape, (1, head_dim))
+        self.assertEqual(k_fp8.stride(0) * k_fp8.element_size() % 16, 0)
+        self.assertEqual(k_scale.stride(), (scale_bytes, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

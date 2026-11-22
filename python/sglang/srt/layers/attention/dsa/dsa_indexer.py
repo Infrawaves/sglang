@@ -1961,7 +1961,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )
         k_fp8, k_scale = gathered.split([k_bytes.shape[1], s_bytes.shape[1]], dim=-1)
-        return k_fp8.contiguous(), k_scale.contiguous()
+        # Dense copies, not contiguous(): a one-row split view already counts as
+        # contiguous yet keeps the 132-byte row stride, and DeepGEMM's TMA needs
+        # a 16-byte-aligned row stride (a one-token health check hits it).
+        return (
+            torch.empty(k_fp8.shape, dtype=k_fp8.dtype, device=k_fp8.device).copy_(
+                k_fp8
+            ),
+            torch.empty(
+                k_scale.shape, dtype=k_scale.dtype, device=k_scale.device
+            ).copy_(k_scale),
+        )
 
     def _indexer_tp_split(
         self, forward_batch: ForwardBatch, q_offset: int
