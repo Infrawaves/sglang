@@ -101,6 +101,7 @@ from sglang.srt.managers.req_types import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
+    FINISH_MATCHED_TOKEN_SEQUENCE,
     FINISHED_MATCHED_REGEX,
     MM_PAD_SHIFT_VALUE,
     BaseFinishReason,
@@ -154,7 +155,10 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import (
+    SamplingParams,
+    get_request_stop_token_sequences,
+)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -549,6 +553,9 @@ class Req(ReqDllmMixin):
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
         self._think_start_match_len = 0
+        # Server-side stop token sequences: [matcher, matched length] pairs,
+        # built on first use.
+        self._stop_sequence_state: Optional[List[list]] = None
 
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
@@ -1304,29 +1311,33 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def _is_stop_token(self, token_id: int) -> bool:
+        """Whether token_id ends the request as a stop token or EOS."""
         if self.sampling_params.ignore_eos:
             return False
-
-        # Check stop token ids
-        matched_eos = False
-
-        for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids and (
-                not self.require_reasoning
-                or (
-                    self._is_reasoning_over
-                    and len(self.output_ids) > self.reasoning_tokens
-                )
+        if self.sampling_params.stop_token_ids and (
+            not self.require_reasoning
+            or (
+                self._is_reasoning_over and len(self.output_ids) > self.reasoning_tokens
+            )
+        ):
+            if token_id in self.sampling_params.stop_token_ids:
+                return True
+        if self.eos_token_ids and token_id in self.eos_token_ids:
+            return True
+        if self.tokenizer is not None:
+            if token_id == self.tokenizer.eos_token_id:
+                return True
+            if (
+                self.tokenizer.additional_stop_token_ids
+                and token_id in self.tokenizer.additional_stop_token_ids
             ):
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
-            if matched_eos:
+                return True
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self._is_stop_token(token_id):
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
                 self.finished_len = matched_pos + 1
@@ -1364,6 +1375,66 @@ class Req(ReqDllmMixin):
             return None
         # The full tail window is already known to match by the caller.
         return len(self.output_ids)
+
+    def _stop_sequence_matchers(self, new_accepted_len: int) -> List[list]:
+        state = self._stop_sequence_state
+        if state is None:
+            sequences = get_request_stop_token_sequences(
+                self.sampling_params.custom_params
+            )
+            state = [[TokenSequenceMatcher(seq), 0] for seq in sequences]
+            # Output committed before the first check (prefill's first token
+            # in PD, a retracted request) still counts toward a match.
+            for entry in state:
+                for token in self.output_ids[: len(self.output_ids) - new_accepted_len]:
+                    entry[1] = entry[0].advance(entry[1], token)
+            self._stop_sequence_state = state
+        return state
+
+    def _check_token_sequence_finish(self, new_accepted_tokens) -> bool:
+        """Finish at a server-side stop token sequence, excluding it. Checked
+        from the first output token, reasoning included: only the special
+        tokens the model generates can match."""
+        state = self._stop_sequence_matchers(len(new_accepted_tokens))
+        if not state:
+            return False
+        base = len(self.output_ids) - len(new_accepted_tokens)
+        max_new_tokens = self.sampling_params.max_new_tokens
+        for i, token in enumerate(new_accepted_tokens):
+            # A stop token, EOS or the length cap reached before the sequence
+            # completes ends the request first; the later checks handle it.
+            if base + i + 1 > max_new_tokens or self._is_stop_token(token):
+                return False
+            for entry in state:
+                matcher, matched = entry
+                matched = matcher.advance(matched, token)
+                entry[1] = matched
+                if matched == len(matcher):
+                    pattern = matcher.pattern
+                    # A client stop string or regex ending no later in this run
+                    # stops first; decode only now that the sequence completed.
+                    if (
+                        self.sampling_params.stop_strs
+                        or self.sampling_params.stop_regex_strs
+                    ) and self._check_str_based_finish(len(new_accepted_tokens)):
+                        if self.finished_len <= base + i + 1:
+                            return True
+                    self.finished_reason = FINISH_MATCHED_TOKEN_SEQUENCE(
+                        matched=(
+                            self.tokenizer.decode(list(pattern))
+                            if self.tokenizer is not None
+                            else None
+                        )
+                    )
+                    self.finished_len = base + i + 1 - len(pattern)
+                    return True
+        return False
+
+    def is_matching_stop_token_sequence(self) -> bool:
+        """Whether the output ends inside a server-side stop token sequence, so
+        streaming holds it back until the sequence completes or breaks."""
+        state = self._stop_sequence_state
+        return bool(state) and any(matched for _, matched in state)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
         if self.require_reasoning and not self._is_reasoning_over:
@@ -1492,6 +1563,12 @@ class Req(ReqDllmMixin):
 
         # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        if new_accepted_len > 0 and self._check_token_sequence_finish(
+            new_accepted_tokens
+        ):
             self._cap_finished_len_at_max_new_tokens()
             return
 

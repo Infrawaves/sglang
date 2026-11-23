@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import msgspec
 
@@ -112,6 +112,65 @@ def set_request_reasoning_end_token_ids(
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
     sampling_params["custom_params"] = custom_params
+
+
+# Private transport, like the reasoning terminator above: token-id sequences
+# that end the request where they start, excluded from the output. Only special
+# tokens the model generates match them, never the same text spelled with
+# ordinary tokens, and checking them needs no decode. Sequences are flattened
+# with STOP_TOKEN_SEQUENCE_SEP between them to stay a JSON-safe list.
+REQUEST_STOP_TOKEN_SEQUENCES_KEY = "__sglang_stop_token_sequences"
+STOP_TOKEN_SEQUENCE_SEP = -1
+MAX_REQUEST_STOP_TOKEN_SEQUENCES_LEN = 64
+
+
+def append_request_stop_token_sequence(
+    sampling_params: Dict, token_ids: Sequence[int]
+) -> None:
+    """Attach a server-side stop token sequence to a request."""
+    if not token_ids or any(
+        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    ):
+        raise ValueError("stop token sequences must be non-empty integers")
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    flat = list(custom_params.get(REQUEST_STOP_TOKEN_SEQUENCES_KEY) or [])
+    if tuple(token_ids) in get_request_stop_token_sequences(custom_params):
+        return
+    if flat:
+        flat.append(STOP_TOKEN_SEQUENCE_SEP)
+    flat.extend(token_ids)
+    custom_params[REQUEST_STOP_TOKEN_SEQUENCES_KEY] = flat
+    sampling_params["custom_params"] = custom_params
+
+
+def get_request_stop_token_sequences(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> List[Tuple[int, ...]]:
+    """Return the request's server-side stop token sequences, if valid."""
+    if not isinstance(custom_params, dict):
+        return []
+    flat = custom_params.get(REQUEST_STOP_TOKEN_SEQUENCES_KEY)
+    if (
+        not isinstance(flat, list)
+        or len(flat) > MAX_REQUEST_STOP_TOKEN_SEQUENCES_LEN
+        or any(type(token_id) is not int for token_id in flat)
+    ):
+        return []
+    sequences, current = [], []
+    for token_id in flat:
+        if token_id == STOP_TOKEN_SEQUENCE_SEP:
+            if not current:
+                return []
+            sequences.append(tuple(current))
+            current = []
+        elif token_id < 0:
+            return []
+        else:
+            current.append(token_id)
+    if not current:
+        return []
+    sequences.append(tuple(current))
+    return sequences
 
 
 # Private transport, like the reasoning terminator above: the request's grammar
