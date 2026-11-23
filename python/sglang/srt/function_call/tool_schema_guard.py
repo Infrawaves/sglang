@@ -6,7 +6,9 @@ choose, it accepts: a schema walle accepts must never get a 400 here.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
+
+import msgspec
 
 # Keeps a pathological ref graph from stalling the event loop; arbitrary,
 # walle's own cap (maxRefWalkSteps) counts differently.
@@ -37,8 +39,13 @@ def _resolve_ref(ref: str, root: Dict[str, Any]) -> Optional[Any]:
     return node
 
 
-def _is_positive_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+class _Verdict(msgspec.Struct, frozen=True):
+    finite: bool  # the schema has a finite instance
+    hit_path_stack: bool  # the answer depended on the path stack: not memoized
+
+
+_FINITE = _Verdict(finite=True, hit_path_stack=False)
+_INFINITE = _Verdict(finite=False, hit_path_stack=False)
 
 
 class _TerminationChecker:
@@ -49,77 +56,70 @@ class _TerminationChecker:
         self.memo: Dict[str, bool] = {}
         self.steps = 0
 
-    def terminates(self, schema: Any, visited: Set[str]) -> Tuple[bool, bool]:
-        """(has a finite instance, verdict depended on the path stack)"""
+    def terminates(self, schema: Any, visited: Set[str]) -> _Verdict:
         self.steps += 1
         if self.steps > _MAX_REF_WALK_STEPS:
             raise ToolSchemaError(
                 "tool parameters schema: reference graph is too complex to validate"
             )
         if schema is False:
-            return False, False
+            return _INFINITE
         if not isinstance(schema, dict):
-            return True, False
+            return _FINITE
 
-        check_type = None
-        schema_type = schema.get("type")
-        if isinstance(schema_type, str):
-            if schema_type not in ("object", "array"):
-                return True, False
-            check_type = schema_type
-        elif isinstance(schema_type, list):
-            for item in schema_type:
-                if isinstance(item, str) and item not in ("object", "array"):
-                    return True, False
-                check_type = item
+        types = _type_list(schema)
+        if types and any(t not in ("object", "array") for t in types):
+            return _FINITE
+        check_type = types[-1] if types else None
 
-        cut = False
+        hit_path_stack = False
         stuck = False
 
         if check_type == "array":
+            min_items = schema.get("minItems")
             # Without a positive minItems the empty array is an instance.
-            if not _is_positive_number(schema.get("minItems")):
-                return True, False
+            if not (_is_number(min_items) and min_items > 0):
+                return _FINITE
             items = schema.get("items")
             if items is None or items == {} or items is True:
-                return True, False
-            ok, items_cut = self.terminates(items, visited)
-            if ok:
-                return True, items_cut
-            cut = cut or items_cut
+                return _FINITE
+            verdict = self.terminates(schema=items, visited=visited)
+            if verdict.finite:
+                return verdict
+            hit_path_stack = verdict.hit_path_stack
             stuck = True
 
         if check_type == "object":
             required = schema.get("required")
             if not isinstance(required, list) or not required:
-                return True, False
+                return _FINITE
             properties = schema.get("properties")
             if not isinstance(properties, dict) or not properties:
-                return True, False
+                return _FINITE
             required_names = {name for name in required if isinstance(name, str)}
             # Every required property must terminate; siblings pointing at the
             # same $ref are not a cycle, so each walks its own visited set.
             for name, sub_schema in properties.items():
                 if name not in required_names:
                     continue
-                ok, prop_cut = self.terminates(sub_schema, set(visited))
-                if not ok:
-                    return False, prop_cut
-                cut = cut or prop_cut
-            return True, cut
+                verdict = self.terminates(schema=sub_schema, visited=set(visited))
+                if not verdict.finite:
+                    return verdict
+                hit_path_stack = hit_path_stack or verdict.hit_path_stack
+            return _Verdict(finite=True, hit_path_stack=hit_path_stack)
 
         any_of = schema.get("anyOf")
         if isinstance(any_of, list):
             if not any_of:
-                return True, False
+                return _FINITE
             seen_in_branches: Set[str] = set()
             for branch in any_of:
                 branch_visited = set(visited)
-                ok, branch_cut = self.terminates(branch, branch_visited)
-                if ok:
+                verdict = self.terminates(schema=branch, visited=branch_visited)
+                if verdict.finite:
                     visited |= branch_visited
-                    return True, branch_cut
-                cut = cut or branch_cut
+                    return verdict
+                hit_path_stack = hit_path_stack or verdict.hit_path_stack
                 seen_in_branches |= branch_visited
             visited |= seen_in_branches
             stuck = True
@@ -127,23 +127,23 @@ class _TerminationChecker:
         ref = schema.get("$ref")
         if isinstance(ref, str):
             if ref in visited:
-                return False, True
+                return _Verdict(finite=False, hit_path_stack=True)
             if ref in self.memo:
-                return self.memo[ref], False
+                return _Verdict(finite=self.memo[ref], hit_path_stack=False)
             visited.add(ref)
-            target = _resolve_ref(ref, self.root)
+            target = _resolve_ref(ref=ref, root=self.root)
             if target is None:
                 # Not ours to judge: an unresolvable ref is left to the schema
-                # validators and the grammar compiler, as before this check.
-                return True, False
-            ok, target_cut = self.terminates(target, visited)
-            if not target_cut:
-                self.memo[ref] = ok
-            return ok, target_cut
+                # validators and the grammar compiler.
+                return _FINITE
+            verdict = self.terminates(schema=target, visited=visited)
+            if not verdict.hit_path_stack:
+                self.memo[ref] = verdict.finite
+            return verdict
 
         # Walle answers "no" for any other non-empty schema reaching this point;
         # only the array/anyOf dead ends above are certain, so accept the rest.
-        return (not stuck), cut
+        return _Verdict(finite=not stuck, hit_path_stack=hit_path_stack)
 
 
 def check_tool_schema_terminates(schema: Any) -> None:
@@ -162,8 +162,7 @@ def check_tool_schema_terminates(schema: Any) -> None:
             return
         ref = node.get("$ref")
         if need_check and isinstance(ref, str):
-            ok, _ = checker.terminates(node, set())
-            if not ok:
+            if not checker.terminates(schema=node, visited=set()).finite:
                 where = "/".join(path) or "<root>"
                 raise ToolSchemaError(
                     "Invalid tool parameters schema: detected infinite recursion "
@@ -174,26 +173,40 @@ def check_tool_schema_terminates(schema: Any) -> None:
         if isinstance(properties, dict):
             child_check = need_check and node.get("required") != []
             for name, child in properties.items():
-                walk(child, child_check, path + ["properties", name])
+                walk(
+                    node=child,
+                    need_check=child_check,
+                    path=path + ["properties", name],
+                )
         if isinstance(node.get("items"), dict):
-            walk(node["items"], need_check, path + ["items"])
+            walk(node=node["items"], need_check=need_check, path=path + ["items"])
         any_of = node.get("anyOf")
         if isinstance(any_of, list):
             for index, child in enumerate(any_of):
-                walk(child, need_check, path + ["anyOf", str(index)])
+                walk(
+                    node=child, need_check=need_check, path=path + ["anyOf", str(index)]
+                )
 
-    walk(schema, True, [])
+    try:
+        walk(node=schema, need_check=True, path=[])
+    except RecursionError:
+        # A ref chain deeper than the interpreter stack is accepted, like
+        # anything else the port cannot decide.
+        return
+
+
+def _type_list(schema: Dict[str, Any]) -> Optional[List[str]]:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return [schema_type]
+    if isinstance(schema_type, list):
+        return [t for t in schema_type if isinstance(t, str)]
+    return None
 
 
 def _allows_object(schema: Dict[str, Any]) -> bool:
-    schema_type = schema.get("type")
-    if schema_type is None:
-        return True
-    if isinstance(schema_type, str):
-        return schema_type == "object"
-    if isinstance(schema_type, list):
-        return "object" in schema_type
-    return True
+    types = _type_list(schema)
+    return types is None or "object" in types
 
 
 def _is_number(value: Any) -> bool:
@@ -227,6 +240,9 @@ _BOUND_PAIRS = (
 )
 
 
+_BOUND_KEYS = frozenset(key for pair in _BOUND_PAIRS for key in pair)
+
+
 def _has_contradicting_bounds(schema: Dict[str, Any]) -> bool:
     for low_key, high_key in _BOUND_PAIRS:
         low, high = schema.get(low_key), schema.get(high_key)
@@ -235,18 +251,25 @@ def _has_contradicting_bounds(schema: Dict[str, Any]) -> bool:
     return False
 
 
+def merge_anyof_branch(
+    parent: Dict[str, Any], branch: Dict[str, Any]
+) -> Dict[str, Any]:
+    """``parent`` with its only ``anyOf`` branch merged in, as walle does: each
+    bound keeps the stricter value, and min > max degrades the branch to ``{}``."""
+    merged = {**parent, **branch}
+    for low_key, high_key in _BOUND_PAIRS:
+        for key, stricter in ((low_key, max), (high_key, min)):
+            values = (parent.get(key), branch.get(key))
+            if all(_is_number(value) for value in values):
+                merged[key] = stricter(*values)
+    if _has_contradicting_bounds(merged):
+        # walle moved the parent's bounds into the branch it degraded.
+        return {key: value for key, value in parent.items() if key not in _BOUND_KEYS}
+    return merged
+
+
 def canonicalize_tool_schema(schema: Any) -> Any:
-    """Copy of ``schema`` with the walle canonicalizations the K3 grammar needs.
-
-    * bounds with min > max: the enclosing schema becomes ``{}``;
-    * ``enum`` keeps only values matching ``type``, and is dropped when none
-      does (the type stays: it is the tighter of the two);
-    * ``required`` keeps only names declared in ``properties``, and is dropped
-      when nothing is left, when there is no ``properties``, or when the schema
-      cannot be an object.
-
-    Literal values (enum/const/default/examples) are never rewritten.
-    """
+    """Copy of ``schema`` with the walle repairs the K3 grammar needs."""
     if isinstance(schema, list):
         return [canonicalize_tool_schema(item) for item in schema]
     if not isinstance(schema, dict):
@@ -267,20 +290,18 @@ def canonicalize_tool_schema(schema: Any) -> Any:
     if _has_contradicting_bounds(result):
         return {}
 
-    schema_type = result.get("type")
-    type_list = (
-        [schema_type]
-        if isinstance(schema_type, str)
-        else [t for t in schema_type if isinstance(t, str)]
-        if isinstance(schema_type, list)
-        else None
-    )
+    types = _type_list(result)
     enum = result.get("enum")
-    if type_list and isinstance(enum, list):
-        kept = [v for v in enum if any(_matches_type(v, t) for t in type_list)]
+    if types and isinstance(enum, list):
+        kept = [
+            value
+            for value in enum
+            if any(_matches_type(value=value, json_type=t) for t in types)
+        ]
         if kept:
             result["enum"] = kept
         else:
+            # The type stays: it is the tighter of the two.
             result.pop("enum")
 
     required = result.get("required")

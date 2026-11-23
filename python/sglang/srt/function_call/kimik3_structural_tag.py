@@ -32,7 +32,10 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
-from sglang.srt.function_call.tool_schema_guard import canonicalize_tool_schema
+from sglang.srt.function_call.tool_schema_guard import (
+    canonicalize_tool_schema,
+    merge_anyof_branch,
+)
 
 _JSON_TYPES = (
     "string",
@@ -268,16 +271,6 @@ def _localize_root_refs(
     return result
 
 
-_BOUND_PICKS = (
-    ("minLength", max),
-    ("minimum", max),
-    ("minItems", max),
-    ("maxLength", min),
-    ("maximum", min),
-    ("maxItems", min),
-)
-
-
 def _restrict_schema_type(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -320,13 +313,7 @@ def _restrict_schema_type(
             return False
         if len(restricted) == 1 and isinstance(restricted[0], dict):
             result.pop(keyword)
-            branch = dict(restricted[0])
-            # Parent and branch bounds both apply; keep the stricter one.
-            for key, pick in _BOUND_PICKS:
-                values = (result.get(key), branch.get(key))
-                if all(isinstance(v, (int, float)) for v in values):
-                    branch[key] = pick(*values)
-            result.update(branch)
+            result = merge_anyof_branch(parent=result, branch=restricted[0])
         else:
             result[keyword] = restricted
 
@@ -429,7 +416,7 @@ def _known_argument_format(
 # Characters an argument key attribute can hold unescaped; `&` and `"` only
 # appear escaped, so a raw key is drawn from the rest.
 _KEY_CLASS_EXCLUDES = r'"& \t\r\n\f\v=<>'
-_KEY_FORBIDDEN_CHARS = frozenset('"& \t\r\n\f\v=<>')
+_KEY_FORBIDDEN_CHARS = frozenset(_KEY_CLASS_EXCLUDES.encode().decode("unicode_escape"))
 _ANY_KEY_CHAR = f"[^{_KEY_CLASS_EXCLUDES}]"
 _REGEX_META = frozenset("\\.^$|?*+()[]{}/")
 _CLASS_META = frozenset("\\]^-[")
@@ -542,7 +529,9 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
         elements.append(
             StarFormat(
                 content=_dynamic_argument_format(
-                    additional, parameters, excluded_keys=properties.keys()
+                    schema=additional,
+                    root_schema=parameters,
+                    excluded_keys=properties.keys(),
                 )
             )
         )

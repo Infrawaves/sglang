@@ -1283,8 +1283,8 @@ def _kvv_call(*arguments):
     ],
 )
 def test_strict_schema_without_finite_instance_is_rejected(schema):
-    """The verifier expects a 400 that names the schema; XGrammar compiles these
-    and a forced call can only run to max_tokens."""
+    """walle rejects these; XGrammar compiles them and a forced call can only run
+    to max_tokens."""
     with pytest.raises(ToolSchemaError, match="parameters schema"):
         check_tool_schema_terminates(schema)
 
@@ -1388,6 +1388,24 @@ def test_single_anyof_branch_keeps_the_stricter_parent_bound():
     )
     assert not _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 19)))
     assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 20)))
+
+
+def test_single_anyof_branch_contradicting_the_parent_bound_leaves_the_type():
+    # walle degrades the merged branch (minLength 20 > maxLength 15) to {}.
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {
+                "v": {
+                    "minLength": 20,
+                    "anyOf": [{"type": "string", "minLength": 10, "maxLength": 15}],
+                }
+            },
+        }
+    )
+    for length in (1, 30):
+        assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * length)))
+    assert not _accepts(grammar, _kvv_call(_argument("v", "number", "1")))
 
 
 if __name__ == "__main__":
