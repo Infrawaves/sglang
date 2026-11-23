@@ -33,7 +33,10 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.req_types import (
+    FINISH_MATCHED_TOKEN_SEQUENCE,
+    BaseFinishReason,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
@@ -604,9 +607,12 @@ class _GenerationStreamAccumulator:
                 if should_output:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
+                    should_output &= not req.is_matching_stop_token_sequence()
             else:
+                # A sequence stop excludes its tokens, so none may be sent yet.
                 should_output = (
                     len(req.output_ids) % self.default_force_stream_interval == 0
+                    and not req.is_matching_stop_token_sequence()
                 )
 
         if not should_output:
@@ -785,8 +791,12 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
+                # An excluded stop sequence leaves no logprob for its tokens.
                 logprob_end = (
-                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                    len(output_ids_)
+                    if req.is_retracted
+                    or isinstance(req.finished_reason, FINISH_MATCHED_TOKEN_SEQUENCE)
+                    else max(len(output_ids_), 1)
                 )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[

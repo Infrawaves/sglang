@@ -1248,10 +1248,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and isinstance(finish_reason, dict)
             and finish_reason.get("type") in ("stop", "length")
         )
+        # A stop sequence excluded from the output still processed the prompt.
+        stopped_before_output = isinstance(finish_reason, dict) and bool(
+            finish_reason.get("stop_excluded")
+        )
         if (
             (plan is None and context is None and physical_ttl is None)
             or state.cache_task is not None
-            or (completion_tokens <= 0 and not physical_finished_without_output)
+            or (
+                completion_tokens <= 0
+                and not physical_finished_without_output
+                and not stopped_before_output
+            )
             or (
                 isinstance(finish_reason, dict)
                 and finish_reason.get("type") in ("abort", "error")

@@ -15,6 +15,7 @@ import copy
 import gc
 import itertools
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
@@ -82,6 +83,7 @@ from sglang.srt.runtime_context import get_context, get_disagg, publish, reset_c
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
+    get_request_stop_token_sequences,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -3531,7 +3533,9 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_json_response_format_constraints(self):
         """json_object stays prompt-guided; a strict json_schema is constrained
         inside the K3 response block, so its markers stay admissible, and stops
-        on the message close a model trapped in a JSON string would write."""
+        on the message close a model trapped in a JSON string would write. Only
+        the unconstrained output stops on a think close written without thinking;
+        in a JSON string it is data."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -3553,6 +3557,7 @@ class ServingChatTestCase(CustomTestCase):
                     messages=[{"role": "user", "content": "Return JSON"}],
                     response_format=response_format,
                     stop=["END"],
+                    thinking={"type": "disabled"},
                 )
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
@@ -3567,11 +3572,62 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(
                     MESSAGE_CLOSE in params["stop"], expected_tag is not None
                 )
+                self.assertEqual(THINK_CLOSE in params["stop"], expected_tag is None)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )
 
+    def test_kimi_k3_stops_reasoning_written_without_thinking(self):
+        """Only a prompt that opens the response channel stops on a think close,
+        and only a request without a tool-call parser stops on a tools open; both
+        stop on the special-token ids, and the client's own stops are kept."""
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        special = {"<|open|>": 900, "<|close|>": 901, "<|sep|>": 902}
+        names = {"think": 910, "tools": 911, "message": 912}
+
+        def encode(text, add_special_tokens=False):
+            match = re.fullmatch(r"(<\|\w+\|>)(\w+)(<\|sep\|>)", text)
+            if match is None:
+                return []
+            head, name, tail = match.groups()
+            return [special[head], names[name], special[tail]]
+
+        self.tm.tokenizer.encode.side_effect = encode
+        self.tm.tokenizer.convert_tokens_to_ids.side_effect = special.get
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        tool = {"type": "function", "function": {"name": "lookup"}}
+        think_close, tools_open = (901, 910, 902), (900, 911, 902)
+        cases = (
+            ({}, False, True),
+            ({"reasoning_effort": "none"}, True, True),
+            ({"thinking": {"type": "disabled"}}, True, True),
+            ({"chat_template_kwargs": {"thinking": False}}, True, True),
+            ({"thinking": {"type": "disabled"}, "tools": [tool]}, True, False),
+            ({"tools": [tool]}, False, False),
+        )
+        for fields, stops_think, stops_tools in cases:
+            with self.subTest(fields=fields):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    stop=["END"],
+                    **fields,
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIn("END", params["stop"])
+                self.assertNotIn(THINK_CLOSE, params["stop"])
+                self.assertNotIn(TOOLS_OPEN, params["stop"])
+                sequences = get_request_stop_token_sequences(params["custom_params"])
+                self.assertEqual(think_close in sequences, stops_think)
+                self.assertEqual(tools_open in sequences, stops_tools)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(stops_think, not kwargs.get("thinking", True))
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):
@@ -8115,16 +8171,27 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "grammar failed")
 
-    def test_server_abort_before_first_token_stays_server_interrupted(self):
-        response = self._abort_before_first_token(HTTPStatus.SERVICE_UNAVAILABLE)
-        self.assertIsInstance(response, StreamingResponse)
-
-        async def _drain():
-            return [chunk async for chunk in response.body_iterator]
-
-        frames = self._frames(get_or_create_event_loop().run_until_complete(_drain()))
-        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
-        self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
+    def test_server_abort_before_first_token_is_an_http_error(self):
+        """A 5xx abort before any byte is sent (e.g. a PD KV transfer that
+        timed out) is an HTTP error as well: a 200 whose only frame is the end
+        frame lacks the role frame and cannot be retried elsewhere. The client
+        gets the status phrase, not the engine's internal message, which goes
+        to the log instead."""
+        for status in (
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        ):
+            with self.subTest(status=status):
+                with (
+                    self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", "WARNING"
+                    ) as logs,
+                    self.assertRaises(HTTPException) as ctx,
+                ):
+                    self._abort_before_first_token(status)
+                self.assertEqual(ctx.exception.status_code, status.value)
+                self.assertEqual(ctx.exception.detail, status.phrase)
+                self.assertIn("grammar failed", "\n".join(logs.output))
 
     def test_other_encodings_still_emit_the_abort_error_frame(self):
         """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
