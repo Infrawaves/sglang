@@ -268,6 +268,16 @@ def _localize_root_refs(
     return result
 
 
+_BOUND_PICKS = (
+    ("minLength", max),
+    ("minimum", max),
+    ("minItems", max),
+    ("maxLength", min),
+    ("maximum", min),
+    ("maxItems", min),
+)
+
+
 def _restrict_schema_type(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -310,7 +320,13 @@ def _restrict_schema_type(
             return False
         if len(restricted) == 1 and isinstance(restricted[0], dict):
             result.pop(keyword)
-            result.update(restricted[0])
+            branch = dict(restricted[0])
+            # Parent and branch bounds both apply; keep the stricter one.
+            for key, pick in _BOUND_PICKS:
+                values = (result.get(key), branch.get(key))
+                if all(isinstance(v, (int, float)) for v in values):
+                    branch[key] = pick(*values)
+            result.update(branch)
         else:
             result[keyword] = restricted
 
@@ -501,20 +517,9 @@ _CLASS_META = frozenset("\\]^-[")
 
 
 def _attribute_key_regex(excluded_keys) -> str:
-    """Regex for a dynamic argument key that is none of ``excluded_keys``.
-
-    Keys declared under ``properties`` go through their own typed tags; letting
-    the additionalProperties path spell them too would let a declared argument
-    escape its schema (``type="number"`` for a string property) or repeat. The
-    complement of a finite set is built over its trie: at each prefix the key
-    may diverge onto a character no declared key continues with, follow a
-    declared key one more character, or stop if the prefix is itself undeclared.
-
-    Only ASCII names are excluded: XGrammar's negated character classes do not
-    exclude a multi-byte character, so a non-ASCII name keeps the old behaviour
-    (such names already drop to a bare type constraint, see
-    _declares_non_ascii_property).
-    """
+    # A declared key spelled through the additionalProperties path would escape
+    # its typed tag. Only ASCII names are excluded: XGrammar's negated character
+    # classes do not exclude a multi-byte character.
     names = {
         key
         for key in excluded_keys
@@ -644,10 +649,8 @@ def _tool_arguments_format(tool: Tool) -> Format:
         raise ValueError(
             f"Kimi K3 strict tool {tool.function.name!r} must define parameters"
         )
-    # Walle's canonical form, not the raw schema: what walle repairs (undeclared
-    # `required`, min > max bounds, an enum with no value of its type) would
-    # otherwise raise here -- swallowed by get_structure_constraint into an
-    # unconstrained call -- or fail to compile in XGrammar.
+    # What walle repairs would otherwise raise here (and leave the call
+    # unconstrained) or fail to compile in XGrammar.
     parameters = canonicalize_tool_schema(parameters)
     schema_types = _schema_types(parameters, parameters)
     if "object" not in schema_types:

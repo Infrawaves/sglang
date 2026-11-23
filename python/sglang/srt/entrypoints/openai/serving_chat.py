@@ -384,14 +384,8 @@ def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | Non
 
 
 def _validate_kimi_k3_strict_tool_schemas(tools: list[Tool]) -> str | None:
-    """Reject strict tool schemas that walle rejects for having no finite instance.
-
-    A schema in which some $ref can never terminate still compiles in XGrammar,
-    so a constrained call on it can only run to max_tokens. Moonshot's walle
-    validator answers 400 for it (the Kimi Vendor Verifier checks this, with
-    tool_choice "auto" and a one-token budget), so it is refused before any
-    grammar work, in streaming and non-streaming requests alike.
-    """
+    # XGrammar compiles a schema with no finite instance and a forced call runs to
+    # max_tokens; walle, and the Kimi Vendor Verifier, expect a 400 instead.
     strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
     for tool in tools:
         function = tool.function

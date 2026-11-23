@@ -34,6 +34,10 @@ from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_json_response_structural_tag,
     get_kimik3_structural_tag,
 )
+from sglang.srt.function_call.tool_schema_guard import (
+    ToolSchemaError,
+    check_tool_schema_terminates,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -1329,6 +1333,173 @@ def test_output_may_start_inside_the_prefilled_response():
 def test_single_call_auto_admits_the_turn_close():
     grammar = _grammar([_tool()], parallel_tool_calls=False)
     assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+
+
+# Strict schemas below come from the Kimi Vendor Verifier's walle cases.
+_N_REQUIRED_SELF = {
+    "type": "object",
+    "properties": {"next": {"$ref": "#/$defs/N"}},
+    "required": ["next"],
+}
+
+
+def _kvv_grammar(parameters):
+    tool = Tool(
+        type="function",
+        function=Function(name="kvv", strict=True, parameters=parameters),
+    )
+    return _grammar([tool], tool_choice="required")
+
+
+def _kvv_call(*arguments):
+    return _tools_section(_call("kvv", 1, *arguments))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "$defs": {"N": _N_REQUIRED_SELF},
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/A"}},
+            "required": ["root"],
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {"b": {"$ref": "#/$defs/B"}},
+                    "required": ["b"],
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"a": {"$ref": "#/$defs/A"}},
+                    "required": ["a"],
+                },
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/L1"}},
+            "required": ["root"],
+            "$defs": {
+                "L1": {
+                    "type": "object",
+                    "properties": {"level2": {"$ref": "#/$defs/L2"}},
+                    "required": ["level2"],
+                },
+                "L2": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/L1"}},
+            },
+        },
+    ],
+)
+def test_strict_schema_without_finite_instance_is_rejected(schema):
+    """The verifier expects a 400 that names the schema; XGrammar compiles these
+    and a forced call can only run to max_tokens."""
+    with pytest.raises(ToolSchemaError, match="parameters schema"):
+        check_tool_schema_terminates(schema)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "$defs": {
+                "N": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/N"}},
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/L1"}},
+            "required": ["root"],
+            "$defs": {
+                "L1": {
+                    "type": "object",
+                    "properties": {"level2": {"$ref": "#/$defs/L2"}},
+                    "required": ["level2"],
+                },
+                "L2": {"type": "array", "items": {"$ref": "#/$defs/L1"}},
+            },
+        },
+        # Walle strips keywords it does not support before checking refs.
+        {
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/N"}}},
+            "$defs": {"N": _N_REQUIRED_SELF},
+        },
+    ],
+)
+def test_strict_schema_with_finite_instance_is_accepted(schema):
+    check_tool_schema_terminates(schema)
+
+
+def test_required_names_without_a_schema_keep_the_call_constrained():
+    """Walle prunes required names that have no schema; they must not leave the
+    call unconstrained."""
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a", "b"],
+        }
+    )
+    assert _accepts(grammar, _kvv_call(_argument("a", "string", "x")))
+    assert not _accepts(grammar, _kvv_call())
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "minLength": 10, "maxLength": 2},
+        {"type": "integer", "minimum": 10, "maximum": 2},
+        {"type": "array", "minItems": 10, "maxItems": 2, "items": {"type": "string"}},
+    ],
+)
+def test_contradicting_bounds_compile_as_unconstrained(schema):
+    """Walle degrades min > max to {}, which XGrammar would refuse to compile."""
+    grammar = _kvv_grammar({"type": "object", "properties": {"a": schema}})
+    assert _accepts(grammar, _kvv_call(_argument("a", "string", "x")))
+
+
+def test_enum_without_a_value_of_its_type_keeps_the_type():
+    grammar = _kvv_grammar(
+        {"type": "object", "properties": {"v": {"type": ["null"], "enum": [False]}}}
+    )
+    assert _accepts(grammar, _kvv_call(_argument("v", "null", "null")))
+    assert not _accepts(grammar, _kvv_call(_argument("v", "boolean", "false")))
+
+
+def test_declared_keys_do_not_escape_through_additional_properties():
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "abc": {"type": "integer"}},
+        }
+    )
+    assert not _accepts(grammar, _kvv_call(_argument("a", "number", "1")))
+    assert not _accepts(grammar, _kvv_call(_argument("abc", "string", "x")))
+    for undeclared in ("ab", "abcd", "b"):
+        assert _accepts(grammar, _kvv_call(_argument(undeclared, "number", "1")))
+
+
+def test_single_anyof_branch_keeps_the_stricter_parent_bound():
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {
+                "v": {"minLength": 20, "anyOf": [{"type": "string", "minLength": 10}]}
+            },
+        }
+    )
+    assert not _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 19)))
+    assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 20)))
 
 
 if __name__ == "__main__":

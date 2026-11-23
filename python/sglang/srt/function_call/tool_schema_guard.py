@@ -1,30 +1,15 @@
-"""Walle-compatible guards for strict tool parameter schemas.
+"""Strict K3 tool schema checks ported from MoonshotAI/walle (validator.go).
 
-Moonshot's own serving stack judges tool schemas with MoonshotAI/walle, and the
-Kimi Vendor Verifier (``tests/tool_call_json_schema``) holds vendors to walle's
-verdicts. Two of them matter before a schema reaches the K3 structural tag:
-
-* Rejection: a schema in which some ``$ref`` can never terminate has no finite
-  instance. XGrammar compiles it anyway, and a forced call then runs to
-  ``max_tokens``. Walle rejects it (``PostValidateRefs``), so we answer 400.
-* Canonicalization: what walle repairs instead of rejecting must not break the
-  grammar either. ``required`` naming undeclared properties made the K3 builder
-  raise, and ``get_structure_constraint`` swallowed the error -- the call then
-  ran with no constraint at all; contradicting bounds and an enum with no value
-  of the schema's type made XGrammar refuse to compile (request aborted).
-
-This is a narrow port of walle's ``CheckRefTermination`` /
-``TraverseAndCheckRefs`` (validator.go), ``SimplifyPruneRequired``,
-``simplifyIntersectEnumWithType`` and ``SimplifyDegradeEnclosingSchema``. Where the
-port has to choose, it errs towards accepting: a schema walle accepts must never
-get a 400 here.
+The Kimi Vendor Verifier holds vendors to walle's verdicts. Where the port has to
+choose, it accepts: a schema walle accepts must never get a 400 here.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# A pathological ref graph must not stall the event loop; walle has the same cap.
+# Keeps a pathological ref graph from stalling the event loop; arbitrary,
+# walle's own cap (maxRefWalkSteps) counts differently.
 _MAX_REF_WALK_STEPS = 100_000
 
 # Keywords whose values are data, not subschemas.
@@ -162,13 +147,11 @@ class _TerminationChecker:
 
 
 def check_tool_schema_terminates(schema: Any) -> None:
-    """Raise ToolSchemaError when a reachable ``$ref`` has no finite instance.
+    """Raise ToolSchemaError when a ``$ref`` walle checks has no finite instance.
 
-    Mirrors walle's TraverseAndCheckRefs: every ``$ref`` met while walking the
-    schema (``$defs`` are only reached through refs) must terminate, including
-    one under an optional property -- an optional property can still be emitted.
-    ``additionalProperties`` and the properties of an object with an explicit
-    empty ``required`` are not checked, as in walle.
+    Like walle's TraverseAndCheckRefs, this walks only the keywords walle keeps
+    (properties, items, anyOf); properties under an explicit empty ``required``
+    are not checked, and an optional property's ref still is.
     """
     if not isinstance(schema, dict):
         return
@@ -187,19 +170,17 @@ def check_tool_schema_terminates(schema: Any) -> None:
                     f"without termination condition at {where} ($ref {ref!r} "
                     "admits no finite instance)."
                 )
-        for key, value in node.items():
-            if key in ("$defs", "definitions") or key in _LITERAL_KEYWORDS:
-                continue
-            if isinstance(value, dict):
-                child_check = need_check
-                if key == "properties" and node.get("required") == []:
-                    child_check = False
-                elif key == "additionalProperties":
-                    child_check = False
-                walk(value, child_check, path + [key])
-            elif key == "anyOf" and isinstance(value, list):
-                for index, item in enumerate(value):
-                    walk(item, need_check, path + [f"anyOf/{index}"])
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            child_check = need_check and node.get("required") != []
+            for name, child in properties.items():
+                walk(child, child_check, path + ["properties", name])
+        if isinstance(node.get("items"), dict):
+            walk(node["items"], need_check, path + ["items"])
+        any_of = node.get("anyOf")
+        if isinstance(any_of, list):
+            for index, child in enumerate(any_of):
+                walk(child, need_check, path + ["anyOf", str(index)])
 
     walk(schema, True, [])
 
@@ -237,10 +218,8 @@ def _matches_type(value: Any, json_type: str) -> bool:
     return True
 
 
-# Pairs walle treats as unsatisfiable when min > max (keyword_validators.go).
-# The enclosing schema degrades to {} (SimplifyDegradeEnclosingSchema) rather
-# than failing: XGrammar refuses to compile such a schema and the request would
-# otherwise be aborted.
+# min > max makes walle degrade the enclosing schema to {}
+# (SimplifyDegradeEnclosingSchema); XGrammar would refuse to compile it.
 _BOUND_PAIRS = (
     ("minLength", "maxLength"),
     ("minimum", "maximum"),
