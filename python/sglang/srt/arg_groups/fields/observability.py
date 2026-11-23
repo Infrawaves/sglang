@@ -51,6 +51,13 @@ class Observability(msgspec.Struct):
             choices=["text", "json"],
         ),
     ] = "text"
+    log_requests_logprobs: A[
+        str,
+        Arg(
+            help="How request logs record logprob arrays in meta_info, independent of --log-requests-level. 'summary' (default) logs only their lengths; 'full' logs them with the usual --log-requests-level formatting.",
+            choices=["summary", "full"],
+        ),
+    ] = "summary"
     log_requests_target: A[
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",

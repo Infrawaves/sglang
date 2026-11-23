@@ -2508,6 +2508,7 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
+    log_requests_logprobs: Optional[str] = None
     log_level: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None

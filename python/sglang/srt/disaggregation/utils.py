@@ -422,8 +422,10 @@ class CustomizedInfoError(ValueError):
 
 
 # cached_tokens slot 7 says whether the prefill wrote the first output token's
-# logprob into its metadata row. A prefill that predates the slot leaves it 0
-# (UNKNOWN), for which decode keeps trusting the row as before.
+# logprob into its metadata row. WRITTEN is set only after
+# _validate_request_metadata checked the selected token ID and the top count.
+# A prefill that predates the slot leaves it 0 (UNKNOWN); its row cannot be
+# told from a previous owner's, so decode treats UNKNOWN like ABSENT.
 FIRST_TOKEN_LOGPROB_SLOT = 7
 FIRST_TOKEN_LOGPROB_UNKNOWN = 0
 FIRST_TOKEN_LOGPROB_WRITTEN = 1
@@ -720,6 +722,27 @@ class MetadataBuffers:
                     f"disaggregation metadata capacity {capacity}. "
                     "Lower top_logprobs_num or increase the metadata buffer."
                 )
+            selected_values = req.logprob.output_token_logprobs_val
+            selected_ids = req.logprob.output_token_logprobs_idx
+            if selected_values or selected_ids:
+                # set_buf marks these rows WRITTEN, and decode commits them
+                # without re-checking.
+                if not (selected_values and selected_ids):
+                    raise InvalidDisaggregationMetadata(
+                        "The first output token logprob needs both a value and "
+                        "a token ID."
+                    )
+                if selected_ids[0] != req.output_ids[0]:
+                    raise InvalidDisaggregationMetadata(
+                        f"The first output token logprob is for token "
+                        f"{selected_ids[0]}, but the prefill sampled token "
+                        f"{req.output_ids[0]}."
+                    )
+                if value_len != req.logprob.top_logprobs_num:
+                    raise InvalidDisaggregationMetadata(
+                        f"The first output token has {value_len} top_logprobs; "
+                        f"the request asked for {req.logprob.top_logprobs_num}."
+                    )
 
         if not req.return_sampling_mask:
             return None
@@ -778,6 +801,7 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
         # Written for every request: the row is reused, and without the state
         # decode cannot tell this request's logprob from a previous owner's.
+        # Selected and top rows were validated together above.
         self.cached_tokens[req.metadata_buffer_index][FIRST_TOKEN_LOGPROB_SLOT] = (
             FIRST_TOKEN_LOGPROB_WRITTEN
             if req.return_logprob and req.logprob.output_token_logprobs_val

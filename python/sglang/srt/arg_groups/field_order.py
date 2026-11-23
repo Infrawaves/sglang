@@ -571,5 +571,7 @@ POSITIONAL_FIELD_ORDER = (
     "cache_namespace",
     "cache_timeout",
     "cache_redis_cluster",
+    # Request log additions preserve all existing positional slots.
+    "log_requests_logprobs",
 )
 # fmt: on
