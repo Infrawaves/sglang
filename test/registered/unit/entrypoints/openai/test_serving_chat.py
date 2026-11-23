@@ -3010,6 +3010,46 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_kimi_k3_strict_tool_schema_without_finite_instance_is_rejected(self):
+        """The Kimi Vendor Verifier expects a 400 naming the schema when a strict
+        tool's required $ref never terminates; other tools still pass."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        recursive = {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "required": ["node"],
+            "$defs": {
+                "N": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/N"}},
+                    "required": ["next"],
+                }
+            },
+        }
+        aliases = {f"d{i}": {"$ref": f"#/$defs/d{i + 1}"} for i in range(3000)}
+        aliases["d3000"] = {"type": "string"}
+        deep_alias_chain = {
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/d0"}},
+            "required": ["a"],
+            "$defs": aliases,
+        }
+
+        def validate(parameters, strict):
+            function = {"name": "f", "parameters": parameters, "strict": strict}
+            return self.chat._validate_request(
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tools=[{"type": "function", "function": function}],
+                )
+            )
+
+        self.assertIn("parameters schema", validate(parameters=recursive, strict=True))
+        self.assertIsNone(validate(parameters=recursive, strict=False))
+        # Deeper than the interpreter stack: served, not a 500.
+        self.assertIsNone(validate(parameters=deep_alias_chain, strict=True))
+
     def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

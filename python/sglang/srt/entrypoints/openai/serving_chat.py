@@ -114,7 +114,7 @@ from sglang.srt.entrypoints.openai.utils import (
     token_id_to_bytes,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.environ import envs
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -124,6 +124,10 @@ from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     THINK_CLOSE,
     TOOLS_OPEN,
+)
+from sglang.srt.function_call.tool_schema_guard import (
+    ToolSchemaError,
+    check_tool_schema_terminates,
 )
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
@@ -389,6 +393,23 @@ def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | Non
                     "with a letter or '_', contain only letters, digits, '_' or "
                     "'-', and be at most 256 characters."
                 )
+    return None
+
+
+def _validate_kimi_k3_strict_tool_schemas(tools: list[Tool]) -> str | None:
+    # XGrammar compiles a schema with no finite instance and a forced call runs to
+    # max_tokens; walle, and the Kimi Vendor Verifier, expect a 400 instead.
+    strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+    for tool in tools:
+        function = tool.function
+        if not isinstance(function.parameters, dict):
+            continue
+        if not (function.strict or strict_level >= ToolStrictLevel.PARAMETER):
+            continue
+        try:
+            check_tool_schema_terminates(function.parameters)
+        except ToolSchemaError as exc:
+            return f"tool {function.name!r}: {exc}"
     return None
 
 
@@ -1576,6 +1597,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         if error_msg:
             return error_msg
+        if self.chat_encoding_spec == "kimi_k3":
+            # After the metaschema check, so a malformed schema keeps its error.
+            schema_error = _validate_kimi_k3_strict_tool_schemas(effective_tools)
+            if schema_error:
+                return schema_error
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
