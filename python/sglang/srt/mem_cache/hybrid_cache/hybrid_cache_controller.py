@@ -44,7 +44,10 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
+    from sglang.srt.mem_cache.mla_host_node_leader import (
+        KDANodeAggregateContext,
+        NodeLeaderMLABroadcast,
+    )
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -197,6 +200,9 @@ class PrefetchSubmission:
 
 
 class HybridCacheController(BaseHiCacheController):
+    # Class default so controllers built without __init__ keep per-rank Mamba IO.
+    kda_node_aggregate: Optional[KDANodeAggregateContext] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -217,8 +223,10 @@ class HybridCacheController(BaseHiCacheController):
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
         node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
+        kda_node_aggregate: Optional[KDANodeAggregateContext] = None,
     ):
         startup_storage_backend = storage_backend
+        self.kda_node_aggregate = kda_node_aggregate
         # The MLA anchor host buffer is another rank's copy (shared or none):
         # this rank never writes it (D2H backup, L3 prefetch).
         anchor_host_pool = mem_pool_host.anchor_entry.host_pool
@@ -1234,6 +1242,46 @@ class HybridCacheController(BaseHiCacheController):
         self.backup_queue.put(operation)
         return operation.id
 
+    def _reduce_storage_hit_count(self, operation, storage_hit_count: int) -> int:
+        if self.pp_prefetch_command_group is not None:
+            # The PP ticket path reduces a scalar on these groups.
+            return super()._reduce_storage_hit_count(operation, storage_hit_count)
+        bounds = torch.tensor([storage_hit_count, -storage_hit_count], dtype=torch.int)
+        self._all_reduce(
+            bounds, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        lo, hi = int(bounds[0].item()), -int(bounds[1].item())
+        if self.enable_diagnostic_metrics:
+            operation.query_rank_spread = hi - lo
+        if lo == hi:
+            # Each rank's hit count is in its own restorable set, so equal counts are common.
+            return lo
+        return self._common_restorable_hit_count(
+            operation, own_hit_count=storage_hit_count, max_pages=hi // self.page_size
+        )
+
+    def _common_restorable_hit_count(
+        self, operation, *, own_hit_count: int, max_pages: int
+    ) -> int:
+        """Longest hit (tokens) that every rank can restore.
+
+        Rank-sharded state such as KDA is stored per rank, so ranks may restore
+        different prefix lengths; reducing per-rank maxima could pick a length
+        another rank cannot restore and discard the whole prefetch.
+        """
+        pages = operation.restorable_prefix_pages
+        if pages is None:
+            pages = range(1, own_hit_count // self.page_size + 1)
+        mask = torch.zeros(max_pages + 1, dtype=torch.int)
+        in_range = [p for p in pages if 0 < p <= max_pages]
+        if in_range:
+            mask[in_range] = 1
+        self._all_reduce(
+            mask, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        common = mask.nonzero()
+        return int(common[-1].item()) * self.page_size if common.numel() else 0
+
     def _storage_hit_query(
         self, operation, pp_rank: Optional[int] = None
     ) -> tuple[list[str], int]:
@@ -1265,6 +1313,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        operation.restorable_prefix_pages = hit_result.restorable_prefix_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         operation.query_done_ts = time.monotonic()
 
@@ -1340,6 +1389,8 @@ class HybridCacheController(BaseHiCacheController):
             operation.skip_reason = "terminated"
         elif kv_completed_pages != len(operation.hash_value):
             operation.skip_reason = "kv_short"
+        transfers_nonkv = []
+        sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
         if operation.skip_reason is None:
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
@@ -1348,7 +1399,6 @@ class HybridCacheController(BaseHiCacheController):
                 for transfer in operation.pool_transfers
                 if transfer.indices_from_pool != PoolName.KV
             ]
-            sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
             sidecar_hit_pages = (
                 operation.sidecar_hit_pages
                 if operation.sidecar_hash_values is not None
@@ -1357,7 +1407,14 @@ class HybridCacheController(BaseHiCacheController):
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             operation.sidecar_ts = time.monotonic()
-            results = {}
+        local_skip = operation.skip_reason is not None
+        results = {}
+        if self.kda_node_aggregate is not None:
+            # Runs even when this rank skipped: peers wait on the exchange.
+            transfers_nonkv = self._get_node_aggregated_mamba(
+                operation, transfers_nonkv, results
+            )
+        if not local_skip:
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys,
                 sidecar_hashes,
@@ -1378,6 +1435,110 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return
+
+    @staticmethod
+    def _exchange_node_slot(
+        group: torch.distributed.ProcessGroup, slot: int
+    ) -> list[int]:
+        """Each node rank's host slot in node-rank order; -1 means that rank skips."""
+        gathered = [
+            torch.empty(1, dtype=torch.int64)
+            for _ in range(torch.distributed.get_world_size(group=group))
+        ]
+        torch.distributed.all_gather(
+            gathered, torch.tensor([slot], dtype=torch.int64), group=group
+        )
+        return [int(value.item()) for value in gathered]
+
+    @staticmethod
+    def _min_reduce_flag(group: torch.distributed.ProcessGroup, flag: bool) -> bool:
+        packed = torch.tensor([int(flag)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            packed, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        return bool(packed.item())
+
+    @staticmethod
+    def _node_mamba_slot(transfer: Optional[PoolTransfer]) -> int:
+        # One checkpoint per op; anything else is -1 so the node skips together.
+        if (
+            transfer is None
+            or not transfer.keys
+            or len(transfer.keys) != 1
+            or transfer.host_indices is None
+            or transfer.host_indices.numel() != 1
+        ):
+            return -1
+        return int(transfer.host_indices.item())
+
+    def _get_node_aggregated_mamba(
+        self,
+        operation: PrefetchOperation,
+        transfers: list[PoolTransfer],
+        results: dict,
+    ) -> list[PoolTransfer]:
+        """Fill ``results`` for MAMBA and return the other transfers.
+
+        Every node rank calls this once per prefetch operation, skipped or not.
+        """
+        ctx = self.kda_node_aggregate
+        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+        slots = self._exchange_node_slot(
+            ctx.prefetch_group, self._node_mamba_slot(mamba)
+        )
+        if mamba is None:
+            return transfers
+        num_keys = len(mamba.keys or [])
+        if -1 in slots:
+            operation.skip_reason = operation.skip_reason or "node_peer_skip"
+            ok = [False] * num_keys
+        elif not ctx.is_leader:
+            # Placeholder; prefetch_sync_thread's MIN takes the leader's result.
+            ok = [True] * num_keys
+        else:
+            try:
+                ok = self.storage_backend.batch_io_node_aggregated_mamba(
+                    mamba, [slots], is_set=False
+                )
+            except Exception:
+                logger.exception("Node-aggregated KDA L3 read failed.")
+                ok = [False] * num_keys
+        results[PoolName.MAMBA] = ok
+        return [t for t in transfers if t is not mamba]
+
+    def _set_node_aggregated_mamba(
+        self, transfers: list[PoolTransfer], results: dict
+    ) -> list[PoolTransfer]:
+        """Fill ``results`` for MAMBA and return the other transfers.
+
+        Every node rank calls this once per backup operation.
+        """
+        ctx = self.kda_node_aggregate
+        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+        slots = self._exchange_node_slot(
+            ctx.backup_group, self._node_mamba_slot(mamba)
+        )
+        ok = False
+        if -1 in slots:
+            pass
+        elif not ctx.is_leader:
+            # Placeholder; the MIN below takes the leader's result.
+            ok = True
+        else:
+            try:
+                ok = all(
+                    self.storage_backend.batch_io_node_aggregated_mamba(
+                        mamba, [slots], is_set=True
+                    )
+                )
+            except Exception:
+                logger.exception("Node-aggregated KDA L3 write failed.")
+        # One flag per op whatever this rank holds, so every rank reduces alike.
+        ok = self._min_reduce_flag(ctx.backup_group, ok)
+        if mamba is None:
+            return transfers
+        results[PoolName.MAMBA] = [ok] * len(mamba.keys or [])
+        return [t for t in transfers if t is not mamba]
 
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;
@@ -1408,12 +1569,19 @@ class HybridCacheController(BaseHiCacheController):
             if self.should_backup(transfer)
         ]
 
+        results = {}
+        storage_transfers = backup_transfers
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = {}
+        if self.kda_node_aggregate is not None:
+            # Runs on every op, with or without Mamba: peers wait on the exchange.
+            storage_transfers = self._set_node_aggregated_mamba(
+                backup_transfers, results
+            )
+        if backup_transfers:
             for extra_info, transfers in _trailing_chain_groups(
-                operation.prefix_keys, operation.hash_value, backup_transfers
+                operation.prefix_keys, operation.hash_value, storage_transfers
             ):
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
