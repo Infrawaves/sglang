@@ -32,6 +32,10 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
+from sglang.srt.function_call.tool_schema_guard import (
+    canonicalize_tool_schema,
+    merge_anyof_branch,
+)
 
 _JSON_TYPES = (
     "string",
@@ -309,7 +313,7 @@ def _restrict_schema_type(
             return False
         if len(restricted) == 1 and isinstance(restricted[0], dict):
             result.pop(keyword)
-            result.update(restricted[0])
+            result = merge_anyof_branch(parent=result, branch=restricted[0])
         else:
             result[keyword] = restricted
 
@@ -325,85 +329,6 @@ def _restrict_schema_type(
     return _with_root_definitions(result, root_schema)
 
 
-_PROPERTY_NAME_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
-# Definition pools are only reachable through a $ref, which the walk follows, so
-# scanning them directly would let an unreferenced definition speak for the whole
-# schema. Literal keywords hold values, not property names: a non-ASCII enum or
-# const compiles fine (only its \u-escaped spelling is refused, and models emit
-# raw UTF-8), so they are not a source of unsatisfiable grammars.
-_NON_PROPERTY_KEYWORDS = (
-    "$defs",
-    "definitions",
-    "const",
-    "enum",
-    "default",
-    "examples",
-)
-
-
-def _declares_non_ascii_property(
-    schema: Any,
-    root: Optional[Dict[str, Any]] = None,
-    depth: int = 0,
-    seen_refs: Optional[Set[str]] = None,
-) -> bool:
-    """Does this schema declare a property name xgrammar cannot express?
-
-    XGrammar builds a literal matcher for each declared property name and clamps
-    it to ASCII, so an object schema naming a non-ASCII property (an emoji or CJK
-    key) compiles to a grammar that rejects every instance -- a forced tool call
-    on it can only fail. Drop back to the bare type constraint for that argument
-    instead: an unconstrained object still admits the key, raw or escaped.
-
-    Only what this argument can actually reach counts. ``_restrict_schema_type``
-    copies the root ``$defs`` onto every argument, so walking them blindly would
-    strip the constraints off every argument of the tool because of one key in a
-    definition none of them reference.
-    """
-    if depth > 64 or not isinstance(schema, (dict, list)):
-        return False
-    if isinstance(schema, list):
-        return any(
-            _declares_non_ascii_property(item, root, depth + 1, seen_refs)
-            for item in schema
-        )
-    if root is None:
-        root = schema
-
-    ref = schema.get("$ref")
-    if isinstance(ref, str):
-        seen_refs = set() if seen_refs is None else seen_refs
-        if ref not in seen_refs:
-            seen_refs.add(ref)
-            target = _resolve_local_ref(ref, root)
-            if target is not None and _declares_non_ascii_property(
-                target, root, depth + 1, seen_refs
-            ):
-                return True
-
-    for keyword in _PROPERTY_NAME_KEYWORDS:
-        names = schema.get(keyword)
-        if isinstance(names, dict) and any(not str(key).isascii() for key in names):
-            return True
-    required = schema.get("required")
-    if isinstance(required, list) and any(
-        isinstance(item, str) and not item.isascii() for item in required
-    ):
-        return True
-    dependent_required = schema.get("dependentRequired")
-    if isinstance(dependent_required, dict) and any(
-        not str(key).isascii()
-        or (isinstance(names, list) and any(not str(n).isascii() for n in names))
-        for key, names in dependent_required.items()
-    ):
-        return True
-    return any(
-        _declares_non_ascii_property(value, root, depth + 1, seen_refs)
-        for key, value in schema.items()
-        if key not in _NON_PROPERTY_KEYWORDS
-    )
-
-
 def _value_format(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -411,8 +336,6 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
-    if _declares_non_ascii_property(schema):
-        schema = {"type": json_type}
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
     # and rejects every valid negative integer. Splitting the range at zero
@@ -490,15 +413,62 @@ def _known_argument_format(
     return OrFormat(elements=variants)
 
 
+# Characters an argument key attribute can hold unescaped; `&` and `"` only
+# appear escaped, so a raw key is drawn from the rest.
+_KEY_CLASS_EXCLUDES = r'"& \t\r\n\f\v=<>'
+_KEY_FORBIDDEN_CHARS = frozenset(_KEY_CLASS_EXCLUDES.encode().decode("unicode_escape"))
+_ANY_KEY_CHAR = f"[^{_KEY_CLASS_EXCLUDES}]"
+_REGEX_META = frozenset("\\.^$|?*+()[]{}/")
+_CLASS_META = frozenset("\\]^-[")
+
+
+def _attribute_key_regex(excluded_keys) -> str:
+    # A declared key spelled through the additionalProperties path would escape
+    # its typed tag. Only ASCII names are excluded: XGrammar's negated character
+    # classes do not exclude a multi-byte character.
+    names = {
+        key
+        for key in excluded_keys
+        if isinstance(key, str)
+        and key
+        and key.isascii()
+        and not (_KEY_FORBIDDEN_CHARS & set(key))
+    }
+    if not names:
+        return _ANY_KEY_CHAR + "+"
+
+    trie: Dict[Optional[str], Any] = {}
+    for name in names:
+        node = trie
+        for char in name:
+            node = node.setdefault(char, {})
+        node[None] = True
+
+    def build(node: Dict[Optional[str], Any], is_root: bool) -> str:
+        children = sorted(char for char in node if char is not None)
+        diverge = "".join("\\" + c if c in _CLASS_META else c for c in children)
+        alternatives = [f"[^{_KEY_CLASS_EXCLUDES}{diverge}]{_ANY_KEY_CHAR}*"]
+        for char in children:
+            literal = "\\" + char if char in _REGEX_META else char
+            alternatives.append(literal + build(node[char], False))
+        group = "(" + "|".join(alternatives) + ")"
+        # The empty key is not a key; a declared name may not stop here.
+        return group if is_root or None in node else group + "?"
+
+    return build(trie, True)
+
+
 def _dynamic_argument_format(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
     loose_strings: bool = False,
+    excluded_keys=(),
 ) -> Format:
+    key_pattern = _attribute_key_regex(excluded_keys)
     variants = [
         SequenceFormat(
             elements=[
-                RegexFormat(pattern=r'[^"& \t\r\n\f\v=<>]+'),
+                RegexFormat(pattern=key_pattern),
                 ConstStringFormat(
                     value=(f'" type="{_JSON_TO_XTML_TYPE[json_type]}"<|sep|>')
                 ),
@@ -551,12 +521,19 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
             argument if key in required_set else OptionalFormat(content=argument)
         )
 
-    additional = parameters.get("additionalProperties", True)
-    if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
-    elif isinstance(additional, dict):
+    # Omitted, it closes a root that declares keys, as XGrammar closes nested
+    # objects; an open root's key regex is slow to compile.
+    additional = parameters.get("additionalProperties", not properties)
+    if additional is True or isinstance(additional, dict):
+        # additionalProperties governs only undeclared keys.
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            StarFormat(
+                content=_dynamic_argument_format(
+                    schema=additional,
+                    root_schema=parameters,
+                    excluded_keys=properties.keys(),
+                )
+            )
         )
     elif additional is not False:
         raise ValueError(
@@ -582,6 +559,9 @@ def _tool_arguments_format(tool: Tool) -> Format:
         raise ValueError(
             f"Kimi K3 strict tool {tool.function.name!r} must define parameters"
         )
+    # What walle repairs would otherwise raise here (and leave the call
+    # unconstrained) or fail to compile in XGrammar.
+    parameters = canonicalize_tool_schema(parameters)
     schema_types = _schema_types(parameters, parameters)
     if "object" not in schema_types:
         raise ValueError(

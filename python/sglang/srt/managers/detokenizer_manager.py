@@ -179,7 +179,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
-        if not finished_reason:
+        if not finished_reason or finished_reason.get("stop_excluded"):
             return output
 
         matched = finished_reason.get("matched", None)
