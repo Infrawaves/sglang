@@ -8119,16 +8119,23 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         """A 5xx abort before any byte is sent (e.g. a PD KV transfer that
         timed out) is an HTTP error as well: a 200 whose only frame is the end
         frame lacks the role frame and cannot be retried elsewhere. The client
-        gets the status phrase, not the engine's internal message."""
+        gets the status phrase, not the engine's internal message, which goes
+        to the log instead."""
         for status in (
             HTTPStatus.INTERNAL_SERVER_ERROR,
             HTTPStatus.SERVICE_UNAVAILABLE,
         ):
             with self.subTest(status=status):
-                with self.assertRaises(HTTPException) as ctx:
+                with (
+                    self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", "WARNING"
+                    ) as logs,
+                    self.assertRaises(HTTPException) as ctx,
+                ):
                     self._abort_before_first_token(status)
                 self.assertEqual(ctx.exception.status_code, status.value)
                 self.assertEqual(ctx.exception.detail, status.phrase)
+                self.assertIn("grammar failed", "\n".join(logs.output))
 
     def test_other_encodings_still_emit_the_abort_error_frame(self):
         """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
