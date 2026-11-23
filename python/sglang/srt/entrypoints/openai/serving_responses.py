@@ -1913,12 +1913,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         if msg_type not in (None, "message"):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 
+        # Item bookkeeping is not chat input. Moonshot ignores `partial` on the
+        # Responses API, and this path budgets and reports usage for a new turn.
+        dropped = ("id", "status", "type", "partial")
         content = message.get("content")
         if not isinstance(content, list):
             return {
-                k: v
-                for k, v in message.items()
-                if v is not None and k not in ("id", "status", "type")
+                k: v for k, v in message.items() if v is not None and k not in dropped
             }
 
         return {
@@ -1930,7 +1931,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     for part in content
                 ],
             }.items()
-            if v is not None and k not in ("id", "status", "type")
+            if v is not None and k not in dropped
         }
 
     @staticmethod

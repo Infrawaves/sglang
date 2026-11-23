@@ -375,6 +375,95 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
     return value
 
 
+def kimi_k3_partial_message(
+    request: ChatCompletionRequest,
+) -> Optional[ChatCompletionMessageGenericParam]:
+    """The final assistant message a request asks Kimi K3 to continue, if any.
+
+    Moonshot's partial mode marks it with ``partial: true``, and
+    ``continue_final_message`` asks the same of whatever assistant message
+    comes last. As on Moonshot, the flag means nothing on any other message.
+    Raw input_ids carry their own prompt, so they never continue a message.
+    """
+    messages = getattr(request, "messages", None)
+    if getattr(request, "input_ids", None) is not None or not messages:
+        return None
+    message = messages[-1]
+    if message.role != "assistant":
+        return None
+    if request.continue_final_message or message.partial is True:
+        return message
+    return None
+
+
+def _kimi_k3_text_parts(content: Any) -> list[str]:
+    """The non-empty texts of a message's content: the string, or its text parts."""
+    if isinstance(content, str):
+        return [content] if content else []
+    texts = []
+    for part in content or []:
+        if isinstance(part, dict):
+            part_type, text = part.get("type"), part.get("text")
+        else:
+            part_type = getattr(part, "type", None)
+            text = getattr(part, "text", None)
+        if part_type in ("text", "input_text") and text:
+            texts.append(text)
+    return texts
+
+
+def kimi_k3_partial_continues_reasoning(reasoning: Any, content: Any) -> bool:
+    """A partial message with reasoning and no answer text continues its
+    reasoning in thinking mode; any other partial message continues its answer."""
+    return bool(reasoning) and not _kimi_k3_text_parts(content)
+
+
+def kimi_k3_partial_answer_prefilled(request: ChatCompletionRequest) -> bool:
+    """Whether the response channel the prompt leaves open already holds answer
+    text, so output constraints must allow the answer to go on from there."""
+    partial = kimi_k3_partial_message(request)
+    return partial is not None and bool(_kimi_k3_text_parts(partial.content))
+
+
+def _kimi_k3_open_tag(tag: str, attrs: tuple = ()) -> list[tuple[str, bool]]:
+    # Split exactly as the K3 encoder splits a tag: only the markers are control
+    # tokens, and the tag name and each attribute piece are encoded on their own.
+    segments = [("<|open|>", True), (tag, False)]
+    for key, value in attrs:
+        escaped = str(value).replace("&", "&amp;").replace('"', "&quot;")
+        segments += [(f" {key}", False), ('="', False)]
+        if escaped:
+            segments.append((escaped, False))
+        segments.append(('"', False))
+    segments.append(("<|sep|>", True))
+    return segments
+
+
+def kimi_k3_partial_segments(
+    message: Dict[str, Any], thinking: bool
+) -> list[tuple[str, bool]]:
+    """Reopen a partial assistant message for K3 to continue.
+
+    Renders the message as the K3 encoder renders an assistant message, left
+    open where the continuation starts: the think channel for reasoning without
+    answer text while thinking, the response channel otherwise. Thinking off
+    drops the reasoning, as the encoder does. Each segment is ``(text,
+    is_control)``, and client text never becomes control tokens.
+    """
+    attrs = (("role", "assistant"),)
+    if message.get("name"):
+        attrs += (("name", message["name"]),)
+    segments = _kimi_k3_open_tag("message", attrs)
+    answer = [(text, False) for text in _kimi_k3_text_parts(message.get("content"))]
+    reasoning = message.get("reasoning_content")
+    if thinking and reasoning:
+        segments += _kimi_k3_open_tag("think") + [(reasoning, False)]
+        if not answer:
+            return segments
+        segments += [("<|close|>", True), ("think", False), ("<|sep|>", True)]
+    return segments + _kimi_k3_open_tag("response") + answer
+
+
 _KIMI_K3_TOOL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,255}")
 
 
@@ -837,7 +926,12 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
-    ) -> tuple[list[dict[str, Any]], int, str | None]:
+    ) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+        """Normalize messages for the K3 encoder.
+
+        Returns the messages to render, their media count and, when the request
+        continues its final assistant message, that message split off.
+        """
         _truncate_kimi_k3_videos(messages)
         media_count = 0
         for index, message in enumerate(messages):
@@ -910,12 +1004,34 @@ class OpenAIServingChat(OpenAIServingBase):
             if message.get("role") == "developer":
                 message["role"] = "system"
 
-        assistant_prefix = None
-        if request.continue_final_message:
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
+        if kimi_k3_partial_message(request) is None:
+            return messages, media_count, None
+        partial = messages.pop()
+        # Positions count from 0 over the client's messages, as Moonshot's do.
+        position = len(messages)
+        if partial.get("tool_calls"):
+            raise ValueError(
+                f"Invalid request: the partial assistant message at position "
+                f"{position} must not have tool_calls"
             )
-        return messages, media_count, assistant_prefix
+        content = partial.get("content")
+        if isinstance(content, list) and any(
+            part.get("type") != "text" for part in content
+        ):
+            raise ValueError(
+                f"Invalid request: the partial assistant message at position "
+                f"{position} must have only text content"
+            )
+        if not (
+            _kimi_k3_text_parts(content)
+            or partial.get("reasoning_content")
+            or partial.get("name")
+        ):
+            raise ValueError(
+                f"Invalid request: the message at position {position} with role "
+                "'assistant' must not be empty"
+            )
+        return messages, media_count, partial
 
     def _encode_messages(
         self,
@@ -939,7 +1055,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
-            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, partial = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
@@ -1011,18 +1127,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            tokenizer = self.tokenizer_manager.tokenizer
+            prompt_ids = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                # A continued message reopens its own channel instead.
+                add_generation_prompt=partial is None,
                 tools=request_tools,
                 return_dict=False,
                 **template_kwargs,
             )
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
+            if partial is not None:
+                prompt_ids = list(prompt_ids)
+                # The encoder's own default when the request leaves it unset.
+                thinking = bool(template_kwargs.get("thinking", True))
+                for text, is_control in kimi_k3_partial_segments(partial, thinking):
+                    # Segment by segment, as apply_chat_template encodes them.
+                    prompt_ids.extend(
+                        tokenizer.encode(text, allow_special_tokens=is_control)
+                    )
             return prompt_ids
         return None
 
@@ -1150,8 +1273,15 @@ class OpenAIServingChat(OpenAIServingBase):
         }
 
     def _k3_stub_tokens(self, request: ChatCompletionRequest) -> int:
-        """The generation stub the K3 template added: none for raw input_ids."""
-        return self._KIMI_K3_GENERATION_STUB_TOKENS if request.input_ids is None else 0
+        """The generation stub the K3 template added: none for raw input_ids,
+        and none for a continued message, which reopens its channel in the
+        prompt instead (Moonshot reports that as input)."""
+        if (
+            request.input_ids is not None
+            or kimi_k3_partial_message(request) is not None
+        ):
+            return 0
+        return self._KIMI_K3_GENERATION_STUB_TOKENS
 
     @staticmethod
     def _k3_generation_started(completion_tokens: int, finish_reason: Any) -> bool:
@@ -1972,6 +2102,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 sampling_params,
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
+                answer_prefilled=kimi_k3_partial_answer_prefilled(request),
             )
             self._stop_kimi_k3_undeclared_tool_calls(
                 sampling_params, self._tool_call_parsing_active(request)
@@ -1979,13 +2110,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
         max_new_tokens = sampling_params["max_new_tokens"]
+        generation_stub_tokens = self._k3_stub_tokens(request)
         if (
             self.chat_encoding_spec == "kimi_k3"
-            and request.input_ids is None
+            and generation_stub_tokens
             and max_new_tokens is not None
-            and max_new_tokens > self._KIMI_K3_GENERATION_STUB_TOKENS
+            and max_new_tokens > generation_stub_tokens
         ):
-            sampling_params["max_new_tokens"] -= self._KIMI_K3_GENERATION_STUB_TOKENS
+            sampling_params["max_new_tokens"] -= generation_stub_tokens
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
@@ -2200,6 +2332,7 @@ class OpenAIServingChat(OpenAIServingBase):
         sampling_params: dict[str, Any],
         tool_call_constraint: ToolCallConstraint | None,
         require_reasoning: bool,
+        answer_prefilled: bool = False,
     ) -> None:
         """Move a JSON response format into the K3 response block it is
         written in, so the grammar admits the block's markers."""
@@ -2209,6 +2342,16 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint is not None
             and tool_call_constraint[0] == "json_schema"
         ):
+            return
+        if answer_prefilled:
+            # The grammar would start a new JSON value inside a continued
+            # answer that already holds the start of one. Until the answer is
+            # fed to the grammar, only the prompt's schema guides the output.
+            logger.warning(
+                "Kimi K3 partial answer: the json_schema response format is "
+                "stated in the prompt but not enforced by a grammar"
+            )
+            del sampling_params["json_schema"]
             return
         schema = json.loads(json_schema)
         # The structural tag compiles the schema without this check.
@@ -2699,6 +2842,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     effective_tools,
                     tool_choice="none",
                     thinking_mode=xgrammar_reasoning,
+                    answer_prefilled=kimi_k3_partial_answer_prefilled(request),
                 ),
             )
 
@@ -3299,6 +3443,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = self._stream_created(request)
+        generation_stub_tokens = self._k3_stub_tokens(request)
 
         # Parsers for tool calls and reasoning
         parser_dict = {}
@@ -3394,11 +3539,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"],
-                    generation_stub_tokens=(
-                        self._KIMI_K3_GENERATION_STUB_TOKENS
-                        if request.input_ids is None
-                        else 0
-                    ),
+                    generation_stub_tokens=generation_stub_tokens,
                 )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
@@ -3410,11 +3551,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if content["meta_info"].get("cache_usage") is not None:
                     cache_usage[index] = self._reported_cache_usage(
                         content["meta_info"],
-                        generation_stub_tokens=(
-                            self._KIMI_K3_GENERATION_STUB_TOKENS
-                            if request.input_ids is None
-                            else 0
-                        ),
+                        generation_stub_tokens=generation_stub_tokens,
                     )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
@@ -3556,11 +3693,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage_headers.update(
                         self._usage_headers(
                             content["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         )
                     )
                     usage_headers_set = True
@@ -4000,11 +4133,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(response, ChatCompletionResponse):
             response._response_headers = self._usage_headers(
                 ret[0]["meta_info"],
-                generation_stub_tokens=(
-                    self._KIMI_K3_GENERATION_STUB_TOKENS
-                    if request.input_ids is None
-                    else 0
-                ),
+                generation_stub_tokens=self._k3_stub_tokens(request),
             )
 
         return response
@@ -4017,6 +4146,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
         if self.chat_encoding_spec == "kimi_k3":
+            generation_stub_tokens = self._k3_stub_tokens(request)
             ret = [
                 {
                     **item,
@@ -4024,19 +4154,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         **item["meta_info"],
                         "prompt_tokens": self._reported_prompt_tokens(
                             item["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         ),
                         "cache_usage": self._reported_cache_usage(
                             item["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         ),
                     },
                 }
@@ -5004,6 +5126,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.chat_encoding_spec == "kimi_k3":
+            partial = kimi_k3_partial_message(request)
+            if partial is not None and not kimi_k3_partial_continues_reasoning(
+                partial.reasoning_content, partial.content
+            ):
+                # The prompt ends inside the reopened response channel, so the
+                # output is answer text even with thinking on.
+                return False
 
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(

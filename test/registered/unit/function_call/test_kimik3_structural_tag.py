@@ -129,6 +129,7 @@ def _grammar(
     thinking_mode=False,
     parallel_tool_calls=True,
     response_channel_open=False,
+    answer_prefilled=False,
 ):
     structural_tag = get_kimik3_structural_tag(
         tools,
@@ -136,6 +137,7 @@ def _grammar(
         thinking_mode=thinking_mode,
         parallel_tool_calls=parallel_tool_calls,
         response_channel_open=response_channel_open,
+        answer_prefilled=answer_prefilled,
     )
     return xgr.Grammar.from_structural_tag(structural_tag)
 
@@ -1215,6 +1217,18 @@ def test_output_may_start_inside_the_prefilled_response():
     assert _accepts(none, "Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE)
     assert not _accepts(none, "<|close|>response<|sep|>" + MESSAGE_CLOSE)
     assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
+
+
+def test_tool_choice_none_lets_a_continued_answer_go_on_or_end():
+    """A partial answer already fills the open response channel, so its
+    continuation may start with whitespace or close at once; tools stay out."""
+    grammar = _grammar([_tool()], tool_choice="none", answer_prefilled=True)
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, " 3, 4" + RESPONSE_CLOSE + MESSAGE_CLOSE)
+    assert _accepts(grammar, RESPONSE_CLOSE + MESSAGE_CLOSE)
+    assert not _accepts(grammar, " 3" + RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, call + MESSAGE_CLOSE)
 
 
 def test_single_call_auto_admits_the_turn_close():

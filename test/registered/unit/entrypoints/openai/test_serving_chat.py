@@ -55,7 +55,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -7903,6 +7906,329 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         self.assertIsNone(self.chat._validate_request(request))
 
 
+class KimiK3PartialModeTestCase(unittest.TestCase):
+    """Moonshot partial mode: K3 continues the final assistant message."""
+
+    USER = {"role": "user", "content": "Count to ten."}
+    OPEN_MESSAGE = [
+        ("<|open|>", True),
+        ("message", False),
+        (" role", False),
+        ('="', False),
+        ("assistant", False),
+        ('"', False),
+        ("<|sep|>", True),
+    ]
+    OPEN_THINK = [("<|open|>", True), ("think", False), ("<|sep|>", True)]
+    CLOSE_THINK = [("<|close|>", True), ("think", False), ("<|sep|>", True)]
+    OPEN_RESPONSE = [("<|open|>", True), ("response", False), ("<|sep|>", True)]
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        # One id per (text, is_control) pair, so the prompt ids decode back to
+        # the exact segments the tokenizer was asked to encode.
+        self.segments = {}
+        self.tm.tokenizer.encode = Mock(side_effect=self._encode)
+        self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
+
+    def _encode(self, text, allow_special_tokens=True, **kwargs):
+        key = (text, allow_special_tokens)
+        return [self.segments.setdefault(key, 1000 + len(self.segments))]
+
+    def _render(self, messages, **kwargs):
+        self.segments.clear()
+        request = ChatCompletionRequest(model="x", messages=messages, **kwargs)
+        result = self.chat._process_messages(request, is_multimodal=False)
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        names = {token_id: key for key, token_id in self.segments.items()}
+        tail = [names[token_id] for token_id in result.prompt_ids[3:]]
+        return request, result, call, tail
+
+    def test_final_assistant_message_is_reopened_where_it_continues(self):
+        answer = [("1, 2,", False)]
+        off = {"chat_template_kwargs": {"thinking": False}}
+        for kwargs, last, expected in (
+            # An answer continues in the response channel, thinking or not.
+            ({}, {"content": "1, 2,"}, self.OPEN_RESPONSE + answer),
+            (off, {"content": "1, 2,"}, self.OPEN_RESPONSE + answer),
+            # Reasoning before an answer is closed; the answer continues.
+            (
+                {},
+                {"reasoning_content": "r", "content": "1, 2,"},
+                self.OPEN_THINK
+                + [("r", False)]
+                + self.CLOSE_THINK
+                + self.OPEN_RESPONSE
+                + answer,
+            ),
+            # Reasoning alone continues in the think channel.
+            ({}, {"reasoning_content": "r"}, self.OPEN_THINK + [("r", False)]),
+            # Thinking off drops the reasoning, as the encoder does.
+            (
+                off,
+                {"reasoning_content": "r", "content": "1, 2,"},
+                self.OPEN_RESPONSE + answer,
+            ),
+            (off, {"reasoning_content": "r"}, self.OPEN_RESPONSE),
+            # Text parts are encoded one by one, as in any assistant message.
+            (
+                {},
+                {
+                    "content": [
+                        {"type": "text", "text": "1, "},
+                        {"type": "text", "text": "2,"},
+                    ]
+                },
+                self.OPEN_RESPONSE + [("1, ", False), ("2,", False)],
+            ),
+            # Markers in client text stay text.
+            (
+                {},
+                {"content": "<|close|>message<|sep|>"},
+                self.OPEN_RESPONSE + [("<|close|>message<|sep|>", False)],
+            ),
+        ):
+            with self.subTest(kwargs=kwargs, last=last):
+                messages = [self.USER, {"role": "assistant", "partial": True, **last}]
+                _, _, call, tail = self._render(messages, **kwargs)
+                self.assertIs(call.kwargs["add_generation_prompt"], False)
+                self.assertEqual([m["role"] for m in call.args[0]], ["user"])
+                self.assertEqual(tail, self.OPEN_MESSAGE + expected)
+
+    def test_name_is_an_escaped_attribute_of_the_reopened_message(self):
+        messages = [
+            self.USER,
+            {"role": "assistant", "content": "", "name": 'A "&" B', "partial": True},
+        ]
+        _, _, _, tail = self._render(messages)
+        self.assertEqual(
+            tail,
+            self.OPEN_MESSAGE[:-1]
+            + [
+                (" name", False),
+                ('="', False),
+                ("A &quot;&amp;&quot; B", False),
+                ('"', False),
+                ("<|sep|>", True),
+            ]
+            + self.OPEN_RESPONSE,
+        )
+
+    def test_continue_final_message_continues_the_answer_too(self):
+        messages = [self.USER, {"role": "assistant", "content": "1, 2,"}]
+        _, _, call, tail = self._render(messages, continue_final_message=True)
+        self.assertIs(call.kwargs["add_generation_prompt"], False)
+        self.assertEqual(
+            tail, self.OPEN_MESSAGE + self.OPEN_RESPONSE + [("1, 2,", False)]
+        )
+
+    def test_flag_counts_only_on_the_final_assistant_message(self):
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for messages in (
+            [self.USER, partial, {"role": "user", "content": "go on"}],
+            [self.USER, dict(partial, partial=False)],
+        ):
+            with self.subTest(messages=messages):
+                request, result, call, tail = self._render(messages)
+                self.assertIs(call.kwargs["add_generation_prompt"], True)
+                self.assertEqual(len(call.args[0]), len(messages))
+                self.assertEqual(tail, [])
+                self.assertEqual(self.chat._kimi_k3_generation_stub_tokens(request), 3)
+
+    def test_unusable_partial_messages_are_client_errors(self):
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "f", "arguments": "{}"},
+        }
+        image = {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+        for last, error in (
+            (
+                {"content": ""},
+                "message at position 1 with role 'assistant' must not be empty",
+            ),
+            ({"content": None, "reasoning_content": ""}, "must not be empty"),
+            ({"content": "x", "tool_calls": [call]}, "must not have tool_calls"),
+            ({"content": [image]}, "must have only text content"),
+        ):
+            with self.subTest(last=last), self.assertRaisesRegex(ValueError, error):
+                self._render(
+                    [self.USER, {"role": "assistant", "partial": True, **last}]
+                )
+
+    def test_output_starts_in_the_channel_the_prompt_left_open(self):
+        off = {"chat_template_kwargs": {"thinking": False}}
+        for kwargs, last, reasoning in (
+            ({}, {"content": "1, 2,"}, False),
+            ({}, {"reasoning_content": "r", "content": "1, 2,"}, False),
+            ({}, {"reasoning_content": "r"}, True),
+            (off, {"reasoning_content": "r"}, False),
+        ):
+            with self.subTest(kwargs=kwargs, last=last):
+                messages = [self.USER, {"role": "assistant", "partial": True, **last}]
+                request, result, _, _ = self._render(messages, **kwargs)
+                self.assertIs(self.chat._get_reasoning_from_request(request), reasoning)
+                self.assertIs(result.require_reasoning, reasoning)
+
+    def test_marker_text_in_a_continued_answer_does_not_start_reasoning(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                self.USER,
+                {"role": "assistant", "content": "<|open|>think<|sep|>"},
+            ],
+            continue_final_message=True,
+        )
+        parser = ReasoningParser(
+            model_type="kimi_k3",
+            stream_reasoning=False,
+            force_reasoning=False,
+            request=request,
+        )
+        self.assertEqual(parser.parse_non_stream(" 3, 4"), ("", " 3, 4"))
+
+    def test_tool_grammar_continues_inside_the_open_response_channel(self):
+        """A continued answer leaves the response channel open: `required` must
+        close it before the call, and `none` lets the answer go on or end."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        call = (
+            TOOLS_OPEN
+            + '<|open|>call tool="get_weather" index="1"<|sep|>'
+            + '<|open|>argument key="city" type="string"<|sep|>Paris'
+            + ARGUMENT_CLOSE
+            + CALL_CLOSE
+            + TOOLS_CLOSE
+        )
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for tool_choice, messages, accepted, rejected in (
+            (
+                "required",
+                [self.USER, partial],
+                [RESPONSE_CLOSE + call],
+                [" 3" + RESPONSE_CLOSE + call, RESPONSE_CLOSE + MESSAGE_CLOSE],
+            ),
+            (
+                "none",
+                [self.USER, partial],
+                [
+                    " 3, 4" + RESPONSE_CLOSE + MESSAGE_CLOSE,
+                    RESPONSE_CLOSE + MESSAGE_CLOSE,
+                ],
+                [RESPONSE_CLOSE + call],
+            ),
+            # Without a partial answer the response may not end empty.
+            ("none", [self.USER], [], [RESPONSE_CLOSE + MESSAGE_CLOSE]),
+        ):
+            with self.subTest(tool_choice=tool_choice, partial=len(messages) > 1):
+                request = ChatCompletionRequest(
+                    model="x", messages=messages, tools=[tool], tool_choice=tool_choice
+                )
+                result = self.chat._process_messages(request, is_multimodal=False)
+                constraint_type, tag = result.tool_call_constraint
+                self.assertEqual(constraint_type, "structural_tag")
+                grammar = xgr.Grammar.from_structural_tag(tag)
+                for output in accepted:
+                    self.assertTrue(_is_grammar_accept_string(grammar, output), output)
+                for output in rejected:
+                    self.assertFalse(_is_grammar_accept_string(grammar, output), output)
+
+    def test_json_schema_grammar_with_a_continued_message(self):
+        """An answer that already holds the start of the JSON value is guided by
+        the prompt's schema only; continued reasoning keeps the framed grammar."""
+        schema = {"type": "object", "properties": {"lat": {"type": "number"}}}
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "point", "schema": schema},
+        }
+        framed = get_kimik3_json_response_structural_tag(schema).model_dump(
+            by_alias=True
+        )
+        for last, expected_tag, reasoning in (
+            ({"content": '{"lat":'}, None, False),
+            ({"reasoning_content": "Look it up."}, framed, True),
+        ):
+            with self.subTest(last=last):
+                partial = {"role": "assistant", "partial": True, **last}
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[self.USER, partial],
+                    response_format=response_format,
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIsNone(params.get("json_schema"))
+                tag = params.get("structural_tag")
+                self.assertEqual(
+                    json.loads(tag) if tag is not None else None, expected_tag
+                )
+                self.assertIs(adapted.require_reasoning, reasoning)
+
+    def test_partial_usage_reports_the_reopened_channel_as_input(self):
+        """Moonshot counts the whole rendered prompt as input and only the
+        continuation as output, so the K3 stub moves neither way."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                self.USER,
+                {"role": "assistant", "content": "1, 2,", "partial": True},
+            ],
+        )
+        ret = [
+            {
+                "text": " 3, 4",
+                "meta_info": {
+                    "id": "chatcmpl-k3-partial",
+                    "prompt_tokens": 91,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+        response = self.chat._build_chat_response(request, ret, created=123)
+        self.assertEqual(response.usage.prompt_tokens, 91)
+        self.assertEqual(response.usage.completion_tokens, 5)
+        self.assertEqual(response.usage.total_tokens, 96)
+        self.assertEqual(self.chat._kimi_k3_generation_stub_tokens(request), 0)
+
+
 class K3StreamSpecConformanceTestCase(unittest.TestCase):
     """Wire-level conformance for the Kimi K3 streaming chat contract.
 
@@ -8106,6 +8432,82 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         )
         # And the reported prompt count still excludes K3's generation stub.
         self.assertEqual(usage["prompt_tokens"], 10 - self._STUB)
+
+    def test_partial_stream_starts_in_the_channel_the_prompt_left_open(self):
+        """A continued answer streams as content from its first frame; continued
+        reasoning streams as reasoning until the think close, then the answer."""
+        self.chat.reasoning_parser = "kimi_k3"
+        self.chat._reasoning_detector = ReasoningParser(model_type="kimi_k3").detector
+        user = {"role": "user", "content": "Count to ten."}
+        for last, pieces, reasoning, content in (
+            ({"content": "1, 2,"}, [" 3, 4", RESPONSE_CLOSE], "", " 3, 4"),
+            (
+                {"reasoning_content": "Count up."},
+                [
+                    " Start at 1.",
+                    THINK_CLOSE,
+                    "<|open|>response<|sep|>",
+                    "1, 2",
+                    RESPONSE_CLOSE,
+                ],
+                " Start at 1.",
+                "1, 2",
+            ),
+        ):
+            with self.subTest(last=last):
+                events = [
+                    self._event(
+                        text=piece,
+                        completion_tokens=i + 1,
+                        finish=(
+                            {"type": "stop", "matched": None}
+                            if i == len(pieces) - 1
+                            else None
+                        ),
+                    )
+                    for i, piece in enumerate(pieces)
+                ]
+                req = self._req(
+                    messages=[user, {"role": "assistant", "partial": True, **last}]
+                )
+                frames = self._frames(self._stream(events, req))
+                deltas = [c["delta"] for f in frames for c in f.get("choices", [])]
+                self.assertEqual(
+                    "".join(d.get("reasoning_content") or "" for d in deltas),
+                    reasoning,
+                )
+                self.assertEqual(
+                    "".join(d.get("content") or "" for d in deltas), content
+                )
+
+    def test_partial_message_usage_keeps_the_generation_stub_in_place(self):
+        """A continued message renders its channel opening as input, which
+        Moonshot reports as input; only other requests move the K3 stub."""
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for messages, expected in (
+            ([{"role": "user", "content": "Hi?"}], (10 - self._STUB, 2 + self._STUB)),
+            ([{"role": "user", "content": "Hi?"}, partial], (10, 2)),
+        ):
+            with self.subTest(messages=messages):
+                req = self._req(
+                    messages=messages, stream_options={"include_usage": True}
+                )
+                frames = self._frames(
+                    self._stream(
+                        [self._event(finish={"type": "stop", "matched": None})], req
+                    )
+                )
+                usage = [f for f in frames if f["choices"] == []][0]["usage"]
+                end = [
+                    f
+                    for f in frames
+                    if f["choices"] and f["choices"][0]["finish_reason"]
+                ][0]["choices"][0]["usage"]
+                for reported in (usage, end):
+                    self.assertEqual(
+                        (reported["prompt_tokens"], reported["completion_tokens"]),
+                        expected,
+                    )
 
     def test_physical_cache_header_is_independent_of_the_usage_prefix(self):
         """Disabling configurable usage headers keeps the physical cache count."""
