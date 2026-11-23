@@ -296,6 +296,15 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_sampling_logprobs",
 )
 
+# Absolute generated position of each incremental event's entries of a key in
+# _INCREMENTAL_STREAMING_META_INFO_KEYS, under ``<key>_segments`` as
+# ``[start, count]`` pairs (one per event, concatenated on coalescing). Each
+# cumulative list can lag behind ``output_ids`` (an entry arrives in a later
+# batch), so every list keeps its own offset, separate from the output-id one.
+_STREAMING_SEGMENTS_SUFFIX = "_segments"
+# Absolute generated position of an incremental event's first ``output_ids`` entry.
+OUTPUT_IDS_START_KEY = "output_ids_start"
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -333,6 +342,12 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+    # Incremental streaming: entries of each cumulative output-side meta list
+    # already sent, per key. Lists may lag ``output_ids``, so an entry that
+    # arrives late is still sent once instead of being sliced away.
+    streaming_meta_sent: Dict[str, int] = dataclasses.field(default_factory=dict)
+    # Incremental streaming: characters of the output text already sent.
+    streaming_text_sent: int = 0
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -425,13 +440,31 @@ def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
     customized_info_keys: Optional[Iterable[str]] = None,
+    sent_offsets: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Align output-side metadata with the current incremental streaming chunk."""
+    """Align output-side metadata with the current incremental streaming chunk.
+
+    With ``sent_offsets`` (the request's per-key sent counts), the built-in
+    cumulative lists are sliced from what was already sent and the counts are
+    advanced, and each gets its absolute ``[start, count]`` segment under
+    ``<key>_segments``; customized keys keep slicing at ``last_output_offset``.
+    """
     streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
     if customized_info_keys is not None:
         streaming_meta_info_keys.update(customized_info_keys)
     for key in meta_info.keys() & streaming_meta_info_keys:
-        meta_info[key] = meta_info[key][last_output_offset:]
+        if sent_offsets is not None and key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+            full = meta_info[key]
+            start = sent_offsets.get(key, 0)
+            meta_info[key] = full[start:]
+            sent_offsets[key] = max(start, len(full))
+            meta_info[key + _STREAMING_SEGMENTS_SUFFIX] = [
+                [start, len(meta_info[key])]
+            ]
+        else:
+            meta_info[key] = meta_info[key][last_output_offset:]
+    if sent_offsets is not None:
+        meta_info[OUTPUT_IDS_START_KEY] = last_output_offset
 
 
 def _build_flat_top_logprobs_fields(
@@ -902,6 +935,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests_level=get_observability().log_requests_level,
             log_requests_format=get_observability().log_requests_format,
             log_requests_target=get_observability().log_requests_target,
+            log_requests_logprobs=get_observability().log_requests_logprobs,
         )
 
         # Dumping
@@ -2712,6 +2746,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             incremental_streaming_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
             if customized_info_keys is not None:
                 incremental_streaming_keys.update(customized_info_keys)
+            incremental_streaming_keys.update(
+                key + _STREAMING_SEGMENTS_SUFFIX
+                for key in _INCREMENTAL_STREAMING_META_INFO_KEYS
+            )
+            if OUTPUT_IDS_START_KEY in meta_info_list[0]:
+                meta_info[OUTPUT_IDS_START_KEY] = meta_info_list[0][
+                    OUTPUT_IDS_START_KEY
+                ]
             for key in incremental_streaming_keys:
                 if any(key in m for m in meta_info_list):
                     meta_info[key] = [
@@ -3302,6 +3344,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
+            log_requests_logprobs=obj.log_requests_logprobs,
         )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
@@ -3573,8 +3616,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.streaming_meta_sent,
                         )
                         state.last_output_offset = len(state.output_ids)
+                        state.streaming_text_sent += len(delta_text)
                         out_dict = {
                             "text": delta_text,
                             "output_ids": output_token_ids,
@@ -3619,6 +3664,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.streaming_meta_sent,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
@@ -4503,10 +4549,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
+        text = state.get_text()
         if is_stream and self.incremental_streaming_output:
-            output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+            # Earlier incremental events already carried their text/id deltas
+            # and logprob entries; the abort event carries only what is still
+            # unsent (normally nothing) plus its positions.
+            output_offset = state.last_output_offset
+            output_ids = output_ids[output_offset:]
+            text = text[state.streaming_text_sent :]
+            state.streaming_text_sent += len(text)
+            _slice_streaming_output_meta_info(
+                meta_info,
+                output_offset,
+                state.customized_info_accumulated.keys(),
+                state.streaming_meta_sent,
+            )
+            state.last_output_offset = len(state.output_ids)
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }

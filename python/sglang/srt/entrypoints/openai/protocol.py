@@ -292,9 +292,26 @@ class StreamOptions(BaseModel):
     # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
-    # K3 API extension: attach choices[].internal_content[].token_ids to
-    # every increment frame — the raw token ids behind that increment.
+    # K3 API extension: attach choices[].internal_content[] to every increment
+    # frame -- token_ids, the raw token ids behind that increment, and
+    # logprobs, each one's selected logprob (-9999.0 when unknown). A token
+    # backing two frames repeats in both (see KimiTokenProvenance).
     include_internal_content: Optional[bool] = False
+    # Internal opt-in on top of include_internal_content: each
+    # internal_content[] entry also carries token_positions, the 0-based
+    # generated position of each of its token_ids (same length). A token that
+    # backs two frames repeats with the same position, so consumers deduplicate
+    # by (choice index, token position).
+    include_internal_token_positions: Optional[bool] = False
+
+    @model_validator(mode="after")
+    def _token_positions_need_internal_content(self) -> "StreamOptions":
+        if self.include_internal_token_positions and not self.include_internal_content:
+            raise ValueError(
+                "stream_options.include_internal_token_positions requires "
+                "stream_options.include_internal_content"
+            )
+        return self
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -1714,10 +1731,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     internal_content: Optional[List[Dict[str, Any]]] = None
+    # K3 forbids a null logprobs key: with this set, a frame without a logprobs
+    # object omits the key. Other encodings keep serializing null.
+    omit_null_logprobs: bool = Field(default=False, exclude=True)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.logprobs is None and self.omit_null_logprobs:
+            data.pop("logprobs", None)
         if self.internal_content is None:
             data.pop("internal_content", None)
         if self.delta.tool_calls is None:
