@@ -788,34 +788,18 @@ def test_strict_schema_enforces_non_ascii_property_names():
     assert not _accepts_value(grammar, json.dumps({key: 1}, ensure_ascii=False))
 
 
-def test_strict_schema_preserves_additional_properties_default():
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="annotate",
-            strict=True,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string"},
-                },
-                "required": ["label"],
-            },
-        ),
+def test_strict_root_admits_undeclared_arguments_only_when_declared_open():
+    schema = {
+        "type": "object",
+        "properties": {"count": {"type": "number"}},
+        "required": ["count"],
+    }
+    call = _kvv_call(
+        _argument("count", "number", "1"), _argument("confidence", "number", "0.9")
     )
-    grammar = _grammar([tool], tool_choice="required")
 
-    assert _accepts(
-        grammar,
-        _tools_section(
-            _call(
-                "annotate",
-                1,
-                _argument("label", "string", "sample"),
-                _argument("confidence", "number", "0.9"),
-            )
-        ),
-    )
+    assert not _accepts(_kvv_grammar(schema), call)
+    assert _accepts(_kvv_grammar({**schema, "additionalProperties": True}), call)
 
 
 def test_dynamic_argument_key_compiles_without_xgrammar_unicode_warning(capfd):
@@ -1384,6 +1368,7 @@ def test_declared_keys_do_not_escape_through_additional_properties():
         {
             "type": "object",
             "properties": {"a": {"type": "string"}, "abc": {"type": "integer"}},
+            "additionalProperties": True,
         }
     )
     assert not _accepts(grammar, _kvv_call(_argument("a", "number", "1")))

@@ -534,7 +534,9 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
             argument if key in required_set else OptionalFormat(content=argument)
         )
 
-    additional = parameters.get("additionalProperties", True)
+    # Omitted, it closes a root that declares keys, as XGrammar closes nested
+    # objects; an open root's key regex is slow to compile.
+    additional = parameters.get("additionalProperties", not properties)
     if additional is True or isinstance(additional, dict):
         # additionalProperties governs only undeclared keys.
         elements.append(
