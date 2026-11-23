@@ -221,9 +221,14 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
-    # Prefill CP with DCP on one group (tp == attn_cp == dcp). Its first stage
-    # serves only aggregated, non-speculative flashmla_kv.
+    # Prefill CP with DCP on one group (tp == attn_cp == dcp), on flashmla_kv.
     prefill_cp_dcp = cfg.enable_prefill_cp and dcp == cfg.attn_cp_size == cfg.tp_size
+    # A PD prefill only writes the DFLASH draft KV from the CP-gathered target
+    # hidden states, in a draft scope that drops CP and keeps DCP (the layout a
+    # DCP prefill serves); it runs no draft or verify forward.
+    prefill_cp_dcp_dflash = (
+        cfg.speculative_algorithm == "DFLASH" and cfg.disaggregation_mode == "prefill"
+    )
     unsupported = {
         "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
         not in (None, "DSPARK", "DFLASH"),
@@ -243,8 +248,10 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
         "prefill context parallel other than --tp-size == --attn-cp-size == "
         "--dcp-size": (cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1)
         and not prefill_cp_dcp,
-        "speculative decoding with prefill context parallel": prefill_cp_dcp
-        and cfg.speculative_algorithm is not None,
+        "speculative decoding with prefill context parallel other than DFLASH "
+        "on a PD prefill": prefill_cp_dcp
+        and cfg.speculative_algorithm is not None
+        and not prefill_cp_dcp_dflash,
         # A prefill CP + DCP prefill ships pages to a decode of the same DCP;
         # that decode serves TP + DCP, never prefill CP.
         "PD decode with prefill context parallel": prefill_cp_dcp

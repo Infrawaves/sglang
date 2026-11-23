@@ -191,19 +191,33 @@ class TestKimiK31PrefillCpWithDcpOverrides(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "prefill context parallel"):
                     self._overrides(**fields)
 
-    def test_speculative_decoding_is_rejected(self):
-        for algorithm in ("DFLASH", "DSPARK"):
-            with self.subTest(algorithm=algorithm):
+    def test_dflash_is_admitted_on_a_pd_prefill(self):
+        # The prefill only writes the draft KV; decode runs the draft and verify.
+        overrides = self._overrides(
+            speculative_algorithm="DFLASH", disaggregation_mode="prefill"
+        )
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "cutedsl_mla")
+
+    def test_other_speculative_layouts_are_rejected(self):
+        # Aggregated DFLASH would run the draft and verify forwards under prefill
+        # CP; DSpark is outside CP-TP group sharing.
+        for fields in (
+            dict(speculative_algorithm="DFLASH"),
+            dict(speculative_algorithm="DSPARK"),
+            dict(speculative_algorithm="DSPARK", disaggregation_mode="prefill"),
+        ):
+            with self.subTest(**fields):
                 with self.assertRaisesRegex(
                     ValueError, "speculative decoding with prefill context parallel"
                 ):
-                    self._overrides(speculative_algorithm=algorithm)
+                    self._overrides(**fields)
 
-    def test_pd_disaggregation_is_rejected(self):
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "PD disaggregation"):
-                    self._overrides(disaggregation_mode=mode)
+    def test_pd_prefill_is_admitted_and_pd_decode_rejected(self):
+        # The prefill ships same-DCP pages to a TP + DCP decode, which never
+        # runs prefill CP itself.
+        self._overrides(disaggregation_mode="prefill")
+        with self.assertRaisesRegex(ValueError, "PD decode with prefill context"):
+            self._overrides(disaggregation_mode="decode")
 
     def test_dsa_backends_other_than_flashmla_kv_are_rejected(self):
         for backend in ("trtllm", "prims_ts"):
