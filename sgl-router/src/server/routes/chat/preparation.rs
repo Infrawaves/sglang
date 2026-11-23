@@ -1503,13 +1503,27 @@ pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<B
 /// The PD prefill copy of an outgoing body. Prefill only fills KV for decode, so
 /// it never streams: its own error status then reaches the client unwrapped.
 /// `stream_options` goes with it, which the engine rejects without `stream`.
+///
+/// Prefill samples the first output token, and its selected logprob reaches
+/// decode only when prefill computed one. Decode returns logprobs for
+/// `stream_options.include_internal_content` even when the client did not ask
+/// for them, so prefill is asked too -- for the selected logprob only, as decode.
 pub(super) fn pd_prefill_body(body: &Bytes) -> Result<Bytes, ApiError> {
     let mut value: Value = serde_json::from_slice(body).map_err(|_| invalid_request())?;
     let Some(fields) = value.as_object_mut() else {
         return Ok(body.clone());
     };
     fields.insert("stream".into(), Value::Bool(false));
-    fields.remove("stream_options");
+    let stream_options = fields.remove("stream_options");
+    let internal_content = stream_options
+        .as_ref()
+        .and_then(|options| options.get("include_internal_content"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if internal_content && fields.get("logprobs").and_then(Value::as_bool) != Some(true) {
+        fields.insert("logprobs".into(), Value::Bool(true));
+        fields.remove("top_logprobs");
+    }
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request")))
@@ -1895,6 +1909,43 @@ pub(crate) fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pd_prefill_body_asks_for_the_first_token_logprob_behind_internal_content() {
+        let prefill = |body: Value| -> Value {
+            let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+            serde_json::from_slice(&pd_prefill_body(&bytes).unwrap()).unwrap()
+        };
+        // Internal content without client logprobs: selected logprob only.
+        let v = prefill(json!({
+            "stream": true,
+            "top_logprobs": 5,
+            "stream_options": {"include_internal_content": true, "include_usage": true},
+        }));
+        assert_eq!(v["stream"], false);
+        assert!(v.get("stream_options").is_none());
+        assert_eq!(v["logprobs"], true);
+        assert!(v.get("top_logprobs").is_none());
+        // The client's own logprobs request passes through untouched.
+        let v = prefill(json!({
+            "stream": true,
+            "logprobs": true,
+            "top_logprobs": 20,
+            "stream_options": {"include_internal_content": true},
+        }));
+        assert_eq!(v["logprobs"], true);
+        assert_eq!(v["top_logprobs"], 20);
+        // Without internal content nothing is added.
+        for body in [
+            json!({"stream": true, "stream_options": {"include_usage": true}}),
+            json!({"stream": true, "stream_options": {"include_internal_content": false}}),
+            json!({"stream": true, "logprobs": false, "top_logprobs": 3}),
+        ] {
+            let v = prefill(body.clone());
+            assert_eq!(v.get("logprobs"), body.get("logprobs"), "{body}");
+            assert_eq!(v.get("top_logprobs"), body.get("top_logprobs"), "{body}");
+        }
+    }
 
     #[test]
     fn minimax_m31_thinking_contract() {

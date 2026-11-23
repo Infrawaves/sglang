@@ -70,6 +70,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    FIRST_TOKEN_LOGPROB_ABSENT,
+    FIRST_TOKEN_LOGPROB_SLOT,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -3191,7 +3193,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         )
             req = decode_req.req
             logprob_token_id = logprob = top_logprobs_val = top_logprobs_idx = None
-            if req.return_logprob:
+            if (
+                req.return_logprob
+                and len(cached_tokens) > FIRST_TOKEN_LOGPROB_SLOT
+                and cached_tokens[FIRST_TOKEN_LOGPROB_SLOT].item()
+                == FIRST_TOKEN_LOGPROB_ABSENT
+            ):
+                # The prefill's copy of the request computed no logprob, so
+                # these rows still hold a previous owner's values. Commit an
+                # unknown (NaN) value to keep the logprob rows aligned with
+                # output_ids; never report the stale or zero-filled one.
+                logprob_token_id = committed_output_id
+                logprob = float("nan")
+                top_logprobs_val = []
+                top_logprobs_idx = []
+            elif req.return_logprob:
                 top_logprobs_num = req.logprob.top_logprobs_num
                 logprob_token_id = output_token_logprobs_idx[0].item()
                 logprob = output_token_logprobs_val[0].item()

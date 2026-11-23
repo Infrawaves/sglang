@@ -292,8 +292,10 @@ class StreamOptions(BaseModel):
     # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
-    # K3 API extension: attach choices[].internal_content[].token_ids to
-    # every increment frame — the raw token ids behind that increment.
+    # K3 API extension: attach choices[].internal_content[] to every increment
+    # frame -- token_ids, the raw token ids behind that increment, and
+    # logprobs, each one's selected logprob (-9999.0 when unknown). A token
+    # backing two frames repeats in both (see KimiTokenProvenance).
     include_internal_content: Optional[bool] = False
 
 
