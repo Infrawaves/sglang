@@ -31,12 +31,13 @@ class StreamChoice(msgspec.Struct):
 
     Must NOT use omit_defaults: the finish_reason key has to appear on every
     frame. usage is only filled on the end frame; middle frames serialize it as
-    null, which the K3 streaming format allows.
+    null, which the K3 streaming format allows. logprobs is UNSET, so omitted,
+    on a frame without a logprobs object: K3 forbids a null logprobs key.
     """
 
     index: int
     delta: StreamDelta
-    logprobs: Optional[dict] = None
+    logprobs: Union[dict, msgspec.UnsetType] = msgspec.UNSET
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
     usage: Optional[dict] = None
@@ -83,7 +84,7 @@ def build_sse_content(
         content: Text content delta
         reasoning_content: Reasoning/thinking content delta
         finish_reason: Finish reason if done
-        logprobs: Log probabilities if requested
+        logprobs: Log probabilities if requested; None omits the key
         matched_stop: Stop token/string that was matched
         usage: Token usage statistics
 
@@ -98,7 +99,7 @@ def build_sse_content(
     choice = StreamChoice(
         index=index,
         delta=delta,
-        logprobs=logprobs,
+        logprobs=logprobs if logprobs is not None else msgspec.UNSET,
         finish_reason=finish_reason,
         matched_stop=matched_stop,
         usage=choice_usage,

@@ -297,6 +297,21 @@ class StreamOptions(BaseModel):
     # logprobs, each one's selected logprob (-9999.0 when unknown). A token
     # backing two frames repeats in both (see KimiTokenProvenance).
     include_internal_content: Optional[bool] = False
+    # Internal opt-in on top of include_internal_content: each
+    # internal_content[] entry also carries token_positions, the 0-based
+    # generated position of each of its token_ids (same length). A token that
+    # backs two frames repeats with the same position, so consumers deduplicate
+    # by (choice index, token position).
+    include_internal_token_positions: Optional[bool] = False
+
+    @model_validator(mode="after")
+    def _token_positions_need_internal_content(self) -> "StreamOptions":
+        if self.include_internal_token_positions and not self.include_internal_content:
+            raise ValueError(
+                "stream_options.include_internal_token_positions requires "
+                "stream_options.include_internal_content"
+            )
+        return self
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -1720,6 +1735,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # A frame without a logprobs object omits the key; never null.
+        if self.logprobs is None:
+            data.pop("logprobs", None)
         if self.internal_content is None:
             data.pop("internal_content", None)
         if self.delta.tool_calls is None:

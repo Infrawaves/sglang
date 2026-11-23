@@ -8528,7 +8528,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         )
         for f in frames:
             for c in f["choices"]:
-                self.assertIsNone(c.get("logprobs"))
+                self.assertNotIn("logprobs", c)
 
     def test_internal_content_logprobs_from_cumulative_events(self):
         """Non-incremental events carry the cumulative id and logprob lists --
@@ -8621,7 +8621,9 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
     # ------------- P1.17 choices[].logprobs -------------
     def _logprob_event(self, text, token_ids, *, completion_tokens, top_k=0, **kw):
         """An incremental event whose tokens' logprobs are deltas, as the
-        tokenizer manager slices them; token text "t<id>"."""
+        tokenizer manager slices them (with their positions); token text
+        "t<id>"."""
+        start = completion_tokens - len(token_ids)
         event = self._event(
             text=text,
             completion_tokens=completion_tokens,
@@ -8631,6 +8633,9 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
                 for _ in token_ids
             ],
             output_token_logprobs_length=completion_tokens,
+            output_ids_start=start,
+            output_token_logprobs_segments=[[start, len(token_ids)]],
+            output_top_logprobs_segments=[[start, len(token_ids)]],
             **kw,
         )
         event["output_ids"] = list(token_ids)
@@ -8673,7 +8678,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
 
         first = choices[0]
         self.assertEqual(first["delta"].get("role"), "assistant")
-        self.assertIsNone(first.get("logprobs"))
+        self.assertNotIn("logprobs", first)
 
         content = [c for c in choices if c["delta"].get("content")]
         self.assertEqual([c["delta"]["content"] for c in content], ["Hello", " world"])
@@ -8765,7 +8770,238 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         frames = self._frames(self._stream(events, req))
         for f in frames:
             for c in f["choices"]:
-                self.assertIsNone(c.get("logprobs"))
+                self.assertNotIn("logprobs", c)
+
+    _TOOL_PIECES = [
+        TOOLS_OPEN,
+        '<|open|>call tool="python" index="1"<|sep|>',
+        '<|open|>argument key="code" type="string"<|sep|>',
+        "first",
+        "<|close|>argument<|sep|>",
+        "<|close|>call<|sep|>",
+        '<|open|>call tool="python" index="2"<|sep|>',
+        '<|open|>argument key="code" type="string"<|sep|>',
+        "second",
+        "<|close|>argument<|sep|>",
+        "<|close|>call<|sep|>",
+        TOOLS_CLOSE,
+    ]
+
+    def _step_events(self, pieces, steps, *, finish=None):
+        """One logprob event per step; ``steps`` lists each step's token ids
+        (ids index ``pieces``). The last step carries ``finish``. A stop token
+        stripped from the text still has real (non-empty) bytes."""
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode() or b"<eos>"
+        )
+        events = []
+        for n, ids in enumerate(steps):
+            events.append(
+                self._logprob_event(
+                    "".join(pieces[i] for i in ids),
+                    ids,
+                    completion_tokens=ids[-1] + 1 if ids else 0,
+                    finish=finish if n == len(steps) - 1 else None,
+                )
+            )
+        return events
+
+    def _assert_k3_logprobs_frames(self, frames, expected_tokens):
+        """K3 with logprobs: every content and end frame carries an object,
+        every other frame omits the key, mid frames keep finish_reason null,
+        and each token's entry arrives once and in order."""
+        delivered = []
+        for f in frames:
+            for c in f["choices"]:
+                if not self._is_end_frame(c):
+                    self.assertIn("finish_reason", c)
+                    self.assertIsNone(c["finish_reason"])
+                if self._carries_content(c) or self._is_end_frame(c):
+                    self.assertIsInstance(c["logprobs"]["content"], list, c)
+                    for entry in c["logprobs"]["content"]:
+                        self.assertEqual(
+                            set(entry), {"token", "logprob", "bytes", "top_logprobs"}
+                        )
+                        delivered.append(entry["token"])
+                else:
+                    self.assertNotIn("logprobs", c)
+        self.assertEqual(delivered, expected_tokens)
+
+    def test_reasoning_and_content_in_one_step_each_carry_a_logprobs_object(self):
+        """Each frame carries the entries up to its last token: the channel
+        markers between reasoning and content ride on the content frame, the
+        stripped stop token on the end frame."""
+        self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        pieces = ["thought", "<|close|>think<|sep|>", "<|open|>response<|sep|>"]
+        pieces += ["answer", ""]
+        req = self._req(logprobs=True)
+        events = self._step_events(pieces, [[0, 1, 2, 3], [4]], finish={"type": "stop"})
+        frames = self._frames(self._stream(events, req))
+        choices = [c for f in frames for c in f["choices"]]
+        reasoning = [c for c in choices if c["delta"].get("reasoning_content")]
+        content = [c for c in choices if c["delta"].get("content")]
+        self.assertTrue(reasoning and content)
+        self.assertEqual(
+            [e["token"] for e in reasoning[0]["logprobs"]["content"]], ["t0"]
+        )
+        self.assertEqual(
+            [e["token"] for e in content[0]["logprobs"]["content"]],
+            ["t1", "t2", "t3"],
+        )
+        end = [c for c in choices if self._is_end_frame(c)]
+        self.assertEqual([e["token"] for e in end[-1]["logprobs"]["content"]], ["t4"])
+        self._assert_k3_logprobs_frames(frames, [f"t{i}" for i in range(5)])
+
+    def test_every_tool_frame_carries_a_logprobs_object_under_each_switch(self):
+        """A tool slot and its arguments from one step, and two calls, through
+        the Pydantic tool frames: with logprobs every tool frame carries an
+        object (the argument continuation and the second call included) and
+        entries arrive once; without it no frame has the key, also when only
+        include_internal_content is on."""
+        self.chat.tool_call_parser = "kimi_k3"
+        pieces = self._TOOL_PIECES + [""]
+        steps = [[0, 1, 2, 3], [4, 5], [6, 7, 8, 9, 10], [11], [12]]
+        tools = [{"type": "function", "function": {"name": "python"}}]
+        switches = {
+            "logprobs": dict(logprobs=True),
+            "internal": dict(stream_options={"include_internal_content": True}),
+            "both": dict(
+                logprobs=True, stream_options={"include_internal_content": True}
+            ),
+        }
+        for name, kw in switches.items():
+            with self.subTest(switches=name):
+                req = self._req(tools=tools, **kw)
+                events = self._step_events(pieces, steps, finish={"type": "stop"})
+                frames = self._frames(self._stream(events, req))
+                choices = [c for f in frames for c in f["choices"]]
+                tool_frames = [c for c in choices if c["delta"].get("tool_calls")]
+                call_indexes = {
+                    t["index"] for c in tool_frames for t in c["delta"]["tool_calls"]
+                }
+                self.assertEqual(len(call_indexes), 2)
+                self.assertGreater(len(tool_frames), 2)
+                end = [c for c in choices if self._is_end_frame(c)]
+                self.assertEqual(end[-1]["finish_reason"], "tool_calls")
+                if "logprobs" in kw:
+                    self._assert_k3_logprobs_frames(
+                        frames, [f"t{i}" for i in range(len(pieces))]
+                    )
+                else:
+                    for c in choices:
+                        self.assertNotIn("logprobs", c)
+                if "stream_options" in kw:
+                    for c in tool_frames:
+                        self.assertTrue(c["internal_content"][0]["token_ids"])
+
+    def test_interrupted_end_frames_carry_a_logprobs_object(self):
+        req = self._req(logprobs=True)
+        with self.subTest(end="status-code abort"):
+            events = [
+                self._logprob_event("Hello", [0], completion_tokens=1),
+                self._event(
+                    text="",
+                    completion_tokens=1,
+                    output_token_logprobs_length=1,
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": "engine died",
+                    },
+                ),
+            ]
+            events[1]["output_ids"] = []
+            frames = self._frames(self._stream(events, req))
+            end = [c for f in frames for c in f["choices"] if self._is_end_frame(c)]
+            self.assertEqual(end[-1]["finish_reason"], "server_interrupted")
+            self.assertIsInstance(end[-1]["logprobs"]["content"], list)
+        with self.subTest(end="exception"):
+
+            async def _gen():
+                yield self._logprob_event("Hello", [0], completion_tokens=1)
+                raise RuntimeError("engine died")
+
+            self.tm.generate_request = Mock(return_value=_gen())
+
+            async def _run():
+                return [
+                    chunk
+                    async for chunk in self.chat._generate_chat_stream(
+                        Mock(), req, self.fastapi_request
+                    )
+                ]
+
+            frames = self._frames(get_or_create_event_loop().run_until_complete(_run()))
+            self.assertEqual(
+                frames[-1]["choices"][0]["finish_reason"], "server_interrupted"
+            )
+            self.assertIsInstance(frames[-1]["choices"][0]["logprobs"]["content"], list)
+
+    def test_incremental_short_logprob_list_never_shifts_onto_a_repeated_id(self):
+        """An incremental event with two equal ids and one entry: the entry
+        belongs to the first position. Right alignment put it on the second,
+        and the id check could not tell."""
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: b"x"
+        event = self._event(
+            text="xx",
+            completion_tokens=2,
+            finish={"type": "stop"},
+            output_token_logprobs=[(-0.3, 5, None)],
+            output_token_logprobs_length=1,
+        )
+        event["output_ids"] = [5, 5]
+        req = self._req(stream_options={"include_internal_content": True})
+        frames = self._frames(self._stream([event], req))
+        increments = [
+            c for f in frames for c in f["choices"] if c["delta"].get("content")
+        ]
+        self.assertEqual(
+            increments[0]["internal_content"],
+            [{"token_ids": [5, 5], "logprobs": [-0.3, -9999.0]}],
+        )
+
+    def test_incremental_coalesced_abort_reads_positions_and_sends_entries_once(self):
+        """A coalesced incremental abort event as the tokenizer manager builds
+        it: a delta for positions 2 and 3, then the abort, which carries only
+        what is still unsent (nothing here). Entries pair with ids by the
+        stated positions and the standard entries go out once."""
+        pieces = ["a", "b", "c", "d"]
+        full = [(-0.1 * (t + 1), t, f"t{t}") for t in range(4)]
+        first = self._logprob_event("ab", [0, 1], completion_tokens=2)
+        abort = self._event(
+            text="cd",
+            completion_tokens=4,
+            output_token_logprobs=full[2:],
+            output_top_logprobs=[[] for _ in full[2:]],
+            output_token_logprobs_length=4,
+            output_ids_start=2,
+            output_token_logprobs_segments=[[2, 2], [4, 0]],
+            output_top_logprobs_segments=[[2, 2], [4, 0]],
+            finish={"type": "abort"},
+        )
+        abort["output_ids"] = [2, 3]
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode()
+        )
+        req = self._req(
+            logprobs=True, stream_options={"include_internal_content": True}
+        )
+        frames = self._frames(self._stream([first, abort], req))
+        increments = [
+            c for f in frames for c in f["choices"] if self._carries_content(c)
+        ]
+        self.assertEqual(
+            [[e["token"] for e in c["logprobs"]["content"]] for c in increments],
+            [["t0", "t1"], ["t2", "t3"]],
+        )
+        self.assertEqual(
+            [c["internal_content"] for c in increments],
+            [
+                [{"token_ids": [0, 1], "logprobs": [full[0][0], full[1][0]]}],
+                [{"token_ids": [2, 3], "logprobs": [full[2][0], full[3][0]]}],
+            ],
+        )
 
     def test_internal_content_absent_unless_requested(self):
         req = self._req(tools=[{"type": "function", "function": {"name": "w"}}])

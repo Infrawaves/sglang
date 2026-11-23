@@ -60,8 +60,10 @@ from sglang.srt.entrypoints.openai import (
 )
 from sglang.srt.entrypoints.openai.kimi_token_provenance import (
     MISSING_LOGPROB,
+    KimiStandardLogprobs,
     KimiTokenProvenance,
     align_token_logprobs,
+    place_event_values,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
@@ -177,13 +179,6 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
 
-def _join_choice_logprobs(first: dict | None, second: dict | None) -> dict | None:
-    """Concatenate two streamed ``choices[].logprobs`` objects, in token order."""
-    if first is None:
-        return second
-    if second is None:
-        return first
-    return {"content": [*first["content"], *second["content"]]}
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 _KIMI_K3_MAX_VIDEO_INPUTS = 2
@@ -1028,16 +1023,69 @@ class OpenAIServingChat(OpenAIServingBase):
             and getattr(request.stream_options, "include_internal_content", False)
         )
 
+    def _k3_logprobs_on(self, request: ChatCompletionRequest) -> bool:
+        """Whether every K3 content and end frame carries a choices[].logprobs
+        object, which is an empty list once the step's entries went out."""
+        return self.chat_encoding_spec == "kimi_k3" and bool(request.logprobs)
+
+    @staticmethod
+    def _frame_logprobs(pending: dict | None, *, object_required: bool) -> dict | None:
+        """choices[].logprobs for a frame with content: the pending entries, or
+        ``{"content": []}`` when ``object_required``; None omits the key."""
+        if pending is None and object_required:
+            return {"content": []}
+        return pending
+
     @staticmethod
     def _end_frame_logprobs(
-        held_logprobs: dict[int, dict] | None, index: int
+        held_logprobs: dict[int, KimiStandardLogprobs] | None, index: int
     ) -> dict | None:
-        """choices[].logprobs for a K3 end frame: the logprobs no earlier frame
+        """choices[].logprobs for a K3 end frame: the entries no earlier frame
         carried (e.g. a stop token whose text was stripped), else an empty
         list. None when logprobs were not requested (or not K3)."""
         if held_logprobs is None:
             return None
-        return held_logprobs.pop(index, None) or {"content": []}
+        standard = held_logprobs.get(index)
+        return {"content": standard.drain() if standard is not None else []}
+
+    @staticmethod
+    def _k3_frame(
+        token_provenance: KimiTokenProvenance | None,
+        standard: KimiStandardLogprobs | None,
+        internal: bool,
+        source: str,
+        **take_kwargs,
+    ) -> tuple[list[dict[str, Any]] | None, dict | None]:
+        """``(internal_content, choices[].logprobs)`` of a K3 frame built from
+        the parser output ``source``.
+
+        The tokens behind ``source`` (token provenance) decide which standard
+        entries the frame carries: every entry not sent yet up to the last of
+        those positions. Without include_internal_content, a source that cannot
+        be mapped to its tokens (e.g. U+FFFD from an incomplete UTF-8 token)
+        switches the choice to releasing entries in arrival order, once, with
+        a warning; with it, the error propagates as before.
+        """
+        internal_content = None
+        positions = None
+        if token_provenance is not None and (
+            internal or standard is None or not standard.degraded
+        ):
+            try:
+                internal_content = token_provenance.take(source, **take_kwargs)
+                positions = token_provenance.last_positions
+            except ValueError as e:
+                if internal or standard is None:
+                    raise
+                standard.degrade(str(e))
+        elif token_provenance is None and standard is not None:
+            standard.degrade("no K3 token provenance for this choice")
+        logprobs = None
+        if standard is not None:
+            logprobs = {
+                "content": standard.claim(None if standard.degraded else positions)
+            }
+        return (internal_content if internal else None), logprobs
 
     def _continuous_usage_cached_details(
         self, content: dict[str, Any]
@@ -1217,14 +1265,16 @@ class OpenAIServingChat(OpenAIServingBase):
         internal_token_ids: list[int] | None = None,
         internal_token_logprobs: list[float] | None = None,
         token_provenance: KimiTokenProvenance | None = None,
-        held_logprobs: dict[int, dict] | None = None,
+        held_logprobs: dict[int, KimiStandardLogprobs] | None = None,
+        internal_token_start: int | None = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content.
 
         ``held_logprobs`` (K3 with logprobs=true) holds per choice the
-        choices[].logprobs no frame carried yet. They ride on the next frame
-        with content instead of a logprobs-only frame; whatever is left at the
-        end goes on the end frame.
+        choices[].logprobs entries no frame carried yet. Each frame with
+        content carries the entries up to its last generated token (see
+        _k3_frame), never a logprobs-only frame; whatever is left at the end
+        goes on the end frame.
         """
         encoding_output = self._encoding_output()
         if encoding_output is not None:
@@ -1261,11 +1311,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
         # nor duplicated across chunks; flush any leftover at the end.
+        k3_logprobs = self._k3_logprobs_on(request)
         remaining_logprobs = choice_logprobs
-        if held_logprobs is not None:
-            remaining_logprobs = _join_choice_logprobs(
-                held_logprobs.pop(index, None), choice_logprobs
-            )
+        # K3: frames take their internal_content and standard entries from the
+        # token provenance; choice_logprobs is None (entries are in standard).
+        standard = held_logprobs.get(index) if held_logprobs is not None else None
+        k3_frames = token_provenance is not None or standard is not None
+        internal_on = self._internal_content_requested(request)
 
         event_internal = (
             [
@@ -1276,6 +1328,18 @@ class OpenAIServingChat(OpenAIServingBase):
                         if internal_token_logprobs is not None
                         and len(internal_token_logprobs) == len(internal_token_ids)
                         else [MISSING_LOGPROB] * len(internal_token_ids)
+                    ),
+                    **(
+                        {
+                            "token_positions": list(
+                                range(
+                                    internal_token_start,
+                                    internal_token_start + len(internal_token_ids),
+                                )
+                            )
+                        }
+                        if internal_token_start is not None
+                        else {}
                     ),
                 }
             ]
@@ -1309,19 +1373,29 @@ class OpenAIServingChat(OpenAIServingBase):
                         cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
+                if k3_frames:
+                    frame_internal, frame_logprobs = self._k3_frame(
+                        token_provenance,
+                        standard,
+                        internal_on,
+                        reasoning_text,
+                        text=True,
+                        reasoning=True,
+                    )
+                else:
+                    frame_internal = event_internal
+                    frame_logprobs = self._frame_logprobs(
+                        remaining_logprobs, object_required=k3_logprobs
+                    )
                 yield build_sse_content(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
-                    logprobs=remaining_logprobs,
+                    logprobs=frame_logprobs,
                     usage=usage,
-                    internal_content=(
-                        token_provenance.take(reasoning_text, text=True, reasoning=True)
-                        if token_provenance
-                        else event_internal
-                    ),
+                    internal_content=frame_internal,
                 )
                 remaining_logprobs = None
 
@@ -1373,6 +1447,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 token_provenance=token_provenance,
                 replay_chars=replay_chars,
                 logprobs=remaining_logprobs,
+                logprobs_object_required=k3_logprobs,
+                standard_logprobs=standard,
+                internal_requested=internal_on,
             ):
                 if chunk:
                     # The first frame it yields carries the logprobs.
@@ -1389,10 +1466,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     index,
                     created=created,
                     internal_content=event_internal,
+                    logprobs=(
+                        self._frame_logprobs(remaining_logprobs, object_required=True)
+                        if k3_logprobs
+                        else None
+                    ),
                 )
                 if remaining_chunk:
-                    if token_provenance:
+                    if token_provenance and internal_on:
                         raise ValueError("K3 tool flush has no token provenance")
+                    if k3_logprobs:
+                        remaining_logprobs = None
                     yield remaining_chunk
 
         else:
@@ -1408,21 +1492,29 @@ class OpenAIServingChat(OpenAIServingBase):
                         cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
+                if k3_frames:
+                    frame_internal, frame_logprobs = self._k3_frame(
+                        token_provenance,
+                        standard,
+                        internal_on,
+                        delta,
+                        text=True,
+                        replay_chars=replay_chars,
+                    )
+                else:
+                    frame_internal = event_internal
+                    frame_logprobs = self._frame_logprobs(
+                        remaining_logprobs, object_required=k3_logprobs
+                    )
                 yield build_sse_content(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=remaining_logprobs,
+                    logprobs=frame_logprobs,
                     usage=usage,
-                    internal_content=(
-                        token_provenance.take(
-                            delta, text=True, replay_chars=replay_chars
-                        )
-                        if token_provenance
-                        else event_internal
-                    ),
+                    internal_content=frame_internal,
                 )
                 remaining_logprobs = None
 
@@ -1432,9 +1524,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # to attach to either way, and a standalone empty-delta logprobs chunk
         # is not a shape clients expect.
         if remaining_logprobs is not None and held_logprobs is not None:
-            # K3: no logprobs-only frame. The next frame with content, or else
-            # the end frame, carries them.
-            held_logprobs[index] = remaining_logprobs
+            # K3: choice_logprobs is always None (entries go to standard).
+            raise ValueError("K3 logprobs bypassed their per-choice allocator")
         elif remaining_logprobs is not None and (
             self.reasoning_parser or self.tool_call_parser
         ):
@@ -3085,13 +3176,26 @@ class OpenAIServingChat(OpenAIServingBase):
         # tail by completion_tokens count) and, since the request then always
         # returns logprobs, output_token_logprobs.
         internal_content_on = self._internal_content_requested(request)
+        # Internal opt-in: internal_content[] entries also carry the generated
+        # position of each token id (StreamOptions validates the dependency).
+        internal_positions_on = internal_content_on and bool(
+            getattr(request.stream_options, "include_internal_token_positions", False)
+        )
         internal_prev_completion: Dict[int, int] = {}
-        token_provenances: Dict[int, KimiTokenProvenance] = {}
-        # K3 with logprobs=true: choices[].logprobs no frame carried yet, per
-        # choice. They go on the next frame with content or on the end frame,
-        # which always carries a logprobs object -- never a logprobs-only frame.
-        held_logprobs: Optional[Dict[int, dict]] = (
-            {} if self.chat_encoding_spec == "kimi_k3" and request.logprobs else None
+        # Non-incremental mode: engine logprob entries already placed, per choice.
+        internal_prev_entries: Dict[int, int] = {}
+        # K3 tracks generated tokens per choice (token provenance) for
+        # internal_content and for attributing choices[].logprobs to frames.
+        k3_track = self.chat_encoding_spec == "kimi_k3" and (
+            internal_content_on or bool(request.logprobs)
+        )
+        token_provenances: Dict[int, KimiTokenProvenance | None] = {}
+        # K3 with logprobs=true: choices[].logprobs entries no frame carried
+        # yet, per choice. Each frame with content carries the entries up to
+        # its last generated token, the end frame the rest -- never a
+        # logprobs-only frame.
+        held_logprobs: Optional[Dict[int, KimiStandardLogprobs]] = (
+            {} if self._k3_logprobs_on(request) else None
         )
 
         # Usage tracking
@@ -3188,8 +3292,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         if get_serving().incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
-                                # The abort chunk re-sends the last token plus any coalesced deltas;
-                                # keep only what brings the total up to completion_tokens.
+                                # The abort chunk carries only unsent ids; still keep
+                                # no more than brings the total up to completion_tokens.
                                 keep = completion_tokens[index] - len(accumulated)
                                 chunk_output_ids = chunk_output_ids[: max(keep, 0)]
                             accumulated.extend(chunk_output_ids)
@@ -3210,6 +3314,29 @@ class OpenAIServingChat(OpenAIServingBase):
                             content, n_prev_token, total_output_logprobs
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
+                    if held_logprobs is not None:
+                        # K3: entries are placed by output position and
+                        # released per frame, so they survive any break below.
+                        standard = held_logprobs.get(index)
+                        if standard is None:
+                            standard = held_logprobs[index] = KimiStandardLogprobs(
+                                content["meta_info"].get("id", ""), index
+                            )
+                        if choice_logprobs is not None:
+                            standard.add(
+                                place_event_values(
+                                    choice_logprobs["content"],
+                                    (
+                                        content["meta_info"].get(
+                                            "output_token_logprobs_segments"
+                                        )
+                                        if get_serving().incremental_streaming_output
+                                        else None
+                                    ),
+                                    n_prev_token,
+                                )
+                            )
+                        choice_logprobs = None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -3308,21 +3435,31 @@ class OpenAIServingChat(OpenAIServingBase):
                         content = {**content, "text": text}
 
                 # Delta token ids for this event (incremental mode
-                # events already carry the delta).
+                # events already carry the delta), and the engine logprob
+                # entries this event delivered, by output position.
                 internal_token_ids = None
                 internal_token_logprobs = None
-                if internal_content_on:
+                internal_token_start = None
+                token_provenance = None
+                if internal_content_on or k3_track:
+                    meta = content["meta_info"]
                     all_ids = content.get("output_ids") or []
-                    output_logprobs = (
-                        content["meta_info"].get("output_token_logprobs") or []
-                    )
+                    output_logprobs = meta.get("output_token_logprobs") or []
                     if get_serving().incremental_streaming_output:
-                        internal_token_ids = list(all_ids)
-                        # Sliced to this event like output_ids, and coalesced
-                        # deltas concatenate in step. The abort event re-sends
-                        # the last id against the whole list, so align from
-                        # the end.
-                        logprob_entries = output_logprobs
+                        # The producer states each event's positions
+                        # (output_ids_start, output_token_logprobs_segments):
+                        # entries can lag their ids and coalesced sub-events
+                        # keep their own offsets.
+                        first = meta.get(
+                            "output_ids_start", internal_prev_completion.get(index, 0)
+                        )
+                        event_ids = list(all_ids)
+                        internal_prev_completion[index] = first + len(event_ids)
+                        placed = place_event_values(
+                            output_logprobs,
+                            meta.get("output_token_logprobs_segments"),
+                            first,
+                        )
                     else:
                         # Non-incremental events carry a REFERENCE to the
                         # cumulative output_ids, and backlog coalescing
@@ -3334,39 +3471,61 @@ class OpenAIServingChat(OpenAIServingBase):
                         # tokens (it grows while the role frame is yielded),
                         # and a duplicated concatenation starts with the whole
                         # cumulative list, so positions below cur are stable.
-                        cur = content["meta_info"].get("completion_tokens", 0) or 0
-                        prev = internal_prev_completion.get(index, 0)
-                        internal_token_ids = (
-                            list(all_ids[prev:cur]) if cur > prev else []
-                        )
-                        internal_prev_completion[index] = cur
+                        cur = meta.get("completion_tokens", 0) or 0
+                        first = internal_prev_completion.get(index, 0)
+                        event_ids = list(all_ids[first:cur]) if cur > first else []
+                        internal_prev_completion[index] = max(cur, first)
                         # The logprob list is the same kind of reference; its
                         # first output_token_logprobs_length entries are output
-                        # positions 0.., so the id at position p pairs with
-                        # entry p.
+                        # positions 0.., placed once each as they arrive.
                         logprobs_len = min(
-                            content["meta_info"].get("output_token_logprobs_length")
-                            or 0,
+                            meta.get("output_token_logprobs_length") or 0,
                             len(output_logprobs),
                         )
-                        logprob_entries = [
-                            output_logprobs[p] if 0 <= p < logprobs_len else None
-                            for p in range(prev, prev + len(internal_token_ids))
+                        prev_entries = internal_prev_entries.get(index, 0)
+                        placed = [
+                            (p, output_logprobs[p])
+                            for p in range(prev_entries, logprobs_len)
                         ]
-                    internal_token_logprobs = align_token_logprobs(
-                        internal_token_ids, logprob_entries
-                    )
-
-                token_provenance = None
-                if internal_content_on and self.chat_encoding_spec == "kimi_k3":
-                    if index not in token_provenances:
-                        token_provenances[index] = KimiTokenProvenance(
-                            self.tokenizer_manager.tokenizer
+                        internal_prev_entries[index] = max(prev_entries, logprobs_len)
+                    if internal_content_on:
+                        by_position = dict(placed)
+                        internal_token_ids = event_ids
+                        if internal_positions_on:
+                            internal_token_start = first
+                        internal_token_logprobs = align_token_logprobs(
+                            event_ids,
+                            [by_position.get(first + i) for i in range(len(event_ids))],
                         )
-                    token_provenance = token_provenances[index]
-                    token_provenance.append(
-                        internal_token_ids or [], internal_token_logprobs
-                    )
+                    if k3_track:
+                        standard = (
+                            held_logprobs.get(index)
+                            if held_logprobs is not None
+                            else None
+                        )
+                        if standard is not None:
+                            standard.note_ids(first + len(event_ids))
+                        if index not in token_provenances:
+                            try:
+                                token_provenances[index] = KimiTokenProvenance(
+                                    self.tokenizer_manager.tokenizer,
+                                    with_positions=internal_positions_on,
+                                )
+                            except ValueError as e:
+                                if internal_content_on or standard is None:
+                                    raise
+                                standard.degrade(str(e))
+                                token_provenances[index] = None
+                        token_provenance = token_provenances[index]
+                        if token_provenance is not None:
+                            try:
+                                token_provenance.append(event_ids)
+                                token_provenance.add_entries(placed)
+                            except ValueError as e:
+                                if internal_content_on or standard is None:
+                                    raise
+                                standard.degrade(str(e))
+                                token_provenances[index] = token_provenance = None
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
                     content=content,
@@ -3387,6 +3546,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     internal_token_logprobs=internal_token_logprobs,
                     token_provenance=token_provenance,
                     held_logprobs=held_logprobs,
+                    internal_token_start=internal_token_start,
                 ):
                     yield chunk
 
@@ -4285,10 +4445,35 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs = output_top_logprobs[
                 n_prev_token:total_output_logprobs
             ]
+        else:
+            # Incremental events carry only unsent entries; top rows are placed
+            # by their own segments onto the selected entries' positions.
+            output_top_logprobs = self._align_incremental_top_logprobs(
+                content["meta_info"], n_prev_token, len(output_token_logprobs)
+            )
         token_logprobs = self._build_token_logprobs_from_raw(
             output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
+
+    @staticmethod
+    def _align_incremental_top_logprobs(
+        meta_info: dict[str, Any], first_position: int, count: int
+    ) -> list[Any]:
+        """Top-logprob rows for the ``count`` selected entries an incremental
+        event carries from ``first_position`` (the request's selected entries
+        arrive in order). Each cumulative list has its own sent offset, so
+        rows are matched by output position; a row not delivered yet is None.
+        A row that arrives after its selected entry was sent is not resent.
+        """
+        rows = meta_info.get("output_top_logprobs") or []
+        if not rows:
+            return []
+        segments = meta_info.get("output_top_logprobs_segments")
+        if segments is None:
+            return list(rows[:count])
+        by_position = dict(place_event_values(rows, segments, first_position))
+        return [by_position.get(first_position + i) for i in range(count)]
 
     def _process_reasoning_stream(
         self,
@@ -4617,6 +4802,9 @@ class OpenAIServingChat(OpenAIServingBase):
         token_provenance: KimiTokenProvenance | None = None,
         replay_chars: int = 0,
         logprobs: dict | None = None,
+        logprobs_object_required: bool = False,
+        standard_logprobs: KimiStandardLogprobs | None = None,
+        internal_requested: bool = False,
     ):
         """Process tool calls in streaming response.
 
@@ -4625,7 +4813,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         ``logprobs`` (this step's choices[].logprobs) rides on the first frame
         yielded, normal text or tool call; with no frame they stay with the
-        caller.
+        caller. With ``logprobs_object_required`` every later frame, including
+        a tool call's argument continuation, carries ``{"content": []}``.
+
+        K3 (``token_provenance`` or ``standard_logprobs`` set): each fragment's
+        frame carries the standard entries up to its last token (_k3_frame).
+        A slot-open frame and its argument continuation share one fragment;
+        the entries ride on the slot-open frame, the continuation carries
+        ``{"content": []}``. internal_content only with ``internal_requested``.
 
         K3 token provenance follows each parser fragment's original XTML source,
         including characters transformed into JSON syntax.
@@ -4686,26 +4881,46 @@ class OpenAIServingChat(OpenAIServingBase):
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
-        frame_logprobs = (
-            ChoiceLogprobs.model_validate(logprobs) if logprobs is not None else None
-        )
+        pending_logprobs = logprobs
+
+        def take_frame_logprobs() -> ChoiceLogprobs | None:
+            nonlocal pending_logprobs
+            frame_logprobs = self._frame_logprobs(
+                pending_logprobs, object_required=logprobs_object_required
+            )
+            pending_logprobs = None
+            if frame_logprobs is None:
+                return None
+            return ChoiceLogprobs.model_validate(frame_logprobs)
+
+        k3_frames = token_provenance is not None or standard_logprobs is not None
 
         # Yield normal text
         if normal_text:
+            if k3_frames:
+                text_internal, text_logprobs = self._k3_frame(
+                    token_provenance,
+                    standard_logprobs,
+                    internal_requested,
+                    normal_text,
+                    text=True,
+                    replay_chars=replay_chars,
+                )
+                text_logprobs = (
+                    ChoiceLogprobs.model_validate(text_logprobs)
+                    if text_logprobs is not None
+                    else None
+                )
+            else:
+                text_internal = internal_content
+                text_logprobs = take_frame_logprobs()
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
-                logprobs=frame_logprobs,
-                internal_content=(
-                    token_provenance.take(
-                        normal_text, text=True, replay_chars=replay_chars
-                    )
-                    if token_provenance
-                    else internal_content
-                ),
+                logprobs=text_logprobs,
+                internal_content=text_internal,
                 finish_reason=None,
             )
-            frame_logprobs = None
             chunk = ChatCompletionStreamResponse(
                 id=self._wire_id(request, content["meta_info"]["id"]),
                 created=created,
@@ -4735,10 +4950,18 @@ class OpenAIServingChat(OpenAIServingBase):
             has_tool_calls[index] = True
 
             call_internal = internal_content
-            if token_provenance:
+            call_logprobs = None
+            if k3_frames:
                 if call_item.source_text is None:
-                    raise ValueError("K3 tool delta has no original token source")
-                call_internal = token_provenance.take(call_item.source_text)
+                    if internal_requested or standard_logprobs is None:
+                        raise ValueError("K3 tool delta has no original token source")
+                    standard_logprobs.degrade("K3 tool delta has no token source")
+                call_internal, call_logprobs = self._k3_frame(
+                    token_provenance,
+                    standard_logprobs,
+                    internal_requested,
+                    call_item.source_text or "",
+                )
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -4781,7 +5004,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 )
 
-            for tool_call in tool_call_deltas:
+            for delta_index, tool_call in enumerate(tool_call_deltas):
+                if not k3_frames:
+                    frame_logprobs = take_frame_logprobs()
+                elif standard_logprobs is None:
+                    frame_logprobs = None
+                else:
+                    frame_logprobs = ChoiceLogprobs.model_validate(
+                        call_logprobs if delta_index == 0 else {"content": []}
+                    )
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=index,
                     delta=DeltaMessage(tool_calls=[tool_call]),
@@ -4789,7 +5020,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     internal_content=call_internal,
                     finish_reason=None,
                 )
-                frame_logprobs = None
                 chunk = ChatCompletionStreamResponse(
                     id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
@@ -4820,6 +5050,7 @@ class OpenAIServingChat(OpenAIServingBase):
         index: int,
         created: int,
         internal_content: list[dict[str, Any]] | None = None,
+        logprobs: dict | None = None,
     ) -> str | None:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -4878,6 +5109,11 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
+                logprobs=(
+                    ChoiceLogprobs.model_validate(logprobs)
+                    if logprobs is not None
+                    else None
+                ),
                 internal_content=internal_content,
                 finish_reason=None,  # Don't send finish_reason with this chunk
             )

@@ -48,6 +48,30 @@ logger = logging.getLogger(__name__)
 # logged as their length plus a hash instead of verbatim.
 _Abbreviation = Tuple[FrozenSet[str], int]
 
+# Logprob arrays in meta_info, by exact key, and the count name their log
+# summary uses. Scalars such as shape, null_prefix and dtype are not listed and
+# stay verbatim.
+_LOGPROB_LOG_FIELDS: Dict[str, str] = {
+    "input_token_logprobs": "entries",
+    "output_token_logprobs": "entries",
+    "input_top_logprobs": "rows",
+    "output_top_logprobs": "rows",
+    "input_token_ids_logprobs": "entries",
+    "output_token_ids_logprobs": "entries",
+    "output_token_sampling_logprobs": "entries",
+    "output_token_sampling_mask": "entries",
+    "input_top_logprobs_val_flat": "elements",
+    "input_top_logprobs_idx_flat": "elements",
+    "output_top_logprobs_val_flat": "elements",
+    "output_top_logprobs_idx_flat": "elements",
+    "input_top_logprobs_val_flat_b64": "encoded_chars",
+    "input_top_logprobs_idx_flat_b64": "encoded_chars",
+    "output_top_logprobs_val_flat_b64": "encoded_chars",
+    "output_top_logprobs_idx_flat_b64": "encoded_chars",
+}
+
+_LOG_REQUESTS_LOGPROBS_MODES = ("summary", "full")
+
 _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
     h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
@@ -69,11 +93,13 @@ class RequestLogger:
         log_requests_level: int,
         log_requests_format: str,
         log_requests_target: Optional[List[str]],
+        log_requests_logprobs: str = "summary",
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
+        self.log_requests_logprobs = _validated_logprobs_mode(log_requests_logprobs)
 
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
@@ -94,6 +120,7 @@ class RequestLogger:
         log_requests_level: Optional[int] = None,
         log_requests_format: Optional[str] = None,
         log_requests_target: Optional[List[str]] = None,
+        log_requests_logprobs: Optional[str] = None,
     ) -> None:
         if log_requests is not None:
             self.log_requests = log_requests
@@ -103,6 +130,10 @@ class RequestLogger:
             self.log_requests_format = log_requests_format
         if log_requests_target is not None:
             self.log_requests_target = log_requests_target
+        if log_requests_logprobs is not None:
+            self.log_requests_logprobs = _validated_logprobs_mode(
+                log_requests_logprobs
+            )
 
         self.metadata = self._compute_metadata()
         self.abbreviation = self._compute_abbreviation()
@@ -203,6 +234,12 @@ class RequestLogger:
         max_length, skip_names, out_skip_names = self.metadata
         headers = _extract_whitelisted_headers(request)
         obj_to_log = _redact_client_watermark(obj)
+        # A log-only view: the API response and metrics exporter share `out`.
+        out_to_log = (
+            summarize_logprobs_for_logging(out)
+            if self.log_requests_logprobs == "summary"
+            else out
+        )
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
@@ -213,7 +250,7 @@ class RequestLogger:
             if headers:
                 log_data["headers"] = headers
             log_data["out"] = _transform_data_for_logging(
-                out, max_length, out_skip_names, self.abbreviation
+                out_to_log, max_length, out_skip_names, self.abbreviation
             )
             log_json(self.targets, "request.finished", log_data)
         else:
@@ -223,7 +260,7 @@ class RequestLogger:
                 skip_names=skip_names,
                 abbreviation=self.abbreviation,
             )
-            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names, abbreviation=self.abbreviation)}"
+            out_str = f", out={_dataclass_to_string_truncated(out_to_log, max_length, skip_names=out_skip_names, abbreviation=self.abbreviation)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
@@ -281,6 +318,36 @@ class RequestLogger:
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
+
+
+def _validated_logprobs_mode(mode: str) -> str:
+    if mode not in _LOG_REQUESTS_LOGPROBS_MODES:
+        raise ValueError(f"Invalid --log-requests-logprobs: {mode=}")
+    return mode
+
+
+def summarize_logprobs_for_logging(out: Any) -> Any:
+    """Return a log view of ``out`` whose logprob arrays are replaced by counts.
+
+    Only ``out`` and its ``meta_info`` dict are copied; the original objects and
+    their nested arrays are left untouched. Counts come from ``len`` so no array
+    is walked. None values stay None.
+    """
+    if not isinstance(out, dict):
+        return out
+    meta = out.get("meta_info")
+    if not isinstance(meta, dict):
+        return out
+    summarized = None
+    for key, count_name in _LOGPROB_LOG_FIELDS.items():
+        value = meta.get(key)
+        if isinstance(value, (list, tuple, str)):
+            if summarized is None:
+                summarized = dict(meta)
+            summarized[key] = {count_name: len(value)}
+    if summarized is None:
+        return out
+    return {**out, "meta_info": summarized}
 
 
 def _watermark_redaction_enabled() -> bool:
