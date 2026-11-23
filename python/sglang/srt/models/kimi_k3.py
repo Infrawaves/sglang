@@ -3742,6 +3742,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        from sglang.srt.speculative.dflash_offload import wants_teacher
+
+        self.logits_processor.offload_verify_hidden = wants_teacher()
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):

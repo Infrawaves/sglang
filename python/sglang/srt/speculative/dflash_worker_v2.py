@@ -79,6 +79,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import dflash_offload
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
@@ -3477,6 +3478,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        capture = dflash_offload.runtime
+        if capture is not None:
+            # This forward may overwrite a previous step's verify inputs or KV.
+            capture.pool.fence_reuse()
         if not self._hosts_draft:
             # An earlier pipeline stage of a PD prefill: the target forward,
             # whose captured aux hidden states ride the PP proxy onward.
@@ -4081,6 +4086,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         logits_output = target_out.logits_output
+        offload_commits = None
+        if capture is not None and capture.role == "decode":
+            offload_commits = capture.snapshot_verify(
+                batch.reqs,
+                positions,
+                verify_input_ids,
+                verify_out_cache_loc,
+                logits_output.last_hidden_states,
+                int(self.block_size),
+            )
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         accepted = None
@@ -4265,6 +4280,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
+            offload_commits=offload_commits,
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,

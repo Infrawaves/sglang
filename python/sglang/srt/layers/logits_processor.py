@@ -587,6 +587,7 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_exec().features.enable_mis
         features = get_exec().features
         self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
+        self.offload_verify_hidden = False
         # Capture-only mode: how many layers the model must capture, when
         # --return-aux-hidden-state-layer-ids names them.
         layer_ids = features.return_aux_hidden_state_layer_ids
@@ -1123,6 +1124,9 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates],
         logits_metadata: LogitsMetadata,
     ) -> Optional[torch.Tensor]:
+        if self.offload_verify_hidden and logits_metadata.forward_mode.is_target_verify():
+            # Final target norm output, also used as the input to the LM head.
+            return hidden_states
         if (
             self.keep_last_hidden_states
             and aux_hidden_states is not None

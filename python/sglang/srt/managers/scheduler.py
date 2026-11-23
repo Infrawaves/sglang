@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
+from sglang.srt.speculative import dflash_offload
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -756,6 +757,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        dflash_offload.initialize(self)
 
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
@@ -2276,6 +2278,7 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
+        dflash_offload.close()
         self.request_receiver.close()
         if self.uocr_runtime is not None:
             self.uocr_runtime.close()

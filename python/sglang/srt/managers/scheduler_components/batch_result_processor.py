@@ -1041,6 +1041,9 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.offload_commits:
+            for commit in result.offload_commits:
+                commit.before()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1187,6 +1190,9 @@ class SchedulerBatchResultProcessor:
                 auxiliary_output_starts,
             )
 
+        if result.offload_commits:
+            for commit in result.offload_commits:
+                commit.after()
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
