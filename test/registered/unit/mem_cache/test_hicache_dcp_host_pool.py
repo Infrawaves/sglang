@@ -368,12 +368,46 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                     )
                 )
 
-    def test_runtime_attach_rejects_dcp_buffer_only(self):
-        for dcp_size in (2, 8):
+    def test_buffer_only_prefetch_gate_counts_logical_usage(self):
+        """Under DCP the buffer-mode load gate must compare logical usage with a
+        logical limit; mixing physical rows makes it fire at the first page."""
+        for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):
                 pool = _make_host_pool(0, dcp_size=dcp_size)
-                with self.assertRaisesRegex(NotImplementedError, "buffer_only"):
-                    self._attach_storage(pool, mode="buffer_only")
+                cc = self._attach_storage(pool, mode="buffer_only")
+                cc.host_write_staged_tokens_fn = None
+                page = pool.logical_page_size
+                limit_pages = -(-cc.prefetch_capacity_limit // page)
+                held = pool.alloc((limit_pages - 1) * page)
+                self.assertIsNotNone(held)
+                self.assertFalse(cc.prefetch_rate_limited())
+                self.assertIsNotNone(pool.alloc(page))
+                self.assertTrue(cc.prefetch_rate_limited())
+
+    def test_buffer_only_backup_oversize_uses_logical_capacity(self):
+        """A write bounce up to the logical pool must stage under DCP; sizing it
+        against physical rows dropped every backup wider than one rank's share."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                group = SimpleNamespace(
+                    anchor_entry=SimpleNamespace(host_pool=pool),
+                    entry_map={},
+                    size=pool.size,
+                    logical_size=pool.logical_size,
+                )
+                pipeline = BufferModePipeline.__new__(BufferModePipeline)
+                pipeline._cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(mem_pool_host=group)
+                )
+                self.assertFalse(pipeline._backup_oversize(pool.logical_size, []))
+                self.assertTrue(
+                    pipeline._backup_oversize(
+                        pool.logical_size + pool.logical_page_size, []
+                    )
+                )
 
     def test_logical_and_physical_sizing(self):
         pool = _make_host_pool(dcp_rank=3)

@@ -90,7 +90,7 @@ prefetch_logger = logging.getLogger("sglang.srt.mem_cache.unified_radix_cache")
 def _minimum_full_transfer_tokens(
     host_pool: HostKVCache, prefetch_threshold: int
 ) -> int:
-    page_size = host_pool.page_size
+    page_size = host_pool.logical_page_size
     return max(page_size, -(-prefetch_threshold // page_size) * page_size)
 
 
@@ -400,7 +400,11 @@ class BufferModePipeline:
         if transfer.keys is None:
             return 0
         entry = self._cache.cache_controller.mem_pool_host.entry_map.get(transfer.name)
-        return 0 if entry is None else len(transfer.keys) * entry.host_pool.page_size
+        return (
+            0
+            if entry is None
+            else len(transfer.keys) * entry.host_pool.logical_page_size
+        )
 
     def host_allocation_units(
         self,
@@ -552,7 +556,7 @@ class BufferModePipeline:
         entry = self._cache.cache_controller.mem_pool_host.entry_map.get(transfer.name)
         if entry is None:
             return None
-        num_pages = len(transfer.device_indices) // entry.host_pool.page_size
+        num_pages = len(transfer.device_indices) // entry.host_pool.logical_page_size
         if num_pages == 0 or num_pages > len(hash_values):
             return None
         return list(hash_values[-num_pages:])
@@ -806,7 +810,7 @@ class BufferModePipeline:
         cc = self._cache.cache_controller
         shared_requests = self._shared_host_requests(kv_tokens, aux_xfers)
         if shared_requests is not None:
-            pool_tokens = cc.mem_pool_host.size
+            pool_tokens = cc.mem_pool_host.logical_size
             max_write_units = pool_tokens - pool_tokens // 10
             if self._host_request_units(kv_tokens, aux_xfers) > max_write_units:
                 return True
@@ -817,14 +821,14 @@ class BufferModePipeline:
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is None:
                 continue
-            need = len(t.keys) * entry.host_pool.page_size
+            need = len(t.keys) * entry.host_pool.logical_page_size
             if entry.host_pool is anchor_pool:
                 anchor_need += need
-            elif need > entry.host_pool.size - self._aux_loads_margin(
+            elif need > entry.host_pool.logical_size - self._aux_loads_margin(
                 t.name, entry.host_pool
             ):
                 return True
-        return anchor_need > cc.mem_pool_host.size
+        return anchor_need > cc.mem_pool_host.logical_size
 
     def _aux_loads_margin(self, pool_name, host_pool) -> int:
         """Aux-pool tokens reserved for loads: at least one trailing window
@@ -839,7 +843,8 @@ class BufferModePipeline:
             and self._auxiliary_swa_component is not None
         ):
             window_pages = self._auxiliary_swa_component.full_window_pages
-        return max(window_pages * host_pool.page_size, host_pool.size // 10)
+        # SWA windows never coexist with DCP; the 10% share must be logical.
+        return max(window_pages * host_pool.page_size, host_pool.logical_size // 10)
 
     def _validate_backup_intent(
         self, intent: _UnifiedBackupIntent
@@ -954,7 +959,7 @@ class BufferModePipeline:
         # Loads have priority (writes are deferrable): the write window is
         # the pool minus prefetch occupancy minus a 10% margin, floored at
         # the configured fraction.
-        pool_tokens = cc.mem_pool_host.size
+        pool_tokens = cc.mem_pool_host.logical_size
         live_cap = max(
             int(HICACHE_WRITE_STAGING_POOL_FRACTION * pool_tokens),
             pool_tokens - cc.prefetch_tokens_occupied - pool_tokens // 10,
@@ -1187,7 +1192,7 @@ class BufferModePipeline:
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is None or entry.host_pool is anchor_pool:
                 continue
-            need = len(t.keys) * entry.host_pool.page_size
+            need = len(t.keys) * entry.host_pool.logical_page_size
             headroom = entry.host_pool.available_size() - self._aux_loads_margin(
                 t.name, entry.host_pool
             )

@@ -642,11 +642,6 @@ class HiCacheController:
                 "The unified key scheme supports only the file storage backend."
             )
         if get_parallel().attn_dcp_size > 1:
-            if self.host_memory_mode == "buffer_only":
-                # Buffer-mode write staging still budgets physical host rows.
-                raise NotImplementedError(
-                    "HiCache L3 with DCP does not support buffer_only host memory."
-                )
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
             if storage_backend not in ("file", "mooncake"):
@@ -709,8 +704,9 @@ class HiCacheController:
                 # The whole pool is transient staging; loads may fill it up
                 # to this fraction, and the tree's write flush gate yields
                 # to live fetch demand (the write fraction is a floor).
+                # Pool usage below is measured in logical tokens (DCP widens rows).
                 self.prefetch_capacity_limit = int(
-                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.logical_size
                 )
             else:
                 # Leave half the pool for write-back. Prefetch occupancy counts
@@ -1484,7 +1480,8 @@ class HiCacheController:
             # state mutates only at scheduler-thread lockstep points, so this
             # stays TP-deterministic. Write staging is the write budget's
             # usage; charging it here would park hits behind its storage drain.
-            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            # available_size() counts logical slots, so take usage against them.
+            used = self.mem_pool_host.logical_size - self.mem_pool_host.available_size()
             if self.host_write_staged_tokens_fn is not None:
                 used -= self.host_write_staged_tokens_fn()
             return max(0, used) >= self.prefetch_capacity_limit

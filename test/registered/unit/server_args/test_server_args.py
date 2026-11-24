@@ -3078,7 +3078,8 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
-    def test_dcp_storage_rejects_buffer_only(self):
+    def test_dcp_storage_accepts_buffer_only(self):
+        """buffer_only staging budgets logical tokens, so DCP L3 must launch."""
         for dcp_size in (2, 8):
             for backend in ("file", "mooncake"):
                 with self.subTest(dcp_size=dcp_size, backend=backend):
@@ -3089,12 +3090,9 @@ class TestHiCacheArgs(CustomTestCase):
                         dcp_size=dcp_size,
                         tp_size=dcp_size,
                     )
-                    with (
-                        patch(
-                            "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
-                            return_value=True,
-                        ),
-                        self.assertRaisesRegex(NotImplementedError, "buffer_only"),
+                    with patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=True,
                     ):
                         handle_hicache(args)
 

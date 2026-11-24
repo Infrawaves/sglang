@@ -401,13 +401,16 @@ class TestBufferModeSidecar(unittest.TestCase):
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(
                     page_size=page_size,
+                    logical_page_size=page_size,
                     size=8,
+                    logical_size=8,
                     available_size=lambda: 8,
                     free=MagicMock(),
                 )
             )
         }
         controller.mem_pool_host.size = 32
+        controller.mem_pool_host.logical_size = 32
         controller.mem_pool_host.anchor_entry.host_pool = SimpleNamespace()
         controller.prefetch_tokens_occupied = 0
         ack_ids = []
