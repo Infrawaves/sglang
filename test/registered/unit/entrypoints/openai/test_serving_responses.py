@@ -130,6 +130,26 @@ class InputMessageConstructionTestCase(CustomTestCase):
             ],
         )
 
+    def test_partial_on_an_input_message_does_not_reach_chat(self):
+        """Moonshot ignores `partial` on the Responses API, and this path budgets
+        and reports usage for a fresh assistant turn."""
+        serving = make_serving()
+        for content in ("1, 2,", [{"type": "output_text", "text": "1, 2,"}]):
+            with self.subTest(content=content):
+                request = ResponsesRequest(
+                    model="x",
+                    input=[
+                        {"role": "user", "content": "Count to ten."},
+                        {"role": "assistant", "content": content, "partial": True},
+                    ],
+                    store=False,
+                )
+
+                messages = serving._construct_input_messages(request)
+
+                self.assertEqual(messages[-1]["role"], "assistant")
+                self.assertNotIn("partial", messages[-1])
+
     def test_stored_tool_turn_matches_client_replay_without_old_instructions(self):
         publish(
             ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"

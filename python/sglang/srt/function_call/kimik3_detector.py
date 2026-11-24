@@ -118,6 +118,7 @@ class KimiK3Detector(BaseFormatDetector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
         response_channel_open: bool = False,
+        answer_prefilled: bool = False,
     ) -> StructuralTag:
         return get_kimik3_structural_tag(
             tools=tools or [],
@@ -125,6 +126,7 @@ class KimiK3Detector(BaseFormatDetector):
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
             response_channel_open=response_channel_open,
+            answer_prefilled=answer_prefilled,
         )
 
     def get_json_response_structural_tag(

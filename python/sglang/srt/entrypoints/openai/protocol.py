@@ -880,6 +880,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+    # Moonshot partial mode: continue this final assistant message. Honored by
+    # the Kimi K3 encoding only; a flag on any other message is ignored.
+    partial: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod

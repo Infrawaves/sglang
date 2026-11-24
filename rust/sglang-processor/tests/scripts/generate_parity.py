@@ -85,6 +85,7 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server.tool_call_parser = tool_call_parser
     server.reasoning_parser = None
     server._reasoning_detector = None
+    server._kimi_k3_marker_ids = {}
     server.is_gpt_oss = server.is_gemma4 = False
     server.is_minimax_m3 = config.get("model_type") == "minimax_m3_vl"
     server.chat_encoding_spec = chat_encoding.resolve_chat_encoding_spec(
@@ -96,6 +97,9 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
+    if server.chat_encoding_spec == "kimi_k3":
+        # Cache both channel-marker lookups before recording prompt segments.
+        server._kimi_k3_generation_prefix([])
     return server
 
 

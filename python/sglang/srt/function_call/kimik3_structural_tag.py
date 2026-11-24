@@ -785,6 +785,7 @@ def get_kimik3_structural_tag(
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
     response_channel_open: bool = False,
+    answer_prefilled: bool = False,
 ) -> StructuralTag:
     """Build the K3 tool-call constraint.
 
@@ -793,11 +794,16 @@ def get_kimik3_structural_tag(
     decides how a forced call reaches the tools section: from inside an open
     response channel the model must close it first, otherwise the tools section
     comes immediately.
+
+    ``answer_prefilled`` says that open channel already holds answer text the
+    request asked to continue, so the answer is not empty however it goes on.
     """
     if tool_choice == "none":
         # The K3 prompt still lists the tools, so forbid the tools section
-        # instead of letting raw call markup reach the content.
-        suffix = SequenceFormat(elements=[_NONEMPTY_RESPONSE, _OPTIONAL_MESSAGE_CLOSE])
+        # instead of letting raw call markup reach the content. A continued
+        # answer may resume with whitespace or end at once.
+        response = _RESPONSE if answer_prefilled else _NONEMPTY_RESPONSE
+        suffix = SequenceFormat(elements=[response, _OPTIONAL_MESSAGE_CLOSE])
         return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
 
     selected_tools, at_least_one = _select_tools(tools, tool_choice)

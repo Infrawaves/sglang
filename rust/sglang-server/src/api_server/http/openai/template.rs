@@ -23,12 +23,15 @@ pub(super) fn render_chat(
     request: &CreateChatCompletionRequest,
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
+    let k3_continuation = formatter
+        .continues_kimi_k3_message(&body)
+        .map_err(|message| TemplateError::Renderer { message })?;
     let args = TemplateArgs::new(&body, defaults);
     let ids = formatter
         .encode_request(body.clone(), defaults)
         .transpose()?;
     let (rendered, ids) = match formatter.render_request(body, defaults) {
-        Err(TemplateError::NeedsRenderFallback { .. }) => {
+        Err(TemplateError::NeedsRenderFallback { .. }) if !k3_continuation => {
             (formatter.render_template(request, &args), None)
         }
         rendered => (rendered, ids),
