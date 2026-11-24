@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 
 use dynamo_renderer::kimi_k3::KimiK3Formatter;
-use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, RenderedPrompt};
+use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, RenderedPrompt, RenderedSegment};
 use serde_json::{Map, Value, json};
 
-use super::pydantic_dump::{engine_message, pydantic_bool, tool_arguments};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, pydantic_bool, tool_arguments,
+};
 use super::schema_types::normalize_json_schema_types;
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
@@ -24,32 +26,48 @@ const TOKENIZER_ARGS: [&str; 8] = [
     "return_tensors",
 ];
 
-/// Render an SGLang chat request body. Returns the prompt, whose segments keep
-/// the special-token boundaries, and the `continue_final_message` prefix,
-/// which SGLang tokenizes separately.
+/// Whether a K3 chat request asks to continue the last assistant message.
+pub(crate) fn kimi_k3_continues_final_message(request: &Value) -> Result<bool, String> {
+    let continuing = continues_final_message(request)?;
+    let Some(last) = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+    else {
+        return Ok(false);
+    };
+    if !last["role"]
+        .as_str()
+        .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
+    {
+        return Ok(false);
+    }
+    let partial = last
+        .get("partial")
+        .filter(|value| !value.is_null())
+        .map(pydantic_bool)
+        .transpose()?;
+    Ok(continuing || partial == Some(true))
+}
+
+/// Render the whole prompt as XTML segments, including any assistant continuation.
 pub(crate) fn render(
     mut request: Value,
     defaults: &HashMap<String, Value>,
 ) -> Result<(RenderedPrompt, String), RenderError> {
-    let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
+    let continuing = kimi_k3_continues_final_message(&request)?;
+    let Some(Value::Array(mut messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
+    };
+    let partial = if continuing {
+        messages.pop().map(prepare_partial).transpose()?
+    } else {
+        None
     };
     let mut messages = messages
         .into_iter()
         .map(|message| prepare_message(engine_message(message)))
         .collect::<Result<Vec<_>, _>>()?;
     let request = &request;
-    // `_handle_last_assistant_message`, which K3 runs only to continue the turn.
-    let mut prefix = String::new();
-    if request
-        .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?
-        && let Some(last) = messages.last().filter(|m| m["role"] == "assistant")
-        && let Some(content) = last["content"].as_str()
-    {
-        prefix = content.to_owned();
-        messages.pop();
-    }
 
     // The template kwargs: the request's, with `reasoning_effort` moved to the
     // request effort, then what `reasoning` implies and the server's defaults.
@@ -58,7 +76,21 @@ pub(crate) fn render(
         .cloned()
         .unwrap_or_default();
     let kwargs_effort = kwargs.remove("reasoning_effort").filter(|e| !e.is_null());
-    if let Some(thinking) = requested_thinking(request) {
+    let thinking_config = if continuing {
+        &request["thinking"]
+    } else {
+        &Value::Null
+    };
+    let configured_effort = thinking_config
+        .get("effort")
+        .filter(|value| !value.is_null());
+    let requested_thinking = thinking_config["type"]
+        .as_str()
+        .map(|kind| kind != "disabled")
+        .or_else(|| configured_effort.map(|effort| effort != "none"))
+        .or_else(|| requested_thinking(request))
+        .or_else(|| (!thinking_config.is_null()).then_some(true));
+    if let Some(thinking) = requested_thinking {
         kwargs.entry("thinking").or_insert(thinking.into());
     }
     for (key, value) in defaults {
@@ -81,11 +113,25 @@ pub(crate) fn render(
     };
     let effort = kwargs_effort
         .as_ref()
+        .or(configured_effort)
         .or_else(|| requested_effort(request))
         .or_else(|| defaults.get("reasoning_effort").filter(|e| !e.is_null()));
     // The tokenizer's default is `max`.
     let thinking_effort = match kwargs.get("thinking_effort") {
         Some(thinking_effort) => thinking_effort.clone(),
+        None if continuing && thinking => match effort.and_then(Value::as_str) {
+            // K3.1 has a native medium tier, while K3 maps medium to high.
+            // Both share the same Rust formatter.
+            Some("medium") => {
+                return Err(RenderError::Declined(
+                    "model-dependent K3 medium effort".into(),
+                ));
+            }
+            Some("low" | "minimal") => "low".into(),
+            Some("high") => "high".into(),
+            Some("max" | "xhigh" | "none") | None => "max".into(),
+            Some(other) => return Err(format!("unsupported thinking effort {other}").into()),
+        },
         None => effort
             .filter(|effort| supported(effort))
             .cloned()
@@ -125,10 +171,19 @@ pub(crate) fn render(
     {
         return Err("tool_choice required needs tools".into());
     }
-    if has_tools && matches!(request["tool_choice"].as_str(), Some("required" | "none")) {
+    let choice = &request["tool_choice"];
+    let allowed = &choice["allowed_tools"];
+    let prompt_choice = match choice.as_str() {
+        Some("none") if has_tools || continuing => Some("none"),
+        Some("required") if has_tools => Some("required"),
+        _ if continuing && allowed["tools"].as_array().is_some_and(Vec::is_empty) => Some("none"),
+        _ if continuing && allowed["mode"] == "required" => Some("required"),
+        _ => None,
+    };
+    if let Some(prompt_choice) = prompt_choice {
         kwargs
             .entry("tool_choice")
-            .or_insert_with(|| request["tool_choice"].clone());
+            .or_insert_with(|| prompt_choice.into());
     }
     let request_format = response_format_dump(&request["response_format"]);
     // `_validate_request` rejects a `json_schema` format without a schema.
@@ -151,6 +206,7 @@ pub(crate) fn render(
         format.insert("json_schema".into(), json!({ "schema": schema }));
     }
 
+    messages.extend(partial);
     let encoder_input = KimiRequest {
         messages,
         tools,
@@ -178,7 +234,91 @@ pub(crate) fn render(
     let prompt = KimiK3Formatter::new(false)
         .render_prompt(&encoder_input)
         .map_err(|error| error.to_string())?;
-    Ok((prompt, prefix))
+    let prompt = match encoder_input.messages.last() {
+        Some(message) if continuing && thinking => align_partial_thinking(prompt, message)?,
+        _ => prompt,
+    };
+    Ok((prompt, String::new()))
+}
+
+fn has_answer(message: &Value) -> bool {
+    match &message["content"] {
+        Value::String(content) => !content.is_empty(),
+        Value::Array(parts) => parts
+            .iter()
+            .any(|part| part["text"].as_str().is_some_and(|text| !text.is_empty())),
+        _ => false,
+    }
+}
+
+fn prepare_partial(message: Value) -> Result<Value, RenderError> {
+    if message["content"]
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(|part| part["type"] != "text"))
+    {
+        return Err(RenderError::Declined(
+            "non-text partial assistant message".into(),
+        ));
+    }
+    if !has_answer(&message)
+        && ["reasoning_content", "name"]
+            .iter()
+            .all(|key| message[*key].as_str().is_none_or(str::is_empty))
+    {
+        return Err("a partial assistant message must not be empty".into());
+    }
+    let mut message = prepare_message(engine_message(message))?;
+    message["partial"] = true.into();
+    Ok(message)
+}
+
+/// Dynamo 7.1.1 renders a partial message with a closed think channel before
+/// the response. Python omits an empty think channel, keeps whitespace, and
+/// leaves think open when the message contains reasoning alone.
+fn align_partial_thinking(
+    prompt: RenderedPrompt,
+    message: &Value,
+) -> Result<RenderedPrompt, RenderError> {
+    let reasoning = message["reasoning_content"]
+        .as_str()
+        .filter(|text| !text.is_empty());
+    let has_answer = has_answer(message);
+    if has_answer && reasoning.is_some_and(|text| !text.trim().is_empty()) {
+        return Ok(prompt);
+    }
+    let mut segments = prompt
+        .segments()
+        .ok_or("K3 partial prompt must be segmented")?
+        .to_vec();
+    let opener = |name: &str| {
+        segments
+            .windows(3)
+            .rposition(|tag| {
+                tag[0].allow_special
+                    && tag[0].text == "<|open|>"
+                    && !tag[1].allow_special
+                    && tag[1].text == name
+                    && tag[2].allow_special
+                    && tag[2].text == "<|sep|>"
+            })
+            .ok_or("missing channel opener in K3 partial prompt")
+    };
+    let think = opener("think")?;
+    match reasoning {
+        None => {
+            let response = opener("response")?;
+            segments.drain(think..response);
+        }
+        Some(text) if has_answer => {
+            // Dynamo elided whitespace-only reasoning.
+            segments.insert(think + 3, RenderedSegment::new(text, false));
+        }
+        Some(text) => {
+            segments.truncate(think + 3);
+            segments.push(RenderedSegment::new(text, false));
+        }
+    }
+    Ok(RenderedPrompt::segmented(segments))
 }
 
 /// `_prepare_kimi_k3_messages` on one dumped message, after

@@ -383,10 +383,11 @@ def kimi_k3_partial_message(
     Moonshot's partial mode marks it with ``partial: true``, and
     ``continue_final_message`` asks the same of whatever assistant message
     comes last. As on Moonshot, the flag means nothing on any other message.
-    Raw input_ids carry their own prompt, so they never continue a message.
+    With precomputed input_ids, the flagged message describes the channel
+    already open in that token sequence.
     """
     messages = getattr(request, "messages", None)
-    if getattr(request, "input_ids", None) is not None or not messages:
+    if not messages:
         return None
     message = messages[-1]
     if message.role != "assistant":
@@ -1004,34 +1005,42 @@ class OpenAIServingChat(OpenAIServingBase):
             if message.get("role") == "developer":
                 message["role"] = "system"
 
-        if kimi_k3_partial_message(request) is None:
+        if self._validated_kimi_k3_partial_message(request) is None:
             return messages, media_count, None
         partial = messages.pop()
-        # Positions count from 0 over the client's messages, as Moonshot's do.
-        position = len(messages)
-        if partial.get("tool_calls"):
+        return messages, media_count, partial
+
+    @staticmethod
+    def _validated_kimi_k3_partial_message(
+        request: ChatCompletionRequest,
+    ) -> Optional[ChatCompletionMessageGenericParam]:
+        partial = kimi_k3_partial_message(request)
+        if partial is None:
+            return None
+        position = len(request.messages) - 1
+        if partial.tool_calls:
             raise ValueError(
                 f"Invalid request: the partial assistant message at position "
                 f"{position} must not have tool_calls"
             )
-        content = partial.get("content")
+        content = partial.content
+        # K3 normalizes image/video parts to image placeholders and ignores
+        # non-text parts such as thinking blocks when rendering an assistant turn.
         if isinstance(content, list) and any(
-            part.get("type") != "text" for part in content
+            part.type in ("image_url", "input_image", "video_url") for part in content
         ):
             raise ValueError(
                 f"Invalid request: the partial assistant message at position "
                 f"{position} must have only text content"
             )
         if not (
-            _kimi_k3_text_parts(content)
-            or partial.get("reasoning_content")
-            or partial.get("name")
+            _kimi_k3_text_parts(content) or partial.reasoning_content or partial.name
         ):
             raise ValueError(
                 f"Invalid request: the message at position {position} with role "
                 "'assistant' must not be empty"
             )
-        return messages, media_count, partial
+        return partial
 
     def _encode_messages(
         self,
@@ -2869,6 +2878,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            if self.chat_encoding_spec == "kimi_k3":
+                self._validated_kimi_k3_partial_message(request)
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,

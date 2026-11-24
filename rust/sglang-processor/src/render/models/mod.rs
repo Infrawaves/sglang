@@ -18,6 +18,8 @@ pub(crate) use self::deepseek_v4::{
     special_tokens as deepseek_v4_special_tokens, task as deepseek_v4_task,
 };
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
+#[cfg(feature = "openai")]
+pub(crate) use self::kimi_k3::kimi_k3_continues_final_message;
 pub(super) use self::kimi_k3::render as render_kimi_k3;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
 pub(super) use self::minimax_m3::{
