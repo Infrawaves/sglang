@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
@@ -20,10 +21,46 @@ class OffloadAttempt:
     capture_id: str
     attempt_id: str
     verified_pages: frozenset[int] = frozenset()
-    error: str | None = field(default=None, init=False)
+    _error: str | None = field(default=None, init=False, repr=False)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
+    _pending: int = field(default=0, init=False, repr=False, compare=False)
+    _released: bool = field(default=False, init=False, repr=False, compare=False)
+    _completed: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def fail(self, reason):
-        self.error = self.error or reason
+    @property
+    def error(self) -> str | None:
+        with self._lock:
+            return self._error
+
+    def fail(self, reason: str) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = reason
+
+    def acquire_packet(self) -> None:
+        with self._lock:
+            self._pending += 1
+
+    def release_packet(self) -> bool:
+        """Decrement pending packets; return True once the attempt is ready to complete."""
+        with self._lock:
+            if self._pending > 0:
+                self._pending -= 1
+            if self._released and self._pending == 0 and not self._completed:
+                self._completed = True
+                return True
+            return False
+
+    def mark_released(self) -> bool:
+        """Mark producer admission closed for this request; return True if completable now."""
+        with self._lock:
+            self._released = True
+            if self._pending == 0 and not self._completed:
+                self._completed = True
+                return True
+            return False
 
 
 @dataclass(frozen=True)
@@ -35,6 +72,10 @@ class MLALayout:
     rope_dim: int
     block_scaled_fp8: bool
     power_of_two_scales: bool
+    dcp_size: int = 1
+    page_size: int = 1
+    scale_block_size: int | None = None
+    format_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -88,6 +129,8 @@ class VerifyCommit:
         self.req = req
         self.attempt = attempt
         self.path = Future()
+        self.start = 0
+        self.anchor = None
 
     def before(self):
         req = self.req
@@ -96,7 +139,7 @@ class VerifyCommit:
             req.output_ids[self.start - 1] if self.start else req.origin_input_ids[-1]
         )
 
-    def after(self):
+    def resolve(self):
         req = self.req
         end = visible_len(req)
         anchor = (
@@ -117,13 +160,58 @@ class VerifyCommit:
             or anchor != self.anchor
         ):
             self.attempt.fail("retracted, aborted or rewritten reply")
+            result = None
+        else:
+            added = tuple(req.output_ids[self.start : end])
+            first = len(req.origin_input_ids) + self.start - 1
+            result = (first, (self.anchor, *added[:-1]) if added else (), added)
+        if not self.path.done():
+            self.path.set_result(result)
+        return result
+
+    def after(self):
+        self.resolve()
+
+    def abort(self, reason: str):
+        self.attempt.fail(reason)
+        if not self.path.done():
             self.path.set_result(None)
-            return
-        added = tuple(req.output_ids[self.start : end])
-        first = len(req.origin_input_ids) + self.start - 1
-        self.path.set_result(
-            (first, (self.anchor, *added[:-1]) if added else (), added)
-        )
+
+
+class VerifyBatchCommit:
+    """Resolve a packed decode verify chunk and release its event-driven CommitGate."""
+
+    def __init__(self, commits: list[VerifyCommit], gate, on_done=None):
+        self.commits = commits
+        self.gate = gate
+        self._on_done = on_done
+        self._lock = threading.Lock()
+        self._resolved = False
+
+    def before(self):
+        for commit in self.commits:
+            commit.before()
+
+    def after(self):
+        with self._lock:
+            if self._resolved:
+                return
+            self._resolved = True
+        paths = tuple(commit.resolve() for commit in self.commits)
+        if self._on_done is not None:
+            self._on_done(self)
+        self.gate.on_commit(paths)
+
+    def abort(self, reason: str):
+        with self._lock:
+            if self._resolved:
+                return
+            self._resolved = True
+        for commit in self.commits:
+            commit.abort(reason)
+        if self._on_done is not None:
+            self._on_done(self)
+        self.gate.on_commit(None)
 
 
 def committed_slice(path, prompt_len, positions, inputs):

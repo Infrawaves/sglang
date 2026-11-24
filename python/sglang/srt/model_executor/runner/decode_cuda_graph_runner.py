@@ -1389,9 +1389,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._capture()
 
     def _capture(self) -> None:
-        from sglang.srt.speculative.dflash_offload import reserve_graph_bytes
-
-        self.offload_graph_bytes = reserve_graph_bytes(self)
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()

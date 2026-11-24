@@ -757,7 +757,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
-        dflash_offload.initialize(self)
+        self.dflash_offload_runtime = dflash_offload.initialize(self)
 
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
@@ -2278,7 +2278,13 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
-        dflash_offload.close()
+        offload_close_error = None
+        try:
+            dflash_offload.close(getattr(self, "dflash_offload_runtime", None))
+        except Exception as exc:
+            offload_close_error = exc
+        finally:
+            self.dflash_offload_runtime = None
         self.request_receiver.close()
         if self.uocr_runtime is not None:
             self.uocr_runtime.close()
@@ -2293,6 +2299,8 @@ class Scheduler(
         destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
+        if offload_close_error is not None:
+            raise offload_close_error
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.

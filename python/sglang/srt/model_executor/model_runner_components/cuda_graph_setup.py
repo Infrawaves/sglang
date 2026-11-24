@@ -404,6 +404,9 @@ def capture_cuda_graphs(
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
+    from sglang.srt.speculative.dflash_offload import configure_target_model
+
+    configure_target_model(model_runner)
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
     # backend so its __init__ can warm up kernels (run-once) and allocate the
@@ -731,6 +734,9 @@ def capture_decode_graph(
     *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
 ) -> GraphCapture:
     """Capture device graphs."""
+    from sglang.srt.speculative.dflash_offload import configure_target_model
+
+    configure_target_model(model_runner)
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():

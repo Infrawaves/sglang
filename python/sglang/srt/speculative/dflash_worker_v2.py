@@ -3478,7 +3478,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        capture = dflash_offload.runtime
+        capture = getattr(self, "_dflash_offload_runtime", None) or dflash_offload.runtime
         if capture is not None:
             # This forward may overwrite a previous step's verify inputs or KV.
             capture.pool.fence_reuse()
@@ -4086,6 +4086,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         logits_output = target_out.logits_output
+        target_lp = self._target_logits_processor
         offload_commits = None
         if capture is not None and capture.role == "decode":
             offload_commits = capture.snapshot_verify(
@@ -4096,12 +4097,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logits_output.last_hidden_states,
                 int(self.block_size),
             )
+            if target_lp is None or not target_lp.keep_last_hidden_states:
+                logits_output.last_hidden_states = None
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         accepted = None
         tail_done = False
         verify_shard = None
-        target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):

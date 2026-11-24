@@ -588,6 +588,7 @@ class LogitsProcessor(nn.Module):
         features = get_exec().features
         self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
         self.offload_verify_hidden = False
+        self.offload_verify_hidden_buffer: Optional[torch.Tensor] = None
         # Capture-only mode: how many layers the model must capture, when
         # --return-aux-hidden-state-layer-ids names them.
         layer_ids = features.return_aux_hidden_state_layer_ids
@@ -1126,6 +1127,13 @@ class LogitsProcessor(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.offload_verify_hidden and logits_metadata.forward_mode.is_target_verify():
             # Final target norm output, also used as the input to the LM head.
+            # Write into a single shared graph buffer when configured so each
+            # captured shape does not retain its own hidden output tensor.
+            buf = self.offload_verify_hidden_buffer
+            if buf is not None and hidden_states.shape[0] <= buf.shape[0]:
+                out = buf[: hidden_states.shape[0]]
+                out.copy_(hidden_states)
+                return out
             return hidden_states
         if (
             self.keep_last_hidden_states
