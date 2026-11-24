@@ -325,6 +325,7 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+_KIMI_K3_TEXT_PART_TYPES = ("text", "input_text")
 
 
 # K3 exposes three thinking tiers and K3.1 adds "medium". The OpenAI tiers map
@@ -415,16 +416,18 @@ def _kimi_k3_text_parts(content: Any) -> list[str]:
         else:
             part_type = getattr(part, "type", None)
             text = getattr(part, "text", None)
-        if part_type in ("text", "input_text") and text:
+        if part_type in _KIMI_K3_TEXT_PART_TYPES and text:
             texts.append(text)
     return texts
 
 
 def _kimi_k3_partial_opens_response(request: ChatCompletionRequest) -> bool:
-    """Whether a partial opens the response channel even with thinking enabled."""
+    """Whether the rendered partial leaves the response channel open."""
     partial = kimi_k3_partial_message(request)
     return partial is not None and (
-        not partial.reasoning_content or bool(_kimi_k3_text_parts(partial.content))
+        not (request.chat_template_kwargs or {}).get("thinking", True)
+        or not partial.reasoning_content
+        or bool(_kimi_k3_text_parts(partial.content))
     )
 
 
@@ -957,7 +960,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if not isinstance(part, dict):
                         continue
                     part_type = part.get("type")
-                    if part_type in ("text", "input_text"):
+                    if part_type in _KIMI_K3_TEXT_PART_TYPES:
                         parts.append(
                             {
                                 "type": "text",
@@ -1038,9 +1041,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"{position} must not have tool_calls"
             )
         content = partial.content
-        # Request validation already normalizes inline audio to audio_url.
         if isinstance(content, list) and any(
-            part.type in _MEDIA_CONTENT_PART_TYPES for part in content
+            part.type not in _KIMI_K3_TEXT_PART_TYPES for part in content
         ):
             raise ValueError(
                 f"Invalid request: the partial assistant message at position "
@@ -1052,6 +1054,15 @@ class OpenAIServingChat(OpenAIServingBase):
             raise ValueError(
                 f"Invalid request: the message at position {position} with role "
                 "'assistant' must not be empty"
+            )
+        # K3 applies length options to history before we append the open channel.
+        kwargs = request.chat_template_kwargs or {}
+        if (
+            kwargs.get("truncation") and kwargs.get("max_length") is not None
+        ) or kwargs.get("padding") == "max_length":
+            raise ValueError(
+                "Kimi K3 partial assistant messages do not support truncation with "
+                "max_length or padding='max_length' in chat_template_kwargs."
             )
         return partial
 

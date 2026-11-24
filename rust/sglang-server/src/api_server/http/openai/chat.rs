@@ -282,11 +282,23 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let prompt_stub_tokens = chat_model.unreported_prompt_tokens() as u32;
-    // As Python, the continued text decides whether generation starts in reasoning.
+    // A K3 continuation already opened its channel, with all prefix tokens
+    // counted as input. Literal markers in that prefix cannot change channels.
+    let k3_continuation = state
+        .chat_formatter
+        .as_ref()
+        .and_then(|formatter| formatter.kimi_k3_continuation_reasoning(&rendered.prompt));
+    let prompt_stub_tokens = if k3_continuation.is_some() {
+        0
+    } else {
+        chat_model.unreported_prompt_tokens() as u32
+    };
     let reasoning_options = ReasoningOptions {
-        force_reasoning,
-        previous_content,
+        force_reasoning: match k3_continuation {
+            Some(thinking) => reasoning_parser.as_ref().map(|_| thinking),
+            None => force_reasoning,
+        },
+        previous_content: previous_content.filter(|_| k3_continuation.is_none()),
         ..Default::default()
     };
     let mut prompt = Some(Box::new(rendered));

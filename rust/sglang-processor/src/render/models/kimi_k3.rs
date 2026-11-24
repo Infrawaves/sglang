@@ -10,8 +10,8 @@ use super::pydantic_dump::{
     continues_final_message, engine_message, pydantic_bool, tool_arguments,
 };
 use super::schema_types::normalize_json_schema_types;
-use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
+use crate::render::{ChatFormatter, RenderError};
 
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 const THINKING_EFFORTS: [&str; 3] = ["low", "high", "max"];
@@ -47,6 +47,35 @@ pub(crate) fn kimi_k3_continues_final_message(request: &Value) -> Result<bool, S
         .map(pydantic_bool)
         .transpose()?;
     Ok(continuing || partial == Some(true))
+}
+
+impl ChatFormatter {
+    /// A typed template fallback cannot reproduce a raw K3 continuation.
+    pub fn continues_kimi_k3_message(&self, request: &Value) -> Result<bool, String> {
+        Ok(matches!(self, Self::KimiK3) && kimi_k3_continues_final_message(request)?)
+    }
+
+    /// The channel a K3 continuation left open. Fresh turns carry a pending
+    /// generation stub. Literal prefix text cannot introduce channel markers.
+    pub fn kimi_k3_continuation_reasoning(&self, prompt: &RenderedPrompt) -> Option<bool> {
+        if !matches!(self, Self::KimiK3) || prompt.pending_segments() != 0 {
+            return None;
+        }
+        match prompt.segments()?.windows(3).rev().find_map(channel_opener) {
+            Some("think") => Some(true),
+            Some("response") => Some(false),
+            _ => None,
+        }
+    }
+}
+
+fn channel_opener(tag: &[RenderedSegment]) -> Option<&str> {
+    (tag[0].allow_special
+        && tag[0].text == "<|open|>"
+        && !tag[1].allow_special
+        && tag[2].allow_special
+        && tag[2].text == "<|sep|>")
+        .then_some(tag[1].text.as_str())
 }
 
 /// Render the whole prompt as XTML segments, including any assistant continuation.
@@ -293,14 +322,7 @@ fn align_partial_thinking(
     let opener = |name: &str| {
         segments
             .windows(3)
-            .rposition(|tag| {
-                tag[0].allow_special
-                    && tag[0].text == "<|open|>"
-                    && !tag[1].allow_special
-                    && tag[1].text == name
-                    && tag[2].allow_special
-                    && tag[2].text == "<|sep|>"
-            })
+            .rposition(|tag| channel_opener(tag) == Some(name))
             .ok_or("missing channel opener in K3 partial prompt")
     };
     let think = opener("think")?;
