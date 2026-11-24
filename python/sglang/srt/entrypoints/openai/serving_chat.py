@@ -1024,10 +1024,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"{position} must not have tool_calls"
             )
         content = partial.content
-        # K3 normalizes image/video parts to image placeholders and ignores
-        # non-text parts such as thinking blocks when rendering an assistant turn.
+        # Request validation already normalizes inline audio to audio_url.
         if isinstance(content, list) and any(
-            part.type in ("image_url", "input_image", "video_url") for part in content
+            part.type in _MEDIA_CONTENT_PART_TYPES for part in content
         ):
             raise ValueError(
                 f"Invalid request: the partial assistant message at position "
@@ -2353,15 +2352,10 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return
         if answer_prefilled:
-            # The grammar would start a new JSON value inside a continued
-            # answer that already holds the start of one. Until the answer is
-            # fed to the grammar, only the prompt's schema guides the output.
-            logger.warning(
-                "Kimi K3 partial answer: the json_schema response format is "
-                "stated in the prompt but not enforced by a grammar"
+            raise ValueError(
+                "Kimi K3 requires an empty assistant answer prefix to enforce "
+                "a strict json_schema response format."
             )
-            del sampling_params["json_schema"]
-            return
         schema = json.loads(json_schema)
         # The structural tag compiles the schema without this check.
         validate_xgrammar_json_schema(schema)
