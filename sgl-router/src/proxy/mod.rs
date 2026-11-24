@@ -29,12 +29,16 @@ use tokio_util::sync::CancellationToken;
 /// back. Arbitrary value; it holds the useful prefix of every observed case.
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
 
-/// Preserve the worker's cache accounting without exposing other upstream headers.
+/// Preserve the worker's cache and usage accounting without exposing other
+/// upstream headers. The usage headers are the prompt-side counts a worker
+/// sends before the body when `SGLANG_USAGE_HEADER_PREFIX=X-Msh-Usage`.
 fn cache_write_response_headers(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::new();
     for name in [
         "msh-usage-cache-write-tokens-5m",
         "msh-usage-cache-write-tokens-1h",
+        "x-msh-usage-prompt-tokens",
+        "x-msh-usage-cached-tokens",
         "x-sgl-cached-tokens",
     ] {
         if let Some(value) = headers.get(name) {
