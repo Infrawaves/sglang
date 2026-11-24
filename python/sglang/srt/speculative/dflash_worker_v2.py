@@ -77,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.conditional_token_ban import batch_token_ban
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -868,6 +869,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             and (penalizer is None or not penalizer.is_required)
             and getattr(sampling_info, "grammar_mask", None) is None
             and getattr(sampling_info, "logit_bias", None) is None
+            # The ban edits full-vocabulary logits; the shard has no room for it.
+            and batch_token_ban(sampling_info) is None
             and getattr(sampling_info, "sampling_mask_batch_indices", None) is None
             and self._megakernel_sampled.sampled_accept_fits(bs, shard)
         )
@@ -900,6 +903,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             and (penalizer is None or not penalizer.is_required)
             and getattr(sampling_info, "grammar_mask", None) is None
             and getattr(sampling_info, "logit_bias", None) is None
+            # The ban needs the logits of every chain position.
+            and batch_token_ban(sampling_info) is None
             and sampling_info.sampling_mask_batch_indices is None
         )
 
@@ -4161,6 +4166,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Constrain every chain position before accept picks from it.
         if grammar_mask is not None:
             grammar_mask.apply(logits_output.next_token_logits)
+
+        # Last, so no later edit can lift the mask. Row j of a request continues
+        # draft_tokens[:, j]: the last committed token, then the drafted ones.
+        token_ban = batch_token_ban(sampling_info)
+        if token_ban is not None and logits_output.next_token_logits is not None:
+            token_ban.apply_chain(logits_output.next_token_logits, draft_tokens)
 
         candidates = draft_tokens
         if accepted is not None:

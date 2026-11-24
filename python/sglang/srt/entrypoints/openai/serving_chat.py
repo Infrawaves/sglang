@@ -128,7 +128,9 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
+    THINK_OPEN,
     TOOLS_OPEN,
 )
 from sglang.srt.function_call.tool_schema_guard import (
@@ -173,8 +175,11 @@ from sglang.srt.parser.response_template import (
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     append_request_stop_token_sequence,
+    clear_request_conditional_token_ban,
+    set_request_conditional_token_ban,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
+    set_request_tool_calls_start,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
@@ -184,6 +189,8 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+_UNSET = object()
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
@@ -636,8 +643,13 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     supports_process_preprocessing = True
+    # Private request attrs set during conversion that later stages read
+    # (see process_request_preprocessor._replayed_private_attrs).
+    process_preprocessing_private_attrs = ("_kimi_k3_generation_prefix_ids",)
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
+    # (think, (<|open|>, <|close|>)) token ids, resolved on first use.
+    _kimi_k3_think_ban_rule_cache: Any = _UNSET
 
     async def handle_request(self, request, raw_request):
         if self._doc_splitter is not None:
@@ -1144,6 +1156,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools=request_tools,
                 return_dict=False,
                 **template_kwargs,
+            )
+            # The template's own generation prefix (the opened think or
+            # response channel); empty when a partial message reopens its own.
+            request._kimi_k3_generation_prefix_ids = self._kimi_k3_generation_prefix(
+                prompt_ids
             )
             if partial is not None:
                 prompt_ids = list(prompt_ids)
@@ -2106,14 +2123,24 @@ class OpenAIServingChat(OpenAIServingBase):
             self._stop_kimi_k3_reasoning_without_thinking(
                 sampling_params, request.chat_template_kwargs
             )
+            self._ban_kimi_k3_think_channel_without_thinking(
+                sampling_params, request.chat_template_kwargs
+            )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
                 answer_prefilled=kimi_k3_partial_answer_prefilled(request),
             )
+            tool_call_parsing_active = self._tool_call_parsing_active(request)
             self._stop_kimi_k3_undeclared_tool_calls(
-                sampling_params, self._tool_call_parsing_active(request)
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+            )
+            self._keep_kimi_k3_tool_calls_from_client_stops(
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+                server_stop=processed_messages.server_stop,
             )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
@@ -2404,6 +2431,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self._kimi_k3_marker_ids[marker] = ids
         return ids
 
+    def _kimi_k3_generation_prefix(self, prompt_ids: list[int]) -> list[int]:
+        """The opened think or response channel ending ``prompt_ids``, or []
+        when the prompt does not end with one of those markers."""
+        tail = list(prompt_ids[-self._KIMI_K3_GENERATION_STUB_TOKENS :])
+        for marker in (THINK_OPEN, RESPONSE_OPEN):
+            if self._kimi_k3_marker_stop_ids(marker) == tail:
+                return tail
+        return []
+
     def _append_kimi_k3_marker_stop(
         self, sampling_params: dict[str, Any], marker: str
     ) -> None:
@@ -2426,6 +2462,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if not tool_call_parsing_active:
             self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
 
+    def _keep_kimi_k3_tool_calls_from_client_stops(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        tool_call_parsing_active: bool,
+        server_stop: list[str],
+    ) -> None:
+        if not tool_call_parsing_active:
+            return
+        token_ids = self._kimi_k3_marker_stop_ids(TOOLS_OPEN)
+        if token_ids is None:
+            return
+        set_request_tool_calls_start(
+            sampling_params, token_ids=token_ids, server_stop_strs=server_stop
+        )
+
     def _stop_kimi_k3_reasoning_without_thinking(
         self,
         sampling_params: dict[str, Any],
@@ -2441,6 +2493,63 @@ class OpenAIServingChat(OpenAIServingBase):
         if sampling_params.get("json_schema"):
             return
         self._append_kimi_k3_marker_stop(sampling_params, THINK_CLOSE)
+
+    def _kimi_k3_think_ban_rule(self) -> tuple[int, tuple[int, int]] | None:
+        """``(think, (<|open|>, <|close|>))`` as the model generates them, or None
+        when the tokenizer does not encode the two think markers as a special
+        token, the same name token and the same ``<|sep|>``."""
+        if self._kimi_k3_think_ban_rule_cache is not _UNSET:
+            return self._kimi_k3_think_ban_rule_cache
+        rule = None
+        open_ids = self._kimi_k3_marker_stop_ids(THINK_OPEN)
+        close_ids = self._kimi_k3_marker_stop_ids(THINK_CLOSE)
+        if (
+            open_ids is not None
+            and close_ids is not None
+            and len(open_ids) == len(close_ids) == 3
+            and open_ids[0] != close_ids[0]
+            # Both markers spell the channel name and the separator alike.
+            and open_ids[1:] == close_ids[1:]
+        ):
+            rule = (open_ids[1], (open_ids[0], close_ids[0]))
+        else:
+            logger.warning(
+                "Kimi K3 think markers are not three-token special sequences; "
+                "the think channel is not masked while thinking is off"
+            )
+        self._kimi_k3_think_ban_rule_cache = rule
+        return rule
+
+    def _ban_kimi_k3_think_channel_without_thinking(
+        self,
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Without thinking the prompt opens the response channel and the think
+        channel is not part of the turn. The model may still reason in the
+        response channel and then write a think close, followed by a second
+        response block, or open a think block of its own. Masking ``think``
+        right after ``<|open|>`` and ``<|close|>`` keeps it out of that channel:
+        it can only close the channel that is open, as on a normal answer.
+
+        The mask is conditional, so the same token stays free in ordinary text.
+        The think-close stop (_stop_kimi_k3_reasoning_without_thinking) remains
+        the fallback wherever the mask does not apply."""
+        rule = None
+        if (
+            envs.SGLANG_K3_THINKING_OFF_BAN_THINK.get()
+            # The encoder opens the response channel only for a present, falsy kwarg.
+            and not (chat_template_kwargs or {}).get("thinking", True)
+        ):
+            rule = self._kimi_k3_think_ban_rule()
+        # Always set or clear: the key is private, not a client parameter.
+        if rule is None:
+            clear_request_conditional_token_ban(sampling_params)
+        else:
+            banned, after = rule
+            set_request_conditional_token_ban(
+                sampling_params, banned=banned, after=after
+            )
 
     def _set_json_grammar_start(
         self,
@@ -2897,6 +3006,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 result.stop = list(result.stop)
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
+            result.server_stop = result.server_stop + [tool_call_stop]
 
         # Configured after rendering so the detokenization options never reach
         # the chat template.
@@ -3819,6 +3929,11 @@ class OpenAIServingChat(OpenAIServingBase):
                                 token_provenances[index] = KimiTokenProvenance(
                                     self.tokenizer_manager.tokenizer,
                                     with_positions=internal_positions_on,
+                                    pending_prefix=(
+                                        request._kimi_k3_generation_prefix_ids
+                                        if internal_content_on
+                                        else ()
+                                    ),
                                 )
                             except ValueError as e:
                                 if internal_content_on or standard is None:
@@ -5395,6 +5510,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     internal_requested,
                     call_item.source_text or "",
                 )
+            # The argument continuation repeats the slot-open frame's generated
+            # tokens, but not the prompt prefix that led it.
+            continuation_internal = call_internal
+            prefix_len = (
+                token_provenance.last_prefix_len if token_provenance is not None else 0
+            )
+            if k3_frames and call_internal and prefix_len:
+                continuation_internal = [
+                    {key: value[prefix_len:] for key, value in entry.items()}
+                    for entry in call_internal
+                ]
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -5451,7 +5577,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=index,
                     delta=DeltaMessage(tool_calls=[tool_call]),
                     logprobs=frame_logprobs,
-                    internal_content=call_internal,
+                    internal_content=(
+                        call_internal if delta_index == 0 else continuation_internal
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(

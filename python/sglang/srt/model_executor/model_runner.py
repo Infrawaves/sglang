@@ -220,6 +220,10 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
+from sglang.srt.sampling.conditional_token_ban import (
+    batch_token_ban,
+    last_input_token_ids,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
@@ -2275,6 +2279,14 @@ class ModelRunner:
             observer_state = self._preprocess_logits(
                 logits_output, forward_batch.sampling_info
             )
+
+        # After the bias and grammar edits, so neither can lift the mask. Only
+        # watermark forcing, where enabled, still edits the logits after it.
+        token_ban = batch_token_ban(forward_batch.sampling_info)
+        if token_ban is not None:
+            prev_tokens = last_input_token_ids(forward_batch)
+            if prev_tokens is not None:
+                token_ban.apply(logits_output.next_token_logits, prev_tokens)
 
         watermark_state = self.watermark_state
         if (

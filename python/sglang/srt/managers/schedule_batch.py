@@ -158,6 +158,7 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import (
     SamplingParams,
     get_request_stop_token_sequences,
+    get_request_tool_calls_start,
 )
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -556,6 +557,16 @@ class Req(ReqDllmMixin):
         # Server-side stop token sequences: [matcher, matched length] pairs,
         # built on first use.
         self._stop_sequence_state: Optional[List[list]] = None
+        opener_ids, server_stop_strs = get_request_tool_calls_start(
+            sampling_params.custom_params
+        ) or ((), ())
+        self._tool_calls_opener = (
+            TokenSequenceMatcher(opener_ids) if opener_ids else None
+        )
+        self._server_stop_strs = frozenset(server_stop_strs)
+        self._tool_calls_opener_matched = 0
+        self._tool_calls_scanned_len = 0
+        self._tool_calls_start: Optional[int] = None
 
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
@@ -1259,44 +1270,82 @@ class Req(ReqDllmMixin):
         self.detokenize_header_sent = True
         return due
 
-    def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+    def _client_stop_end(self, content_start: int) -> int:
+        if self._tool_calls_start is not None:
+            return self._tool_calls_start
+        opener = self._tool_calls_opener
+        if opener is None:
+            return len(self.output_ids)
+        matched = self._tool_calls_opener_matched
+        # An opener written inside reasoning does not end client stops.
+        scan_start = max(self._tool_calls_scanned_len, content_start)
+        for position in range(scan_start, len(self.output_ids)):
+            matched = opener.advance(matched, self.output_ids[position])
+            if matched == len(opener):
+                self._tool_calls_start = position + 1 - len(opener)
+                return self._tool_calls_start
+        self._tool_calls_opener_matched = matched
+        self._tool_calls_scanned_len = len(self.output_ids)
+        return len(self.output_ids)
+
+    def _stop_match_window(
+        self, new_accepted_len: int, *, client_stop: bool = True
+    ) -> Optional[Tuple[int, int, int]]:
+        # (start, end, newly accepted tokens in it); client stops end at tool
+        # calls. None when there is no new output to check.
         # Reasoning-aware user stops currently target non-speculative decoding only.
-        content_len = len(self.output_ids)
-        if self.require_reasoning:
-            if not self._is_reasoning_over:
-                return 0
-            content_len -= self.reasoning_tokens
+        if self.require_reasoning and not self._is_reasoning_over:
+            return None
+        content_start = self.reasoning_tokens if self.require_reasoning else 0
+        end = (
+            self._client_stop_end(content_start)
+            if client_stop
+            else len(self.output_ids)
+        )
+        new_len = new_accepted_len - (len(self.output_ids) - end)
+        if end < len(self.output_ids) and new_len <= 0:
+            return None
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,
             self.sampling_params.stop_regex_max_len + 1,
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(max_len_tail_str + max(new_accepted_len - 1, 0), content_len)
+        tail_len = min(max_len_tail_str + max(new_len - 1, 0), end - content_start)
+        return end - tail_len, end, new_len
 
-    def tail_str(self, new_accepted_len: int = 1) -> str:
-        # Check stop strings and stop regex patterns together
-        if (
-            len(self.sampling_params.stop_strs) == 0
-            and len(self.sampling_params.stop_regex_strs) == 0
-        ):
-            return ""
+    def _decode_stop_window(
+        self, window: Optional[Tuple[int, int, int]]
+    ) -> Optional[str]:
+        if window is None:
+            return None
+        start, end, _ = window
+        return self.tokenizer.decode(self.output_ids[start:end]) if end > start else ""
 
-        tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:]) if tail_len else ""
+    def _stop_tails(self, new_accepted_len: int) -> Tuple[Optional[str], Optional[str]]:
+        # (client stop tail, server stop tail); None when nothing new to check.
+        client_tail = self._decode_stop_window(
+            self._stop_match_window(new_accepted_len)
+        )
+        # Until an opener is found the client window is the whole tail.
+        if not self._server_stop_strs or self._tool_calls_start is None:
+            return client_tail, client_tail
+        server_window = self._stop_match_window(new_accepted_len, client_stop=False)
+        return client_tail, self._decode_stop_window(server_window)
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
             return False
 
-        tail_str = self.tail_str()
-
-        # Early return if tail_str is empty
-        if not tail_str:
-            return False
+        client_tail, server_tail = self._stop_tails(1)
 
         for stop_str in self.sampling_params.stop_strs:
             if not stop_str:
+                continue
+            tail_str = (
+                server_tail if stop_str in self._server_stop_strs else client_tail
+            )
+            if not tail_str:
                 continue
             # Check if stop_str is contained in tail_str (fastest check first)
             if stop_str in tail_str:
@@ -1352,6 +1401,7 @@ class Req(ReqDllmMixin):
         stop_str: Optional[str] = None,
         stop_regex: Optional[str] = None,
         full_window_matched: bool = True,
+        client_stop: bool = True,
     ) -> Optional[int]:
         """Map a matched stop string/regex to output_ids length (stop included)."""
 
@@ -1360,13 +1410,14 @@ class Req(ReqDllmMixin):
                 return stop_str in text
             return re.search(stop_regex, text) is not None
 
-        tail_len = self._stop_match_tail_len(new_accepted_len)
-        start = len(self.output_ids) - tail_len
-        token_window = self.output_ids[start:]
+        start, end, new_len = self._stop_match_window(
+            new_accepted_len, client_stop=client_stop
+        )
+        token_window = self.output_ids[start:end]
 
         # Old prefixes were checked in the previous step.
         for token_count in range(
-            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+            max(1, len(token_window) - new_len + 1), len(token_window)
         ):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count
@@ -1374,7 +1425,7 @@ class Req(ReqDllmMixin):
         if not full_window_matched:
             return None
         # The full tail window is already known to match by the caller.
-        return len(self.output_ids)
+        return end
 
     def _stop_sequence_matchers(self, new_accepted_len: int) -> List[list]:
         state = self._stop_sequence_state
@@ -1443,20 +1494,24 @@ class Req(ReqDllmMixin):
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str(new_accepted_len)
+            tail_str, server_tail_str = self._stop_tails(new_accepted_len)
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str:
+                    client_stop = stop_str not in self._server_stop_strs
+                    text = tail_str if client_stop else server_tail_str
+                    if text is not None and stop_str in text:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         self.finished_len = self._locate_str_stop_finished_len(
-                            new_accepted_len, stop_str=stop_str
+                            new_accepted_len,
+                            stop_str=stop_str,
+                            client_stop=client_stop,
                         )
                         return True
 
             # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
+            if len(self.sampling_params.stop_regex_strs) > 0 and tail_str is not None:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
                     # Seatbelt, not validation: patterns are checked at ingress
                     # (Python's `normalize`, or the rust server's stricter
