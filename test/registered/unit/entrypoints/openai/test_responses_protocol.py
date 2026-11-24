@@ -239,6 +239,16 @@ class IncludeOutputLogprobsTestCase(CustomTestCase):
         self.assertFalse(has(None))
         self.assertFalse(has(["reasoning.encrypted_content"]))
 
+    def test_accepts_web_search_include_values(self):
+        """OpenAI clients send these with a web_search tool; rejecting them 400s the whole request."""
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            include=["web_search_call.results", "web_search_call.action.sources"],
+        )
+        self.assertFalse(request.is_include_output_logprobs())
+
 
 class ThinkingControlTestCase(CustomTestCase):
     def test_effort_none_disables_thinking(self):

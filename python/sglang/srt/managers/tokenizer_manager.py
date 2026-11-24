@@ -646,6 +646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = get_observability().enable_trace
         self.allow_auto_truncate = get_serving().allow_auto_truncate
+        self.clamp_max_new_tokens = get_serving().clamp_max_new_tokens
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
@@ -2137,15 +2138,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.allow_auto_truncate:
-                logger.warning(
+            if self.allow_auto_truncate or self.clamp_max_new_tokens:
+                # Under --clamp-max-new-tokens the clamp is the expected
+                # behavior, so keep it out of the warning log.
+                log = logger.warning if self.allow_auto_truncate else logger.debug
+                log(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
                     "Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                # Rebind instead of writing in place: batch items share one dict.
+                obj.sampling_params = {
+                    **obj.sampling_params,
+                    "max_new_tokens": max(0, _max_req_len - input_token_num),
+                }
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
