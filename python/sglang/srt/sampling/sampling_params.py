@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import msgspec
 
@@ -111,6 +111,67 @@ def set_request_reasoning_end_token_ids(
         raise ValueError("reasoning end token IDs must be non-empty integers")
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
+    sampling_params["custom_params"] = custom_params
+
+
+# Private transport, like the reasoning terminator above: a conditional token
+# ban ``[prev, banned, opener]``. Right after the token ``prev`` the sampler
+# masks the token ``banned``. A request whose first output token is ``opener``
+# opened a channel of its own, and the rule is off for it.
+REQUEST_CONDITIONAL_TOKEN_BAN_KEY = "__sglang_conditional_token_ban"
+
+
+def get_request_conditional_token_ban(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[Tuple[int, int, int]]:
+    """Return a validated ``(prev, banned, opener)`` rule, if the request has one."""
+    if not isinstance(custom_params, dict):
+        return None
+    if REQUEST_CONDITIONAL_TOKEN_BAN_KEY not in custom_params:
+        return None
+    rule = custom_params.get(REQUEST_CONDITIONAL_TOKEN_BAN_KEY)
+    invalid = (
+        not isinstance(rule, list)
+        or len(rule) != 3
+        or any(type(token_id) is not int or token_id < 0 for token_id in rule)
+        or (vocab_size is not None and any(token_id >= vocab_size for token_id in rule))
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "conditional token ban must be three vocabulary-bounded token "
+                "IDs: [prev, banned, opener]"
+            )
+        return None
+    return rule[0], rule[1], rule[2]
+
+
+def set_request_conditional_token_ban(
+    sampling_params: Dict,
+    rule: Optional[Sequence[int]],
+) -> None:
+    """Attach a renderer-selected conditional token ban to a request.
+
+    ``None`` removes the key, so a client cannot supply a rule of its own."""
+    custom_params = sampling_params.get("custom_params")
+    if rule is None:
+        if (
+            isinstance(custom_params, dict)
+            and REQUEST_CONDITIONAL_TOKEN_BAN_KEY in custom_params
+        ):
+            custom_params = dict(custom_params)
+            del custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY]
+            sampling_params["custom_params"] = custom_params or None
+        return
+    if len(rule) != 3 or any(
+        type(token_id) is not int or token_id < 0 for token_id in rule
+    ):
+        raise ValueError("conditional token ban must be three non-negative integers")
+    custom_params = dict(custom_params or {})
+    custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY] = list(rule)
     sampling_params["custom_params"] = custom_params
 
 
@@ -312,6 +373,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 )
 
         get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
+        get_request_conditional_token_ban(
             self.custom_params,
             vocab_size=vocab_size,
             strict=True,

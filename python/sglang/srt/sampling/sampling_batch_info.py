@@ -17,6 +17,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.sampling.conditional_token_ban import ConditionalTokenBan
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -120,6 +121,10 @@ class SamplingBatchInfo:
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+
+    # Tokens masked right after another token (K3: no think close while thinking
+    # is off). None when no request in the batch carries such a rule.
+    conditional_token_ban: Optional[ConditionalTokenBan] = None
 
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
@@ -322,6 +327,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            conditional_token_ban=_conditional_token_ban_from_reqs(reqs, device),
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
@@ -503,6 +509,10 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+        if self.conditional_token_ban is not None:
+            self.conditional_token_ban = self.conditional_token_ban.filtered(
+                keep_indices, keep_indices_device
+            )
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
@@ -581,6 +591,13 @@ class SamplingBatchInfo:
         # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
             self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
+        )
+        self.conditional_token_ban = ConditionalTokenBan.merged(
+            self.conditional_token_ban,
+            other.conditional_token_ban,
+            self_len,
+            other_len,
+            self.device,
         )
         if (
             self.return_sampling_masks is not None
@@ -697,6 +714,30 @@ class SamplingBatchInfo:
             new.penalizer_orchestrator = None
             return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+_warned_unsupported_token_ban = False
+
+
+def _conditional_token_ban_from_reqs(reqs, device) -> Optional[ConditionalTokenBan]:
+    global _warned_unsupported_token_ban
+    ban = ConditionalTokenBan.from_reqs(reqs, device)
+    if ban is None:
+        return None
+    # Only plain sampling and the DFLASH verify apply the ban. Under another
+    # speculative algorithm it would hold for the first token and not for the
+    # verified ones, so it is dropped as a whole.
+    algorithm = (get_spec().speculative_algorithm or "").upper()
+    if algorithm not in ("", "NONE", "DFLASH"):
+        if not _warned_unsupported_token_ban:
+            _warned_unsupported_token_ban = True
+            logger.warning(
+                "Conditional token bans are not applied under speculative "
+                "algorithm %s; requests that carry one run without it.",
+                algorithm,
+            )
+        return None
+    return ban
 
 
 @cache

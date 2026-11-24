@@ -932,6 +932,9 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
     SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR = EnvBool(True)
+    # Kimi K3 with thinking off: mask `think` right after `<|close|>`, so the
+    # model cannot close a think channel the prompt never opened.
+    SGLANG_K3_THINKING_OFF_BAN_THINK_CLOSE = EnvBool(True)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation
