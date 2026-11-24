@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,6 +12,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestClampMaxNewTokens(CustomTestCase):
     """`--clamp-max-new-tokens` clamps an over-budget output but never the input."""
+
+    def setUp(self):
+        super().setUp()
+        override = rc.get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
 
     def _manager(self, *, clamp, auto_truncate=False):
         manager = TokenizerManager.__new__(TokenizerManager)
@@ -47,6 +54,18 @@ class TestClampMaxNewTokens(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "longer than the model's context"):
             self._manager(clamp=True)._validate_one_request(req, req.input_ids)
         self.assertEqual(len(req.input_ids), 10, "input must not be truncated")
+
+    def test_clamp_does_not_leak_across_batch_items(self):
+        req = GenerateReqInput(
+            input_ids=[list(range(1, 9)), [1, 2]],
+            sampling_params={"max_new_tokens": 5},
+        )
+        req.normalize_batch_and_arguments()
+        manager = self._manager(clamp=True)
+        for i in range(2):
+            manager._validate_one_request(req[i], req[i].input_ids)
+        self.assertEqual(req[0].sampling_params["max_new_tokens"], 2)
+        self.assertEqual(req[1].sampling_params["max_new_tokens"], 5)
 
 
 if __name__ == "__main__":

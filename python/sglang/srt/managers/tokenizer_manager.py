@@ -2105,9 +2105,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"exceeds the model's context length ({self.context_len} tokens). "
                     "Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                # Rebind instead of writing in place: batch items share one dict.
+                obj.sampling_params = {
+                    **obj.sampling_params,
+                    "max_new_tokens": max(0, _max_req_len - input_token_num),
+                }
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
