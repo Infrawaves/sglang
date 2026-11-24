@@ -85,6 +85,7 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, get_disagg, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    get_request_conditional_token_ban,
     get_request_reasoning_in_grammar,
     get_request_stop_token_sequences,
     get_request_tool_calls_start,
@@ -3675,12 +3676,12 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         special = {"<|open|>": 900, "<|close|>": 901, "<|sep|>": 902}
-        names = {"think": 910, "tools": 911, "message": 912}
+        names = {"think": 910, "tools": 911, "message": 912, "response": 913}
 
-        def encode(text, add_special_tokens=False):
+        def encode(text, **kwargs):
             match = re.fullmatch(r"(<\|\w+\|>)(\w+)(<\|sep\|>)", text)
             if match is None:
-                return []
+                return [special.get(text, names.get(text, 999))]
             head, name, tail = match.groups()
             return [special[head], names[name], special[tail]]
 
@@ -3691,20 +3692,24 @@ class ServingChatTestCase(CustomTestCase):
         tool = {"type": "function", "function": {"name": "lookup"}}
         think_close, tools_open = (901, 910, 902), (900, 911, 902)
         cases = (
-            ({}, False, True),
-            ({"reasoning_effort": "none"}, True, True),
-            ({"thinking": {"type": "disabled"}}, True, True),
-            ({"chat_template_kwargs": {"thinking": False}}, True, True),
-            ({"thinking": {"type": "disabled"}, "tools": [tool]}, True, False),
-            ({"tools": [tool]}, False, False),
+            ({}, None, False, True),
+            ({"reasoning_effort": "none"}, None, True, True),
+            ({"thinking": {"type": "disabled"}}, None, True, True),
+            ({"chat_template_kwargs": {"thinking": False}}, None, True, True),
+            ({"thinking": {"type": "disabled"}, "tools": [tool]}, None, True, False),
+            ({"tools": [tool]}, None, False, False),
+            ({}, {"content": "1, 2,"}, True, True),
+            ({"input_ids": [11, 12]}, {"content": "1, 2,"}, True, True),
+            ({}, {"name": "Alice"}, True, True),
+            ({}, {"reasoning_content": "Count up."}, False, True),
         )
-        for fields, stops_think, stops_tools in cases:
-            with self.subTest(fields=fields):
+        for fields, partial, stops_think, stops_tools in cases:
+            with self.subTest(fields=fields, partial=partial):
+                messages = [{"role": "user", "content": "Hi"}]
+                if partial is not None:
+                    messages.append({"role": "assistant", "partial": True, **partial})
                 request = ChatCompletionRequest(
-                    model="x",
-                    messages=[{"role": "user", "content": "Hi"}],
-                    stop=["END"],
-                    **fields,
+                    model="x", messages=messages, stop=["END"], **fields
                 )
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
@@ -3715,13 +3720,18 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertNotIn(TOOLS_OPEN, params["stop"])
                 sequences = get_request_stop_token_sequences(params["custom_params"])
                 self.assertEqual(think_close in sequences, stops_think)
+                self.assertEqual(
+                    get_request_conditional_token_ban(params["custom_params"]),
+                    (910, (900, 901)) if stops_think else None,
+                )
                 self.assertEqual(tools_open in sequences, stops_tools)
                 self.assertEqual(
                     get_request_tool_calls_start(params["custom_params"]),
                     None if stops_tools else (list(tools_open), [TOOLS_CLOSE]),
                 )
-                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                self.assertEqual(stops_think, not kwargs.get("thinking", True))
+                if partial is None:
+                    kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                    self.assertEqual(stops_think, not kwargs.get("thinking", True))
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):
@@ -8062,7 +8072,7 @@ class KimiK3PartialModeTestCase(unittest.TestCase):
                 self.assertIs(call.kwargs["add_generation_prompt"], True)
                 self.assertEqual(len(call.args[0]), len(messages))
                 self.assertEqual(tail, [])
-                self.assertEqual(self.chat._kimi_k3_generation_stub_tokens(request), 3)
+                self.assertEqual(self.chat._k3_stub_tokens(request), 3)
 
     def test_unusable_partial_messages_are_client_errors(self):
         call = {
@@ -8174,37 +8184,49 @@ class KimiK3PartialModeTestCase(unittest.TestCase):
                     self.assertFalse(_is_grammar_accept_string(grammar, output), output)
 
     def test_json_schema_grammar_with_a_continued_message(self):
-        """An answer that already holds the start of the JSON value is guided by
-        the prompt's schema only; continued reasoning keeps the framed grammar."""
+        """A strict schema requires an empty answer prefix. Continued reasoning
+        leaves the answer empty, so the response grammar still applies."""
+        self.tm.process_request_preprocessor = None
         schema = {"type": "object", "properties": {"lat": {"type": "number"}}}
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {"name": "point", "schema": schema},
-        }
+        answer = {"content": '{"lat":'}
         framed = get_kimik3_json_response_structural_tag(schema).model_dump(
             by_alias=True
         )
-        for last, expected_tag, reasoning in (
-            ({"content": '{"lat":'}, None, False),
-            ({"reasoning_content": "Look it up."}, framed, True),
+        for last, strict, expected in (
+            (answer, {}, HTTPStatus.BAD_REQUEST),
+            (answer, {"strict": True}, HTTPStatus.BAD_REQUEST),
+            (answer, {"strict": False}, None),
+            ({"reasoning_content": "Look it up."}, {}, framed),
         ):
-            with self.subTest(last=last):
+            with self.subTest(last=last, strict=strict):
                 partial = {"role": "assistant", "partial": True, **last}
                 request = ChatCompletionRequest(
                     model="x",
                     messages=[self.USER, partial],
-                    response_format=response_format,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "point", "schema": schema, **strict},
+                    },
                 )
+                if expected == HTTPStatus.BAD_REQUEST:
+                    response = asyncio.run(
+                        self.chat.handle_request(request, self.fastapi_request)
+                    )
+                    self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                    message = json.loads(response.body)["error"]["message"]
+                    self.assertIn("remove the assistant answer prefix", message)
+                    self.assertIn(
+                        "set response_format.json_schema.strict to false", message
+                    )
+                    continue
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
                 )
                 params = adapted.sampling_params
                 self.assertIsNone(params.get("json_schema"))
                 tag = params.get("structural_tag")
-                self.assertEqual(
-                    json.loads(tag) if tag is not None else None, expected_tag
-                )
-                self.assertIs(adapted.require_reasoning, reasoning)
+                self.assertEqual(json.loads(tag) if tag is not None else None, expected)
+                self.assertEqual(adapted.require_reasoning, "reasoning_content" in last)
 
     def test_partial_usage_reports_the_reopened_channel_as_input(self):
         """Moonshot counts the whole rendered prompt as input and only the
@@ -8233,7 +8255,7 @@ class KimiK3PartialModeTestCase(unittest.TestCase):
         self.assertEqual(response.usage.prompt_tokens, 91)
         self.assertEqual(response.usage.completion_tokens, 5)
         self.assertEqual(response.usage.total_tokens, 96)
-        self.assertEqual(self.chat._kimi_k3_generation_stub_tokens(request), 0)
+        self.assertEqual(self.chat._k3_stub_tokens(request), 0)
 
 
 class K3StreamSpecConformanceTestCase(unittest.TestCase):

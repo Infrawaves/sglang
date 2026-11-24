@@ -1,6 +1,7 @@
 """Regenerate Kimi IDs with SGLang and the pinned checkpoint tokenizer.
 
-Run from sgl-router in a SGLang Python environment.
+Run from sgl-router in a SGLang Python environment. Pass case names to
+regenerate only those rows.
 """
 
 import base64
@@ -44,13 +45,20 @@ with tempfile.NamedTemporaryFile(suffix=".model", mode="w+") as model:
     tokenizer = TikTokenTokenizer(model.name, **config)
 server = object.__new__(OpenAIServingChat)
 server.chat_encoding_spec = "kimi_k3"
-# A server without a reasoning parser or a custom encoding adapter, as the
-# router renders: the assistant prefix is appended with no answer opener.
 server._encoding_adapter = None
 server._reasoning_detector = None
-server.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer)
+server._kimi_k3_marker_ids = {}
+server.tokenizer_manager = SimpleNamespace(
+    tokenizer=tokenizer,
+    model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
+)
 cases = json.loads((fixture / "prompts.json").read_text())
+selected = set(sys.argv[1:])
+if unknown := selected.difference(case["name"] for case in cases):
+    raise SystemExit(f"Unknown cases: {', '.join(sorted(unknown))}")
 for case in cases:
+    if selected and case["name"] not in selected:
+        continue
     data = copy.deepcopy(case["request"])
     if "repeat" in case:
         data["messages"][0]["content"] *= case["repeat"]

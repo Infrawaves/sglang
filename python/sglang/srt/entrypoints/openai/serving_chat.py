@@ -420,10 +420,12 @@ def _kimi_k3_text_parts(content: Any) -> list[str]:
     return texts
 
 
-def kimi_k3_partial_continues_reasoning(reasoning: Any, content: Any) -> bool:
-    """A partial message with reasoning and no answer text continues its
-    reasoning in thinking mode; any other partial message continues its answer."""
-    return bool(reasoning) and not _kimi_k3_text_parts(content)
+def _kimi_k3_partial_opens_response(request: ChatCompletionRequest) -> bool:
+    """Whether a partial opens the response channel even with thinking enabled."""
+    partial = kimi_k3_partial_message(request)
+    return partial is not None and (
+        not partial.reasoning_content or bool(_kimi_k3_text_parts(partial.content))
+    )
 
 
 def kimi_k3_partial_answer_prefilled(request: ChatCompletionRequest) -> bool:
@@ -2120,11 +2122,16 @@ class OpenAIServingChat(OpenAIServingBase):
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
         if self.chat_encoding_spec == "kimi_k3":
+            continuing_answer = _kimi_k3_partial_opens_response(request)
             self._stop_kimi_k3_reasoning_without_thinking(
-                sampling_params, request.chat_template_kwargs
+                sampling_params,
+                request.chat_template_kwargs,
+                continuing_answer=continuing_answer,
             )
             self._ban_kimi_k3_think_channel_without_thinking(
-                sampling_params, request.chat_template_kwargs
+                sampling_params,
+                request.chat_template_kwargs,
+                continuing_answer=continuing_answer,
             )
             self._frame_kimi_k3_json_response(
                 sampling_params,
@@ -2380,8 +2387,9 @@ class OpenAIServingChat(OpenAIServingBase):
             return
         if answer_prefilled:
             raise ValueError(
-                "Kimi K3 requires an empty assistant answer prefix to enforce "
-                "a strict json_schema response format."
+                "To enforce a strict json_schema response format with Kimi K3, "
+                "remove the assistant answer prefix. To keep the prefix with "
+                "prompt-only schema guidance, set response_format.json_schema.strict to false."
             )
         schema = json.loads(json_schema)
         # The structural tag compiles the schema without this check.
@@ -2482,11 +2490,11 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         sampling_params: dict[str, Any],
         chat_template_kwargs: dict[str, Any] | None,
+        *,
+        continuing_answer: bool = False,
     ) -> None:
-        """Without thinking the model may still reason and close a think block;
-        the official API ends the output there, keeping the text before it."""
-        # The encoder opens the response channel only for a present, falsy kwarg.
-        if (chat_template_kwargs or {}).get("thinking", True):
+        """Stop a stray think close when generation starts in the response channel."""
+        if not continuing_answer and (chat_template_kwargs or {}).get("thinking", True):
             return
         # In a JSON answer the marker can only be text in a string, where stopping
         # would cut the JSON; run before the K3 framing replaces the json_schema.
@@ -2515,7 +2523,7 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             logger.warning(
                 "Kimi K3 think markers are not three-token special sequences; "
-                "the think channel is not masked while thinking is off"
+                "the think channel mask is unavailable"
             )
         self._kimi_k3_think_ban_rule_cache = rule
         return rule
@@ -2524,22 +2532,19 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         sampling_params: dict[str, Any],
         chat_template_kwargs: dict[str, Any] | None,
+        *,
+        continuing_answer: bool = False,
     ) -> None:
-        """Without thinking the prompt opens the response channel and the think
-        channel is not part of the turn. The model may still reason in the
-        response channel and then write a think close, followed by a second
-        response block, or open a think block of its own. Masking ``think``
-        right after ``<|open|>`` and ``<|close|>`` keeps it out of that channel:
-        it can only close the channel that is open, as on a normal answer.
+        """With thinking off or a resumed answer, generation starts inside
+        the response channel. Masking ``think`` right after ``<|open|>`` and
+        ``<|close|>`` prevents a stray think marker from switching channels.
 
         The mask is conditional, so the same token stays free in ordinary text.
         The think-close stop (_stop_kimi_k3_reasoning_without_thinking) remains
         the fallback wherever the mask does not apply."""
         rule = None
-        if (
-            envs.SGLANG_K3_THINKING_OFF_BAN_THINK.get()
-            # The encoder opens the response channel only for a present, falsy kwarg.
-            and not (chat_template_kwargs or {}).get("thinking", True)
+        if envs.SGLANG_K3_THINKING_OFF_BAN_THINK.get() and (
+            continuing_answer or not (chat_template_kwargs or {}).get("thinking", True)
         ):
             rule = self._kimi_k3_think_ban_rule()
         # Always set or clear: the key is private, not a client parameter.
@@ -5247,14 +5252,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
-        if self.chat_encoding_spec == "kimi_k3":
-            partial = kimi_k3_partial_message(request)
-            if partial is not None and not kimi_k3_partial_continues_reasoning(
-                partial.reasoning_content, partial.content
-            ):
-                # The prompt ends inside the reopened response channel, so the
-                # output is answer text even with thinking on.
-                return False
+        if self.chat_encoding_spec == "kimi_k3" and _kimi_k3_partial_opens_response(
+            request
+        ):
+            return False
 
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(
