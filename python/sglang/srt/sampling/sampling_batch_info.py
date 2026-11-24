@@ -122,8 +122,8 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
-    # Tokens masked right after another token (K3: no think close while thinking
-    # is off). None when no request in the batch carries such a rule.
+    # Tokens masked right after certain other tokens (K3: no think channel while
+    # thinking is off). None when no request in the batch carries such a rule.
     conditional_token_ban: Optional[ConditionalTokenBan] = None
 
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the

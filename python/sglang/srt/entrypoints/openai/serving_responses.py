@@ -576,7 +576,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         self._stop_kimi_k3_reasoning_without_thinking(
                             sampling_params, request.chat_template_kwargs
                         )
-                        self._ban_kimi_k3_think_close_without_thinking(
+                        self._ban_kimi_k3_think_channel_without_thinking(
                             sampling_params, request.chat_template_kwargs
                         )
                         self._frame_kimi_k3_json_response(

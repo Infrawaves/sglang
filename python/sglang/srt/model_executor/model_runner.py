@@ -221,7 +221,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.conditional_token_ban import (
-    armed_token_ban,
+    batch_token_ban,
     last_input_token_ids,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -2280,8 +2280,9 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
-        # After the bias and grammar edits, so neither can lift the mask.
-        token_ban = armed_token_ban(forward_batch.sampling_info)
+        # After the bias and grammar edits, so neither can lift the mask. Only
+        # watermark forcing, where enabled, still edits the logits after it.
+        token_ban = batch_token_ban(forward_batch.sampling_info)
         if token_ban is not None:
             prev_tokens = last_input_token_ids(forward_batch)
             if prev_tokens is not None:
