@@ -158,6 +158,7 @@ POSITIONAL_FIELD_ORDER = (
     "asr_max_concurrent_sessions",
     "preferred_sampling_params",
     "allow_auto_truncate",
+    "clamp_max_new_tokens",
     "stream_interval",
     "batch_notify_size",
     "stream_response_default_include_usage",
