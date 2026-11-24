@@ -175,6 +175,7 @@ from sglang.srt.sampling.sampling_params import (
     append_request_stop_token_sequence,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
+    set_request_tool_calls_start,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
@@ -1973,8 +1974,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
             )
+            tool_call_parsing_active = self._tool_call_parsing_active(request)
             self._stop_kimi_k3_undeclared_tool_calls(
-                sampling_params, self._tool_call_parsing_active(request)
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+            )
+            self._keep_kimi_k3_tool_calls_from_client_stops(
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+                server_stop=processed_messages.server_stop,
             )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
@@ -2279,6 +2287,22 @@ class OpenAIServingChat(OpenAIServingBase):
         passes marker text spelled with ordinary tokens through as content."""
         if not tool_call_parsing_active:
             self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
+
+    def _keep_kimi_k3_tool_calls_from_client_stops(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        tool_call_parsing_active: bool,
+        server_stop: list[str],
+    ) -> None:
+        if not tool_call_parsing_active:
+            return
+        token_ids = self._kimi_k3_marker_stop_ids(TOOLS_OPEN)
+        if token_ids is None:
+            return
+        set_request_tool_calls_start(
+            sampling_params, token_ids=token_ids, server_stop_strs=server_stop
+        )
 
     def _stop_kimi_k3_reasoning_without_thinking(
         self,
@@ -2748,6 +2772,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 result.stop = list(result.stop)
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
+            result.server_stop = result.server_stop + [tool_call_stop]
 
         # Configured after rendering so the detokenization options never reach
         # the chat template.

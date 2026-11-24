@@ -582,15 +582,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                             processed_messages.require_reasoning,
                         )
                         # Same predicate as the parsers' tool_call_parser_active.
+                        tool_call_parsing_active = bool(
+                            self.tool_call_parser
+                            and self._tool_parsing_active(
+                                request,
+                                self._response_tools_to_chat_tools(request),
+                            )
+                        )
                         self._stop_kimi_k3_undeclared_tool_calls(
-                            sampling_params,
-                            bool(
-                                self.tool_call_parser
-                                and self._tool_parsing_active(
-                                    request,
-                                    self._response_tools_to_chat_tools(request),
-                                )
-                            ),
+                            sampling_params=sampling_params,
+                            tool_call_parsing_active=tool_call_parsing_active,
+                        )
+                        self._keep_kimi_k3_tool_calls_from_client_stops(
+                            sampling_params=sampling_params,
+                            tool_call_parsing_active=tool_call_parsing_active,
+                            server_stop=processed_messages.server_stop,
                         )
                     # Match Chat's budget including the reported K3 stub;
                     # tiny limits keep their original generation budget.

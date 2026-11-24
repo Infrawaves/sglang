@@ -173,6 +173,59 @@ def get_request_stop_token_sequences(
     return sequences
 
 
+# Private transport, like the reasoning terminator above: client stop strings
+# and regexes do not match from the first tool-call opener on; the listed
+# server stop strings still match the whole output.
+REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY = "__sglang_tool_calls_start_token_ids"
+REQUEST_SERVER_STOP_STRS_KEY = "__sglang_server_stop_strs"
+MAX_REQUEST_TOOL_CALLS_START_TOKEN_IDS = 32
+
+
+def _valid_tool_calls_start(*, token_ids: object, server_stop_strs: object) -> bool:
+    return (
+        isinstance(token_ids, list)
+        and 0 < len(token_ids) <= MAX_REQUEST_TOOL_CALLS_START_TOKEN_IDS
+        and all(type(token_id) is int and token_id >= 0 for token_id in token_ids)
+        and isinstance(server_stop_strs, list)
+        and len(server_stop_strs) <= MAX_STOP_COUNT
+        and all(type(stop_str) is str for stop_str in server_stop_strs)
+    )
+
+
+def get_request_tool_calls_start(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> Optional[Tuple[List[int], List[str]]]:
+    if not isinstance(custom_params, dict):
+        return None
+    token_ids = custom_params.get(REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY)
+    server_stop_strs = custom_params.get(REQUEST_SERVER_STOP_STRS_KEY, [])
+    if not _valid_tool_calls_start(
+        token_ids=token_ids, server_stop_strs=server_stop_strs
+    ):
+        return None
+    return list(token_ids), list(server_stop_strs)
+
+
+def set_request_tool_calls_start(
+    sampling_params: Dict,
+    *,
+    token_ids: Sequence[int],
+    server_stop_strs: Sequence[str],
+) -> None:
+    token_ids, server_stop_strs = list(token_ids), list(server_stop_strs)
+    if not _valid_tool_calls_start(
+        token_ids=token_ids, server_stop_strs=server_stop_strs
+    ):
+        raise ValueError(
+            "tool-call opener token IDs must be a non-empty, bounded list of "
+            "non-negative integers, and server stop strings a bounded list of str"
+        )
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY] = token_ids
+    custom_params[REQUEST_SERVER_STOP_STRS_KEY] = server_stop_strs
+    sampling_params["custom_params"] = custom_params
+
+
 # Private transport, like the reasoning terminator above: the request's grammar
 # also describes the reasoning, so it applies from the first output token.
 REQUEST_REASONING_IN_GRAMMAR_KEY = "__sglang_reasoning_in_grammar"
