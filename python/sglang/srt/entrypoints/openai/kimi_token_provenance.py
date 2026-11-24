@@ -96,9 +96,14 @@ class KimiTokenProvenance:
     every non-empty increment frame must carry non-empty token_ids. Summing
     internal_content logprobs over frames therefore over-counts such a token;
     a sequence logprob has to come from the deduplicated token sequence.
+
+    ``pending_prefix`` holds prompt token ids that precede generation (K3's
+    opened think or response channel). The first successful take() leads its
+    entry with them, at MISSING_LOGPROB and positions -len..-1; they are not
+    generated tokens, so raw, ids, ends and last_positions never include them.
     """
 
-    def __init__(self, tokenizer, *, with_positions=False):
+    def __init__(self, tokenizer, *, with_positions=False, pending_prefix=()):
         # Both the HF Kimi tokenizer and SGLang's tiktoken wrapper expose the
         # actual Encoding. Its byte API preserves partial UTF-8 tokens.
         encoding = getattr(tokenizer, "model", None)
@@ -119,6 +124,9 @@ class KimiTokenProvenance:
         self.last_positions = []
         # Add token_positions (generated positions) to each taken entry.
         self.with_positions = with_positions
+        self._pending_prefix = list(pending_prefix)
+        # Prompt prefix ids leading the last take()'s entry (0 after the first).
+        self.last_prefix_len = 0
 
     def append(self, token_ids, logprobs=None):
         """Record generated tokens; ``logprobs`` is aligned with ``token_ids``
@@ -180,6 +188,7 @@ class KimiTokenProvenance:
         return ranges
 
     def take(self, source, *, text=False, reasoning=False, replay_chars=0):
+        self.last_prefix_len = 0
         ranges = []
         if replay_chars:
             prefix = source[:replay_chars].encode("utf-8")
@@ -214,6 +223,15 @@ class KimiTokenProvenance:
         }
         if self.with_positions:
             entry["token_positions"] = list(positions)
+        if self._pending_prefix:
+            prefix, self._pending_prefix = self._pending_prefix, []
+            self.last_prefix_len = len(prefix)
+            entry["token_ids"] = prefix + entry["token_ids"]
+            entry["logprobs"] = [MISSING_LOGPROB] * len(prefix) + entry["logprobs"]
+            if self.with_positions:
+                entry["token_positions"] = (
+                    list(range(-len(prefix), 0)) + entry["token_positions"]
+                )
         return [entry]
 
 
