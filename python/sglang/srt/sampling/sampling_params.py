@@ -114,6 +114,75 @@ def set_request_reasoning_end_token_ids(
     sampling_params["custom_params"] = custom_params
 
 
+# Private transport, like the reasoning terminator above: a conditional token
+# ban ``[banned, prev, ...]``. Right after any of the ``prev`` tokens the sampler
+# masks the token ``banned``; everywhere else that token stays free.
+REQUEST_CONDITIONAL_TOKEN_BAN_KEY = "__sglang_conditional_token_ban"
+MAX_CONDITIONAL_TOKEN_BAN_PREVS = 4
+
+
+def get_request_conditional_token_ban(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[Tuple[int, Tuple[int, ...]]]:
+    """Return a validated ``(banned, prevs)`` rule, if the request has one."""
+    if not isinstance(custom_params, dict):
+        return None
+    if REQUEST_CONDITIONAL_TOKEN_BAN_KEY not in custom_params:
+        return None
+    rule = custom_params.get(REQUEST_CONDITIONAL_TOKEN_BAN_KEY)
+    invalid = (
+        not isinstance(rule, list)
+        or not 2 <= len(rule) <= 1 + MAX_CONDITIONAL_TOKEN_BAN_PREVS
+        or any(type(token_id) is not int or token_id < 0 for token_id in rule)
+        or (vocab_size is not None and any(token_id >= vocab_size for token_id in rule))
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "conditional token ban must be vocabulary-bounded token IDs "
+                f"[banned, prev, ...] with 1 to {MAX_CONDITIONAL_TOKEN_BAN_PREVS} "
+                "previous tokens"
+            )
+        return None
+    return rule[0], tuple(rule[1:])
+
+
+def set_request_conditional_token_ban(
+    sampling_params: Dict,
+    *,
+    banned: int,
+    after: Sequence[int],
+) -> None:
+    """Attach a renderer-selected conditional token ban to a request: mask
+    ``banned`` right after any of the ``after`` tokens."""
+    rule = [banned, *after]
+    if not 2 <= len(rule) <= 1 + MAX_CONDITIONAL_TOKEN_BAN_PREVS or any(
+        type(token_id) is not int or token_id < 0 for token_id in rule
+    ):
+        raise ValueError(
+            "conditional token ban must be a non-negative token ID and 1 to "
+            f"{MAX_CONDITIONAL_TOKEN_BAN_PREVS} non-negative previous token IDs"
+        )
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY] = rule
+    sampling_params["custom_params"] = custom_params
+
+
+def clear_request_conditional_token_ban(sampling_params: Dict) -> None:
+    """Remove the rule, so that a client cannot supply one of its own."""
+    custom_params = sampling_params.get("custom_params")
+    if (
+        isinstance(custom_params, dict)
+        and REQUEST_CONDITIONAL_TOKEN_BAN_KEY in custom_params
+    ):
+        custom_params = dict(custom_params)
+        del custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY]
+        sampling_params["custom_params"] = custom_params or None
+
+
 # Private transport, like the reasoning terminator above: token-id sequences
 # that end the request where they start, excluded from the output. Only special
 # tokens the model generates match them, never the same text spelled with
@@ -424,6 +493,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 )
 
         get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
+        get_request_conditional_token_ban(
             self.custom_params,
             vocab_size=vocab_size,
             strict=True,

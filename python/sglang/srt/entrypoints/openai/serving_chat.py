@@ -175,6 +175,8 @@ from sglang.srt.parser.response_template import (
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     append_request_stop_token_sequence,
+    clear_request_conditional_token_ban,
+    set_request_conditional_token_ban,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
     set_request_tool_calls_start,
@@ -187,6 +189,8 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+_UNSET = object()
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
@@ -554,6 +558,8 @@ class OpenAIServingChat(OpenAIServingBase):
     process_preprocessing_private_attrs = ("_kimi_k3_generation_prefix_ids",)
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
+    # (think, (<|open|>, <|close|>)) token ids, resolved on first use.
+    _kimi_k3_think_ban_rule_cache: Any = _UNSET
 
     async def handle_request(self, request, raw_request):
         if self._doc_splitter is not None:
@@ -1979,6 +1985,9 @@ class OpenAIServingChat(OpenAIServingBase):
             self._stop_kimi_k3_reasoning_without_thinking(
                 sampling_params, request.chat_template_kwargs
             )
+            self._ban_kimi_k3_think_channel_without_thinking(
+                sampling_params, request.chat_template_kwargs
+            )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
@@ -2338,6 +2347,63 @@ class OpenAIServingChat(OpenAIServingBase):
         if sampling_params.get("json_schema"):
             return
         self._append_kimi_k3_marker_stop(sampling_params, THINK_CLOSE)
+
+    def _kimi_k3_think_ban_rule(self) -> tuple[int, tuple[int, int]] | None:
+        """``(think, (<|open|>, <|close|>))`` as the model generates them, or None
+        when the tokenizer does not encode the two think markers as a special
+        token, the same name token and the same ``<|sep|>``."""
+        if self._kimi_k3_think_ban_rule_cache is not _UNSET:
+            return self._kimi_k3_think_ban_rule_cache
+        rule = None
+        open_ids = self._kimi_k3_marker_stop_ids(THINK_OPEN)
+        close_ids = self._kimi_k3_marker_stop_ids(THINK_CLOSE)
+        if (
+            open_ids is not None
+            and close_ids is not None
+            and len(open_ids) == len(close_ids) == 3
+            and open_ids[0] != close_ids[0]
+            # Both markers spell the channel name and the separator alike.
+            and open_ids[1:] == close_ids[1:]
+        ):
+            rule = (open_ids[1], (open_ids[0], close_ids[0]))
+        else:
+            logger.warning(
+                "Kimi K3 think markers are not three-token special sequences; "
+                "the think channel is not masked while thinking is off"
+            )
+        self._kimi_k3_think_ban_rule_cache = rule
+        return rule
+
+    def _ban_kimi_k3_think_channel_without_thinking(
+        self,
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Without thinking the prompt opens the response channel and the think
+        channel is not part of the turn. The model may still reason in the
+        response channel and then write a think close, followed by a second
+        response block, or open a think block of its own. Masking ``think``
+        right after ``<|open|>`` and ``<|close|>`` keeps it out of that channel:
+        it can only close the channel that is open, as on a normal answer.
+
+        The mask is conditional, so the same token stays free in ordinary text.
+        The think-close stop (_stop_kimi_k3_reasoning_without_thinking) remains
+        the fallback wherever the mask does not apply."""
+        rule = None
+        if (
+            envs.SGLANG_K3_THINKING_OFF_BAN_THINK.get()
+            # The encoder opens the response channel only for a present, falsy kwarg.
+            and not (chat_template_kwargs or {}).get("thinking", True)
+        ):
+            rule = self._kimi_k3_think_ban_rule()
+        # Always set or clear: the key is private, not a client parameter.
+        if rule is None:
+            clear_request_conditional_token_ban(sampling_params)
+        else:
+            banned, after = rule
+            set_request_conditional_token_ban(
+                sampling_params, banned=banned, after=after
+            )
 
     def _set_json_grammar_start(
         self,
