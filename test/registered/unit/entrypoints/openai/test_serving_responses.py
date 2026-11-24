@@ -49,7 +49,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
-from sglang.srt.function_call.kimik3_format import THINK_CLOSE
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import (
     get_context,
@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
+    get_request_tool_calls_start,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1350,6 +1351,51 @@ class KimiK3AdditionalToolsTestCase(CustomTestCase):
                 )
                 self.assertIn("END", captured["stop"])
                 self.assertEqual(THINK_CLOSE in captured["stop"], stops)
+
+    def test_client_stops_end_at_the_tools_channel(self):
+        """With a tool-call parser, the client's stops end at the tools open's
+        special tokens, so a stop in call arguments keeps the call; the server's
+        tools close stop still applies to the whole output, even when the client
+        sends the same stop."""
+        tools_open = [900, 911, 902]
+        tokenizer = self.serving.tokenizer_manager.tokenizer
+        tokenizer.encode.side_effect = lambda text, add_special_tokens=False: (
+            tools_open if text == TOOLS_OPEN else []
+        )
+        tokenizer.convert_tokens_to_ids.side_effect = {
+            "<|open|>": 900,
+            "<|sep|>": 902,
+        }.get
+        for tools, expected in (
+            ([self.TOOL], (tools_open, [TOOLS_CLOSE])),
+            ([], None),
+        ):
+            with self.subTest(tools=tools):
+                captured = {}
+
+                async def generate(internal_request, raw_request):
+                    captured["params"] = internal_request.sampling_params
+                    chunk = engine_chunk("ok")
+                    chunk["meta_info"]["finish_reason"] = {"type": "stop"}
+                    yield chunk
+
+                self.serving.tokenizer_manager.generate_request = generate
+                asyncio.run(
+                    self.serving.create_responses(
+                        ResponsesRequest(
+                            model="x",
+                            input="Hi",
+                            tools=tools,
+                            stop=["Shanghai", TOOLS_CLOSE],
+                        )
+                    )
+                )
+                self.assertEqual(
+                    get_request_tool_calls_start(
+                        captured["params"].get("custom_params")
+                    ),
+                    expected,
+                )
 
     def test_declares_tools_in_place_and_parses_their_calls(self):
         """Declared tools render at their position and their calls are parsed."""

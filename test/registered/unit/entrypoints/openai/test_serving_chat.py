@@ -84,6 +84,7 @@ from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
     get_request_stop_token_sequences,
+    get_request_tool_calls_start,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -3665,7 +3666,9 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_stops_reasoning_written_without_thinking(self):
         """Only a prompt that opens the response channel stops on a think close,
         and only a request without a tool-call parser stops on a tools open; both
-        stop on the special-token ids, and the client's own stops are kept."""
+        stop on the special-token ids, and the client's own stops are kept. With
+        a tool-call parser, the client's stops end at the tools open instead and
+        the server's tools close stop does not."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         special = {"<|open|>": 900, "<|close|>": 901, "<|sep|>": 902}
@@ -3710,6 +3713,10 @@ class ServingChatTestCase(CustomTestCase):
                 sequences = get_request_stop_token_sequences(params["custom_params"])
                 self.assertEqual(think_close in sequences, stops_think)
                 self.assertEqual(tools_open in sequences, stops_tools)
+                self.assertEqual(
+                    get_request_tool_calls_start(params["custom_params"]),
+                    None if stops_tools else (list(tools_open), [TOOLS_CLOSE]),
+                )
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(stops_think, not kwargs.get("thinking", True))
 

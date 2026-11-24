@@ -20,7 +20,7 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Annotated,
     Any,
@@ -2864,6 +2864,8 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
+    # Server stops that still apply inside tool calls; client stops are not listed.
+    server_stop: List[str] = field(default_factory=list)
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
