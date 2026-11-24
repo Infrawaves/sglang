@@ -301,7 +301,10 @@ class StreamOptions(BaseModel):
     # internal_content[] entry also carries token_positions, the 0-based
     # generated position of each of its token_ids (same length). A token that
     # backs two frames repeats with the same position, so consumers deduplicate
-    # by (choice index, token position).
+    # by (choice index, token position). The prompt's generation prefix that
+    # leads a choice's first entry (see KimiTokenProvenance) takes the
+    # negative positions -len..-1 (-3, -2, -1 for K3); generated token 0 keeps
+    # position 0.
     include_internal_token_positions: Optional[bool] = False
 
     @model_validator(mode="after")
@@ -1079,6 +1082,11 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
+    # K3: the last prompt token ids the chat template rendered as the
+    # generation prefix (the opened think or response channel), captured
+    # before continue_final_message appends an assistant prefix. Empty for raw
+    # input_ids. Leads each choice's internal_content.
+    _kimi_k3_generation_prefix_ids: List[int] = PrivateAttr(default_factory=list)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create

@@ -128,7 +128,9 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
+    THINK_OPEN,
     TOOLS_OPEN,
 )
 from sglang.srt.function_call.tool_schema_guard import (
@@ -547,6 +549,9 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     supports_process_preprocessing = True
+    # Private request attrs set during conversion that later stages read
+    # (see process_request_preprocessor._replayed_private_attrs).
+    process_preprocessing_private_attrs = ("_kimi_k3_generation_prefix_ids",)
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
@@ -1019,6 +1024,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools=request_tools,
                 return_dict=False,
                 **template_kwargs,
+            )
+            # The template's own generation prefix (the opened think or
+            # response channel), before any assistant prefix.
+            request._kimi_k3_generation_prefix_ids = self._kimi_k3_generation_prefix(
+                prompt_ids
             )
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
@@ -2265,6 +2275,15 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         self._kimi_k3_marker_ids[marker] = ids
         return ids
+
+    def _kimi_k3_generation_prefix(self, prompt_ids: list[int]) -> list[int]:
+        """The opened think or response channel ending ``prompt_ids``, or []
+        when the prompt does not end with one of those markers."""
+        tail = list(prompt_ids[-self._KIMI_K3_GENERATION_STUB_TOKENS :])
+        for marker in (THINK_OPEN, RESPONSE_OPEN):
+            if self._kimi_k3_marker_stop_ids(marker) == tail:
+                return tail
+        return []
 
     def _append_kimi_k3_marker_stop(
         self, sampling_params: dict[str, Any], marker: str
@@ -3706,6 +3725,11 @@ class OpenAIServingChat(OpenAIServingBase):
                                 token_provenances[index] = KimiTokenProvenance(
                                     self.tokenizer_manager.tokenizer,
                                     with_positions=internal_positions_on,
+                                    pending_prefix=(
+                                        request._kimi_k3_generation_prefix_ids
+                                        if internal_content_on
+                                        else ()
+                                    ),
                                 )
                             except ValueError as e:
                                 if internal_content_on or standard is None:
@@ -5284,6 +5308,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     internal_requested,
                     call_item.source_text or "",
                 )
+            # The argument continuation repeats the slot-open frame's generated
+            # tokens, but not the prompt prefix that led it.
+            continuation_internal = call_internal
+            prefix_len = (
+                token_provenance.last_prefix_len if token_provenance is not None else 0
+            )
+            if k3_frames and call_internal and prefix_len:
+                continuation_internal = [
+                    {key: value[prefix_len:] for key, value in entry.items()}
+                    for entry in call_internal
+                ]
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -5340,7 +5375,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=index,
                     delta=DeltaMessage(tool_calls=[tool_call]),
                     logprobs=frame_logprobs,
-                    internal_content=call_internal,
+                    internal_content=(
+                        call_internal if delta_index == 0 else continuation_internal
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
