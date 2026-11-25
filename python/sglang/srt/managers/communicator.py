@@ -104,6 +104,7 @@ class FanOutCommunicator(Generic[T]):
 
     @staticmethod
     def merge_results(results):
+        # Generator on purpose: all() stops at the first failed worker.
         all_success = all(r.success for r in results)
         all_message = [r.message for r in results]
         all_message = " | ".join(all_message)
