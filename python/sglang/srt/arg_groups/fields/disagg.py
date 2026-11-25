@@ -56,6 +56,41 @@ class Disagg(msgspec.Struct):
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
+    prefill_pull_router: A[
+        Optional[str],
+        "Comma-separated router URLs from which this prefill worker acquires requests; enables request-pull admission. An http:// hostname is re-resolved every 10s and each address is claimed from, e.g. a Kubernetes headless Service.",
+    ] = None
+    prefill_pull_worker_url: A[
+        Optional[str],
+        "This prefill worker's externally reachable URL, exactly as registered with the pull router.",
+    ] = None
+    prefill_pull_router_api_key: A[
+        Optional[str],
+        "API key for the pull router's internal endpoints: the router's --pull-control-api-key, not the engine --api-key. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_max_tokens: A[
+        Optional[int],
+        "Maximum outstanding prompt tokens still to prefill, after cache hits; a request stops counting once its last chunk is scheduled. One more request is claimed while any remains, so the total may exceed this by one request. KV is budgeted separately from free memory. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_max_requests: A[
+        Optional[int],
+        "Maximum outstanding pull requests and reservations. Required with --prefill-pull-router.",
+    ] = None
+    prefill_pull_safety_margin_tokens: A[
+        int, "Additional KV token headroom excluded from prefill pull grants."
+    ] = 0
+    prefill_pull_concurrent_claims: A[
+        int,
+        "Requests the prefill pull agent claims concurrently from each router, so one claim's round trips overlap the next. 1 to 16.",
+    ] = 2
+    prefill_pull_poll_wait_ms: A[
+        int,
+        "Longest a prefill pull claim waits at a router for a request that fits, in milliseconds. 0 to 30000; the router caps it at 30000.",
+    ] = 10000
+    prefill_pull_allow_push: A[
+        bool,
+        "Also accept requests a push router dispatches without a pull reservation, charging them to the same budget. Lets push and pull routers share this prefill worker during a rollout.",
+    ] = False
     disaggregation_decode_allocation_policy: A[
         Literal["early", "prefill_complete"],
         "When to reserve per-request decode KV in disaggregated serving. "

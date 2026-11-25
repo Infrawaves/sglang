@@ -111,6 +111,15 @@ impl BreakerOutcome {
     }
 }
 
+/// Records an engine status that reached the router other than as a proxied
+/// response (a pull prefill's reported outcome), as a dispatch would.
+pub(crate) fn record_upstream_status(breaker: &CircuitBreaker, status: u16) {
+    match reqwest::StatusCode::from_u16(status) {
+        Ok(status) => breaker_outcome(status).record(breaker),
+        Err(_) => breaker.record_failure(),
+    }
+}
+
 /// Classify an upstream status for circuit-breaker accounting.
 ///
 /// A backpressure status — `503 Service Unavailable` or `429 Too Many

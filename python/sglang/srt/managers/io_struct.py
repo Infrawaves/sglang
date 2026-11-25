@@ -309,6 +309,8 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    prefill_pull_reservation_id: Optional[str] = None
+    prefill_pull_assignment_id: Optional[str] = None
     # Deprecated alias for `routed_dp_rank`, still accepted because
     # sgl-model-gateway's dp-aware mode injects this spelling into every
     # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
@@ -1056,6 +1058,8 @@ class GenerateReqInput:
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
             routed_dp_rank=self.routed_dp_rank,
+            prefill_pull_reservation_id=self.prefill_pull_reservation_id,
+            prefill_pull_assignment_id=self.prefill_pull_assignment_id,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
@@ -1147,6 +1151,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    prefill_pull_reservation_id: Optional[str] = None
+    prefill_pull_assignment_id: Optional[str] = None
+    # Set by the tokenizer for its own health/warmup traffic; not an HTTP field.
+    prefill_pull_internal: bool = False
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 
@@ -2342,6 +2350,20 @@ class SlowDownReqInput(BaseReq, kw_only=True):
 
 class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
+
+
+class PrefillPullBudgetReq(BaseReq, kw_only=True):
+    action: str
+    reservation_id: str
+    assignment_id: Optional[str] = None
+    request_id: Optional[str] = None
+    tokens: Optional[int] = None
+
+
+class PrefillPullBudgetReqOutput(BaseReq, kw_only=True):
+    success: bool
+    data: Dict[str, Any] = msgspec.field(default_factory=dict)
+    error: Optional[str] = None
 
 
 class PdRoleSwitchReqInput(BaseReq, kw_only=True):

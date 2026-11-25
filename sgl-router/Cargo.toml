@@ -99,6 +99,7 @@ rmp-serde = "1"
 # src/policies/kv_events/tree.rs.
 rustc-hash = "2"
 sha2 = "0.10"
+subtle = "2.6"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 

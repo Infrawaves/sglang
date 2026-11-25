@@ -152,6 +152,9 @@ from sglang.srt.managers.request_validation import (
 from sglang.srt.managers.req_types import (
     get_request_return_hidden_states_mode,
 )
+from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    prepare_prefill_pull_request,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -885,6 +888,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+        # Set by the HTTP server; accepted pull work can precede rid registration.
+        self.prefill_pull_agent = None
 
     def is_healthy(self) -> bool:
         """Return whether startup completed and the server is neither unhealthy nor shutting down."""
@@ -1602,6 +1607,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        prefill_pull_internal = False
+        if get_disagg().prefill_pull_router is not None:
+            prefill_pull_internal = prepare_prefill_pull_request(
+                obj,
+                request,
+                starting=self.server_status == ServerStatus.Starting,
+                allow_push=get_disagg().prefill_pull_allow_push,
+            )
+
         self._resolve_cache_identity(obj, request)
         if isinstance(obj, GenerateReqInput):
             self._validate_cache_request(obj)
@@ -1658,6 +1672,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+                        tokenized_obj.prefill_pull_internal = prefill_pull_internal
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -2340,6 +2356,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
+                prefill_pull_reservation_id=obj.prefill_pull_reservation_id,
+                prefill_pull_assignment_id=obj.prefill_pull_assignment_id,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 kv_hints=obj.kv_hints,
@@ -4354,6 +4372,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
+        pull_drain = (
+            asyncio.create_task(self.prefill_pull_agent.drain())
+            if self.prefill_pull_agent is not None
+            else None
+        )
         # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
@@ -4376,12 +4399,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.force_exit_handler()
                 break
 
+            pull_draining = pull_drain is not None and not pull_drain.done()
             logger.info(
-                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
+                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}. Pull agent draining {pull_draining}."
             )
-            if remain_num_req > 0:
+            if remain_num_req > 0 or pull_draining:
                 await asyncio.sleep(5)
             else:
+                if pull_drain is not None:
+                    await pull_drain
                 break
 
         await self.close_cache_accounting()

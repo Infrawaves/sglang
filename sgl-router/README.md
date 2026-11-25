@@ -22,6 +22,22 @@ Grafana), [BENCHMARKS.md](BENCHMARKS.md),
 [sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer),
 [EXAMPLES.md](EXAMPLES.md) (GLM-5.3-Flash and DeepSeek-V4.1-Flash, end to end).
 
+Experimental **prefill request pull** is available with
+`--chat-routing reorg --prefill-dispatch-mode pull` and matching prefill worker
+flags. Prefill reserves scheduler capacity, acquires a request from the router,
+and executes it locally; the router still dispatches decode and returns its
+output. The default remains push. Pull requires DP1, single text requests, and
+a nonempty `--pull-control-api-key` matching the prefill agent's
+`--prefill-pull-router-api-key` and differing from `--worker-api-key` (engine
+callers hold that key and must not reach the pull control plane); static `--worker-urls` and `--service-discovery`
+both work, and a prefill agent can claim from several router replicas. Raw text
+requires a router tokenizer; with `--no-tokenizer`, send `input_ids`. A claiming
+worker prefers requests whose prefix it caches, for up to
+`--pull-affinity-max-wait-ms` (default 500); a request that has waited
+`--pull-starvation-ms` (default 5000) stops a worker that could fit it from
+claiming younger ones. GPU inference and performance validation are still
+pending.
+
 ## Architecture
 
 A deployment is a **router** in front of **buckets of SGLang engines**. A bucket

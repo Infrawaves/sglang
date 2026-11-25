@@ -9,7 +9,7 @@
 // exercised deterministically.
 
 use std::num::NonZeroU32;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -144,6 +144,22 @@ impl CircuitBreaker {
 
     /// Claim admission, releasing an unfinished recovery probe on cancellation.
     pub fn acquire(&self) -> Option<CircuitPermit<'_>> {
+        Some(CircuitPermit {
+            breaker: self,
+            generation: self.try_admit()?,
+        })
+    }
+
+    /// Hold admission when the request can outlive the dispatch that started it.
+    pub(crate) fn acquire_owned(self: &Arc<Self>) -> Option<OwnedCircuitPermit> {
+        let generation = self.try_admit()?;
+        Some(OwnedCircuitPermit {
+            breaker: Arc::clone(self),
+            generation,
+        })
+    }
+
+    fn try_admit(&self) -> Option<Option<u64>> {
         let mut g = self.inner.lock().unwrap();
         let generation = match g.state {
             State::Closed => None,
@@ -161,10 +177,19 @@ impl CircuitBreaker {
                 Some(g.probe_generation)
             }
         };
-        Some(CircuitPermit {
-            breaker: self,
-            generation,
-        })
+        Some(generation)
+    }
+
+    fn release_probe(&self, generation: Option<u64>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        if g.probe_generation == generation {
+            if let State::HalfOpen { probe_in_flight } = &mut g.state {
+                *probe_in_flight = false;
+            }
+        }
     }
 
     pub fn record_success(&self) {
@@ -250,15 +275,24 @@ impl CircuitPermit<'_> {
 
 impl Drop for CircuitPermit<'_> {
     fn drop(&mut self) {
-        let Some(generation) = self.generation else {
-            return;
-        };
-        let mut g = self.breaker.inner.lock().unwrap();
-        if g.probe_generation == generation {
-            if let State::HalfOpen { probe_in_flight } = &mut g.state {
-                *probe_in_flight = false;
-            }
-        }
+        self.breaker.release_probe(self.generation);
+    }
+}
+
+pub(crate) struct OwnedCircuitPermit {
+    breaker: Arc<CircuitBreaker>,
+    generation: Option<u64>,
+}
+
+impl OwnedCircuitPermit {
+    pub(crate) fn breaker(&self) -> &CircuitBreaker {
+        &self.breaker
+    }
+}
+
+impl Drop for OwnedCircuitPermit {
+    fn drop(&mut self) {
+        self.breaker.release_probe(self.generation);
     }
 }
 

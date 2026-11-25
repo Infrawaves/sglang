@@ -22,6 +22,43 @@ pub(super) async fn select_workers(
     headers: &HeaderMap,
     excluded: &[WorkerId],
 ) -> Result<SelectedWorkers, ApiError> {
+    select_workers_inner(ctx, resolver, request, headers, excluded, None, true).await
+}
+
+pub(super) async fn select_workers_for_prefill(
+    ctx: &AppContext,
+    resolver: &BucketResolver,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    prefill: &std::sync::Arc<crate::workers::Worker>,
+) -> Result<SelectedWorkers, ApiError> {
+    select_workers_inner(ctx, resolver, request, headers, &[], Some(prefill), true).await
+}
+
+/// Only check membership, model/version pairing, health, and bucket limits.
+/// D selection/admission occurs later, when this P actually acquires the work.
+pub(super) async fn prefill_is_eligible(
+    ctx: &AppContext,
+    resolver: &BucketResolver,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    prefill: &std::sync::Arc<crate::workers::Worker>,
+) -> Result<(), ApiError> {
+    select_workers_inner(ctx, resolver, request, headers, &[], Some(prefill), false)
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn select_workers_inner(
+    ctx: &AppContext,
+    resolver: &BucketResolver,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    excluded: &[WorkerId],
+    prefill: Option<&std::sync::Arc<crate::workers::Worker>>,
+    select_decode: bool,
+) -> Result<SelectedWorkers, ApiError> {
     let input_tokens = request.sequence_token_count as u64;
     if request
         .output_tokens
@@ -84,13 +121,23 @@ pub(super) async fn select_workers(
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
     for bucket in buckets {
-        match bucket.pick_engines(&ctx.registry, &bucket_request).await {
+        let selected = match prefill {
+            Some(p) => {
+                bucket
+                    .pick_for_prefill(&ctx.registry, &bucket_request, p, select_decode)
+                    .await
+            }
+            None => bucket.pick_engines(&ctx.registry, &bucket_request).await,
+        };
+        match selected {
             Ok(picks) => {
-                record_prefill_route(
-                    ctx,
-                    prefix.local_signal().as_deref(),
-                    &picks.prefill.engine.url,
-                );
+                if select_decode {
+                    record_prefill_route(
+                        ctx,
+                        prefix.local_signal().as_deref(),
+                        &picks.prefill.engine.url,
+                    );
+                }
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,

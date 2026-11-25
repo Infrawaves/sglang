@@ -286,6 +286,53 @@ impl Bucket {
         Ok(BucketPick { prefill, decode })
     }
 
+    /// Pull admission is owned by the claiming P; preserve bucket membership and
+    /// version pairing, then run the normal decode policy on that P's peers.
+    pub async fn pick_for_prefill(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        claimed: &Arc<Worker>,
+        select_decode: bool,
+    ) -> Result<BucketPick, (Stage, PickError)> {
+        let BucketGroups::Pd { prefill, decode } = &self.groups else {
+            return Err((Stage::Prefill, PickError::NoCandidates));
+        };
+        if !prefill
+            .candidates(workers, request, Stage::Prefill)
+            .iter()
+            .any(|p| p.id == claimed.id)
+        {
+            return Err((Stage::Prefill, PickError::NoCandidates));
+        }
+        let peers: Vec<_> = decode
+            .candidates(workers, request, Stage::Decode)
+            .into_iter()
+            .filter(|d| d.version_group() == claimed.version_group() && d.dp_ranks() == 1)
+            .collect();
+        let decode = if select_decode {
+            self.pick_from_group(decode, Stage::Decode, peers, request)
+                .await?
+        } else {
+            // Queue eligibility must not run a stateful D policy or reject a
+            // request just because D is temporarily at its admission limit.
+            Pick {
+                engine: peers
+                    .into_iter()
+                    .next()
+                    .ok_or((Stage::Decode, PickError::NoCandidates))?,
+                reason: "compatible decode peer",
+            }
+        };
+        Ok(BucketPick {
+            prefill: Pick {
+                engine: claimed.clone(),
+                reason: "worker pull reservation",
+            },
+            decode: Some(decode),
+        })
+    }
+
     /// Scope the request to this bucket and role, then ask the group for one engine.
     async fn pick_from_group(
         &self,

@@ -471,7 +471,8 @@ async fn serve(
     let stop = grpc_stop.clone();
     let mut result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal(sigterm, sigint, app_context, drain).await;
+            shutdown_signal(sigterm, sigint, Arc::clone(&app_context), drain).await;
+            drain_pull_queue(&app_context).await;
             let _ = drain_tx.send(Some(Instant::now()));
             stop.cancel();
         })
@@ -490,6 +491,35 @@ async fn serve(
     ServeOutcome {
         result,
         inflight_drain_secs,
+    }
+}
+
+/// In pull mode a held request completes only through prefill agents calling
+/// `/internal/pull/*` on new connections, which axum's graceful shutdown would
+/// refuse: the claimed prefill then lost its control plane, was cancelled and
+/// the client timed out. So stop new intake, keep accepting until every held
+/// request finished, then let axum drain the rest. Bounded by the request
+/// deadline, after which held requests have timed out anyway.
+async fn drain_pull_queue(app_context: &AppContext) {
+    if app_context.config.proxy.pull.mode != sgl_router::config::PrefillDispatchMode::Pull {
+        return;
+    }
+    app_context.pull_queue.close();
+    let limit = app_context
+        .router_inflight_load
+        .stale_request_timeout()
+        .min(Duration::from_secs(
+            app_context.config.proxy.request_timeout_secs,
+        ));
+    tracing::info!(
+        limit_secs = limit.as_secs(),
+        "draining pull queue: new requests refused, control plane still served"
+    );
+    if tokio::time::timeout(limit, app_context.pull_queue.drained())
+        .await
+        .is_err()
+    {
+        tracing::warn!("pull queue still held requests at the request deadline");
     }
 }
 

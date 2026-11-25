@@ -12,7 +12,7 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.runtime_context import create_context, use_context
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.srt.utils import request_logger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,6 +73,30 @@ class _LongestWalkSpy:
 
 
 class TestRequestLogRedaction(CustomTestCase):
+    def test_pull_router_credentials_are_hidden_in_config_and_launch_reports(self):
+        """Pull credentials stay usable while public/logged config omits them."""
+        secret = "pull-router-test-secret"
+        for option in (
+            ["--prefill-pull-router-api-key", secret],
+            [f"--prefill-pull-router-api-key={secret}"],
+        ):
+            args = prepare_server_args(["--model-path", "dummy", *option])
+            self.assertEqual(args.prefill_pull_router_api_key, secret)
+            reports = (
+                repr(args),
+                args.launch_command,
+                repr(redact_watermark_secrets(args)),
+                repr(redact_watermark_secrets(args.resolved_dict())),
+                repr(
+                    redact_watermark_secrets(
+                        {"config_updates": [{"prefill_pull_router_api_key": secret}]}
+                    )
+                ),
+            )
+            for report in reports:
+                self.assertNotIn(secret, report)
+            self.assertEqual(args.prefill_pull_router_api_key, secret)
+
     def test_secrets_redacted_in_both_formatters(self):
         for num_ids in (16, 100_000):
             req = _request(num_ids)

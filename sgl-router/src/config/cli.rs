@@ -125,6 +125,31 @@ pub struct ModelArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ServerArgs {
+    /// Prefill dispatch: push (default) or worker-initiated request pull.
+    #[arg(long, value_enum, default_value = "push")]
+    pub prefill_dispatch_mode: crate::config::PrefillDispatchMode,
+    /// Maximum queued and offered pull requests; committed ones no longer count.
+    #[arg(long, default_value_t = 1024)]
+    pub pull_max_requests: usize,
+    /// Maximum request payload bytes of queued and offered pull requests.
+    #[arg(long, default_value_t = 67_108_864)]
+    pub pull_max_bytes: usize,
+    /// Maximum input tokens of queued and offered pull requests.
+    #[arg(long, default_value_t = 4_194_304)]
+    pub pull_max_tokens: usize,
+    /// Uncommitted offer lease in milliseconds; expiry permits reassignment.
+    #[arg(long, default_value_t = 30_000)]
+    pub pull_offer_timeout_ms: u64,
+    /// Milliseconds a pull request waits for the prefill worker holding its
+    /// longest cached prefix before any eligible worker may claim it. 0 is FIFO.
+    #[arg(long, default_value_t = 500)]
+    pub pull_affinity_max_wait_ms: u64,
+    /// Queue age in milliseconds after which a pull request too long for a
+    /// worker's current grant stops that worker from claiming younger requests,
+    /// for at most one more such period.
+    #[arg(long, default_value_t = 5_000)]
+    pub pull_starvation_ms: u64,
+
     /// Address to bind the HTTP server to.
     #[arg(long, default_value_t = default_host())]
     pub host: String,
@@ -153,6 +178,12 @@ pub struct ServerArgs {
     /// `/model_info`). Set it to the engines' `--api-key`.
     #[arg(long)]
     pub worker_api_key: Option<String>,
+
+    /// Key prefill pull agents present on `/internal/pull/*` (their
+    /// `--prefill-pull-router-api-key`). Required with
+    /// `--prefill-dispatch-mode pull`, and must differ from `--worker-api-key`.
+    #[arg(long)]
+    pub pull_control_api_key: Option<String>,
 
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
@@ -666,6 +697,12 @@ impl Cli {
             .as_deref()
             .map(bearer)
             .transpose()?;
+        let pull_control_auth = self
+            .server
+            .pull_control_api_key
+            .as_deref()
+            .map(bearer)
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
@@ -674,6 +711,7 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                pull_control_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -715,6 +753,15 @@ impl Cli {
             },
             discovery,
             proxy: ProxyConfig {
+                pull: crate::config::PullConfig {
+                    mode: self.server.prefill_dispatch_mode,
+                    max_requests: self.server.pull_max_requests,
+                    max_bytes: self.server.pull_max_bytes,
+                    max_tokens: self.server.pull_max_tokens,
+                    offer_timeout_ms: self.server.pull_offer_timeout_ms,
+                    affinity_max_wait_ms: self.server.pull_affinity_max_wait_ms,
+                    starvation_ms: self.server.pull_starvation_ms,
+                },
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
                 max_attempts: self.server.retry_max_attempts,
@@ -728,6 +775,12 @@ impl Cli {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
+        if self.server.prefill_dispatch_mode == crate::config::PrefillDispatchMode::Pull {
+            ensure!(
+                self.routing.chat_routing == ChatRoutingKind::Reorg,
+                "pull requires --chat-routing reorg"
+            );
+        }
         config.validate()?;
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
             crate::policies_reorg::factory::validate(&config.model)?;

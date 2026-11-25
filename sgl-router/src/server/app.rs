@@ -23,7 +23,9 @@ use tower_http::catch_panic::CatchPanicLayer;
 /// `access_log_and_record`). They are counted in both edge counters either way;
 /// filter them by `route` in PromQL.
 fn is_infra_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
+    // Prefill pull agents poll these per claim and per in-flight request
+    // (status every second), which would otherwise bury client traffic.
+    matches!(path, "/healthz" | "/readyz" | "/metrics") || path.starts_with("/internal/pull/")
 }
 
 /// Collapse an HTTP method to a bounded allow-list for use as a metric label.
@@ -194,6 +196,28 @@ fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppC
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let max_chat_body_bytes = ctx.config.proxy.max_chat_body_bytes;
     let router = Router::new()
+        .route(
+            "/internal/pull/acquire",
+            post(crate::server::routes::work_pull::acquire),
+        )
+        .route(
+            "/internal/pull/accept",
+            post(crate::server::routes::work_pull::accept),
+        )
+        .route(
+            "/internal/pull/reject",
+            post(crate::server::routes::work_pull::reject),
+        )
+        .route(
+            "/internal/pull/status",
+            post(crate::server::routes::work_pull::status),
+        )
+        .route(
+            "/internal/pull/outcome",
+            post(crate::server::routes::work_pull::outcome).layer(DefaultBodyLimit::max(
+                crate::state::work_pull::MAX_OUTCOME_WIRE_BYTES,
+            )),
+        )
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))

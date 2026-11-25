@@ -186,6 +186,11 @@ class TokenizerControlMixin:
     """
 
     def init_communicators(self: TokenizerManager):
+        from sglang.srt.managers.io_struct import PrefillPullBudgetReqOutput
+        from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+            PrefillPullBudgetClient,
+        )
+
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
@@ -197,7 +202,31 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+        self._prefill_pull_budget_client = PrefillPullBudgetClient(
+            self._dispatch_to_scheduler
+        )
+        dispatch_pairs.append(
+            (PrefillPullBudgetReqOutput, self._prefill_pull_budget_client.handle_recv)
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    async def prefill_pull_budget(
+        self: TokenizerManager,
+        *,
+        action: str,
+        reservation_id: str,
+        assignment_id: Optional[str] = None,
+        tokens: Optional[int] = None,
+        request_id: Optional[str] = None,
+    ) -> dict:
+        self.auto_create_handle_loop()
+        return await self._prefill_pull_budget_client.call(
+            action=action,
+            reservation_id=reservation_id,
+            assignment_id=assignment_id,
+            tokens=tokens,
+            request_id=request_id,
+        )
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (

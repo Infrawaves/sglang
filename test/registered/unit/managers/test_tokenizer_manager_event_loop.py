@@ -5,6 +5,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from contextvars import ContextVar
+from unittest import mock
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -31,6 +32,119 @@ class _BlockingFastTokenizer:
 
 
 class TestTokenizerManagerEventLoop(CustomTestCase):
+    def test_shutdown_waits_for_pull_work_before_local_intake_and_after_output(self):
+        """SIGTERM must keep schedulers alive while accepted pull work has no
+        tokenizer rid yet, and while its outcome is still being reported."""
+        from sglang.srt.managers import tokenizer_manager as module
+        from sglang.srt.managers.io_struct import ShutdownReq
+        from sglang.srt.managers.prefill_pull_agent import (
+            PrefillPullAgent,
+            PrefillPullAgentConfig,
+        )
+
+        async def run_shutdown():
+            allow_generate = asyncio.Event()
+            local_started = asyncio.Event()
+            allow_output = asyncio.Event()
+            outcome_pending = asyncio.Event()
+            allow_outcome = asyncio.Event()
+            polls = asyncio.Queue()
+            next_poll = asyncio.Queue()
+            finish_polling = False
+            real_sleep = asyncio.sleep
+            shutdown_requests = []
+            shutdown_events = []
+
+            manager = TokenizerManager.__new__(TokenizerManager)
+            manager.gracefully_exit = True
+            manager.rid_to_state = {}
+            manager.server_status = module.ServerStatus.Up
+            manager._cache_store = None
+            manager._subprocess_watchdog = None
+            manager.asyncio_tasks = set()
+            manager._dispatch_to_scheduler = shutdown_requests.append
+            manager._server_stop_hook = lambda: shutdown_events.append("server stopped")
+            agent = PrefillPullAgent(
+                PrefillPullAgentConfig(
+                    router_urls=("http://router",),
+                    worker_url="http://worker",
+                    local_url="http://worker",
+                    max_inflight=1,
+                ),
+                budget=mock.AsyncMock(),
+                abort=mock.Mock(),
+                ready=lambda: True,
+            )
+            manager.prefill_pull_agent = agent
+
+            async def accepted_work():
+                await allow_generate.wait()
+                manager.rid_to_state["pull-rid"] = object()
+                local_started.set()
+                await allow_output.wait()
+                manager.rid_to_state.pop("pull-rid")
+                outcome_pending.set()
+                await allow_outcome.wait()
+                shutdown_events.append("outcome reported")
+
+            async def controlled_sleep(delay):
+                self.assertEqual(delay, 5)
+                polls.put_nowait(None)
+                if not finish_polling:
+                    await next_poll.get()
+                await real_sleep(0)
+
+            assignment = asyncio.create_task(accepted_work())
+            agent._assignments["assignment"] = assignment
+            assignment.add_done_callback(
+                lambda task: agent._assignment_done("assignment", task)
+            )
+            with mock.patch.object(
+                module.asyncio, "sleep", side_effect=controlled_sleep
+            ), mock.patch.object(
+                module, "get_bool_env_var", return_value=False
+            ), mock.patch.object(
+                module, "collect_scheduler_processes", return_value=[]
+            ), mock.patch.object(
+                module, "kill_process_tree"
+            ):
+                watchdog = asyncio.create_task(manager.sigterm_watchdog())
+                try:
+                    await real_sleep(0)
+                    self.assertEqual(manager.rid_to_state, {})
+                    self.assertEqual(shutdown_requests, [])
+                    await asyncio.wait_for(polls.get(), timeout=1)
+
+                    allow_generate.set()
+                    await asyncio.wait_for(local_started.wait(), timeout=1)
+                    next_poll.put_nowait(None)
+                    await asyncio.wait_for(polls.get(), timeout=1)
+                    self.assertEqual(shutdown_requests, [])
+
+                    allow_output.set()
+                    await asyncio.wait_for(outcome_pending.wait(), timeout=1)
+                    next_poll.put_nowait(None)
+                    await asyncio.wait_for(polls.get(), timeout=1)
+                    self.assertEqual(manager.rid_to_state, {})
+                    self.assertEqual(shutdown_requests, [])
+                    self.assertFalse(assignment.cancelled())
+
+                    allow_outcome.set()
+                    finish_polling = True
+                    next_poll.put_nowait(None)
+                    await asyncio.wait_for(watchdog, timeout=1)
+                    self.assertEqual(len(shutdown_requests), 1)
+                    self.assertIsInstance(shutdown_requests[0], ShutdownReq)
+                    self.assertEqual(
+                        shutdown_events, ["outcome reported", "server stopped"]
+                    )
+                finally:
+                    assignment.cancel()
+                    watchdog.cancel()
+                    await asyncio.gather(assignment, watchdog, return_exceptions=True)
+
+        asyncio.run(run_shutdown())
+
     def test_regular_tokenizer_does_not_block_event_loop(self):
         tokenization_started = threading.Event()
         loop_progressed = threading.Event()

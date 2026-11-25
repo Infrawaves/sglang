@@ -15,9 +15,46 @@ pub struct Config {
     pub router_inflight_load: InflightLoadConfig,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillDispatchMode {
+    #[default]
+    Push,
+    Pull,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PullConfig {
+    pub mode: PrefillDispatchMode,
+    pub max_requests: usize,
+    pub max_bytes: usize,
+    pub max_tokens: usize,
+    pub offer_timeout_ms: u64,
+    /// How long a request waits for the worker holding its longest prefix
+    /// before any eligible worker may claim it.
+    pub affinity_max_wait_ms: u64,
+    /// Queue age after which a request that does not fit stops its workers
+    /// from claiming younger ones.
+    pub starvation_ms: u64,
+}
+
+impl Default for PullConfig {
+    fn default() -> Self {
+        Self {
+            mode: PrefillDispatchMode::Push,
+            max_requests: 1024,
+            max_bytes: 64 * 1024 * 1024,
+            max_tokens: 4 * 1024 * 1024,
+            offer_timeout_ms: 30_000,
+            affinity_max_wait_ms: 500,
+            starvation_ms: 5_000,
+        }
+    }
+}
+
 /// Outbound request timeout and retry settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
+    pub pull: PullConfig,
     /// Timeout for upstream response headers, and for a non-streaming body.
     /// SGLang's chat endpoint sends streaming headers with the first token.
     /// Counts as a circuit-breaker failure.
@@ -68,6 +105,7 @@ pub const fn default_max_chat_body_bytes() -> usize {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            pull: PullConfig::default(),
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
             max_attempts: NonZeroU32::MIN,
@@ -356,6 +394,11 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// `Authorization` prefill pull agents must present on `/internal/pull/*`,
+    /// from `--pull-control-api-key`. Kept apart from the engine key: anyone
+    /// holding that key (every caller of an engine) could otherwise claim
+    /// other clients' requests from the queue.
+    pub pull_control_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -387,6 +430,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            pull_control_auth: None,
         }
     }
 }
