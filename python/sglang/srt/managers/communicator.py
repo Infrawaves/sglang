@@ -104,7 +104,7 @@ class FanOutCommunicator(Generic[T]):
 
     @staticmethod
     def merge_results(results):
-        all_success = all([r.success for r in results])
+        all_success = all(r.success for r in results)
         all_message = [r.message for r in results]
         all_message = " | ".join(all_message)
         return all_success, all_message
