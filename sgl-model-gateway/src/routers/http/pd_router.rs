@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,6 +25,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     decode_gate::{DecodeGate, DecodeSlot},
+    migration_resume::{self, ResumeState, ResumeStop, SseEventSplitter},
     pd_types::api_path,
 };
 use crate::{
@@ -58,7 +60,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -68,6 +70,7 @@ pub struct PDRouter {
     pub enable_igw: bool,
     pub decode_gate: Option<Arc<DecodeGate>>,
     pub request_timeout: Duration,
+    pub enable_decode_migration_resume: bool,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -84,7 +87,32 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+    /// Set on original chat requests that may be handed off and resumed.
+    resume: Option<Arc<ResumeSeed>>,
+    /// Pick only workers that accept resumed requests.
+    resume_only: bool,
 }
+
+/// What resubmitting a handed-off chat request needs from the original one.
+struct ResumeSeed {
+    /// The serialized client request, before bootstrap injection.
+    original: Value,
+    request_text: Option<String>,
+    model_id: Option<String>,
+    headers: Option<HeaderMap>,
+    include_usage: bool,
+}
+
+type SegmentStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send>>;
+type ClientSender = tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, String>>;
+
+enum SegmentEnd {
+    Finished,
+    HandOff(Value, migration_resume::HandOff),
+}
+
+const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// Marker placed on a `Response` by paths inside
 /// `execute_dual_dispatch_internal` that have already recorded prefill and
@@ -204,6 +232,7 @@ impl PDRouter {
                 .decode_dispatch_limit
                 .map(|limit| Arc::new(DecodeGate::new(limit))),
             request_timeout: Duration::from_secs(ctx.router_config.request_timeout_secs),
+            enable_decode_migration_resume: ctx.router_config.enable_decode_migration_resume,
         })
     }
 
@@ -416,19 +445,21 @@ impl PDRouter {
                     async move {
                         let request_text = context.request_text.as_deref();
                         let selected = if self.decode_gate.is_some() {
-                            self.select_worker(
+                            self.select_worker_for(
                                 request_text,
                                 context.model_id,
                                 context.headers.as_ref(),
                                 false,
+                                context.resume_only,
                             )
                             .await
                             .map(|prefill| (prefill, None))
                         } else {
-                            self.select_pd_pair(
+                            self.select_pd_pair_for(
                                 request_text,
                                 context.model_id,
                                 context.headers.as_ref(),
+                                context.resume_only,
                             )
                             .await
                             .map(|(prefill, decode)| (prefill, Some(decode)))
@@ -464,6 +495,9 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        if context.resume.is_some() {
+                            migration_resume::mark_allow_migration(&mut json_request);
+                        }
 
                         let ctx_is_stream = context.is_stream;
                         let (response, decode) = self
@@ -741,11 +775,12 @@ impl PDRouter {
             let decode = match decode {
                 Some(decode) => decode,
                 None => self
-                    .select_worker(
+                    .select_worker_for(
                         context.request_text.as_deref(),
                         context.model_id,
                         context.headers.as_ref(),
                         true,
+                        context.resume_only,
                     )
                     .await
                     .map_err(Self::handle_server_selection_error)?,
@@ -791,23 +826,46 @@ impl PDRouter {
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
-        let prefill_result;
+        let mut prefill_result = None;
         let mut decode_early = None;
         loop {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
-                    prefill_result = pr;
+                    prefill_result = Some(pr);
                     break;
                 }
                 dr = &mut decode_leg, if decode_early.is_none() => {
+                    let draining = matches!(
+                        &dr,
+                        Ok((_, _, Ok(res)))
+                            if migration_resume::is_draining_rejection(res.status(), res.headers())
+                    );
                     decode_early = Some(dr);
+                    if draining {
+                        break;
+                    }
                 }
             }
         }
         if let Some(slot) = &slot {
             slot.release();
         }
+
+        // Only a draining decode ends the loop before prefill. Returning drops
+        // the prefill request now; otherwise it waits out its bootstrap timeout.
+        let Some(prefill_result) = prefill_result else {
+            warn!(
+                "Decode is draining, cancelling paired prefill request prefill_url={}",
+                prefill.url()
+            );
+            if let Some(Ok((decode, _, _))) = &decode_early {
+                self.mark_draining(decode.as_ref());
+            }
+            let mut response = Self::draining_response();
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return (response, None);
+        };
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -887,6 +945,19 @@ impl PDRouter {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 debug!("Decode response status: {}", status);
+
+                if migration_resume::is_draining_rejection(status, res.headers()) {
+                    // A planned retirement, not a decode fault: skip decode's breaker.
+                    let prefill_ok = match &prefill_result {
+                        Ok(r) => r.status().is_success() || r.status().is_client_error(),
+                        Err(_) => false,
+                    };
+                    prefill.record_outcome(prefill_ok);
+                    self.mark_draining(decode.as_ref());
+                    let mut response = Self::draining_response();
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return response;
+                }
 
                 if !status.is_success() {
                     error!(
@@ -969,7 +1040,7 @@ impl PDRouter {
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
-                    self.create_streaming_response(
+                    let response = self.create_streaming_response(
                         res.bytes_stream(),
                         status,
                         prefill_logprobs,
@@ -977,7 +1048,11 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
-                    )
+                    );
+                    match &context.resume {
+                        Some(seed) => self.relay_with_resume(response, Arc::clone(seed)),
+                        None => response,
+                    }
                 } else {
                     // Non-streaming response
                     if context.return_logprob {
@@ -1048,6 +1123,293 @@ impl PDRouter {
         }
     }
 
+    /// Excludes a decode that announced a planned retirement from this
+    /// router's routing. Unlike `set_healthy(false)`, health checks keep it.
+    fn mark_draining(&self, decode: &dyn Worker) {
+        if !decode.is_draining() {
+            warn!(
+                "Decode worker is draining, excluding it from routing decode_url={}",
+                decode.url()
+            );
+        }
+        decode.set_draining(true);
+        // DP-aware registrations of one engine share its retirement.
+        for worker in self.worker_registry.get_decode_workers() {
+            if worker.base_url() == decode.base_url() {
+                worker.set_draining(true);
+            }
+        }
+    }
+
+    fn draining_response() -> Response {
+        error::service_unavailable("decode_draining", "Decode worker is draining")
+    }
+
+    fn resume_seed(
+        &self,
+        body: &ChatCompletionRequest,
+        context: &PDRequestContext<'_>,
+    ) -> Option<Arc<ResumeSeed>> {
+        // The engine never hands off n>1 or logprob requests; the logprob
+        // merge path stays untouched.
+        if !self.enable_decode_migration_resume
+            || context.batch_size.is_some()
+            || context.return_logprob
+        {
+            return None;
+        }
+        let original = match serde_json::to_value(body) {
+            Ok(original) => original,
+            Err(e) => {
+                warn!("Failed to serialize chat request for migration resume: {}", e);
+                return None;
+            }
+        };
+        let include_usage = original
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Some(Arc::new(ResumeSeed {
+            original,
+            request_text: context.request_text.clone(),
+            model_id: context.model_id.map(str::to_string),
+            headers: context.headers.clone(),
+            include_usage,
+        }))
+    }
+
+    /// Resubmits a handed-off request to a resume-capable pair, with the
+    /// usual retries, decode gate and breaker accounting.
+    async fn dispatch_resume(&self, seed: &ResumeSeed, body: Value, is_stream: bool) -> Response {
+        let context = PDRequestContext {
+            route: CHAT_COMPLETIONS_ROUTE,
+            batch_size: None,
+            is_stream,
+            return_logprob: false,
+            request_text: seed.request_text.clone(),
+            model_id: seed.model_id.as_deref(),
+            headers: seed.headers.clone(),
+            resume: None,
+            resume_only: true,
+        };
+        self.execute_dual_dispatch(seed.headers.as_ref(), &body, context)
+            .await
+    }
+
+    /// Relays `response` to the client, resuming the stream elsewhere each
+    /// time its decode hands the request off.
+    fn relay_with_resume(&self, response: Response, seed: Arc<ResumeSeed>) -> Response {
+        let (parts, body) = response.into_parts();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let first: SegmentStream = Box::pin(body.into_data_stream());
+        tokio::spawn(Arc::new(self.clone()).relay_resumable_stream(seed, first, tx));
+        Response::from_parts(parts, Body::from_stream(UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn relay_resumable_stream(
+        self: Arc<Self>,
+        seed: Arc<ResumeSeed>,
+        mut segment: SegmentStream,
+        tx: ClientSender,
+    ) {
+        let mut state = ResumeState::default();
+        loop {
+            let (envelope, handoff) = match Self::relay_segment(&mut segment, &mut state, &tx).await
+            {
+                SegmentEnd::HandOff(envelope, handoff) => (envelope, handoff),
+                SegmentEnd::Finished => return,
+            };
+            let body = match state.hand_off(&envelope, &handoff, &seed.original) {
+                Ok(body) => body,
+                Err(ResumeStop::BudgetExhausted) => {
+                    for event in state.length_finish_events(seed.include_usage) {
+                        let _ = tx.send(Ok(event));
+                    }
+                    return;
+                }
+                Err(stop) => {
+                    warn!(
+                        "Not resuming handed-off stream attempts={} reason={:?}",
+                        state.attempts(),
+                        stop
+                    );
+                    let message = format!("Decode migration resume stopped: {:?}", stop);
+                    let _ = tx.send(Ok(migration_resume::error_event(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        message.as_bytes(),
+                    )));
+                    let _ = tx.send(Ok(bytes::Bytes::from_static(migration_resume::DONE_EVENT)));
+                    return;
+                }
+            };
+            debug!(
+                "Resuming handed-off stream attempt={} generated_tokens={} kv_flushed_tokens={}",
+                state.attempts(),
+                handoff.output_ids.len(),
+                handoff.kv_flushed_tokens
+            );
+            // Dropping the dispatch on client disconnect cancels its requests.
+            let response = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                response = self.dispatch_resume(&seed, body, true) => response,
+            };
+            if !response.status().is_success() {
+                Self::send_resume_error(response, &tx).await;
+                return;
+            }
+            segment = Box::pin(response.into_body().into_data_stream());
+        }
+    }
+
+    /// Forwards one segment's events; swallows its hand-off and what follows it.
+    async fn relay_segment(
+        segment: &mut SegmentStream,
+        state: &mut ResumeState,
+        tx: &ClientSender,
+    ) -> SegmentEnd {
+        let mut splitter = SseEventSplitter::default();
+        let mut handoff = None;
+        loop {
+            tokio::select! {
+                biased;
+                item = segment.next() => match item {
+                    Some(Ok(chunk)) => {
+                        for event in splitter.feed(&chunk) {
+                            if handoff.is_some() {
+                                continue;
+                            }
+                            if let Some(found) = migration_resume::parse_handoff_event(&event) {
+                                handoff = Some(found);
+                                continue;
+                            }
+                            if tx.send(Ok(state.rewrite_event(event))).is_err() {
+                                return SegmentEnd::Finished;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        return SegmentEnd::Finished;
+                    }
+                    None => break,
+                },
+                _ = tx.closed() => return SegmentEnd::Finished,
+            }
+        }
+        if handoff.is_none() {
+            if let Some(rest) = splitter.flush() {
+                let _ = tx.send(Ok(state.rewrite_event(rest)));
+            }
+        }
+        match handoff {
+            Some((envelope, handoff)) => SegmentEnd::HandOff(envelope, handoff),
+            None => SegmentEnd::Finished,
+        }
+    }
+
+    async fn send_resume_error(response: Response, tx: &ClientSender) {
+        let status = response.status();
+        let is_sse = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        warn!("Resubmitting handed-off stream failed status={}", status);
+        let event = if is_sse && !body.is_empty() {
+            body
+        } else {
+            migration_resume::error_event(status, &body)
+        };
+        let _ = tx.send(Ok(event));
+        let _ = tx.send(Ok(bytes::Bytes::from_static(migration_resume::DONE_EVENT)));
+    }
+
+    /// Follows non-streaming hand-offs and returns the last segment's
+    /// response with the first segment's id, created and accumulated usage.
+    async fn resume_non_streaming(&self, response: Response, seed: &ResumeSeed) -> Response {
+        if !response.status().is_success() {
+            return response;
+        }
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to read decode response: {}", e);
+                return error::internal_error("read_response_failed", "Failed to read response");
+            }
+        };
+        if !migration_resume::may_contain_handoff(&bytes) {
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+        let mut json = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(json) => json,
+            Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+        };
+        let Some(mut handoff) = migration_resume::take_handoff(&mut json) else {
+            return Response::from_parts(parts, Body::from(bytes));
+        };
+
+        let mut state = ResumeState::default();
+        loop {
+            state.observe_first_segment(&json);
+            let body = match state.hand_off(&json, &handoff, &seed.original) {
+                Ok(body) => body,
+                Err(ResumeStop::BudgetExhausted) => {
+                    let json = state.length_finish_response(json);
+                    return Self::json_response(parts, &json);
+                }
+                Err(stop) => {
+                    warn!(
+                        "Not resuming handed-off request attempts={} reason={:?}",
+                        state.attempts(),
+                        stop
+                    );
+                    return error::service_unavailable(
+                        "decode_migration_resume_failed",
+                        format!("Decode migration resume stopped: {:?}", stop),
+                    );
+                }
+            };
+            let response = self.dispatch_resume(seed, body, false).await;
+            if !response.status().is_success() {
+                return response;
+            }
+            let (next_parts, next_body) = response.into_parts();
+            let bytes = match axum::body::to_bytes(next_body, usize::MAX).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to read resumed decode response: {}", e);
+                    return error::internal_error(
+                        "read_response_failed",
+                        "Failed to read response",
+                    );
+                }
+            };
+            json = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(json) => json,
+                Err(_) => return Response::from_parts(next_parts, Body::from(bytes)),
+            };
+            parts = next_parts;
+            match migration_resume::take_handoff(&mut json) {
+                Some(next) => handoff = next,
+                None => break,
+            }
+        }
+        state.rewrite_chunk(&mut json);
+        Self::json_response(parts, &json)
+    }
+
+    fn json_response(mut parts: axum::http::response::Parts, json: &Value) -> Response {
+        parts.headers.remove(CONTENT_LENGTH);
+        match serde_json::to_vec(json) {
+            Ok(body) => Response::from_parts(parts, Body::from(body)),
+            Err(e) => Self::handle_serialization_error(e),
+        }
+    }
+
     fn policies_need_request_text(&self) -> bool {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -1082,21 +1444,33 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        self.select_pd_pair_for(request_text, model_id, headers, false)
+            .await
+    }
+
+    async fn select_pd_pair_for(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        resume_only: bool,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let prefill = self
-            .select_worker(request_text, model_id, headers, false)
+            .select_worker_for(request_text, model_id, headers, false, resume_only)
             .await?;
         let decode = self
-            .select_worker(request_text, model_id, headers, true)
+            .select_worker_for(request_text, model_id, headers, true, resume_only)
             .await?;
         Ok((prefill, decode))
     }
 
-    async fn select_worker(
+    async fn select_worker_for(
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
         decode: bool,
+        resume_only: bool,
     ) -> Result<Arc<dyn Worker>, String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -1119,6 +1493,15 @@ impl PDRouter {
                 .collect(),
             None if decode => self.worker_registry.get_decode_workers(),
             None => self.worker_registry.get_prefill_workers(),
+        };
+        // An engine without resume support would silently regenerate from scratch.
+        let workers: Vec<Arc<dyn Worker>> = if resume_only {
+            workers
+                .into_iter()
+                .filter(|w| w.supports_migration_resume())
+                .collect()
+        } else {
+            workers
         };
 
         let (policy, role, label) = if decode {
@@ -1698,6 +2081,8 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            resume: None,
+            resume_only: false,
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1721,17 +2106,25 @@ impl RouterTrait for PDRouter {
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
 
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
+        let mut context = PDRequestContext {
+            route: CHAT_COMPLETIONS_ROUTE,
             batch_size,
             is_stream,
             return_logprob,
             request_text,
             model_id,
             headers: headers.cloned(),
+            resume: None,
+            resume_only: false,
         };
+        let resume = self.resume_seed(body, &context);
+        context.resume = resume.clone();
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let response = self.execute_dual_dispatch(headers, body, context).await;
+        match resume {
+            Some(seed) if !is_stream => self.resume_non_streaming(response, &seed).await,
+            _ => response,
+        }
     }
 
     async fn route_completion(
@@ -1763,6 +2156,8 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            resume: None,
+            resume_only: false,
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1807,6 +2202,8 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            resume: None,
+            resume_only: false,
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1833,6 +2230,8 @@ impl RouterTrait for PDRouter {
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
+            resume: None,
+            resume_only: false,
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1890,6 +2289,7 @@ mod tests {
             enable_igw: false,
             decode_gate: None,
             request_timeout: Duration::from_secs(600),
+            enable_decode_migration_resume: false,
         }
     }
 

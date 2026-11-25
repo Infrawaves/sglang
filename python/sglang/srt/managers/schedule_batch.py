@@ -484,9 +484,12 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        allow_migration: bool = False,
     ):
         # Input and output info
         self.rid = rid
+        # The router can resume this request elsewhere if its decode hands it off.
+        self.allow_migration = allow_migration
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         # Internal accounting input is frozen after MM expansion and sent once.

@@ -409,6 +409,7 @@ struct Router {
     health_check_endpoint: String,
     disable_health_check: bool,
     enable_igw: bool,
+    enable_decode_migration_resume: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
@@ -652,6 +653,7 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .decode_migration_resume(self.enable_decode_migration_resume)
             .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
             .connect_timeout_secs(self.connect_timeout_secs)
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
@@ -732,6 +734,7 @@ impl Router {
         health_check_endpoint = String::from("/health"),
         disable_health_check = false,
         enable_igw = false,
+        enable_decode_migration_resume = false,
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
@@ -825,6 +828,7 @@ impl Router {
         health_check_endpoint: String,
         disable_health_check: bool,
         enable_igw: bool,
+        enable_decode_migration_resume: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
@@ -931,6 +935,7 @@ impl Router {
             health_check_endpoint,
             disable_health_check,
             enable_igw,
+            enable_decode_migration_resume,
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,

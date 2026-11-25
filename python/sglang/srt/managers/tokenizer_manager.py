@@ -144,6 +144,7 @@ from sglang.srt.managers.mm_utils import (
     wrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.pause_admission import PauseAdmission
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.request_validation import (
     validate_generation_request,
@@ -937,6 +938,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self.pause_admission = PauseAdmission()
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
 
@@ -1662,7 +1664,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
             async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                await self.is_pause_cond.wait_for(
+                    lambda: not self.is_pause or self.pause_admission.draining
+                )
+                self.pause_admission.check()
                 for state in request_states.values():
                     state.waiting_at_pause_gate = False
 
@@ -2366,6 +2371,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                allow_migration=obj.allow_migration,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -3125,6 +3131,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         async with self.is_pause_cond:
             self.is_pause = True
+            self.pause_admission.on_pause(obj.mode)
+            # Requests already held at the pause gate are refused under migrate.
+            self.is_pause_cond.notify_all()
             if obj.mode != "abort":
                 await self._async_dispatch_to_scheduler(obj)
             else:
@@ -3147,6 +3156,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         async with self.is_pause_cond:
             self.is_pause = False
+            self.pause_admission.on_continue()
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
@@ -3168,9 +3178,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             if obj.is_pause:
                 self.is_pause = True
+                self.pause_admission.on_pause(obj.pause_mode)
             else:
                 self.is_pause = False
-                self.is_pause_cond.notify_all()
+                self.pause_admission.on_continue()
+            self.is_pause_cond.notify_all()
 
         # Resolve the pending future if this worker initiated the pause/continue
         if self._pause_continue_future and not self._pause_continue_future.done():

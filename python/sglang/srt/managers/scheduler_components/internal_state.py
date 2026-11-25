@@ -103,6 +103,15 @@ class SchedulerInternalStateController:
         state["decode_cuda_graph_memory_gb"] = round(
             sum(graph_memory[phase] for phase in _DECODE_GRAPH_PHASES), 3
         )
+        # A router retiring this instance (decode migration, then a restart in
+        # another role) waits for this before tearing it down.
+        state["fully_idle"] = self.scheduler.is_fully_idle()
+        # A decode group's non-leader pods wait for this before exiting: unlike
+        # fully_idle, it stays false on an idle instance no migrate pause reached.
+        exporter = self.scheduler.decode_migration_exporter
+        state["migration_done"] = (
+            exporter is not None and exporter.is_done() and state["fully_idle"]
+        )
 
     def _add_elastic_ep(self, state: Dict[str, Any]) -> None:
         if get_exec().moe.elastic_ep_backend is None:

@@ -404,6 +404,7 @@ mod pd_responses_routing_tests {
             enable_igw: false,
             decode_gate: None,
             request_timeout: Duration::from_secs(600),
+            enable_decode_migration_resume: false,
         }
     }
 

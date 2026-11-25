@@ -331,6 +331,10 @@ class GenerateReqInput:
     # Per-request thinking budget. Requires strict thinking so the runtime can
     # enforce the limit rather than silently treating it as metadata.
     max_thinking_tokens: Optional[int] = None
+    # Set by a router that resumes this request elsewhere when a retiring
+    # decode hands it off (pause_generation mode="migrate"); without it such a
+    # request is ended with a 503 instead.
+    allow_migration: bool = False
 
     # Priority for the request
     priority: Optional[int] = None
@@ -1061,6 +1065,7 @@ class GenerateReqInput:
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
             max_thinking_tokens=self.max_thinking_tokens,
+            allow_migration=self.allow_migration,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
@@ -1205,6 +1210,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal opt-in for one scheduler-finalized MM accounting input snapshot.
     # Identity and TTL remain in TokenizerManager, outside scheduler IPC.
     return_cache_input: bool = False
+    # See GenerateReqInput.allow_migration.
+    allow_migration: bool = False
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2024,9 +2031,22 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
             requests will be retracted back to the waiting_queue.
             Note: The KV cache can be flushed in this mode and will be automatically
             recomputed after continue_generation.
+
+    migrate: PD decode with --disaggregation-decode-enable-offload-kvcache only.
+            Decoding continues until no request is still receiving KV from
+            prefill; then the engine pauses, writes the KV of the running
+            requests to the storage backend, and finishes each with
+            finish_reason.type == "migrated", carrying the tokens a router needs
+            to resubmit it elsewhere. Requests that cannot be resubmitted finish
+            with a 503 abort. The engine stays paused until continue_generation;
+            meanwhile new requests fail at once with a 503 carrying
+            X-SGLang-Draining: 1 instead of waiting.
     """
 
-    mode: Literal["abort", "retract", "in_place"] = "abort"
+    mode: Literal["abort", "retract", "in_place", "migrate"] = "abort"
+    # mode="migrate" only: how long to wait for storage writes before handing
+    # a request off with whatever was written.
+    migrate_flush_timeout_s: float = 30.0
 
 
 class ContinueGenerationReqInput(BaseReq, kw_only=True):
@@ -2048,6 +2068,8 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     """Broadcast from router to all workers to set is_pause state."""
 
     is_pause: bool
+    # PauseGenerationReqInput.mode of a pause; None for a continue.
+    pause_mode: Optional[str] = None
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):

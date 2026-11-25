@@ -643,6 +643,16 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         s.req_to_token_pool.clear.assert_called_once_with()
         s.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
+    def test_shared_storage_backend_survives_the_flip(self):
+        """Regression: the flip cleared the HiCache storage backend, which for
+        Mooncake is a remove_all over the L3 every instance shares, dropping all
+        prefixes and KV another instance was reading back."""
+        s = _radix_scheduler(disable_radix_cache=False)
+        s.tree_cache.clear_storage_backend = MagicMock()
+        _release_prefix_cache_for_role_switch(s)
+        s.tree_cache.clear_storage_backend.assert_not_called()
+        s.tree_cache.reset.assert_called_once_with()
+
     def test_teardown_invokes_release(self):
         s = _radix_scheduler(disable_radix_cache=False)
         s.disaggregation_mode = DisaggregationMode.PREFILL

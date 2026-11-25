@@ -67,6 +67,8 @@ class RouterArgs:
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
+    # Resume chat requests a retiring PD decode hands off (decode hot migration)
+    enable_decode_migration_resume: bool = False
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
@@ -369,6 +371,12 @@ class RouterArgs:
         )
 
         # PD-specific arguments
+        pd_group.add_argument(
+            f"--{prefix}enable-decode-migration-resume",
+            action="store_true",
+            help="Resume /v1/chat/completions requests that a retiring PD decode "
+            "hands off, on another prefill/decode pair (decode hot migration).",
+        )
         pd_group.add_argument(
             f"--{prefix}mini-lb",
             action="store_true",

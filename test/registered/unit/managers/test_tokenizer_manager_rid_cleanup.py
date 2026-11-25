@@ -36,7 +36,13 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseContinueBroadcastReq,
+    PauseGenerationReqInput,
     RequestOutputStats,
+)
+from sglang.srt.managers.pause_admission import (  # noqa: E402
+    PauseAdmission,
+    ServerDrainingError,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -999,6 +1005,7 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
+    tm.pause_admission = PauseAdmission()
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
     tm.request_metrics_exporter_manager = Mock()
@@ -1778,6 +1785,100 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+
+class TestMigratePauseRefusesNewRequests(CustomTestCase):
+    """A migrate pause retires the instance and no continue_generation follows,
+    so a new request must fail at once (a 503 its router retries elsewhere)
+    instead of waiting at the pause gate forever; other pauses still hold it."""
+
+    @staticmethod
+    def _make_tm(case) -> TokenizerManager:
+        tm = _make_tm_for_generate(case)
+        tm.tokenizer_ipc_name = None
+        tm._async_dispatch_to_scheduler = AsyncMock()
+        tm._pause_continue_future = None
+        return tm
+
+    @staticmethod
+    def _obj(rid):
+        return GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+
+    @staticmethod
+    async def _until_held(tm, rid):
+        while rid not in tm.rid_to_state or not (
+            tm.rid_to_state[rid].waiting_at_pause_gate
+        ):
+            await asyncio.sleep(0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    def test_new_request_fails_immediately(self):
+        tm = self._make_tm(self)
+
+        async def drive():
+            await tm.pause_generation(PauseGenerationReqInput(mode="migrate"))
+            with self.assertRaises(ServerDrainingError):
+                await asyncio.wait_for(
+                    tm.generate_request(self._obj("late")).__anext__(), timeout=2
+                )
+
+        asyncio.run(drive())
+        self.assertNotIn("late", tm.rid_to_state)
+
+    def test_request_held_by_an_earlier_pause_fails_once_migrating(self):
+        tm = self._make_tm(self)
+
+        async def drive():
+            await tm.pause_generation(PauseGenerationReqInput(mode="retract"))
+            held = asyncio.create_task(
+                tm.generate_request(self._obj("held")).__anext__()
+            )
+            await asyncio.wait_for(self._until_held(tm, "held"), timeout=2)
+            await tm.pause_generation(PauseGenerationReqInput(mode="migrate"))
+            with self.assertRaises(ServerDrainingError):
+                await asyncio.wait_for(held, timeout=2)
+
+        asyncio.run(drive())
+
+    def test_retract_and_in_place_pauses_keep_holding(self):
+        for mode in ("retract", "in_place"):
+            with self.subTest(mode=mode):
+                tm = self._make_tm(self)
+
+                async def drive():
+                    await tm.pause_generation(PauseGenerationReqInput(mode=mode))
+                    task = asyncio.create_task(
+                        tm.generate_request(self._obj(mode)).__anext__()
+                    )
+                    await asyncio.wait_for(self._until_held(tm, mode), timeout=2)
+                    self.assertFalse(task.done())
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+                asyncio.run(drive())
+
+    def test_multi_tokenizer_broadcast_carries_the_mode(self):
+        """With several tokenizer workers the pause reaches a worker only as the
+        router's broadcast, which must say it is a migrate pause."""
+        tm = self._make_tm(self)
+
+        async def drive():
+            await tm._apply_pause_continue_broadcast(
+                PauseContinueBroadcastReq(is_pause=True, pause_mode="migrate")
+            )
+            with self.assertRaises(ServerDrainingError):
+                await asyncio.wait_for(
+                    tm.generate_request(self._obj("w")).__anext__(), timeout=2
+                )
+            await tm._apply_pause_continue_broadcast(
+                PauseContinueBroadcastReq(is_pause=False)
+            )
+            self.assertFalse(tm.pause_admission.draining)
+
+        asyncio.run(drive())
 
 
 if __name__ == "__main__":

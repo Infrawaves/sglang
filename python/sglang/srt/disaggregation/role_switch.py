@@ -276,19 +276,19 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     that means (a) the new role would match against stale prefixes whose KV no
     longer means what it did (corruption) and (b) those locked slots would leak
     on every flip. Reset mirrors ``Scheduler.flush_cache``'s cache-release block
-    (the instance is already fully idle, checked before teardown) and, for
-    hicache, best-effort clears the storage backend so it is released completely.
+    (the instance is already fully idle, checked before teardown).
+
+    The HiCache storage backend (L3) is left as is. It is shared by every
+    instance of the deployment, and its keys already carry the model and
+    layout, so its entries stay valid for either role; clearing it here (a
+    Mooncake ``remove_all``) would drop every instance's prefixes, including
+    KV another instance is reading back. Operators who do need an empty L3
+    call ``/clear_hicache_storage_backend`` explicitly.
     """
     if scheduler.disable_radix_cache:
         return
     tree_cache = scheduler.tree_cache
     if tree_cache is not None:
-        clear_storage = getattr(tree_cache, "clear_storage_backend", None)
-        if callable(clear_storage):
-            try:
-                clear_storage()
-            except Exception:
-                logger.exception("hicache storage release on role switch failed")
         tree_cache.reset()
     scheduler.req_to_token_pool.clear()
     scheduler.token_to_kv_pool_allocator.clear()

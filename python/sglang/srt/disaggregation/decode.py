@@ -3838,6 +3838,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
+            self.maybe_start_decode_migration()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -3891,6 +3892,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
+            self.maybe_start_decode_migration()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue

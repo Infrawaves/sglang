@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransfer
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.decode_migration import DecodeMigrationExporter
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
@@ -24,7 +25,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MIGRATED
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -134,6 +135,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.decode_migration_exporter = None
         scheduler.disagg_prefill_bootstrap_queue = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
@@ -240,6 +242,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         manager.ongoing_backup = {}
         manager.offloaded_state = WeakKeyDictionary()
         manager.offload_inflight = WeakKeyDictionary()
+        manager.storage_confirmed_len = WeakKeyDictionary()
+        manager._storage_chain_broken = WeakKeyDictionary()
         if offload:
             self.assertTrue(manager.offload_kv_cache(req))
         scheduler.decode_offload_manager = manager
@@ -262,6 +266,51 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             setattr(released_req.kv, "req_pool_idx", None)
         )
         return req, frees
+
+    def test_migrate_pause_keeps_device_kv_until_its_copy_lands(self):
+        """Retract refuses to pause while a device-to-host copy is pending; a
+        migrate pause hands such a request off instead, so its device KV must
+        outlive the copy, and the hand-off waits for it."""
+        scheduler = self._new_scheduler()
+        req, frees = self._decode_req_with_pending_offload(scheduler)
+        # Its router can resume it; otherwise the hand-off ends it with a 503.
+        req.allow_migration = True
+        # The manager releases through the scheduler's pools, as in production.
+        manager = scheduler.decode_offload_manager
+        scheduler.tree_cache.req_to_token_pool.req_to_token = (
+            manager.req_to_token_pool.req_to_token
+        )
+        manager.req_to_token_pool = scheduler.tree_cache.req_to_token_pool
+        manager.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
+        manager.tree_cache = scheduler.tree_cache
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[req], with_tensors=True
+        )
+        emitted = []
+        scheduler.decode_migration_exporter = DecodeMigrationExporter(
+            offload_manager=scheduler.decode_offload_manager,
+            emit_outputs=emitted.extend,
+        )
+        # No request is receiving KV from prefill.
+        scheduler.request_lists = lambda: {}
+
+        scheduler.pause_generation(
+            PauseGenerationReqInput(mode="migrate", migrate_flush_timeout_s=0.0)
+        )
+        self.assertFalse(scheduler._engine_paused)
+        scheduler.maybe_start_decode_migration()
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertIsInstance(req.finished_reason, FINISH_MIGRATED)
+        self.assertEqual(frees, [])
+        self.assertEqual(emitted, [])
+
+        scheduler.decode_migration_exporter.poll()
+
+        self.assertEqual(frees, [(req.rid, True)])
+        self.assertEqual(emitted, [req])
 
     def _retract_by_pause(self, scheduler: Scheduler, req: Req):
         scheduler.disaggregation_mode = DisaggregationMode.DECODE

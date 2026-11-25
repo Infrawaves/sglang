@@ -215,6 +215,10 @@ struct CliArgs {
     #[arg(long, help_heading = "PD Disaggregation")]
     decode_dispatch_limit: Option<usize>,
 
+    /// Resume chat streams a retiring decode hands off on a new prefill/decode pair
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    enable_decode_migration_resume: bool,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
@@ -1075,6 +1079,7 @@ impl CliArgs {
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw)
+            .decode_migration_resume(self.enable_decode_migration_resume)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()

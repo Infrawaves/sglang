@@ -28,6 +28,9 @@ pub struct RouterConfig {
     pub dp_aware: bool,
     #[serde(default)]
     pub decode_dispatch_limit: Option<usize>,
+    /// PD HTTP mode: resume chat requests a retiring decode hands off
+    #[serde(default)]
+    pub enable_decode_migration_resume: bool,
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -517,6 +520,7 @@ impl Default for RouterConfig {
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             decode_dispatch_limit: None,
+            enable_decode_migration_resume: false,
             api_key: None,
             discovery: None,
             metrics: None,

@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.pause_admission import DRAINING_HEADERS, ServerDrainingError
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -152,6 +153,14 @@ class OpenAIServingBase(ABC):
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+        except ServerDrainingError as e:
+            response = self.create_error_response(
+                message=str(e),
+                err_type="ServiceUnavailable",
+                status_code=e.status_code.value,
+            )
+            response.headers.update(DRAINING_HEADERS)
+            return response
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code

@@ -496,6 +496,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn decode_migration_resume(mut self, enable: bool) -> Self {
+        self.config.enable_decode_migration_resume = enable;
+        self
+    }
+
     // ==================== Option Setters ====================
     // Accept Option<T> and only set if Some
 

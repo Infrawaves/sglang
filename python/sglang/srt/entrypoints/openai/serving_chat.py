@@ -56,6 +56,7 @@ from sglang.srt.constrained.json_schema_validation import (
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
+    chat_migration,
     encoding_dsv32,
 )
 from sglang.srt.entrypoints.openai.kimi_token_provenance import KimiTokenProvenance
@@ -1754,7 +1755,13 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Handle single vs multiple requests
-        if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
+        resume = request.migration_resume
+        if resume is not None:
+            self._validate_migration_resume(request, processed_messages)
+            # The rendered prompt is not used; rendering still settles the
+            # stops and parser configuration exactly as for the original request.
+            prompt_kwargs = {"input_ids": chat_migration.resume_input_ids(resume)}
+        elif request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
             processed_messages, is_multimodal
         ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
@@ -1811,7 +1818,10 @@ class OpenAIServingChat(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
-            require_reasoning=processed_messages.require_reasoning,
+            require_reasoning=self._engine_require_reasoning(
+                request, processed_messages
+            ),
+            allow_migration=self._allows_migration(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -1849,8 +1859,123 @@ class OpenAIServingChat(OpenAIServingBase):
                 message_start_tool_call_constraint=(
                     processed_messages.message_start_tool_call_constraint
                 ),
+                prompt_ids=resume.origin_input_ids if resume is not None else None,
             )
         return adapted_request, request
+
+    def _allows_migration(self, request: ChatCompletionRequest) -> bool:
+        """Whether a hand-off of this request can be turned into one event the
+        router resumes from; an encoding adapter owns its own stream framing."""
+        return (
+            request.allow_migration
+            and request.n == 1
+            and self._encoding_output() is None
+        )
+
+    def _validate_migration_resume(
+        self,
+        request: ChatCompletionRequest,
+        processed_messages: MessageProcessingResult,
+    ) -> None:
+        if request.n != 1:
+            raise ValueError("migration_resume requires n=1")
+        if request.input_ids is not None:
+            raise ValueError("migration_resume cannot be combined with input_ids")
+        if self._encoding_output() is not None:
+            raise ValueError(
+                f"migration_resume is not supported with the "
+                f"{self.chat_encoding_spec} chat encoding"
+            )
+        if (
+            processed_messages.image_data
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        ):
+            raise ValueError("migration_resume is not supported with media input")
+
+    def _engine_require_reasoning(
+        self,
+        request: ChatCompletionRequest,
+        processed_messages: MessageProcessingResult,
+    ) -> bool:
+        """require_reasoning for the engine. A resumed request whose earlier
+        output already closed the reasoning is past it: the engine would
+        otherwise wait for a second terminator before honouring stops."""
+        resume = request.migration_resume
+        if not processed_messages.require_reasoning or resume is None:
+            return processed_messages.require_reasoning
+        think_end_ids = processed_messages.reasoning_end_token_ids
+        if think_end_ids is None and self._reasoning_detector is not None:
+            think_end_ids = self._reasoning_detector.get_think_end_token_ids(
+                self.tokenizer_manager.tokenizer
+            )
+        return not chat_migration.contains_token_sequence(
+            resume.output_ids, think_end_ids or []
+        )
+
+    def _migration_decode(
+        self, request: ChatCompletionRequest
+    ) -> chat_migration.Decode:
+        """Decode ids with this request's detokenization settings."""
+        tokenizer = self.tokenizer_manager.tokenizer
+        skip_special_tokens = request.skip_special_tokens
+        spaces_between_special_tokens = (request.chat_template_kwargs or {}).get(
+            "spaces_between_special_tokens", True
+        )
+        return lambda ids: tokenizer.decode(
+            ids,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+
+    async def _migration_replay_text(self, request: ChatCompletionRequest) -> str:
+        """The text of migration_resume.output_ids: what the client already has."""
+        resume = request.migration_resume
+        return await self.tokenizer_manager.run_in_request_preprocessor(
+            lambda: chat_migration.decode_output_text(
+                self._migration_decode(request),
+                prompt_ids=resume.origin_input_ids,
+                output_ids=resume.output_ids,
+            )
+        )
+
+    def _migration_handoff(
+        self,
+        request: ChatCompletionRequest,
+        index: int,
+        finish_reason: dict,
+        segment_reasoning_tokens: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """The hand-off event payload, and whether the output was cut back to
+        a whole character (its last text then ends in replacement characters)."""
+        origin_input_ids, output_ids = chat_migration.handoff_split(
+            finish_reason, request.migration_resume
+        )
+        kept = chat_migration.complete_char_output_len(
+            self._migration_decode(request),
+            prompt_ids=origin_input_ids,
+            output_ids=output_ids,
+        )
+        payload = chat_migration.handoff_payload(
+            index=index,
+            origin_input_ids=origin_input_ids,
+            output_ids=output_ids[:kept],
+            kv_flushed_tokens=finish_reason.get("kv_flushed_tokens", 0),
+            reasoning_tokens=self._migration_reasoning_tokens(
+                request, segment_reasoning_tokens
+            ),
+        )
+        return payload, kept < len(output_ids)
+
+    @staticmethod
+    def _migration_reasoning_tokens(
+        request: ChatCompletionRequest, segment_reasoning_tokens: int
+    ) -> int:
+        """Reasoning tokens of the whole request at a hand-off: the engine only
+        counts this segment, the earlier ones arrive in migration_resume."""
+        resume = request.migration_resume
+        earlier = resume.reasoning_tokens if resume is not None else 0
+        return earlier + (segment_reasoning_tokens or 0)
 
     def _set_response_parser_context(
         self,
@@ -1863,14 +1988,18 @@ class OpenAIServingChat(OpenAIServingBase):
         message_start_tool_call_constraint: (
             Callable[[], ToolCallConstraint | None] | None
         ) = None,
+        prompt_ids: Optional[List[int]] = None,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill.
 
-        `tools` are the tools whose calls the tool-call parser reads."""
+        `tools` are the tools whose calls the tool-call parser reads.
+        `prompt_ids` overrides the engine prompt when it holds earlier output."""
         prefix = adapted_request.text
-        if not isinstance(prefix, str) and adapted_request.input_ids:
+        if prompt_ids is None:
+            prompt_ids = adapted_request.input_ids
+        if not isinstance(prefix, str) and prompt_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
-                adapted_request.input_ids,
+                prompt_ids,
                 skip_special_tokens=False,
                 spaces_between_special_tokens=False,
             )
@@ -3028,6 +3157,14 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
         input_ids: list[int] | None = None
         output_ids: dict[int, list[int]] = {}
+        # Decode hot migration: the output a resumed request replays, and the
+        # hand-off event that ends a stream instead of a finish chunk.
+        resume = request.migration_resume
+        replay_text = (
+            await self._migration_replay_text(request) if resume is not None else ""
+        )
+        replayed: set[int] = set()
+        handoff: dict[str, Any] | None = None
 
         stream_started = False
         usage_headers_set = False
@@ -3053,6 +3190,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if resume is not None:
+                    content = chat_migration.with_resumed_prompt(
+                        content, origin_len=len(resume.origin_input_ids)
+                    )
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"],
@@ -3093,6 +3234,24 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+                if finish_reason_type == chat_migration.MIGRATED_FINISH_TYPE:
+                    # Not a finish for the client: relay the last text without
+                    # flushing the parsers, whose held-back text the next decode
+                    # re-creates by replay; the hand-off event follows the loop.
+                    handoff, cut = self._migration_handoff(
+                        request,
+                        index,
+                        finish_reason,
+                        content["meta_info"].get("reasoning_tokens", 0),
+                    )
+                    if cut:
+                        content = {
+                            **content,
+                            "text": chat_migration.trim_unfinished_char(
+                                content["text"]
+                            ),
+                        }
+                    finish_reason = finish_reason_type = None
 
                 if return_input_ids and input_ids is None:
                     # The prompt is the full, shared prompt (same across choices
@@ -3186,24 +3345,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     usage_headers_set = True
 
-                # First chunk with role
+                # First chunk with role. A resumed stream continues the message
+                # the client already has through the router, so it sends none;
+                # the client stream has started either way.
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    # K2 templates require preserved thinking, including empty reasoning.
-                    yield build_sse_content(
-                        chunk_id=self._wire_id(request, content["meta_info"]["id"]),
-                        created=created,
-                        model=request.model,
-                        index=index,
-                        role="assistant",
-                        content="",
-                        reasoning_content=(
-                            ""
-                            if self.reasoning_parser == "k2_horizon"
-                            and request.separate_reasoning
-                            else None
-                        ),
-                    )
+                    if request.migration_resume is None:
+                        # K2 templates require preserved thinking, including empty reasoning.
+                        yield build_sse_content(
+                            chunk_id=self._wire_id(request, content["meta_info"]["id"]),
+                            created=created,
+                            model=request.model,
+                            index=index,
+                            role="assistant",
+                            content="",
+                            reasoning_content=(
+                                ""
+                                if self.reasoning_parser == "k2_horizon"
+                                and request.separate_reasoning
+                                else None
+                            ),
+                        )
                     stream_started = True
 
                 # Settle the stop token here, where the whole generated text is
@@ -3225,6 +3387,26 @@ class OpenAIServingChat(OpenAIServingBase):
                             content["text"], finish_reason, request, output
                         )
                         content = {**content, "text": text}
+
+                if replay_text and index not in replayed:
+                    replayed.add(index)
+                    await self._replay_migrated_output(
+                        replay_text=replay_text,
+                        content=content,
+                        index=index,
+                        request=request,
+                        created=created,
+                        stream_offsets=stream_offsets,
+                        reasoning_parser_dict=reasoning_parser_dict,
+                        parser_dict=parser_dict,
+                        has_tool_calls=has_tool_calls,
+                        token_provenances=(
+                            token_provenances
+                            if internal_content_on
+                            and self.chat_encoding_spec == "kimi_k3"
+                            else None
+                        ),
+                    )
 
                 # Delta token ids for this event (incremental mode
                 # events already carry the delta).
@@ -3275,6 +3457,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     token_provenance=token_provenance,
                 ):
                     yield chunk
+
+            if handoff is not None:
+                yield chat_migration.handoff_sse(
+                    chunk_id=self._wire_id(request, content["meta_info"]["id"]),
+                    created=created,
+                    model=request.model,
+                    migration=handoff,
+                )
+                yield "data: [DONE]\n\n"
+                return
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -3495,6 +3687,51 @@ class OpenAIServingChat(OpenAIServingBase):
 
         yield "data: [DONE]\n\n"
 
+    async def _replay_migrated_output(
+        self,
+        *,
+        replay_text: str,
+        content: dict[str, Any],
+        index: int,
+        request: ChatCompletionRequest,
+        created: int,
+        stream_offsets: dict[int, int],
+        reasoning_parser_dict: dict,
+        parser_dict: dict,
+        has_tool_calls: dict[int, bool],
+        token_provenances: Optional[Dict[int, KimiTokenProvenance]],
+    ) -> None:
+        """Run the output a resumed request's client already has through this
+        choice's reasoning and tool-call parsers, discarding what they emit, so
+        the stream continues with only new deltas."""
+        token_provenance = None
+        if token_provenances is not None:
+            token_provenance = token_provenances.setdefault(
+                index, KimiTokenProvenance(self.tokenizer_manager.tokenizer)
+            )
+            token_provenance.append(list(request.migration_resume.output_ids))
+        replay = {**content, "text": replay_text}
+        async for _ in self._generate_stream_content(
+            content=replay,
+            index=index,
+            request=request,
+            created=created,
+            stream_offsets=stream_offsets,
+            reasoning_parser_dict=reasoning_parser_dict,
+            parser_dict=parser_dict,
+            has_tool_calls=has_tool_calls,
+            choice_logprobs=None,
+            finish_reason_type=None,
+            continuous_usage_stats=False,
+            prompt_tokens={},
+            reasoning_tokens={},
+            completion_tokens={},
+            token_provenance=token_provenance,
+        ):
+            pass
+        # The engine's text starts after the replayed output.
+        stream_offsets.pop(index, None)
+
     async def _handle_non_streaming_request(
         self,
         adapted_request: GenerateReqInput,
@@ -3511,6 +3748,41 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
+
+        resume = request.migration_resume
+        if resume is not None:
+            # Parse the whole message: the earlier output, then this segment's.
+            replay_text = await self._migration_replay_text(request)
+            ret = [
+                {
+                    **chat_migration.with_resumed_prompt(
+                        item, origin_len=len(resume.origin_input_ids)
+                    ),
+                    "text": replay_text + item["text"],
+                }
+                for item in ret
+            ]
+        finish_reason = ret[0]["meta_info"].get("finish_reason")
+        if (
+            finish_reason is not None
+            and finish_reason["type"] == chat_migration.MIGRATED_FINISH_TYPE
+        ):
+            # The router resumes it and returns the last segment's full message.
+            handoff, _ = self._migration_handoff(
+                request,
+                0,
+                finish_reason,
+                ret[0]["meta_info"].get("reasoning_tokens", 0),
+            )
+            return ORJSONResponse(
+                content=chat_migration.handoff_body(
+                    object_type="chat.completion",
+                    response_id=self._wire_id(request, ret[0]["meta_info"]["id"]),
+                    created=int(time.time()),
+                    model=request.model,
+                    migration=handoff,
+                )
+            )
 
         response = self._build_chat_response(
             request,

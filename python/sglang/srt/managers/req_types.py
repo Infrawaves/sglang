@@ -597,6 +597,29 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class FINISH_MIGRATED(BaseFinishReason):
+    """A decode request handed off for a planned retirement of its instance.
+
+    Not an error: the router resubmits `origin_input_ids + output_ids` to another
+    prefill/decode pair, which reads the stored KV back from the shared storage
+    backend. `kv_flushed_tokens` counts the decode-written tokens that storage
+    confirmed; it is filled in when the hand-off is reported."""
+
+    def __init__(self, origin_input_ids: List[int], output_ids: List[int]):
+        super().__init__()
+        self.origin_input_ids = origin_input_ids
+        self.output_ids = output_ids
+        self.kv_flushed_tokens = 0
+
+    def to_json(self):
+        return {
+            "type": "migrated",
+            "origin_input_ids": list(self.origin_input_ids),
+            "output_ids": list(self.output_ids),
+            "kv_flushed_tokens": self.kv_flushed_tokens,
+        }
+
+
 @dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""

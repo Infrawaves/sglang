@@ -237,7 +237,7 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
             .into_response();
     }
 
-    Json(json!({
+    let mut info = json!({
         "model_path": "mock-model-path",
         "tokenizer_path": "mock-tokenizer-path",
         "port": config.port,
@@ -272,8 +272,11 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
             "waiting_queue_size": 0,
             "running_queue_size": 0
         }]
-    }))
-    .into_response()
+    });
+    if supports_migration_resume(config.port) {
+        info["supports_migration_resume"] = json!(true);
+    }
+    Json(info).into_response()
 }
 
 async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
@@ -485,6 +488,11 @@ async fn chat_completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_chat_request(config.port, &payload);
+
+    if let Some(response) = migration_mock_response(config.port, &payload) {
+        return response;
+    }
 
     if should_fail(&config).await {
         return (
@@ -1892,4 +1900,242 @@ impl Drop for OpenAiOnlyMockWorker {
             let _ = tx.send(());
         }
     }
+}
+
+// --- Decode hot migration (per-port, set before the request is sent) ---
+
+/// How a mock decode hands off chat requests that carry `allow_migration`.
+#[derive(Clone, Copy, Debug)]
+pub struct MockMigration {
+    /// Content chunks streamed before the hand-off event.
+    pub chunks_before_handoff: usize,
+    /// Prompt length reported in `origin_input_ids` on a first segment.
+    pub origin_len: usize,
+    /// Tokens each segment adds to `output_ids`.
+    pub tokens_per_segment: usize,
+    /// Hand off while `migration_resume.attempt` (0 when absent) is below this.
+    pub handoff_below_attempt: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MockRejection {
+    /// 503 with `X-SGLang-Draining: 1`, as a retiring engine answers.
+    Draining,
+    /// 503 without the marker.
+    Unavailable,
+}
+
+static MIGRATION_CONFIG: OnceLock<Mutex<HashMap<u16, MockMigration>>> = OnceLock::new();
+static REJECTION_CONFIG: OnceLock<Mutex<HashMap<u16, MockRejection>>> = OnceLock::new();
+static RESUME_CAPABLE: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+static CHAT_REQUESTS: OnceLock<Mutex<HashMap<u16, Vec<serde_json::Value>>>> = OnceLock::new();
+
+pub fn set_migration_handoff(port: u16, migration: MockMigration) {
+    MIGRATION_CONFIG
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(port, migration);
+}
+
+pub fn set_chat_rejection(port: u16, rejection: Option<MockRejection>) {
+    let mut map = REJECTION_CONFIG.get_or_init(Default::default).lock().unwrap();
+    match rejection {
+        Some(rejection) => map.insert(port, rejection),
+        None => map.remove(&port),
+    };
+}
+
+/// Make `/server_info` report `supports_migration_resume: true`. Set it
+/// before the worker registers; the gateway reads it once.
+pub fn set_supports_migration_resume(port: u16, supported: bool) {
+    let mut set = RESUME_CAPABLE.get_or_init(Default::default).lock().unwrap();
+    if supported {
+        set.insert(port);
+    } else {
+        set.remove(&port);
+    }
+}
+
+fn supports_migration_resume(port: u16) -> bool {
+    RESUME_CAPABLE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .contains(&port)
+}
+
+fn record_chat_request(port: u16, payload: &serde_json::Value) {
+    CHAT_REQUESTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(port)
+        .or_default()
+        .push(payload.clone());
+}
+
+/// Every `/v1/chat/completions` body the worker received, in order.
+pub fn take_chat_requests(port: u16) -> Vec<serde_json::Value> {
+    CHAT_REQUESTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&port)
+        .unwrap_or_default()
+}
+
+fn id_list(value: Option<&serde_json::Value>) -> Option<Vec<u64>> {
+    value?
+        .as_array()
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).collect())
+}
+
+fn migration_mock_response(port: u16, payload: &serde_json::Value) -> Option<Response> {
+    let rejection = REJECTION_CONFIG
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&port)
+        .copied();
+    if let Some(rejection) = rejection {
+        let body = Json(json!({"error": {"message": "Server is retiring", "code": 503}}));
+        return Some(match rejection {
+            MockRejection::Draining => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("x-sglang-draining", "1")],
+                body,
+            )
+                .into_response(),
+            MockRejection::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, body).into_response(),
+        });
+    }
+
+    let migration = MIGRATION_CONFIG
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&port)
+        .copied()?;
+    if payload.get("allow_migration") != Some(&json!(true)) {
+        return None;
+    }
+
+    let resume = payload.get("migration_resume");
+    let attempt = resume
+        .and_then(|r| r.get("attempt"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let origin = id_list(resume.and_then(|r| r.get("origin_input_ids")))
+        .unwrap_or_else(|| (0..migration.origin_len as u64).collect());
+    let mut output_ids = id_list(resume.and_then(|r| r.get("output_ids"))).unwrap_or_default();
+    let previous = output_ids.len() as u64;
+    output_ids.extend((0..migration.tokens_per_segment as u64).map(|i| 1000 + previous + i));
+
+    let handoff = attempt < migration.handoff_below_attempt;
+    let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + attempt;
+    let usage = json!({
+        "prompt_tokens": origin.len(),
+        "completion_tokens": migration.tokens_per_segment,
+        "total_tokens": origin.len() + migration.tokens_per_segment,
+        "prompt_tokens_details": {"cached_tokens": 100 + attempt},
+    });
+    let handoff_obj = json!({
+        "index": 0,
+        "origin_input_ids": origin,
+        "output_ids": output_ids,
+        "kv_flushed_tokens": origin.len() + output_ids.len(),
+    });
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !is_stream {
+        let mut body = json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": format!("segment-{attempt}")},
+                "finish_reason": "stop"
+            }],
+            "usage": usage,
+        });
+        if handoff {
+            body["choices"] = json!([]);
+            body["sglang_migration"] = handoff_obj;
+        }
+        return Some(Json(body).into_response());
+    }
+
+    let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": "mock-model",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+        })
+        .to_string()
+    };
+    let content_chunks = if handoff {
+        migration.chunks_before_handoff
+    } else {
+        migration.tokens_per_segment
+    };
+    let mut events: Vec<String> = (0..content_chunks)
+        .map(|i| {
+            chunk(
+                json!({"content": format!("s{attempt}-{i} ")}),
+                serde_json::Value::Null,
+            )
+        })
+        .collect();
+    if handoff {
+        events.push(
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": "mock-model",
+                "choices": [],
+                "sglang_migration": handoff_obj,
+            })
+            .to_string(),
+        );
+    } else {
+        events.push(chunk(json!({}), json!("stop")));
+        let include_usage = payload
+            .pointer("/stream_options/include_usage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if include_usage {
+            events.push(
+                json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": "mock-model",
+                    "choices": [],
+                    "usage": usage,
+                })
+                .to_string(),
+            );
+        }
+    }
+    events.push("[DONE]".to_string());
+    let stream = stream::iter(
+        events
+            .into_iter()
+            .map(|data| Ok::<_, Infallible>(Event::default().data(data))),
+    );
+    Some(Sse::new(stream).into_response())
 }

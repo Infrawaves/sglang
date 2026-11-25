@@ -100,6 +100,10 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.decode_migration import (
+    DecodeMigrationExporter,
+    decode_receive_side_idle,
+)
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -705,6 +709,7 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        self.maybe_init_decode_migration_exporter()
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
         # its copies behind that forward; the decode offload controller has none.
@@ -3455,6 +3460,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                allow_migration=recv_req.allow_migration,
             )
             req.tokenizer = self.tokenizer
 
@@ -6048,6 +6054,13 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        # The paused loop skips process_decode_queue, the usual driver of
+        # offload acks; a migration in progress is advanced here instead.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.decode_migration_exporter is not None
+        ):
+            self.decode_migration_exporter.poll()
         if self.deferred_responses.has_pending():
             self.deferred_responses.stream_released()
             time.sleep(0)
@@ -6130,6 +6143,14 @@ class Scheduler(
                 and self.decode_offload_manager is not None
             ):
                 idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                if self.decode_migration_exporter is not None:
+                    # Armed: requests are about to be handed off. In progress: a
+                    # timed-out hand-off can still have storage writes reading
+                    # host memory, which a teardown must not free.
+                    idle &= not (
+                        self.decode_migration_exporter.is_armed()
+                        or self.decode_migration_exporter.has_pending()
+                    )
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6537,7 +6558,22 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract")
+        assert recv_req.mode in ("in_place", "retract", "migrate")
+        if recv_req.mode == "migrate":
+            # Decoding goes on until no request is receiving KV from prefill;
+            # maybe_start_decode_migration then pauses the engine.
+            if self.decode_migration_exporter is None:
+                logger.error(
+                    "pause_generation(mode='migrate') needs a PD decode instance "
+                    "with --disaggregation-decode-enable-offload-kvcache and no "
+                    "pipeline parallelism; ignoring it."
+                )
+                return
+            self.decode_migration_exporter.arm(
+                flush_timeout_s=recv_req.migrate_flush_timeout_s
+            )
+            return
+
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -6552,51 +6588,7 @@ class Scheduler(
                 self._pause_started_at = time.monotonic()
             return
 
-        if self.enable_overlap and self.last_batch:
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and (req := self.chunked_req) is not None
-            ):
-                # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-        elif self.enable_overlap_mlx:
-            self._drain_mlx_pending_jobs()
-        # A first retract starts the pause once the in-flight result has drained.
-        if self._pause_started_at is None:
-            self._pause_started_at = time.monotonic()
-
-        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
-        if (
-            self.last_batch is not None
-            and self.last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and self.last_batch is not self.running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_transfer_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
-
-        if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs.append(self.chunked_req)
-
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Transferred requests wait for a slot holding their row and KV;
-            # retract them too, so their KV is rebuilt under the new weights.
-            retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
-
-        self.last_batch = None
-        self.cur_batch_for_debug = None
+        retract_reqs = self._take_reqs_for_pause()
 
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
@@ -6642,6 +6634,93 @@ class Scheduler(
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
 
+        self._publish_paused_state()
+
+    def maybe_init_decode_migration_exporter(self) -> None:
+        self.decode_migration_exporter = (
+            DecodeMigrationExporter(
+                offload_manager=self.decode_offload_manager,
+                emit_outputs=self._stream_finished_outputs,
+            )
+            if self.decode_offload_manager is not None and get_parallel().pp_size == 1
+            else None
+        )
+
+    def _stream_finished_outputs(self, reqs: List[Req]) -> None:
+        self.output_streamer.stream_output(reqs, return_logprob=False)
+
+    def maybe_start_decode_migration(self) -> None:
+        """Pause and hand off the running requests once a migrate-mode pause is
+        armed and no request is receiving KV; called by the decode event loops."""
+        exporter = self.decode_migration_exporter
+        if exporter is None or not exporter.is_armed():
+            return
+        receive_side_idle = decode_receive_side_idle(
+            lists=self.request_lists(), waiting_queue=self.waiting_queue
+        )
+        if not exporter.should_start(receive_side_idle=receive_side_idle):
+            return
+        self._engine_paused = True
+        reqs = self._take_reqs_for_pause()
+        self.running_batch.reqs = []
+        self.running_reqs.leave(reqs)
+        self.running_batch.batch_is_full = False
+        self.chunked_req = None
+        exporter.begin(reqs)
+        self._publish_paused_state()
+
+    def _take_reqs_for_pause(self) -> List[Req]:
+        """Drain the in-flight result and collect the unfinished requests that a
+        pause detaches: running, last extend batch, chunked, and (PD decode)
+        transferred requests waiting for a slot."""
+        if self.enable_overlap and self.last_batch:
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and (req := self.chunked_req) is not None
+            ):
+                # Retract skips the chunk step that sets this result's KV send boundary.
+                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        elif self.enable_overlap_mlx:
+            self._drain_mlx_pending_jobs()
+        # A first retract starts the pause once the in-flight result has drained.
+        if self._pause_started_at is None:
+            self._pause_started_at = time.monotonic()
+
+        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            # A running batch that DP attention converted to extend is
+            # last_batch itself; its requests are already listed above.
+            and self.last_batch is not self.running_batch
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_transfer_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
+
+        if (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and self.chunked_req not in retract_reqs
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs.append(self.chunked_req)
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Transferred requests wait for a slot holding their row and KV;
+            # retract them too, so their KV is rebuilt under the new weights.
+            retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
+
+        self.last_batch = None
+        self.cur_batch_for_debug = None
+        return retract_reqs
+
+    def _publish_paused_state(self) -> None:
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
         # so without this hop ``gen_throughput`` retains its last non-zero

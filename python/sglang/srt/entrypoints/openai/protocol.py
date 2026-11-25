@@ -408,6 +408,20 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
+class MigrationResume(BaseModel):
+    """The continuation of a chat request a retiring decode handed off.
+
+    Built by the router from the hand-off event (`sglang_migration`):
+    `origin_input_ids` is the original prompt and `output_ids` everything
+    generated so far, across all earlier hand-offs."""
+
+    origin_input_ids: List[int] = Field(min_length=1)
+    output_ids: List[int]
+    attempt: int = 0
+    # Reasoning tokens among `output_ids`; the router adds them to usage.
+    reasoning_tokens: int = Field(default=0, ge=0)
+
+
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -421,8 +435,23 @@ class PDRoutingFields(BaseModel):
     # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 
+    # Decode hot migration (pause_generation mode="migrate"). A router sets
+    # allow_migration when it can resume this request from the hand-off event,
+    # and migration_resume on the resubmitted request.
+    allow_migration: bool = False
+    migration_resume: Optional[MigrationResume] = None
+
     def pd_routing_kwargs(self) -> Dict[str, Any]:
-        return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
+        # The migration fields are left out: an adapter that re-issues the
+        # request as a chat request does not relay the hand-off event.
+        return {
+            name: getattr(self, name)
+            for name in PDRoutingFields.model_fields
+            if name not in _MIGRATION_FIELDS
+        }
+
+
+_MIGRATION_FIELDS = ("allow_migration", "migration_resume")
 
 
 class CompletionRequest(PDRoutingFields):

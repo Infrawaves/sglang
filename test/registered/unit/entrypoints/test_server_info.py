@@ -165,7 +165,16 @@ class TestServerInfoTransportParity(CustomTestCase):
                 )
                 http_info = _call_server_info_with(args)
                 self.assertEqual(http_info["frontend"], "python")
-                for field in ("startup_time", "internal_states", "version", "frontend"):
+                # Routers resume handed-off chat requests only where this is
+                # set; it describes the HTTP chat endpoint, not gRPC.
+                self.assertIs(http_info["supports_migration_resume"], True)
+                for field in (
+                    "startup_time",
+                    "internal_states",
+                    "version",
+                    "frontend",
+                    "supports_migration_resume",
+                ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
 

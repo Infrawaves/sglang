@@ -29,6 +29,9 @@ pub const DEFAULT_WORKER_PRIORITY: u32 = 50;
 /// Default worker cost factor (baseline cost)
 pub const DEFAULT_WORKER_COST: f32 = 1.0;
 
+/// Worker label caching `/server_info`'s `supports_migration_resume`.
+pub const SUPPORTS_MIGRATION_RESUME_LABEL: &str = "supports_migration_resume";
+
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
@@ -225,9 +228,26 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (healthy + not draining + circuit closed/half-open)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        self.is_healthy() && !self.is_draining() && self.circuit_breaker().can_execute()
+    }
+
+    /// Whether this router saw the worker announce a planned retirement.
+    /// Local to this router; health checks never clear it.
+    fn is_draining(&self) -> bool {
+        false
+    }
+
+    fn set_draining(&self, _draining: bool) {}
+
+    /// Whether the engine accepts resumed (`migration_resume`) requests,
+    /// as reported by `/server_info` at registration.
+    fn supports_migration_resume(&self) -> bool {
+        self.metadata()
+            .labels
+            .get(SUPPORTS_MIGRATION_RESUME_LABEL)
+            .is_some_and(|v| v == "true")
     }
 
     /// Record the outcome of a request to this worker
@@ -653,6 +673,7 @@ pub struct BasicWorker {
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
+    pub draining: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
@@ -670,6 +691,7 @@ impl fmt::Debug for BasicWorker {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("draining", &self.draining.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .field("grpc_client", &"<RwLock>")
             .finish()
@@ -728,6 +750,14 @@ impl Worker for BasicWorker {
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
         Metrics::set_worker_health(self.url(), healthy);
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Release);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1045,6 +1075,14 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn is_draining(&self) -> bool {
+        self.base_worker.is_draining()
+    }
+
+    fn set_draining(&self, draining: bool) {
+        self.base_worker.set_draining(draining);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {

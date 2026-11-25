@@ -131,6 +131,10 @@ class DecodeKVCacheOffloadManager:
         # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
         self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
+        # Decode-written tokens the storage backend confirmed, contiguous from the
+        # prompt pages: a gap breaks the hash chain, so later pages cannot hit.
+        self.storage_confirmed_len: WeakKeyDict[Req, int] = WeakKeyDict()
+        self._storage_chain_broken: WeakKeyDict[Req, bool] = WeakKeyDict()
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
@@ -181,16 +185,25 @@ class DecodeKVCacheOffloadManager:
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
+        return self._offload_aligned(req, align=self.offload_stride) > 0
 
+    def flush_for_migration(self, req) -> int:
+        """Queue every complete page of `req` not yet offloaded.
+
+        Returns the queued token count: 0 when no complete page is left, -1 when
+        host memory is full (retry once storage backups free some)."""
+        return self._offload_aligned(req, align=self.page_size)
+
+    def _offload_aligned(self, req, *, align: int) -> int:
         if self.cache_controller is None or self.decode_host_mem_pool is None:
-            return False
+            return 0
 
         if req.kv.req_pool_idx == -1 or len(req.output_ids) == 0:
-            return False
+            return 0
 
         token_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
         if token_indices.dim() == 0 or token_indices.numel() == 0:
-            return False
+            return 0
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
@@ -207,12 +220,10 @@ class DecodeKVCacheOffloadManager:
             self.offloaded_state[req] = state
         incremental_total = len(all_tokens) - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
-        incremental_aligned_len = (
-            incremental_new // self.offload_stride * self.offload_stride
-        )
+        incremental_aligned_len = incremental_new // align * align
 
-        if incremental_aligned_len == 0:
-            return False
+        if incremental_aligned_len <= 0:
+            return 0
 
         # Extract incremental tokens and indices for the newly available chunk
         start = prefill_offloaded_len + state.inc_len
@@ -239,7 +250,7 @@ class DecodeKVCacheOffloadManager:
         )
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
-            return False
+            return -1
 
         self._mark_offload_started(req)
         self.ongoing_offload[ack_id] = (
@@ -250,7 +261,7 @@ class DecodeKVCacheOffloadManager:
             pool_transfers,
         )
         state.inc_len += incremental_aligned_len
-        return True
+        return incremental_aligned_len
 
     def check_offload_progress(self):
         """Check the progress of offload from device to host and backup from host to storage."""
@@ -357,8 +368,14 @@ class DecodeKVCacheOffloadManager:
         for _ in range(finish_count):
             storage_operation = self.cache_controller.ack_backup_queue.get()
             ack_id = storage_operation.id
-            req_id, host_indices, start_time, pool_transfers = self.ongoing_backup.pop(
+            req, host_indices, start_time, pool_transfers = self.ongoing_backup.pop(
                 ack_id
+            )
+            req_id = req.rid
+            self._record_storage_outcome(
+                req,
+                written=storage_operation.completed_tokens,
+                requested=len(storage_operation.token_ids),
             )
 
             # Release host memory
@@ -392,13 +409,50 @@ class DecodeKVCacheOffloadManager:
             hash_value=page_hashes,
             **({"extra_pools": pool_transfers} if pool_transfers else {}),
         )
+        # Keyed by Req identity, like offloaded_state: a rid can be reused.
         self.ongoing_backup[ack_id] = (
-            req.rid,
+            req,
             host_indices,
             start_time,
             pool_transfers,
         )
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
+
+    def _record_storage_outcome(self, req: Req, *, written: int, requested: int):
+        """Extend the contiguous confirmed length, stopping at the first gap.
+
+        Backups of one request complete in submission order (one backup thread,
+        FIFO queue), so the confirmed span grows from the prompt pages."""
+        if self._storage_chain_broken.get(req, False):
+            return
+        self.storage_confirmed_len[req] = (
+            self.storage_confirmed_len.get(req, 0) + written
+        )
+        if written < requested:
+            self._storage_chain_broken[req] = True
+            logger.warning(
+                "Decode offload backup for %s stored %d of %d tokens; "
+                "later pages of this request cannot be hit.",
+                req.rid,
+                written,
+                requested,
+            )
+
+    def has_pending_device_copy(self, req: Req) -> bool:
+        """Whether a device-to-host copy of `req` may still read its device KV."""
+        return self._has_inflight_offload(req)
+
+    def has_pending_storage_write(self, req: Req) -> bool:
+        """Whether a host-to-storage backup of `req` is still unacknowledged."""
+        return any(entry[0] is req for entry in self.ongoing_backup.values())
+
+    def has_pending_transfers(self) -> bool:
+        """Whether any copy or backup still holds device or host memory."""
+        return bool(self.ongoing_offload or self.ongoing_backup)
+
+    def storage_confirmed_tokens(self, req: Req) -> int:
+        """Decode-written tokens of `req` stored contiguously after its prompt."""
+        return self.storage_confirmed_len.get(req, 0)
 
     def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
         """Match prefill storage hashes."""

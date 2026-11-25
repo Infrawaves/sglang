@@ -17,6 +17,18 @@ import orjson
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from sglang_router.migration_resume import (
+    MAX_RESUMES,
+    ResumeStitcher,
+    SseEventSplitter,
+    as_progress,
+    build_resume_request,
+    is_done_event,
+    migrated_finish,
+    parse_sse_data,
+    resumable,
+    to_sse,
+)
 from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger(__name__)
@@ -150,6 +162,50 @@ class MiniLoadBalancer:
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
+        response = await self._generate_once(
+            modified_request, prefill_server, decode_server, endpoint
+        )
+        if endpoint != "generate":
+            return response
+        return await self._resume_migrated(modified_request, response, endpoint)
+
+    async def _resume_migrated(
+        self, original_request, response: ORJSONResponse, endpoint
+    ) -> ORJSONResponse:
+        """Resubmit a request its decode handed off until it really finishes."""
+        ret_json = orjson.loads(response.body)
+        stitcher = None
+        attempt = 0
+        while (finish := migrated_finish(ret_json)) is not None:
+            if attempt >= MAX_RESUMES:
+                return ORJSONResponse(
+                    content={"error": "request was handed off too many times"},
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            attempt += 1
+            if stitcher is None:
+                stitcher = ResumeStitcher.for_first_hand_off(ret_json, finish)
+            stitcher.absorb(ret_json, finish)
+            prefill_server, bootstrap_port, decode_server = self.select_pair()
+            resumed = _with_bootstrap(
+                build_resume_request(original_request, finish, attempt),
+                prefill_server,
+                bootstrap_port,
+            )
+            response = await self._generate_once(
+                resumed, prefill_server, decode_server, endpoint
+            )
+            if response.status_code != 200:
+                # No retry: the client already has nothing to deduplicate against.
+                return response
+            ret_json = orjson.loads(response.body)
+        if stitcher is None:
+            return response
+        return ORJSONResponse(content=stitcher.rewrite(ret_json), status_code=200)
+
+    async def _generate_once(
+        self, modified_request, prefill_server, decode_server, endpoint
+    ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
@@ -258,6 +314,11 @@ class MiniLoadBalancer:
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
                             yield chunk
+                elif endpoint == "generate":
+                    async for chunk in self._stream_with_resume(
+                        session, modified_request, decode_response, endpoint
+                    ):
+                        yield chunk
                 else:
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
@@ -268,6 +329,52 @@ class MiniLoadBalancer:
             stream_results(),
             media_type="text/event-stream",
         )
+
+    async def _stream_with_resume(
+        self, session, original_request, decode_response, endpoint
+    ):
+        """Relay a /generate stream; when its decode hands the request off,
+        resubmit it and relay the continuation as part of the same stream."""
+        stitcher = None
+        attempt = 0
+        while True:
+            hand_off = None
+            async for event in _iter_sse_events(decode_response):
+                payload = parse_sse_data(event)
+                if payload is None:
+                    if hand_off is not None and is_done_event(event):
+                        continue  # the stream goes on in the resumed request
+                    yield event
+                    continue
+                finish = migrated_finish(payload)
+                out = payload if stitcher is None else stitcher.rewrite(payload)
+                if finish is not None:
+                    hand_off = (payload, finish)
+                    out = as_progress(out)
+                yield to_sse(out)
+            if hand_off is None:
+                return
+            if attempt >= MAX_RESUMES:
+                yield to_sse({"error": "request was handed off too many times"})
+                yield b"data: [DONE]\n\n"
+                return
+            attempt += 1
+            payload, finish = hand_off
+            if stitcher is None:
+                stitcher = ResumeStitcher.for_first_hand_off(payload, finish)
+            stitcher.absorb(payload, finish)
+            prefill_server, bootstrap_port, decode_server = self.select_pair()
+            resumed = _with_bootstrap(
+                build_resume_request(original_request, finish, attempt),
+                prefill_server,
+                bootstrap_port,
+            )
+            # The prefill response is only kept alive with the session, as for
+            # the first segment.
+            _, decode_response = await asyncio.gather(
+                session.post(f"{prefill_server}/{endpoint}", json=resumed),
+                session.post(f"{decode_server}/{endpoint}", json=resumed),
+            )
 
 
 app = FastAPI()
@@ -352,6 +459,90 @@ async def pd_role_switch(request_data: dict):
 
     lb.apply_role_switch(worker_url, new_role, request_data.get("bootstrap_port"))
     return ORJSONResponse(content=result, status_code=200)
+
+
+async def _post_json(url, body):
+    """POST `body` to a backend; return (status, json). Transport errors and
+    non-JSON replies are reported as failures."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=lb.timeout)
+        ) as session:
+            async with session.post(url, json=body) as resp:
+                try:
+                    return resp.status, await resp.json(content_type=None)
+                except ValueError:
+                    return resp.status, {"message": await resp.text()}
+    except Exception as e:
+        return 502, {"success": False, "message": str(e)}
+
+
+async def _worker_fully_idle(worker_url) -> bool:
+    """Whether every DP rank of a backend reports it holds no request state."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=lb.timeout)
+        ) as session:
+            async with session.get(f"{worker_url}/server_info") as resp:
+                info = await resp.json()
+    except Exception as e:
+        logger.warning(f"[MiniLB] idle probe of {worker_url} failed: {e}")
+        return False
+    states = info.get("internal_states") or []
+    return bool(states) and all(state.get("fully_idle") is True for state in states)
+
+
+@app.post("/retire_decode")
+async def retire_decode(request_data: dict):
+    """Empty a decode server so it can be restarted in another role. Body:
+    {"worker_url", "grace_secs"?, "flush_timeout_secs"?, "drain_timeout_secs"?}.
+
+    The server is taken out of routing, given a grace period for short
+    requests to finish, then paused in migrate mode: it stores the KV of the
+    remaining requests and hands each back to this LB, which resubmits it to
+    another pair (see `_resume_migrated`). Returns once the server reports
+    itself fully idle; restarting it is left to the caller. The server stays
+    paused and out of routing either way."""
+    worker_url = request_data.get("worker_url")
+    if worker_url not in lb.decode_urls:
+        raise HTTPException(
+            status_code=400, detail=f"{worker_url!r} is not a routed decode server"
+        )
+    if len(lb.decode_urls) < 2:
+        raise HTTPException(
+            status_code=400, detail="no other decode server to hand requests off to"
+        )
+    grace = request_data.get("grace_secs", 60)
+    flush_timeout = request_data.get("flush_timeout_secs", 30)
+    drain_timeout = request_data.get("drain_timeout_secs", 300)
+
+    lb.remove_worker(worker_url)
+    await asyncio.sleep(grace)
+
+    status, result = await _post_json(
+        f"{worker_url}/pause_generation",
+        {"mode": "migrate", "migrate_flush_timeout_s": flush_timeout},
+    )
+    if status != 200:
+        # Rejected before the engine paused: it can keep serving.
+        lb.add_worker(worker_url, "decode")
+        return ORJSONResponse(content=result, status_code=status)
+
+    deadline = asyncio.get_event_loop().time() + drain_timeout
+    while not await _worker_fully_idle(worker_url):
+        if asyncio.get_event_loop().time() >= deadline:
+            return ORJSONResponse(
+                content={
+                    "success": False,
+                    "message": "timed out waiting for the server to become idle",
+                },
+                status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            )
+        await asyncio.sleep(1.0)
+    return ORJSONResponse(
+        content={"success": True, "message": "idle; restart it in its new role"},
+        status_code=200,
+    )
 
 
 @app.post("/flush_cache")
@@ -484,6 +675,9 @@ async def handle_generate_request(request_data: dict):
                 "bootstrap_room": _generate_bootstrap_room(),
             }
         )
+        if resumable(modified_request):
+            # Lets a retiring decode hand the request off; see _resume_migrated.
+            modified_request["allow_migration"] = True
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -538,6 +732,26 @@ async def handle_completion_request(request_data: dict):
 
 def _generate_bootstrap_room():
     return random.randint(0, 2**63 - 1)
+
+
+def _with_bootstrap(request, prefill_server, bootstrap_port):
+    """`request` (single, not batch) addressed to `prefill_server`."""
+    hostname = maybe_wrap_ipv6_address(urllib.parse.urlparse(prefill_server).hostname)
+    return {
+        **request,
+        "bootstrap_host": hostname,
+        "bootstrap_port": bootstrap_port,
+        "bootstrap_room": _generate_bootstrap_room(),
+    }
+
+
+async def _iter_sse_events(response):
+    splitter = SseEventSplitter()
+    async for chunk in response.content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+        for event in splitter.feed(chunk):
+            yield event
+    for event in splitter.flush():
+        yield event
 
 
 # We may utilize `GenerateReqInput`'s logic later

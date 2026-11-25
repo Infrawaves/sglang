@@ -12,7 +12,10 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    core::{
+        steps::workflow_data::LocalWorkerWorkflowData, worker::SUPPORTS_MIGRATION_RESUME_LABEL,
+        ConnectionMode,
+    },
     routers::grpc::client::GrpcClient,
 };
 
@@ -42,6 +45,7 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+    pub supports_migration_resume: Option<bool>,
 }
 
 impl ServerInfo {
@@ -348,6 +352,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     if let Some(disaggregation_mode) = server_info.disaggregation_mode {
                         labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
+                    if server_info.supports_migration_resume == Some(true) {
+                        labels.insert(
+                            SUPPORTS_MIGRATION_RESUME_LABEL.to_string(),
+                            "true".to_string(),
+                        );
+                    }
                 }
 
                 if let Some(model_info) = model_info {
@@ -430,6 +440,15 @@ mod server_info_tests {
     fn a_server_without_attention_dp_size_counts_dp_size() {
         let info = parse(r#"{"dp_size": 4}"#);
         assert_eq!(info.num_dp_ranks(), Some(4));
+    }
+
+    #[test]
+    fn migration_resume_capability_is_optional() {
+        assert_eq!(
+            parse(r#"{"supports_migration_resume": true}"#).supports_migration_resume,
+            Some(true)
+        );
+        assert_eq!(parse("{}").supports_migration_resume, None);
     }
 
     #[test]

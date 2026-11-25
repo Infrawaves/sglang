@@ -172,6 +172,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.pause_admission import (
+    DRAINING_HEADERS,
+    ServerDrainingError,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
@@ -570,6 +574,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_lora,
+    get_memory,
     get_model,
     get_observability,
     get_parallel,
@@ -603,6 +608,28 @@ def _kimi_k3_chat_error_response(
     if chat.chat_encoding_spec != "kimi_k3":
         return None
     return chat.create_error_response(message, err_type, status_code)
+
+
+def draining_error_response(exc: ServerDrainingError) -> ORJSONResponse:
+    """The 503 a retiring instance answers new requests with; see DRAINING_HEADERS."""
+    error = ErrorResponse(
+        object="error",
+        message=str(exc),
+        type=HTTPStatus.SERVICE_UNAVAILABLE.phrase,
+        code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+    )
+    return ORJSONResponse(
+        content=error.model_dump(),
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        headers=DRAINING_HEADERS,
+    )
+
+
+@app.exception_handler(ServerDrainingError)
+async def server_draining_exception_handler(
+    request: Request, exc: ServerDrainingError
+):
+    return draining_error_response(exc)
 
 
 @app.exception_handler(HTTPException)
@@ -948,6 +975,9 @@ async def server_info():
                 "internal_states": internal_states,
                 "version": __version__,
                 "frontend": "python",
+                # This engine accepts a chat request's migration_resume; routers
+                # resume handed-off requests only on instances reporting it.
+                "supports_migration_resume": True,
             }
         )
     )
@@ -1013,6 +1043,9 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     except ValueError as e:
         return _create_error_response(e)
     if obj.stream:
+        # Refuse before the 200 is sent; a stream that reaches the pause gate
+        # later still ends with an in-band 503 error below.
+        _global_state.tokenizer_manager.pause_admission.check()
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
@@ -1020,6 +1053,16 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
+            except ServerDrainingError as e:
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "server_draining",
+                        "code": e.status_code.value,
+                        "retryable": True,
+                    }
+                }
+                yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1894,12 +1937,32 @@ async def separate_reasoning_request(
     return ORJSONResponse(content=response_data, status_code=200)
 
 
+def _migrate_pause_unsupported_reason() -> Optional[str]:
+    disagg = get_disagg()
+    if disagg.disaggregation_mode != "decode":
+        return "mode='migrate' is only supported on a PD decode instance"
+    if not disagg.disaggregation_decode_enable_offload_kvcache:
+        return "mode='migrate' requires --disaggregation-decode-enable-offload-kvcache"
+    if get_memory().hicache_storage_backend is None:
+        return "mode='migrate' requires --hicache-storage-backend"
+    if get_parallel().pp_size != 1:
+        return "mode='migrate' does not support pipeline parallelism"
+    return None
+
+
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
     """Pause generation."""
+    if obj.mode == "migrate" and (reason := _migrate_pause_unsupported_reason()):
+        # The scheduler ignores an unsupported migrate pause; reject it here so
+        # the caller does not wait for hand-offs that never come.
+        return ORJSONResponse(
+            content={"message": reason, "status": "error"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
