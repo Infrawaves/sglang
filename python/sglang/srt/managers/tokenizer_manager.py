@@ -2886,17 +2886,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             if key in state.customized_info_reported_keys:
                                 meta_info.setdefault(key, list(values))
 
-            try:
-                await self._attach_cache_usage(state, out)
-            except CacheAccountingError as exc:
-                raise fastapi.HTTPException(
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    detail="Cache accounting is temporarily unavailable",
-                ) from exc
-
-            # Resolve deferred text for non-incremental streaming.
-            # _handle_batch_output sets "text": None on intermediate chunks
-            # to avoid O(n) string rebuild per step (O(n^2) total).
+            # Snapshot the text alongside this chunk's completion_tokens.
+            # The next batch can append text while cache accounting is pending.
             if (
                 is_stream
                 and not incremental_stream
@@ -2904,6 +2895,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and out["text"] is None
             ):
                 out["text"] = state.get_text()
+
+            try:
+                await self._attach_cache_usage(state, out)
+            except CacheAccountingError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Cache accounting is temporarily unavailable",
+                ) from exc
 
             # Flattened so the downstream finished/logging/metrics logic is shared.
             if out.get("beam_results"):
