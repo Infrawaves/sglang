@@ -435,15 +435,18 @@ def test_guard_release_stages_or_syncs_in_flight_gathers():
     pool.device = torch.device("cpu")
     pool.lock = threading.RLock()
     pool.gathering = False
-    fwd_stream = SimpleNamespace(waited=[])
-    cur_stream = SimpleNamespace(waited=[])
-    cur_stream.wait_event = cur_stream.waited.append
-    pool.fence_reuse = lambda stream=None: None
+    fwd_stream = SimpleNamespace(cuda_stream=1001, waited=[])
+    # Distinct Python wrapper with the same underlying cuda_stream handle
+    # (mirrors torch.cuda.current_stream() returning a fresh Stream object).
+    fwd_wrapper = SimpleNamespace(cuda_stream=1001, waited=[])
+    fences = []
+    pool.fence_reuse = lambda stream=None: fences.append(stream)
 
-    # Case 1: allocator supports reuse guard and all reads are on forward_stream -> stage without sync.
+    # Case 1: allocator supports reuse guard and all reads share forward_stream's handle
+    # -> stage without host sync AND without stalling schedule_stream via fence_reuse().
     synced = []
     ev1 = SimpleNamespace(query=lambda: False, synchronize=lambda: synced.append("ev1"))
-    pool.reads = [(ev1, fwd_stream)]
+    pool.reads = [(ev1, fwd_wrapper)]
     guarded = []
     alloc_staged = SimpleNamespace(
         supports_reuse_guard=True,
@@ -453,8 +456,9 @@ def test_guard_release_stages_or_syncs_in_flight_gathers():
     pool.guard_release(alloc_staged, forward_stream=fwd_stream)
     assert guarded == [ev1]
     assert synced == []
+    assert fences == []
 
-    # Case 2: allocator has no reuse guard -> synchronizes pending gather event.
+    # Case 2: allocator has no reuse guard -> fences and synchronizes pending gather event.
     done = {"flag": False}
     ev2 = SimpleNamespace(
         query=lambda: done["flag"],
@@ -464,7 +468,29 @@ def test_guard_release_stages_or_syncs_in_flight_gathers():
     alloc_plain = SimpleNamespace(supports_reuse_guard=False, need_sort=False)
     pool.guard_release(alloc_plain, forward_stream=fwd_stream)
     assert synced == ["ev2"]
+    assert len(fences) == 1
     assert pool.reads == []
+
+
+def test_fence_reuse_skips_same_cuda_stream_handle():
+    pool = object.__new__(SnapshotPool)
+    pool.device = torch.device("cpu")
+    pool.lock = threading.RLock()
+    ev = SimpleNamespace(query=lambda: False)
+    s_same_a = SimpleNamespace(cuda_stream=777, waited=[])
+    s_same_b = SimpleNamespace(cuda_stream=777, waited=[])
+    s_same_b.wait_event = s_same_b.waited.append
+    s_other = SimpleNamespace(cuda_stream=888, waited=[])
+    s_other.wait_event = s_other.waited.append
+    pool.reads = [(ev, s_same_a)]
+
+    # Same underlying CUDA stream handle: already stream-ordered -> no wait_event.
+    pool.fence_reuse(stream=s_same_b)
+    assert s_same_b.waited == []
+
+    # Different CUDA stream handle: must wait_event.
+    pool.fence_reuse(stream=s_other)
+    assert s_other.waited == [ev]
 
 
 def test_submit_fill_failure_resets_gathering_and_recycles_slot(monkeypatch):

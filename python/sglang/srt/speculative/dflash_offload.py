@@ -34,8 +34,8 @@ class OffloadConfig:
     consume: Callable[[OffloadAttempt, OffloadedRows], None]
     on_complete: Callable[[OffloadAttempt], None] | None = None
     slots: int = 32
-    prompt_chunk_rows: int = 256
-    decode_batch_reqs: int = 8
+    prompt_chunk_rows: int = 2048
+    decode_batch_reqs: int = 32
     gpu_bytes: int = 256 << 20
     pinned_bytes: int = 128 << 20
     commit_timeout: float = 1.0
@@ -485,24 +485,26 @@ class OffloadRuntime:
             ),
         )
 
-    def _select_verify_rows(self, tensor, batch_size, width, req_indices):
-        if len(req_indices) == 1:
-            idx = req_indices[0]
-            return tensor.reshape(-1)[idx * width : (idx + 1) * width]
+    def _select_verify_rows(self, tensor, batch_size, width, req_indices, idx_t=None):
         if len(req_indices) == batch_size:
             return tensor.reshape(-1)
-        idx_t = torch.tensor(req_indices, dtype=torch.int64, device=tensor.device)
+        first, last = req_indices[0], req_indices[-1]
+        if last - first + 1 == len(req_indices):
+            return tensor.reshape(-1)[first * width : (last + 1) * width]
+        if idx_t is None:
+            idx_t = torch.tensor(req_indices, dtype=torch.int64, device=tensor.device)
         return tensor.reshape(batch_size, width).index_select(0, idx_t).reshape(-1)
 
-    def _select_verify_hidden(self, hidden, batch_size, width, req_indices):
+    def _select_verify_hidden(self, hidden, batch_size, width, req_indices, idx_t=None):
         if hidden is None:
             return None
-        if len(req_indices) == 1:
-            idx = req_indices[0]
-            return hidden[idx * width : (idx + 1) * width]
         if len(req_indices) == batch_size:
             return hidden
-        idx_t = torch.tensor(req_indices, dtype=torch.int64, device=hidden.device)
+        first, last = req_indices[0], req_indices[-1]
+        if last - first + 1 == len(req_indices):
+            return hidden[first * width : (last + 1) * width]
+        if idx_t is None:
+            idx_t = torch.tensor(req_indices, dtype=torch.int64, device=hidden.device)
         return (
             hidden.reshape(batch_size, width, self.hidden_width)
             .index_select(0, idx_t)
@@ -549,13 +551,28 @@ class OffloadRuntime:
             lengths = tuple(len(req.origin_input_ids) for _, req, _ in group)
             attempts = tuple(attempt for _, _, attempt in group)
 
-            group_ids = self._select_verify_rows(ids, batch_size, width, req_indices)
-            group_pos = self._select_verify_rows(
-                positions, batch_size, width, req_indices
+            is_contiguous = (
+                len(req_indices) == batch_size
+                or req_indices[-1] - req_indices[0] + 1 == len(req_indices)
             )
-            group_tok = self._select_verify_rows(tokens, batch_size, width, req_indices)
+            idx_t = (
+                None
+                if is_contiguous
+                else torch.tensor(req_indices, dtype=torch.int64, device=ids.device)
+            )
+            group_ids = self._select_verify_rows(
+                ids, batch_size, width, req_indices, idx_t
+            )
+            group_pos = self._select_verify_rows(
+                positions, batch_size, width, req_indices, idx_t
+            )
+            group_tok = self._select_verify_rows(
+                tokens, batch_size, width, req_indices, idx_t
+            )
             group_hidden = (
-                self._select_verify_hidden(hidden, batch_size, width, req_indices)
+                self._select_verify_hidden(
+                    hidden, batch_size, width, req_indices, idx_t
+                )
                 if self.hidden_width
                 else None
             )
@@ -618,7 +635,12 @@ class OffloadRuntime:
                 self._pending_commits.add(batch_commit)
 
             submitted = self.pool.submit(
-                plan.nbytes, fill, deliver, fail, gate=gate
+                plan.nbytes,
+                fill,
+                deliver,
+                fail,
+                stream=self.forward_stream,
+                gate=gate,
             )
             if submitted:
                 batch_commits.append(batch_commit)
@@ -631,7 +653,7 @@ class OffloadRuntime:
         if guard is not None:
             guard(self.allocator, forward_stream=self.forward_stream)
         else:
-            self.pool.fence_reuse()
+            self.pool.fence_reuse(stream=self.forward_stream)
 
     def before_release(self, req):
         if self.role != "prefill":
@@ -643,7 +665,7 @@ class OffloadRuntime:
                     attempt.fail("decode released before completion")
                 self._mark_attempt_released(attempt)
             return
-        self.pool.fence_reuse()
+        self.pool.fence_reuse(stream=self.forward_stream)
         attempt = self._attempt(req)
         if attempt is None:
             existing = getattr(req, "_dflash_offload_attempt", None)

@@ -15,6 +15,14 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _same_stream(a, b) -> bool:
+    if a is b:
+        return True
+    ha = getattr(a, "cuda_stream", None)
+    hb = getattr(b, "cuda_stream", None)
+    return ha is not None and ha == hb
+
+
 @dataclass(frozen=True)
 class PackedRows:
     fields: tuple
@@ -179,7 +187,9 @@ class SnapshotPool:
         target = torch.cuda.current_stream(self.device) if stream is None else stream
         with self.lock:
             self._prune_reads_locked()
-            events = [event for event, _ in self.reads]
+            events = [
+                event for event, st in self.reads if not _same_stream(st, target)
+            ]
         for event in events:
             target.wait_event(event)
 
@@ -189,10 +199,9 @@ class SnapshotPool:
 
         If every outstanding gather ran on ``forward_stream`` and the allocator
         supports staged reuse guards, attach the latest gather event with zero
-        host sync; otherwise wait for in-flight gathers before pages return to
-        the free list.
+        host sync and zero schedule-stream stall; otherwise fence and wait for
+        in-flight gathers before pages return to the free list.
         """
-        self.fence_reuse()
         with self.lock:
             self._prune_reads_locked()
             if not self.reads:
@@ -204,10 +213,11 @@ class SnapshotPool:
             and getattr(allocator, "supports_reuse_guard", False)
             and getattr(allocator, "need_sort", False)
             and hasattr(allocator, "set_reuse_guard_event")
-            and all(st is forward_stream for _, st in pending)
+            and all(_same_stream(st, forward_stream) for _, st in pending)
         ):
             allocator.set_reuse_guard_event(pending[-1][0])
             return
+        self.fence_reuse()
         for event, _ in pending:
             event.synchronize()
         with self.lock:
@@ -230,24 +240,30 @@ class SnapshotPool:
         gpu, _, _ = slot
         caller_stream = torch.cuda.current_stream(self.device)
         gather_stream = caller_stream if stream is None else stream
+        cross_stream = not _same_stream(gather_stream, caller_stream)
         try:
             if nbytes > gpu.numel():
                 raise ValueError("Snapshot exceeds slot capacity")
-            if gather_stream is not caller_stream:
+            if cross_stream:
                 gather_stream.wait_stream(caller_stream)
             gathered = torch.cuda.Event()
             with self.lock:
                 self._prune_reads_locked()
                 self.gathering = True
-                if gather_stream is not caller_stream:
+                if cross_stream:
                     with torch.cuda.stream(gather_stream):
                         fill(gpu[:nbytes], gather_stream)
                 else:
                     fill(gpu[:nbytes], gather_stream)
                 gathered.record(gather_stream)
+                self.reads = [
+                    (ev, st)
+                    for ev, st in self.reads
+                    if not _same_stream(st, gather_stream)
+                ]
                 self.reads.append((gathered, gather_stream))
                 self.gathering = False
-            if gather_stream is not caller_stream:
+            if cross_stream:
                 caller_stream.wait_event(gathered)
         except Exception:
             # A gather may already have launched. An unknown completion is fatal
