@@ -128,7 +128,12 @@ class VideoDecoderWrapper:
         elif self._backend == "pyav":
             return self._decoder[idx]
         else:
-            frame = self._decoder[idx]
+            from decord import DECORDError
+
+            try:
+                frame = self._decoder[idx]
+            except DECORDError as error:
+                return self._decode_with_pyav_fallback("frame index", [idx], error)[0]
             return frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
 
     @property
@@ -161,7 +166,7 @@ class VideoDecoderWrapper:
         elif self._backend == "pyav":
             return self._decoder.get_frames_at(indices)
         else:
-            return self._decoder.get_batch(indices).asnumpy()
+            return self._decord_batch(indices)
 
     def get_frames_as_tensor(self, indices: list, num_threads: Optional[int] = None):
         """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory).
@@ -199,9 +204,87 @@ class VideoDecoderWrapper:
         elif self._backend == "pyav":
             return torch.from_numpy(self._decoder.get_frames_at(indices)).pin_memory()
         else:
-            arr = self._decoder.get_batch(indices).asnumpy()
-            output = torch.from_numpy(arr)
+            output = torch.from_numpy(self._decord_batch(indices))
             return output if _is_cpu_engine() else output.pin_memory()
+
+    def _decord_batch(self, indices):
+        from decord import DECORDError
+
+        try:
+            return self._decoder.get_batch(indices).asnumpy()
+        except DECORDError as error:
+            return self._decode_with_pyav_fallback("get_batch", indices, error)
+
+    def _decode_with_pyav_fallback(self, operation, indices, error):
+        # decord's drain loop feeds an empty frame into its filter graph when
+        # the decoder reports a non-EOF error near the end of the stream
+        # (dmlc/decord#183), so get_batch and frame reads fail on trailing
+        # frames of truncated uploads. Sequential PyAV skips the corrupt
+        # packets and returns the frames that still decode.
+        from sglang.srt.utils.common import CORRUPT_VIDEO_MESSAGE
+        from sglang.srt.utils.video_metadata_fallback import (
+            SequentialVideoDecoder,
+            VideoFallbackLimitError,
+            decord_fallback_limits,
+        )
+
+        # decord validated the indices against its own frame count and counts
+        # negative ones from that end before decoding.
+        num_frames = len(self._decoder)
+        indices = [index + num_frames if index < 0 else index for index in indices]
+        logger.warning(
+            "decord %s failed (%s); re-decoding %d frames "
+            "(max index %s of %d) with sequential PyAV.",
+            operation,
+            str(error).split("\n", 1)[0],
+            len(indices),
+            max(indices, default=None),
+            num_frames,
+        )
+        try:
+            # This decode replaces decord's on the same IO-pool thread, so the
+            # pool already bounds its concurrency; the shared fallback slots
+            # would turn a busy pool into failed requests.
+            fallback = SequentialVideoDecoder(
+                self._source,
+                limits=decord_fallback_limits(num_frames),
+                decode_slots=False,
+                skip_corrupt_packets=True,
+            )
+            try:
+                # On a truncated stream decord's frame count can exceed what
+                # PyAV decodes. Callers derive timestamps from decord's indices
+                # and FPS, so trailing indices take the last decodable frame
+                # and the request keeps its sampled frame count.
+                last = len(fallback) - 1
+                if max(indices, default=0) > last:
+                    logger.warning(
+                        "PyAV decoded %d of decord's %d frames; indices past "
+                        "%d use frame %d.",
+                        len(fallback),
+                        num_frames,
+                        last,
+                        last,
+                    )
+                    indices = [min(index, last) for index in indices]
+                return fallback.get_frames_at(indices)
+            finally:
+                fallback.close()
+        except (ImportError, MemoryError):
+            raise  # missing backend / OOM are server errors
+        except VideoFallbackLimitError as limit_error:
+            # The limits scale with what decord accepted, so a hit is a cost
+            # of this upload: 400, retried nowhere else.
+            logger.warning(
+                "PyAV fallback after decord %s stopped at a limit: %s",
+                operation,
+                limit_error,
+            )
+            raise ValueError(f"Could not decode video: {limit_error}") from limit_error
+        except Exception as fallback_error:
+            # PyAV errors and a stream with no decodable frame mean the
+            # upload itself is unreadable: 400.
+            raise ValueError(CORRUPT_VIDEO_MESSAGE) from fallback_error
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
