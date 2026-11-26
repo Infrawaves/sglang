@@ -3055,7 +3055,15 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        from sglang.srt.speculative import dflash_offload
+
+        offload_reservation_gb = dflash_offload.gpu_budget_reservation_gb()
+        rest_memory = (
+            available_gpu_memory
+            - slack_gb
+            - mm_reservation_gb
+            - offload_reservation_gb
+        )
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

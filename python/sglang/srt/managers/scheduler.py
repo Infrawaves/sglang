@@ -2278,11 +2278,10 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
-        offload_close_error = None
         try:
             dflash_offload.close(getattr(self, "dflash_offload_runtime", None))
-        except Exception as exc:
-            offload_close_error = exc
+        except Exception:
+            logger.exception("Failed to close DFLASH offload runtime cleanly")
         finally:
             self.dflash_offload_runtime = None
         self.request_receiver.close()
@@ -2299,8 +2298,6 @@ class Scheduler(
         destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
-        if offload_close_error is not None:
-            raise offload_close_error
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.

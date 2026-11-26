@@ -3479,9 +3479,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         capture = getattr(self, "_dflash_offload_runtime", None) or dflash_offload.runtime
-        if capture is not None:
-            # This forward may overwrite a previous step's verify inputs or KV.
-            capture.pool.fence_reuse()
         if not self._hosts_draft:
             # An earlier pipeline stage of a PD prefill: the target forward,
             # whose captured aux hidden states ride the PP proxy onward.
@@ -3495,6 +3492,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         self._validate_phase1_sampling_support(batch)
+        if capture is not None:
+            capture.before_step()
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -4077,6 +4076,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if capture is not None:
+            capture.before_verify()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -4087,13 +4088,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         target_lp = self._target_logits_processor
-        offload_commits = None
-        if capture is not None and capture.role == "decode":
-            offload_commits = capture.snapshot_verify(
+        if capture is not None:
+            capture.snapshot_verify_hidden(
                 batch.reqs,
                 positions,
                 verify_input_ids,
-                verify_out_cache_loc,
                 logits_output.last_hidden_states,
                 int(self.block_size),
             )
@@ -4282,7 +4281,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
-            offload_commits=offload_commits,
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,

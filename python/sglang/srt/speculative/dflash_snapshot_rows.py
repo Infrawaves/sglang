@@ -1,9 +1,8 @@
-"""CPU contract for an MLA cache snapshot and a linear DFLASH verify chain."""
+"""CPU contract for Decode-only DFLASH MLA KV + Teacher hidden snapshot offload."""
 
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 
 import torch
@@ -11,11 +10,12 @@ import torch
 
 @dataclass
 class OffloadAttempt:
-    """One local producer's handle. P and D must use the same capture/attempt IDs.
+    """One local producer's handle for a sampled decode request.
 
-    verified_pages names full prompt page indices for which the consumer already
-    holds validated bytes for this owner, layout, and attempt. An empty set
-    requests the entire prompt. A consumer must discard an attempt with an error.
+    verified_pages optionally names complete prompt page indices that the consumer
+    already holds (e.g. from HiCache/Mooncake) and wants skipped during KV export.
+    An empty set exports the entire prompt + reply KV directly from Decode.
+    A consumer must discard any attempt whose ``error`` is not None.
     """
 
     capture_id: str
@@ -75,14 +75,25 @@ class MLALayout:
     dcp_size: int = 1
     page_size: int = 1
     scale_block_size: int | None = None
-    format_version: int = 1
+    format_version: int = 2
+    dp_size: int = 1
 
 
 @dataclass(frozen=True)
 class OffloadedRows:
-    """Raw cache bytes are [owned row, layer, byte]. The consumer borrows tensors
-    until its callback returns. Labels and final hidden states use the full
-    verify positions, including predecessor rows whose KV lives on another rank.
+    """One delivered packet of KV rows or final teacher hidden rows on CPU.
+
+    - KV packets (emitted once per span on request release across all DCP owners):
+      ``positions``, ``input_ids``, ``owned`` (all True), ``physical_ids``, and
+      ``raw_kv`` ``[N_owned, n_layers, row_bytes]`` contain only rows owned by
+      ``owner``; ``next_token_ids`` and ``final_hidden`` are None.
+    - Teacher hidden packets (emitted once on request release by the DP group's
+      hidden owner ``attn_dcp_rank == 0``):
+      ``positions``, ``input_ids``, ``next_token_ids``, and ``final_hidden``
+      ``[N_reply, hidden_size]`` BF16 cover all committed decode teacher rows
+      (``prompt_len .. prompt_len + output_len - 2``); ``raw_kv`` is empty.
+
+    The consumer borrows tensors until its callback returns.
     """
 
     role: str
@@ -95,14 +106,16 @@ class OffloadedRows:
     raw_kv: torch.Tensor
     next_token_ids: torch.Tensor | None
     final_hidden: torch.Tensor | None
+    dp_rank: int = 0
 
 
-def prompt_spans(length, verified_pages, page_size, chunk_rows):
+def prompt_spans(length: int, verified_pages, page_size: int, chunk_rows: int):
+    """Yield (start, end) spans covering [0, length) while skipping verified complete pages."""
     if any(
         type(i) is not int or not 0 <= i < length // page_size for i in verified_pages
     ):
         raise ValueError(
-            "A verified prompt page must be complete and within the prompt"
+            "A verified page must be complete and within the sequence"
         )
     begin = 0
     for end_page in sorted(verified_pages):
@@ -114,7 +127,7 @@ def prompt_spans(length, verified_pages, page_size, chunk_rows):
         yield offset, min(offset + chunk_rows, length)
 
 
-def visible_len(req):
+def visible_len(req) -> int:
     return (
         len(req.output_ids)
         if req.finished_len is None
@@ -122,107 +135,103 @@ def visible_len(req):
     )
 
 
-class VerifyCommit:
-    """Resolve only after the scheduler applies acceptance, grammar and stop."""
+class RequestHiddenBuffer:
+    """Position-indexed CPU buffer for a single sampled decode request.
 
-    def __init__(self, req, attempt):
-        self.req = req
-        self.attempt = attempt
-        self.path = Future()
-        self.start = 0
-        self.anchor = None
+    Owned exclusively by the single FIFO consumer thread. Every target-verify
+    step writes (position, input_id, bf16_hidden) at ``offset = pos - prompt_len``;
+    later verify steps automatically overwrite rejected speculative draft slots.
+    At request release, ``extract()`` trims to ``[prompt_len, prompt_len + out_len - 1)``
+    and verifies every position was captured with matching predecessor token ID.
+    """
 
-    def before(self):
-        req = self.req
-        self.start = visible_len(req)
-        self.anchor = (
-            req.output_ids[self.start - 1] if self.start else req.origin_input_ids[-1]
+    def __init__(self, prompt_len: int, hidden_width: int, init_cap: int = 64) -> None:
+        self.prompt_len = int(prompt_len)
+        self.hidden_width = int(hidden_width)
+        self.cap = 0
+        self.nbytes = 0
+        self.hidden: torch.Tensor | None = None
+        self.tokens: torch.Tensor | None = None
+        self.present: torch.Tensor | None = None
+        self._init_cap = max(16, int(init_cap))
+
+    def _grow(self, min_cap: int) -> int:
+        new_cap = max(self._init_cap, self.cap * 2 if self.cap else self._init_cap)
+        while new_cap < min_cap:
+            new_cap *= 2
+        new_hidden = torch.empty(
+            (new_cap, self.hidden_width), dtype=torch.bfloat16, device="cpu"
         )
-
-    def resolve(self):
-        req = self.req
-        end = visible_len(req)
-        anchor = (
-            req.output_ids[self.start - 1]
-            if 0 < self.start <= end
-            else req.origin_input_ids[-1]
+        new_tokens = torch.empty((new_cap,), dtype=torch.int64, device="cpu")
+        new_present = torch.zeros((new_cap,), dtype=torch.bool, device="cpu")
+        if self.cap > 0 and self.hidden is not None:
+            new_hidden[: self.cap].copy_(self.hidden)
+            new_tokens[: self.cap].copy_(self.tokens)
+            new_present[: self.cap].copy_(self.present)
+        old_bytes = self.nbytes
+        self.hidden = new_hidden
+        self.tokens = new_tokens
+        self.present = new_present
+        self.cap = new_cap
+        self.nbytes = (
+            new_hidden.numel() * 2 + new_tokens.numel() * 8 + new_present.numel()
         )
-        reason = (
-            None
-            if req.finished_reason is None
-            else req.finished_reason.to_json()["type"]
+        return self.nbytes - old_bytes
+
+    def write(
+        self,
+        positions: torch.Tensor,
+        tokens: torch.Tensor,
+        hidden: torch.Tensor,
+        *,
+        budget_remaining: int,
+    ) -> int:
+        """Overwrite positions >= prompt_len. Returns delta bytes allocated, or raises MemoryError."""
+        pos_list = positions.tolist()
+        tok_list = tokens.tolist()
+        max_off = -1
+        for p in pos_list:
+            off = p - self.prompt_len
+            if off >= 0 and off > max_off:
+                max_off = off
+        if max_off < 0:
+            return 0
+        delta_bytes = 0
+        if max_off + 1 > self.cap:
+            est_cap = max(self._init_cap, self.cap * 2 if self.cap else self._init_cap)
+            while est_cap < max_off + 1:
+                est_cap *= 2
+            row_bytes = self.hidden_width * 2 + 9
+            est_delta = est_cap * row_bytes - self.nbytes
+            if est_delta > budget_remaining:
+                raise MemoryError("host hidden buffer budget exceeded")
+            delta_bytes = self._grow(max_off + 1)
+        assert self.hidden is not None and self.tokens is not None and self.present is not None
+        for idx, (p, t) in enumerate(zip(pos_list, tok_list, strict=True)):
+            off = p - self.prompt_len
+            if off < 0:
+                continue
+            self.hidden[off].copy_(hidden[idx])
+            self.tokens[off] = t
+            self.present[off] = True
+        return delta_bytes
+
+    def extract(self, output_ids: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return (positions, input_ids, next_token_ids, final_hidden) for committed reply rows."""
+        n = max(0, len(output_ids) - 1)
+        if n == 0:
+            return None
+        if self.cap < n or self.present is None or self.tokens is None or self.hidden is None:
+            raise ValueError(f"missing teacher hidden rows: have cap={self.cap}, need {n}")
+        if not bool(self.present[:n].all().item()):
+            raise ValueError("incomplete teacher hidden coverage across reply positions")
+        stored = self.tokens[:n].tolist()
+        expected_in = list(output_ids[:n])
+        if stored != expected_in:
+            raise ValueError("teacher hidden predecessor token mismatch")
+        positions = torch.arange(
+            self.prompt_len, self.prompt_len + n, dtype=torch.int64, device="cpu"
         )
-        if (
-            req.is_retracted
-            or req.retraction_count
-            or reason not in (None, "stop", "length")
-            or end < self.start
-            or anchor != self.anchor
-        ):
-            self.attempt.fail("retracted, aborted or rewritten reply")
-            result = None
-        else:
-            added = tuple(req.output_ids[self.start : end])
-            first = len(req.origin_input_ids) + self.start - 1
-            result = (first, (self.anchor, *added[:-1]) if added else (), added)
-        if not self.path.done():
-            self.path.set_result(result)
-        return result
-
-    def after(self):
-        self.resolve()
-
-    def abort(self, reason: str):
-        self.attempt.fail(reason)
-        if not self.path.done():
-            self.path.set_result(None)
-
-
-class VerifyBatchCommit:
-    """Resolve a packed decode verify chunk and release its event-driven CommitGate."""
-
-    def __init__(self, commits: list[VerifyCommit], gate, on_done=None):
-        self.commits = commits
-        self.gate = gate
-        self._on_done = on_done
-        self._lock = threading.Lock()
-        self._resolved = False
-
-    def before(self):
-        for commit in self.commits:
-            commit.before()
-
-    def after(self):
-        with self._lock:
-            if self._resolved:
-                return
-            self._resolved = True
-        paths = tuple(commit.resolve() for commit in self.commits)
-        if self._on_done is not None:
-            self._on_done(self)
-        self.gate.on_commit(paths)
-
-    def abort(self, reason: str):
-        with self._lock:
-            if self._resolved:
-                return
-            self._resolved = True
-        for commit in self.commits:
-            commit.abort(reason)
-        if self._on_done is not None:
-            self._on_done(self)
-        self.gate.on_commit(None)
-
-
-def committed_slice(path, prompt_len, positions, inputs):
-    if path is None:
-        return slice(0, 0), ()
-    first, predecessors, labels = path
-    n = len(labels)
-    if n > len(positions) or positions[:n].tolist() != list(range(first, first + n)):
-        raise ValueError("Verify predecessor position mismatch")
-    if tuple(inputs[:n].tolist()) != predecessors:
-        raise ValueError("Verify predecessor token mismatch")
-    # A teacher row at h predicts token h+1. P supplied the first reply token.
-    begin = int(first < prompt_len)
-    return slice(begin, n), labels[begin:]
+        input_ids = torch.tensor(expected_in, dtype=torch.int64, device="cpu")
+        next_token_ids = torch.tensor(output_ids[1 : n + 1], dtype=torch.int64, device="cpu")
+        return positions, input_ids, next_token_ids, self.hidden[:n]

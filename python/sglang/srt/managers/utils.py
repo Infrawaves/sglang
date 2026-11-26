@@ -44,7 +44,6 @@ if TYPE_CHECKING:
         FpmTiming,
         ScheduledRequestMetrics,
     )
-    from sglang.srt.speculative.dflash_snapshot_rows import VerifyBatchCommit, VerifyCommit
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -175,7 +174,6 @@ class GenerationBatchResult:
     # ForwardObserver output, copied together with the sampling observer's.
     forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
-    offload_commits: Optional[list["VerifyBatchCommit | VerifyCommit"]] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
