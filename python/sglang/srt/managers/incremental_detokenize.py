@@ -189,7 +189,16 @@ class DetokenizeState(msgspec.Struct):
                 # commit (token offsets stay so the next iteration retries
                 # with more tokens).
                 printable = find_printable_text(new_text)
-                self.sent_offset = self.decoded_text_len + len(printable)
+                # find_printable_text is a stateless heuristic whose result
+                # can be shorter than a previous step's: its CJK branch emits
+                # through a trailing CJK char, its last-space branch retreats
+                # to a space, and a non-CJK char with no space to fall back to
+                # collapses it to "". sent_offset must not follow it
+                # backwards, or the next clean step under-counts `pending`
+                # and re-sends text the client already has.
+                self.sent_offset = max(
+                    self.sent_offset, self.decoded_text_len + len(printable)
+                )
                 return printable[pending:] if pending else printable
 
         # Finished: materialize once, trim the matched stop, emit the tail.
