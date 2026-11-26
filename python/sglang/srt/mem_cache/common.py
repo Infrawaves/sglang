@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.speculative import dflash_offload
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -464,6 +465,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    if dflash_offload.runtime is not None and req.kv.holds_kv:
+        dflash_offload.runtime.before_release(req)
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (

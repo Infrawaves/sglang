@@ -1876,6 +1876,8 @@ class Envs:
     SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # Explicit opt-in switch for decode-side DFLASH snapshot offload plugins.
+    SGLANG_DFLASH_SNAPSHOT_OFFLOAD = EnvBool(False)
     # Prefetch the DFLASH draft's small tensors into L2 in its graph.
     SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get

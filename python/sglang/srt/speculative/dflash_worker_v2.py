@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.conditional_token_ban import batch_token_ban
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import dflash_offload
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
@@ -3482,6 +3483,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        capture = getattr(self, "_dflash_offload_runtime", None) or dflash_offload.runtime
         if not self._hosts_draft:
             # An earlier pipeline stage of a PD prefill: the target forward,
             # whose captured aux hidden states ride the PP proxy onward.
@@ -3495,6 +3497,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         self._validate_phase1_sampling_support(batch)
+        if capture is not None:
+            capture.before_step()
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -4077,6 +4081,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if capture is not None:
+            capture.before_verify()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -4086,12 +4092,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         logits_output = target_out.logits_output
+        target_lp = self._target_logits_processor
+        if capture is not None:
+            capture.snapshot_verify_hidden(
+                batch.reqs,
+                positions,
+                verify_input_ids,
+                logits_output.last_hidden_states,
+                int(self.block_size),
+            )
+            if target_lp is None or not target_lp.keep_last_hidden_states:
+                logits_output.last_hidden_states = None
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         accepted = None
         tail_done = False
         verify_shard = None
-        target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
