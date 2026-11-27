@@ -58,7 +58,13 @@ from sglang.srt.entrypoints.openai import (
     chat_encoding_adapters,
     encoding_dsv32,
 )
-from sglang.srt.entrypoints.openai.kimi_token_provenance import KimiTokenProvenance
+from sglang.srt.entrypoints.openai.kimi_token_provenance import (
+    MISSING_LOGPROB,
+    KimiStandardLogprobs,
+    KimiTokenProvenance,
+    align_token_logprobs,
+    place_event_values,
+)
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
     parallel_prompt_encode,
@@ -114,13 +120,23 @@ from sglang.srt.entrypoints.openai.utils import (
     token_id_to_bytes,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.environ import envs
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
-from sglang.srt.function_call.kimik3_format import MESSAGE_CLOSE
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_OPEN,
+    TOOLS_OPEN,
+)
+from sglang.srt.function_call.tool_schema_guard import (
+    ToolSchemaError,
+    check_tool_schema_terminates,
+)
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -158,8 +174,12 @@ from sglang.srt.parser.response_template import (
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
+    append_request_stop_token_sequence,
+    clear_request_conditional_token_ban,
+    set_request_conditional_token_ban,
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
+    set_request_tool_calls_start,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
@@ -170,7 +190,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+
+
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 _KIMI_K3_MAX_VIDEO_INPUTS = 2
@@ -301,6 +325,7 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+_KIMI_K3_TEXT_PART_TYPES = ("text", "input_text")
 
 
 # K3 exposes three thinking tiers and K3.1 adds "medium". The OpenAI tiers map
@@ -333,6 +358,14 @@ def kimi_k3_thinking_effort(
     )
 
 
+def _append_stop(sampling_params: dict[str, Any], stop_str: str) -> None:
+    stop = sampling_params.get("stop") or []
+    stop = [stop] if isinstance(stop, str) else list(stop)
+    if stop_str not in stop:
+        stop.append(stop_str)
+    sampling_params["stop"] = stop
+
+
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
 
@@ -348,6 +381,100 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def kimi_k3_partial_message(
+    request: ChatCompletionRequest,
+) -> Optional[ChatCompletionMessageGenericParam]:
+    """The final assistant message a request asks Kimi K3 to continue, if any.
+
+    Moonshot's partial mode marks it with ``partial: true``, and
+    ``continue_final_message`` asks the same of whatever assistant message
+    comes last. As on Moonshot, the flag means nothing on any other message.
+    With precomputed input_ids, the flagged message describes the channel
+    already open in that token sequence.
+    """
+    messages = getattr(request, "messages", None)
+    if not messages:
+        return None
+    message = messages[-1]
+    if message.role != "assistant":
+        return None
+    if request.continue_final_message or message.partial is True:
+        return message
+    return None
+
+
+def _kimi_k3_text_parts(content: Any) -> list[str]:
+    """The non-empty texts of a message's content: the string, or its text parts."""
+    if isinstance(content, str):
+        return [content] if content else []
+    texts = []
+    for part in content or []:
+        if isinstance(part, dict):
+            part_type, text = part.get("type"), part.get("text")
+        else:
+            part_type = getattr(part, "type", None)
+            text = getattr(part, "text", None)
+        if part_type in _KIMI_K3_TEXT_PART_TYPES and text:
+            texts.append(text)
+    return texts
+
+
+def _kimi_k3_partial_opens_response(request: ChatCompletionRequest) -> bool:
+    """Whether the rendered partial leaves the response channel open."""
+    partial = kimi_k3_partial_message(request)
+    return partial is not None and (
+        not (request.chat_template_kwargs or {}).get("thinking", True)
+        or not partial.reasoning_content
+        or bool(_kimi_k3_text_parts(partial.content))
+    )
+
+
+def kimi_k3_partial_answer_prefilled(request: ChatCompletionRequest) -> bool:
+    """Whether the response channel the prompt leaves open already holds answer
+    text, so output constraints must allow the answer to go on from there."""
+    partial = kimi_k3_partial_message(request)
+    return partial is not None and bool(_kimi_k3_text_parts(partial.content))
+
+
+def _kimi_k3_open_tag(tag: str, attrs: tuple = ()) -> list[tuple[str, bool]]:
+    # Split exactly as the K3 encoder splits a tag: only the markers are control
+    # tokens, and the tag name and each attribute piece are encoded on their own.
+    segments = [("<|open|>", True), (tag, False)]
+    for key, value in attrs:
+        escaped = str(value).replace("&", "&amp;").replace('"', "&quot;")
+        segments += [(f" {key}", False), ('="', False)]
+        if escaped:
+            segments.append((escaped, False))
+        segments.append(('"', False))
+    segments.append(("<|sep|>", True))
+    return segments
+
+
+def kimi_k3_partial_segments(
+    message: Dict[str, Any], thinking: bool
+) -> list[tuple[str, bool]]:
+    """Reopen a partial assistant message for K3 to continue.
+
+    Renders the message as the K3 encoder renders an assistant message, left
+    open where the continuation starts: the think channel for reasoning without
+    answer text while thinking, the response channel otherwise. Thinking off
+    drops the reasoning, as the encoder does. Each segment is ``(text,
+    is_control)``, and client text never becomes control tokens.
+    """
+    attrs = (("role", "assistant"),)
+    if message.get("name"):
+        attrs += (("name", message["name"]),)
+    segments = _kimi_k3_open_tag("message", attrs)
+    answer = [(text, False) for text in _kimi_k3_text_parts(message.get("content"))]
+    reasoning = message.get("reasoning_content")
+    if thinking and reasoning:
+        segments += _kimi_k3_open_tag("think") + [(reasoning, False)]
+        if not answer:
+            return segments
+        segments += [("<|close|>", True), ("think", False), ("<|sep|>", True)]
+    return segments + _kimi_k3_open_tag("response") + answer
 
 
 _KIMI_K3_TOOL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,255}")
@@ -376,6 +503,23 @@ def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | Non
                     "with a letter or '_', contain only letters, digits, '_' or "
                     "'-', and be at most 256 characters."
                 )
+    return None
+
+
+def _validate_kimi_k3_strict_tool_schemas(tools: list[Tool]) -> str | None:
+    # XGrammar compiles a schema with no finite instance and a forced call runs to
+    # max_tokens; walle, and the Kimi Vendor Verifier, expect a 400 instead.
+    strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+    for tool in tools:
+        function = tool.function
+        if not isinstance(function.parameters, dict):
+            continue
+        if not (function.strict or strict_level >= ToolStrictLevel.PARAMETER):
+            continue
+        try:
+            check_tool_schema_terminates(function.parameters)
+        except ToolSchemaError as exc:
+            return f"tool {function.name!r}: {exc}"
     return None
 
 
@@ -504,8 +648,13 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     supports_process_preprocessing = True
+    # Private request attrs set during conversion that later stages read
+    # (see process_request_preprocessor._replayed_private_attrs).
+    process_preprocessing_private_attrs = ("_kimi_k3_generation_prefix_ids",)
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
+    # (think, (<|open|>, <|close|>)) token ids, resolved on first use.
+    _kimi_k3_think_ban_rule_cache: Any = _UNSET
 
     async def handle_request(self, request, raw_request):
         if self._doc_splitter is not None:
@@ -525,6 +674,8 @@ class OpenAIServingChat(OpenAIServingBase):
             get_serving().default_chat_template_kwargs or {}
         )
         self._reasoning_detector = None
+        # K3 marker -> its special-token ids, or None to stop on the text.
+        self._kimi_k3_marker_ids: dict[str, list[int] | None] = {}
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
@@ -793,7 +944,12 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
-    ) -> tuple[list[dict[str, Any]], int, str | None]:
+    ) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+        """Normalize messages for the K3 encoder.
+
+        Returns the messages to render, their media count and, when the request
+        continues its final assistant message, that message split off.
+        """
         _truncate_kimi_k3_videos(messages)
         media_count = 0
         for index, message in enumerate(messages):
@@ -804,7 +960,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if not isinstance(part, dict):
                         continue
                     part_type = part.get("type")
-                    if part_type in ("text", "input_text"):
+                    if part_type in _KIMI_K3_TEXT_PART_TYPES:
                         parts.append(
                             {
                                 "type": "text",
@@ -866,12 +1022,49 @@ class OpenAIServingChat(OpenAIServingBase):
             if message.get("role") == "developer":
                 message["role"] = "system"
 
-        assistant_prefix = None
-        if request.continue_final_message:
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
+        if self._validated_kimi_k3_partial_message(request) is None:
+            return messages, media_count, None
+        partial = messages.pop()
+        return messages, media_count, partial
+
+    @staticmethod
+    def _validated_kimi_k3_partial_message(
+        request: ChatCompletionRequest,
+    ) -> Optional[ChatCompletionMessageGenericParam]:
+        partial = kimi_k3_partial_message(request)
+        if partial is None:
+            return None
+        position = len(request.messages) - 1
+        if partial.tool_calls:
+            raise ValueError(
+                f"Invalid request: the partial assistant message at position "
+                f"{position} must not have tool_calls"
             )
-        return messages, media_count, assistant_prefix
+        content = partial.content
+        if isinstance(content, list) and any(
+            part.type not in _KIMI_K3_TEXT_PART_TYPES for part in content
+        ):
+            raise ValueError(
+                f"Invalid request: the partial assistant message at position "
+                f"{position} must have only text content"
+            )
+        if not (
+            _kimi_k3_text_parts(content) or partial.reasoning_content or partial.name
+        ):
+            raise ValueError(
+                f"Invalid request: the message at position {position} with role "
+                "'assistant' must not be empty"
+            )
+        # K3 applies length options to history before we append the open channel.
+        kwargs = request.chat_template_kwargs or {}
+        if (
+            kwargs.get("truncation") and kwargs.get("max_length") is not None
+        ) or kwargs.get("padding") == "max_length":
+            raise ValueError(
+                "Kimi K3 partial assistant messages do not support truncation with "
+                "max_length or padding='max_length' in chat_template_kwargs."
+            )
+        return partial
 
     def _encode_messages(
         self,
@@ -895,7 +1088,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
-            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, partial = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
@@ -967,18 +1160,30 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            tokenizer = self.tokenizer_manager.tokenizer
+            prompt_ids = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                # A continued message reopens its own channel instead.
+                add_generation_prompt=partial is None,
                 tools=request_tools,
                 return_dict=False,
                 **template_kwargs,
             )
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
+            # The template's own generation prefix (the opened think or
+            # response channel); empty when a partial message reopens its own.
+            request._kimi_k3_generation_prefix_ids = self._kimi_k3_generation_prefix(
+                prompt_ids
+            )
+            if partial is not None:
+                prompt_ids = list(prompt_ids)
+                # The encoder's own default when the request leaves it unset.
+                thinking = bool(template_kwargs.get("thinking", True))
+                for text, is_control in kimi_k3_partial_segments(partial, thinking):
+                    # Segment by segment, as apply_chat_template encodes them.
+                    prompt_ids.extend(
+                        tokenizer.encode(text, allow_special_tokens=is_control)
+                    )
             return prompt_ids
         return None
 
@@ -1002,6 +1207,89 @@ class OpenAIServingChat(OpenAIServingBase):
         """Whether sampled output token ids should be returned via sglext."""
         return request.return_output_ids_in_sglext or get_serving().return_output_ids
 
+    @staticmethod
+    def _internal_content_requested(request: ChatCompletionRequest) -> bool:
+        """Whether a streaming request asked for choices[].internal_content.
+
+        K3 API extension: every increment frame carries the generated token ids
+        behind it and each token's selected logprob.
+        """
+        return bool(
+            request.stream
+            and request.stream_options
+            and getattr(request.stream_options, "include_internal_content", False)
+        )
+
+    def _k3_logprobs_on(self, request: ChatCompletionRequest) -> bool:
+        """Whether every K3 content and end frame carries a choices[].logprobs
+        object, which is an empty list once the step's entries went out."""
+        return self.chat_encoding_spec == "kimi_k3" and bool(request.logprobs)
+
+    def _build_sse(self, **kwargs) -> str:
+        """build_sse_content; K3 omits a null logprobs key, others keep null."""
+        return build_sse_content(
+            omit_null_logprobs=self.chat_encoding_spec == "kimi_k3", **kwargs
+        )
+
+    @staticmethod
+    def _frame_logprobs(pending: dict | None, *, object_required: bool) -> dict | None:
+        """choices[].logprobs for a frame with content: the pending entries, or
+        ``{"content": []}`` when ``object_required``; None omits the key."""
+        if pending is None and object_required:
+            return {"content": []}
+        return pending
+
+    @staticmethod
+    def _end_frame_logprobs(
+        held_logprobs: dict[int, KimiStandardLogprobs] | None, index: int
+    ) -> dict | None:
+        """choices[].logprobs for a K3 end frame: the entries no earlier frame
+        carried (e.g. a stop token whose text was stripped), else an empty
+        list. None when logprobs were not requested (or not K3)."""
+        if held_logprobs is None:
+            return None
+        standard = held_logprobs.get(index)
+        return {"content": standard.drain() if standard is not None else []}
+
+    @staticmethod
+    def _k3_frame(
+        token_provenance: KimiTokenProvenance | None,
+        standard: KimiStandardLogprobs | None,
+        internal: bool,
+        source: str,
+        **take_kwargs,
+    ) -> tuple[list[dict[str, Any]] | None, dict | None]:
+        """``(internal_content, choices[].logprobs)`` of a K3 frame built from
+        the parser output ``source``.
+
+        The tokens behind ``source`` (token provenance) decide which standard
+        entries the frame carries: every entry not sent yet up to the last of
+        those positions. Without include_internal_content, a source that cannot
+        be mapped to its tokens (e.g. U+FFFD from an incomplete UTF-8 token)
+        switches the choice to releasing entries in arrival order, once, with
+        a warning; with it, the error propagates as before.
+        """
+        internal_content = None
+        positions = None
+        if token_provenance is not None and (
+            internal or standard is None or not standard.degraded
+        ):
+            try:
+                internal_content = token_provenance.take(source, **take_kwargs)
+                positions = token_provenance.last_positions
+            except ValueError as e:
+                if internal or standard is None:
+                    raise
+                standard.degrade(str(e))
+        elif token_provenance is None and standard is not None:
+            standard.degrade("no K3 token provenance for this choice")
+        logprobs = None
+        if standard is not None:
+            logprobs = {
+                "content": standard.claim(None if standard.degraded else positions)
+            }
+        return (internal_content if internal else None), logprobs
+
     def _continuous_usage_cached_details(
         self, content: dict[str, Any]
     ) -> PromptTokensDetails | None:
@@ -1011,6 +1299,36 @@ class OpenAIServingChat(OpenAIServingBase):
             cached_tokens=content["meta_info"].get("cached_tokens", 0)
         )
 
+    @staticmethod
+    def _k3_prompt_choices(started: Dict[int, bool], n: int) -> Dict[int, int]:
+        """For each prompt's first choice index, the choice whose prompt-side
+        usage reports the prompt: one that started generating, so the stub
+        leaves the input whichever choice index started."""
+        firsts = {index - index % n for index in started}
+        return {
+            first: next((i for i in range(first, first + n) if started.get(i)), first)
+            for first in firsts
+        }
+
+    def _k3_stub_tokens(self, request: ChatCompletionRequest) -> int:
+        """The generation stub the K3 template added: none for raw input_ids,
+        and none for a continued message, which reopens its channel in the
+        prompt instead (Moonshot reports that as input)."""
+        if (
+            request.input_ids is not None
+            or kimi_k3_partial_message(request) is not None
+        ):
+            return 0
+        return self._KIMI_K3_GENERATION_STUB_TOKENS
+
+    @staticmethod
+    def _k3_generation_started(completion_tokens: int, finish_reason: Any) -> bool:
+        """Whether generation started, so the K3 stub moves to output: some
+        output, or a stop sequence excluded at the first output token."""
+        return completion_tokens > 0 or (
+            isinstance(finish_reason, dict) and bool(finish_reason.get("stop_excluded"))
+        )
+
     def _reported_prompt_tokens(
         self, meta_info: dict[str, Any], *, generation_stub_tokens: int = 3
     ) -> int:
@@ -1018,7 +1336,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if (
             self.chat_encoding_spec == "kimi_k3"
             and generation_stub_tokens
-            and meta_info.get("completion_tokens", 0) > 0
+            and self._k3_generation_started(
+                meta_info.get("completion_tokens", 0), meta_info.get("finish_reason")
+            )
         ):
             # Transfer the stub only after generation starts; raw input_ids do
             # not imply that the chat template added a K3 generation stub.
@@ -1178,9 +1498,19 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens: dict[int, int],
         completion_tokens: dict[int, int],
         internal_token_ids: list[int] | None = None,
+        internal_token_logprobs: list[float] | None = None,
         token_provenance: KimiTokenProvenance | None = None,
+        held_logprobs: dict[int, KimiStandardLogprobs] | None = None,
+        internal_token_start: int | None = None,
     ) -> AsyncGenerator[str, None]:
-        """Generate SSE chunks for streaming content."""
+        """Generate SSE chunks for streaming content.
+
+        ``held_logprobs`` (K3 with logprobs=true) holds per choice the
+        choices[].logprobs entries no frame carried yet. Each frame with
+        content carries the entries up to its last generated token (see
+        _k3_frame), never a logprobs-only frame; whatever is left at the end
+        goes on the end frame.
+        """
         encoding_output = self._encoding_output()
         if encoding_output is not None:
             usage = None
@@ -1216,10 +1546,40 @@ class OpenAIServingChat(OpenAIServingBase):
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
         # nor duplicated across chunks; flush any leftover at the end.
+        k3_logprobs = self._k3_logprobs_on(request)
         remaining_logprobs = choice_logprobs
+        # K3: frames take their internal_content and standard entries from the
+        # token provenance; choice_logprobs is None (entries are in standard).
+        standard = held_logprobs.get(index) if held_logprobs is not None else None
+        k3_frames = token_provenance is not None or standard is not None
+        internal_on = self._internal_content_requested(request)
 
         event_internal = (
-            [{"token_ids": internal_token_ids}] if internal_token_ids else None
+            [
+                {
+                    "token_ids": internal_token_ids,
+                    "logprobs": (
+                        internal_token_logprobs
+                        if internal_token_logprobs is not None
+                        and len(internal_token_logprobs) == len(internal_token_ids)
+                        else [MISSING_LOGPROB] * len(internal_token_ids)
+                    ),
+                    **(
+                        {
+                            "token_positions": list(
+                                range(
+                                    internal_token_start,
+                                    internal_token_start + len(internal_token_ids),
+                                )
+                            )
+                        }
+                        if internal_token_start is not None
+                        else {}
+                    ),
+                }
+            ]
+            if internal_token_ids
+            else None
         )
         replay_chars = 0
 
@@ -1248,19 +1608,29 @@ class OpenAIServingChat(OpenAIServingBase):
                         cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
-                yield build_sse_content(
+                if k3_frames:
+                    frame_internal, frame_logprobs = self._k3_frame(
+                        token_provenance,
+                        standard,
+                        internal_on,
+                        reasoning_text,
+                        text=True,
+                        reasoning=True,
+                    )
+                else:
+                    frame_internal = event_internal
+                    frame_logprobs = self._frame_logprobs(
+                        remaining_logprobs, object_required=k3_logprobs
+                    )
+                yield self._build_sse(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
-                    logprobs=remaining_logprobs,
+                    logprobs=frame_logprobs,
                     usage=usage,
-                    internal_content=(
-                        token_provenance.take(reasoning_text, text=True, reasoning=True)
-                        if token_provenance
-                        else event_internal
-                    ),
+                    internal_content=frame_internal,
                 )
                 remaining_logprobs = None
 
@@ -1286,7 +1656,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         and reasoning_over
                     ):
                         parser._k3_boundary_sent = True
-                        yield build_sse_content(
+                        yield self._build_sse(
                             chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                             created=created,
                             model=request.model,
@@ -1311,8 +1681,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 internal_content=event_internal,
                 token_provenance=token_provenance,
                 replay_chars=replay_chars,
+                logprobs=remaining_logprobs,
+                logprobs_object_required=k3_logprobs,
+                standard_logprobs=standard,
+                internal_requested=internal_on,
             ):
                 if chunk:
+                    # The first frame it yields carries the logprobs.
+                    remaining_logprobs = None
                     yield chunk
 
             # Send any remaining tool call arguments when generation finishes
@@ -1325,10 +1701,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     index,
                     created=created,
                     internal_content=event_internal,
+                    logprobs=(
+                        self._frame_logprobs(remaining_logprobs, object_required=True)
+                        if k3_logprobs
+                        else None
+                    ),
                 )
                 if remaining_chunk:
-                    if token_provenance:
+                    if token_provenance and internal_on:
                         raise ValueError("K3 tool flush has no token provenance")
+                    if k3_logprobs:
+                        remaining_logprobs = None
                     yield remaining_chunk
 
         else:
@@ -1344,21 +1727,29 @@ class OpenAIServingChat(OpenAIServingBase):
                         cache_usage=content["meta_info"].get("cache_usage"),
                     ).model_dump()
 
-                yield build_sse_content(
+                if k3_frames:
+                    frame_internal, frame_logprobs = self._k3_frame(
+                        token_provenance,
+                        standard,
+                        internal_on,
+                        delta,
+                        text=True,
+                        replay_chars=replay_chars,
+                    )
+                else:
+                    frame_internal = event_internal
+                    frame_logprobs = self._frame_logprobs(
+                        remaining_logprobs, object_required=k3_logprobs
+                    )
+                yield self._build_sse(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=remaining_logprobs,
+                    logprobs=frame_logprobs,
                     usage=usage,
-                    internal_content=(
-                        token_provenance.take(
-                            delta, text=True, replay_chars=replay_chars
-                        )
-                        if token_provenance
-                        else event_internal
-                    ),
+                    internal_content=frame_internal,
                 )
                 remaining_logprobs = None
 
@@ -1367,7 +1758,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # no content chunk. On the plain path an empty-delta step has no chunk
         # to attach to either way, and a standalone empty-delta logprobs chunk
         # is not a shape clients expect.
-        if remaining_logprobs is not None and (
+        if remaining_logprobs is not None and held_logprobs is not None:
+            # K3: choice_logprobs is always None (entries go to standard).
+            raise ValueError("K3 logprobs bypassed their per-choice allocator")
+        elif remaining_logprobs is not None and (
             self.reasoning_parser or self.tool_call_parser
         ):
             usage = None
@@ -1380,7 +1774,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cache_usage=content["meta_info"].get("cache_usage"),
                 ).model_dump()
 
-            yield build_sse_content(
+            yield self._build_sse(
                 chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                 created=created,
                 model=request.model,
@@ -1536,6 +1930,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         if error_msg:
             return error_msg
+        if self.chat_encoding_spec == "kimi_k3":
+            # After the metaschema check, so a malformed schema keeps its error.
+            schema_error = _validate_kimi_k3_strict_tool_schemas(effective_tools)
+            if schema_error:
+                return schema_error
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1544,7 +1943,9 @@ class OpenAIServingChat(OpenAIServingBase):
             and max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ) and not get_serving().allow_auto_truncate:
+        ) and not (
+            get_serving().allow_auto_truncate or get_serving().clamp_max_new_tokens
+        ):
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -1734,21 +2135,44 @@ class OpenAIServingChat(OpenAIServingBase):
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
         if self.chat_encoding_spec == "kimi_k3":
+            continuing_answer = _kimi_k3_partial_opens_response(request)
+            self._stop_kimi_k3_reasoning_without_thinking(
+                sampling_params,
+                request.chat_template_kwargs,
+                continuing_answer=continuing_answer,
+            )
+            self._ban_kimi_k3_think_channel_without_thinking(
+                sampling_params,
+                request.chat_template_kwargs,
+                continuing_answer=continuing_answer,
+            )
             self._frame_kimi_k3_json_response(
                 sampling_params,
                 processed_messages.tool_call_constraint,
                 processed_messages.require_reasoning,
+                answer_prefilled=kimi_k3_partial_answer_prefilled(request),
+            )
+            tool_call_parsing_active = self._tool_call_parsing_active(request)
+            self._stop_kimi_k3_undeclared_tool_calls(
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+            )
+            self._keep_kimi_k3_tool_calls_from_client_stops(
+                sampling_params=sampling_params,
+                tool_call_parsing_active=tool_call_parsing_active,
+                server_stop=processed_messages.server_stop,
             )
         # K3 reports the generation stub as output, so reserve it in the budget.
         # Preserve tiny limits (1..3) rather than turning them into zero/negative.
         max_new_tokens = sampling_params["max_new_tokens"]
+        generation_stub_tokens = self._k3_stub_tokens(request)
         if (
             self.chat_encoding_spec == "kimi_k3"
-            and request.input_ids is None
+            and generation_stub_tokens
             and max_new_tokens is not None
-            and max_new_tokens > self._KIMI_K3_GENERATION_STUB_TOKENS
+            and max_new_tokens > generation_stub_tokens
         ):
-            sampling_params["max_new_tokens"] -= self._KIMI_K3_GENERATION_STUB_TOKENS
+            sampling_params["max_new_tokens"] -= generation_stub_tokens
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
@@ -1777,6 +2201,13 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        # internal_content needs each generated token's selected logprob even
+        # when the client did not ask for logprobs. Emitting choices[].logprobs
+        # stays gated on request.logprobs, so such a request computes only the
+        # selected logprob: no top-k and no per-token text.
+        internal_logprobs_only = (
+            self._internal_content_requested(request) and not request.logprobs
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             **cache_params,
@@ -1784,13 +2215,15 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
-            return_logprob=request.logprobs,
+            return_logprob=request.logprobs or internal_logprobs_only,
             logprob_start_len=-1,
-            top_logprobs_num=request.top_logprobs or 0,
+            top_logprobs_num=(
+                0 if internal_logprobs_only else (request.top_logprobs or 0)
+            ),
             return_sampling_mask=request.return_sampling_mask,
             sampling_logprobs_mode=request.sampling_logprobs_mode,
             stream=request.stream,
-            return_text_in_logprobs=True,
+            return_text_in_logprobs=not internal_logprobs_only,
             return_flat_raw_output_top_logprobs=request.return_flat_raw_output_top_logprobs,
             # GenerateReqInput rejects b64 without a flat flag; chat has only the output one
             return_flat_raw_top_logprobs_b64=(
@@ -1954,6 +2387,7 @@ class OpenAIServingChat(OpenAIServingBase):
         sampling_params: dict[str, Any],
         tool_call_constraint: ToolCallConstraint | None,
         require_reasoning: bool,
+        answer_prefilled: bool = False,
     ) -> None:
         """Move a JSON response format into the K3 response block it is
         written in, so the grammar admits the block's markers."""
@@ -1964,6 +2398,12 @@ class OpenAIServingChat(OpenAIServingBase):
             and tool_call_constraint[0] == "json_schema"
         ):
             return
+        if answer_prefilled:
+            raise ValueError(
+                "To enforce a strict json_schema response format with Kimi K3, "
+                "remove the assistant answer prefix. To keep the prefix with "
+                "prompt-only schema guidance, set response_format.json_schema.strict to false."
+            )
         schema = json.loads(json_schema)
         # The structural tag compiles the schema without this check.
         validate_xgrammar_json_schema(schema)
@@ -1981,11 +2421,153 @@ class OpenAIServingChat(OpenAIServingBase):
         # max_tokens; stopping on the message close ends it at once. The
         # response close is not a stop: trimming it would hide the marker the
         # reasoning parser uses to recognize an answer that skipped thinking.
-        stop = sampling_params.get("stop") or []
-        stop = [stop] if isinstance(stop, str) else list(stop)
-        if MESSAGE_CLOSE not in stop:
-            stop.append(MESSAGE_CLOSE)
-        sampling_params["stop"] = stop
+        self._append_kimi_k3_marker_stop(sampling_params, MESSAGE_CLOSE)
+
+    def _kimi_k3_marker_stop_ids(self, marker: str) -> list[int] | None:
+        """The special-token ids the model generates for a K3 marker, or None
+        when the tokenizer does not encode it as `<|open|>`/`<|close|>`, name,
+        `<|sep|>`."""
+        if marker in self._kimi_k3_marker_ids:
+            return self._kimi_k3_marker_ids[marker]
+        ids = None
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is not None:
+            encoded = tokenizer.encode(marker, add_special_tokens=False)
+            head = marker[: marker.index("|>") + 2]
+            tail = marker[marker.rindex("<|") :]
+            if (
+                isinstance(encoded, list)
+                and 3 <= len(encoded) <= 8
+                and all(type(token_id) is int for token_id in encoded)
+                and encoded[0] == tokenizer.convert_tokens_to_ids(head)
+                and encoded[-1] == tokenizer.convert_tokens_to_ids(tail)
+            ):
+                ids = encoded
+        if ids is None:
+            logger.warning(
+                "Kimi K3 marker %r is not a special-token sequence; stopping on "
+                "its text instead",
+                marker,
+            )
+        self._kimi_k3_marker_ids[marker] = ids
+        return ids
+
+    def _kimi_k3_generation_prefix(self, prompt_ids: list[int]) -> list[int]:
+        """The opened think or response channel ending ``prompt_ids``, or []
+        when the prompt does not end with one of those markers."""
+        tail = list(prompt_ids[-self._KIMI_K3_GENERATION_STUB_TOKENS :])
+        for marker in (THINK_OPEN, RESPONSE_OPEN):
+            if self._kimi_k3_marker_stop_ids(marker) == tail:
+                return tail
+        return []
+
+    def _append_kimi_k3_marker_stop(
+        self, sampling_params: dict[str, Any], marker: str
+    ) -> None:
+        """Stop where the model generates a K3 marker. As a token sequence it
+        excludes the marker, matches only the special tokens and costs no
+        per-step decode; the same text spelled with ordinary tokens does not stop."""
+        ids = self._kimi_k3_marker_stop_ids(marker)
+        if ids is None:
+            _append_stop(sampling_params, marker)
+        else:
+            append_request_stop_token_sequence(sampling_params, ids)
+
+    def _stop_kimi_k3_undeclared_tool_calls(
+        self, sampling_params: dict[str, Any], tool_call_parsing_active: bool
+    ) -> None:
+        """With no tool-call parser to read it, a tools channel is a call to an
+        undeclared tool; the official API returns none and ends there. Stopping
+        at its open marker also spares generating the call. The parser still
+        passes marker text spelled with ordinary tokens through as content."""
+        if not tool_call_parsing_active:
+            self._append_kimi_k3_marker_stop(sampling_params, TOOLS_OPEN)
+
+    def _keep_kimi_k3_tool_calls_from_client_stops(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        tool_call_parsing_active: bool,
+        server_stop: list[str],
+    ) -> None:
+        if not tool_call_parsing_active:
+            return
+        token_ids = self._kimi_k3_marker_stop_ids(TOOLS_OPEN)
+        if token_ids is None:
+            return
+        set_request_tool_calls_start(
+            sampling_params, token_ids=token_ids, server_stop_strs=server_stop
+        )
+
+    def _stop_kimi_k3_reasoning_without_thinking(
+        self,
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+        *,
+        continuing_answer: bool = False,
+    ) -> None:
+        """Stop a stray think close when generation starts in the response channel."""
+        if not continuing_answer and (chat_template_kwargs or {}).get("thinking", True):
+            return
+        # In a JSON answer the marker can only be text in a string, where stopping
+        # would cut the JSON; run before the K3 framing replaces the json_schema.
+        if sampling_params.get("json_schema"):
+            return
+        self._append_kimi_k3_marker_stop(sampling_params, THINK_CLOSE)
+
+    def _kimi_k3_think_ban_rule(self) -> tuple[int, tuple[int, int]] | None:
+        """``(think, (<|open|>, <|close|>))`` as the model generates them, or None
+        when the tokenizer does not encode the two think markers as a special
+        token, the same name token and the same ``<|sep|>``."""
+        if self._kimi_k3_think_ban_rule_cache is not _UNSET:
+            return self._kimi_k3_think_ban_rule_cache
+        rule = None
+        open_ids = self._kimi_k3_marker_stop_ids(THINK_OPEN)
+        close_ids = self._kimi_k3_marker_stop_ids(THINK_CLOSE)
+        if (
+            open_ids is not None
+            and close_ids is not None
+            and len(open_ids) == len(close_ids) == 3
+            and open_ids[0] != close_ids[0]
+            # Both markers spell the channel name and the separator alike.
+            and open_ids[1:] == close_ids[1:]
+        ):
+            rule = (open_ids[1], (open_ids[0], close_ids[0]))
+        else:
+            logger.warning(
+                "Kimi K3 think markers are not three-token special sequences; "
+                "the think channel mask is unavailable"
+            )
+        self._kimi_k3_think_ban_rule_cache = rule
+        return rule
+
+    def _ban_kimi_k3_think_channel_without_thinking(
+        self,
+        sampling_params: dict[str, Any],
+        chat_template_kwargs: dict[str, Any] | None,
+        *,
+        continuing_answer: bool = False,
+    ) -> None:
+        """With thinking off or a resumed answer, generation starts inside
+        the response channel. Masking ``think`` right after ``<|open|>`` and
+        ``<|close|>`` prevents a stray think marker from switching channels.
+
+        The mask is conditional, so the same token stays free in ordinary text.
+        The think-close stop (_stop_kimi_k3_reasoning_without_thinking) remains
+        the fallback wherever the mask does not apply."""
+        rule = None
+        if envs.SGLANG_K3_THINKING_OFF_BAN_THINK.get() and (
+            continuing_answer or not (chat_template_kwargs or {}).get("thinking", True)
+        ):
+            rule = self._kimi_k3_think_ban_rule()
+        # Always set or clear: the key is private, not a client parameter.
+        if rule is None:
+            clear_request_conditional_token_ban(sampling_params)
+        else:
+            banned, after = rule
+            set_request_conditional_token_ban(
+                sampling_params, banned=banned, after=after
+            )
 
     def _set_json_grammar_start(
         self,
@@ -2390,6 +2972,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     effective_tools,
                     tool_choice="none",
                     thinking_mode=xgrammar_reasoning,
+                    answer_prefilled=kimi_k3_partial_answer_prefilled(request),
                 ),
             )
 
@@ -2416,6 +2999,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            if self.chat_encoding_spec == "kimi_k3":
+                self._validated_kimi_k3_partial_message(request)
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
@@ -2439,6 +3024,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 result.stop = list(result.stop)
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
+            result.server_stop = result.server_stop + [tool_call_stop]
 
         # Configured after rendering so the detokenization options never reach
         # the chat template.
@@ -2990,6 +3576,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = self._stream_created(request)
+        generation_stub_tokens = self._k3_stub_tokens(request)
 
         # Parsers for tool calls and reasoning
         parser_dict = {}
@@ -2997,21 +3584,44 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # State tracking for streaming
         is_firsts = {}
+        # Choices whose end frame (finish_reason) has been yielded.
+        ended_choices: set[int] = set()
         stream_offsets = {}
         generated_parts = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
-        # Attach per-frame delta token ids when
+        # Attach per-frame delta token ids and their selected logprobs when
         # include_internal_content is set. Engine stream events already carry
         # output_ids (a delta in incremental mode; otherwise sliced from the
-        # tail by completion_tokens count).
-        internal_content_on = bool(
-            request.stream_options
-            and getattr(request.stream_options, "include_internal_content", False)
+        # tail by completion_tokens count) and, since the request then always
+        # returns logprobs, output_token_logprobs.
+        internal_content_on = self._internal_content_requested(request)
+        # Internal opt-in: internal_content[] entries also carry the generated
+        # position of each token id (StreamOptions validates the dependency).
+        internal_positions_on = internal_content_on and bool(
+            getattr(request.stream_options, "include_internal_token_positions", False)
         )
         internal_prev_completion: Dict[int, int] = {}
-        token_provenances: Dict[int, KimiTokenProvenance] = {}
+        # Non-incremental mode: engine logprob entries already placed, per choice.
+        internal_prev_entries: Dict[int, int] = {}
+        # K3 tracks generated tokens per choice (token provenance) for
+        # internal_content and for attributing choices[].logprobs to frames.
+        k3_track = self.chat_encoding_spec == "kimi_k3" and (
+            internal_content_on or bool(request.logprobs)
+        )
+        token_provenances: Dict[int, KimiTokenProvenance | None] = {}
+        # include_internal_content: per choice, an event whose ids are ahead of
+        # their logprob entries, held and merged into the next event so no
+        # internal_content frame goes out before its scores are known.
+        held_events: Dict[int, tuple[dict, int]] = {}
+        # K3 with logprobs=true: choices[].logprobs entries no frame carried
+        # yet, per choice. Each frame with content carries the entries up to
+        # its last generated token, the end frame the rest -- never a
+        # logprobs-only frame.
+        held_logprobs: Optional[Dict[int, KimiStandardLogprobs]] = (
+            {} if self._k3_logprobs_on(request) else None
+        )
 
         # Usage tracking
         prompt_tokens = {}
@@ -3053,14 +3663,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if internal_content_on:
+                    content = self._hold_event_until_scored(
+                        content, index, held_events
+                    )
+                    if content is None:
+                        continue
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"],
-                    generation_stub_tokens=(
-                        self._KIMI_K3_GENERATION_STUB_TOKENS
-                        if request.input_ids is None
-                        else 0
-                    ),
+                    generation_stub_tokens=generation_stub_tokens,
                 )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
@@ -3072,11 +3684,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if content["meta_info"].get("cache_usage") is not None:
                     cache_usage[index] = self._reported_cache_usage(
                         content["meta_info"],
-                        generation_stub_tokens=(
-                            self._KIMI_K3_GENERATION_STUB_TOKENS
-                            if request.input_ids is None
-                            else 0
-                        ),
+                        generation_stub_tokens=generation_stub_tokens,
                     )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
@@ -3107,8 +3715,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         if get_serving().incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
-                                # The abort chunk re-sends the last token plus any coalesced deltas;
-                                # keep only what brings the total up to completion_tokens.
+                                # The abort chunk carries only unsent ids; still keep
+                                # no more than brings the total up to completion_tokens.
                                 keep = completion_tokens[index] - len(accumulated)
                                 chunk_output_ids = chunk_output_ids[: max(keep, 0)]
                             accumulated.extend(chunk_output_ids)
@@ -3129,6 +3737,29 @@ class OpenAIServingChat(OpenAIServingBase):
                             content, n_prev_token, total_output_logprobs
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
+                    if held_logprobs is not None:
+                        # K3: entries are placed by output position and
+                        # released per frame, so they survive any break below.
+                        standard = held_logprobs.get(index)
+                        if standard is None:
+                            standard = held_logprobs[index] = KimiStandardLogprobs(
+                                content["meta_info"].get("id", ""), index
+                            )
+                        if choice_logprobs is not None:
+                            standard.add(
+                                place_event_values(
+                                    choice_logprobs["content"],
+                                    (
+                                        content["meta_info"].get(
+                                            "output_token_logprobs_segments"
+                                        )
+                                        if get_serving().incremental_streaming_output
+                                        else None
+                                    ),
+                                    n_prev_token,
+                                )
+                            )
+                        choice_logprobs = None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -3143,14 +3774,32 @@ class OpenAIServingChat(OpenAIServingBase):
                     ):
                         if self.chat_encoding_spec == "kimi_k3":
                             code = finish_reason["status_code"]
-                            if not stream_started and code < 500:
-                                # A client error found before any byte
-                                # is sent is a plain HTTP error, not a stream.
+                            if not stream_started:
+                                # An abort found before any byte is sent is
+                                # raised, and /v1/chat/completions (which awaits
+                                # the first chunk) answers it as a plain HTTP
+                                # error with a JSON body (spec P0.17), never a
+                                # stream whose first frame is the end frame: the
+                                # role frame would be missing, and a 200 keeps
+                                # the router and the gateway from retrying
+                                # elsewhere. A server error does not echo its
+                                # message, which can name ranks, rids and peer
+                                # addresses; it is logged instead, as not every
+                                # abort site logs it.
+                                detail = finish_reason.get(
+                                    "message", "Generation aborted."
+                                )
+                                if code >= 500:
+                                    logger.warning(
+                                        "Request %s aborted before its first frame "
+                                        "with status %d: %s",
+                                        content["meta_info"]["id"],
+                                        code.value,
+                                        detail,
+                                    )
+                                    detail = code.phrase
                                 raise HTTPException(
-                                    status_code=code.value,
-                                    detail=finish_reason.get(
-                                        "message", "Generation aborted."
-                                    ),
+                                    status_code=code.value, detail=detail
                                 )
                             # A mid-stream failure may only be expressed
                             # through finish_reason -- an error-only SSE frame
@@ -3177,11 +3826,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage_headers.update(
                         self._usage_headers(
                             content["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         )
                     )
                     usage_headers_set = True
@@ -3190,7 +3835,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     # K2 templates require preserved thinking, including empty reasoning.
-                    yield build_sse_content(
+                    yield self._build_sse(
                         chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                         created=created,
                         model=request.model,
@@ -3227,34 +3872,102 @@ class OpenAIServingChat(OpenAIServingBase):
                         content = {**content, "text": text}
 
                 # Delta token ids for this event (incremental mode
-                # events already carry the delta).
+                # events already carry the delta), and the engine logprob
+                # entries this event delivered, by output position.
                 internal_token_ids = None
-                if internal_content_on:
+                internal_token_logprobs = None
+                internal_token_start = None
+                token_provenance = None
+                if internal_content_on or k3_track:
+                    meta = content["meta_info"]
                     all_ids = content.get("output_ids") or []
+                    output_logprobs = meta.get("output_token_logprobs") or []
                     if get_serving().incremental_streaming_output:
-                        internal_token_ids = list(all_ids)
+                        # The producer states each event's positions
+                        # (output_ids_start, output_token_logprobs_segments):
+                        # entries can lag their ids and coalesced sub-events
+                        # keep their own offsets.
+                        first = meta.get(
+                            "output_ids_start", internal_prev_completion.get(index, 0)
+                        )
+                        event_ids = list(all_ids)
+                        internal_prev_completion[index] = first + len(event_ids)
+                        placed = place_event_values(
+                            output_logprobs,
+                            meta.get("output_token_logprobs_segments"),
+                            first,
+                        )
                     else:
                         # Non-incremental events carry a REFERENCE to the
                         # cumulative output_ids, and backlog coalescing
                         # (_coalesce) concatenates that same reference multiple
                         # times — length-based offsets would slice garbage. Use
                         # the completion_tokens count instead: this event added
-                        # k tokens, take the last k; the tail of a duplicated
-                        # concatenation is still the true cumulative tail.
-                        cur = content["meta_info"].get("completion_tokens", 0) or 0
-                        prev = internal_prev_completion.get(index, 0)
-                        k = cur - prev
-                        internal_token_ids = list(all_ids[-k:]) if k > 0 else []
-                        internal_prev_completion[index] = cur
-
-                token_provenance = None
-                if internal_content_on and self.chat_encoding_spec == "kimi_k3":
-                    if index not in token_provenances:
-                        token_provenances[index] = KimiTokenProvenance(
-                            self.tokenizer_manager.tokenizer
+                        # positions prev..cur-1. Slice them by position, not
+                        # from the tail: the live list may already hold later
+                        # tokens (it grows while the role frame is yielded),
+                        # and a duplicated concatenation starts with the whole
+                        # cumulative list, so positions below cur are stable.
+                        cur = meta.get("completion_tokens", 0) or 0
+                        first = internal_prev_completion.get(index, 0)
+                        event_ids = list(all_ids[first:cur]) if cur > first else []
+                        internal_prev_completion[index] = max(cur, first)
+                        # The logprob list is the same kind of reference; its
+                        # first output_token_logprobs_length entries are output
+                        # positions 0.., placed once each as they arrive.
+                        logprobs_len = min(
+                            meta.get("output_token_logprobs_length") or 0,
+                            len(output_logprobs),
                         )
-                    token_provenance = token_provenances[index]
-                    token_provenance.append(internal_token_ids or [])
+                        prev_entries = internal_prev_entries.get(index, 0)
+                        placed = [
+                            (p, output_logprobs[p])
+                            for p in range(prev_entries, logprobs_len)
+                        ]
+                        internal_prev_entries[index] = max(prev_entries, logprobs_len)
+                    if internal_content_on:
+                        by_position = dict(placed)
+                        internal_token_ids = event_ids
+                        if internal_positions_on:
+                            internal_token_start = first
+                        internal_token_logprobs = align_token_logprobs(
+                            event_ids,
+                            [by_position.get(first + i) for i in range(len(event_ids))],
+                        )
+                    if k3_track:
+                        standard = (
+                            held_logprobs.get(index)
+                            if held_logprobs is not None
+                            else None
+                        )
+                        if standard is not None:
+                            standard.note_ids(first + len(event_ids))
+                        if index not in token_provenances:
+                            try:
+                                token_provenances[index] = KimiTokenProvenance(
+                                    self.tokenizer_manager.tokenizer,
+                                    with_positions=internal_positions_on,
+                                    pending_prefix=(
+                                        request._kimi_k3_generation_prefix_ids
+                                        if internal_content_on
+                                        else ()
+                                    ),
+                                )
+                            except ValueError as e:
+                                if internal_content_on or standard is None:
+                                    raise
+                                standard.degrade(str(e))
+                                token_provenances[index] = None
+                        token_provenance = token_provenances[index]
+                        if token_provenance is not None:
+                            try:
+                                token_provenance.append(event_ids)
+                                token_provenance.add_entries(placed)
+                            except ValueError as e:
+                                if internal_content_on or standard is None:
+                                    raise
+                                standard.degrade(str(e))
+                                token_provenances[index] = token_provenance = None
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
                     content=content,
@@ -3272,7 +3985,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                     internal_token_ids=internal_token_ids,
+                    internal_token_logprobs=internal_token_logprobs,
                     token_provenance=token_provenance,
+                    held_logprobs=held_logprobs,
+                    internal_token_start=internal_token_start,
                 ):
                     yield chunk
 
@@ -3300,16 +4016,23 @@ class OpenAIServingChat(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
                         cached_tokens=cached_tokens.get(idx, 0) or 0,
                         cache_usage=cache_usage.get(idx),
+                        stub_tokens=self._k3_stub_tokens(request)
+                        if self._k3_generation_started(
+                            completion_tokens.get(idx, 0), finish_reason_data
+                        )
+                        else 0,
                     )
-                yield build_sse_content(
+                yield self._build_sse(
                     chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=idx,
                     finish_reason=self._wire_finish_reason(final_finish_reason),
+                    logprobs=self._end_frame_logprobs(held_logprobs, idx),
                     matched_stop=matched_stop,
                     choice_usage=choice_usage,
                 )
+                ended_choices.add(idx)
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
@@ -3323,6 +4046,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             created=created,
                             choices=[
                                 ChatCompletionResponseStreamChoice(
+                                    omit_null_logprobs=self.chat_encoding_spec == "kimi_k3",
                                     index=index,
                                     delta=DeltaMessage(
                                         hidden_states=response_hidden_states
@@ -3426,28 +4150,45 @@ class OpenAIServingChat(OpenAIServingBase):
                 total_video_tokens = sum(
                     tok for idx, tok in video_tokens.items() if idx % request.n == 0
                 )
+                prompt_usage = (prompt_tokens, cached_tokens, cache_usage)
+                started = {
+                    index: self._k3_generation_started(
+                        tokens, finish_reasons.get(index)
+                    )
+                    for index, tokens in completion_tokens.items()
+                }
+                if self.chat_encoding_spec == "kimi_k3":
+                    choice_of = self._k3_prompt_choices(started, request.n)
+                    prompt_usage = tuple(
+                        {
+                            **values,
+                            **{
+                                first: values[choice]
+                                for first, choice in choice_of.items()
+                                if choice in values
+                            },
+                        }
+                        for values in prompt_usage
+                    )
                 usage = UsageProcessor.calculate_streaming_usage(
-                    prompt_tokens,
+                    prompt_usage[0],
                     reasoning_tokens,
                     completion_tokens,
-                    cached_tokens=cached_tokens,
+                    cached_tokens=prompt_usage[1],
                     n_choices=request.n,
                     enable_cache_report=get_serving().enable_cache_report,
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
-                    cache_usage=cache_usage,
+                    cache_usage=prompt_usage[2],
                 )
                 usage = self._apply_k3_usage_details(
                     usage,
-                    n_choices=sum(
-                        bool(prompt_tokens.get(index, 0) or tokens)
-                        for index, tokens in completion_tokens.items()
-                    ),
+                    stub_tokens=self._k3_stub_tokens(request) * sum(started.values()),
                     reasoning_tokens=sum(reasoning_tokens.values()),
                     cached_tokens=sum(
                         tok
-                        for idx, tok in cached_tokens.items()
+                        for idx, tok in prompt_usage[1].items()
                         if idx % request.n == 0
                     ),
                 )
@@ -3465,30 +4206,38 @@ class OpenAIServingChat(OpenAIServingBase):
             if not stream_started or not (is_k3 or isinstance(e, ValueError)):
                 raise
             if is_k3:
-                # No error-only frame; surface it as a finish_reason.
-                # Which candidates were still open is not tracked here, so this
-                # closes index 0 -- the only candidate for the overwhelming
-                # majority of requests, and still better than a frame a strict
-                # client cannot parse.
+                # No error-only frame; surface it as a finish_reason on every
+                # choice that started and has no end frame yet, each with its
+                # remaining logprobs entries.
                 logger.warning(
                     "Stream failed mid-response, closing it: %s",
                     e,
                     exc_info=not isinstance(e, ValueError),
                 )
-                yield build_sse_content(
-                    chunk_id=self._wire_id(request, ""),
-                    created=self._stream_created(request),
-                    model=request.model,
-                    index=0,
-                    finish_reason="server_interrupted",
-                    choice_usage=self._k3_usage(
-                        prompt_tokens=prompt_tokens.get(0, 0),
-                        completion_tokens=completion_tokens.get(0, 0),
-                        reasoning_tokens=reasoning_tokens.get(0, 0) or 0,
-                        cached_tokens=cached_tokens.get(0, 0) or 0,
-                        cache_usage=cache_usage.get(0),
-                    ),
+                open_choices = sorted(
+                    idx
+                    for idx, first in is_firsts.items()
+                    if not first and idx not in ended_choices
                 )
+                for idx in open_choices:
+                    yield self._build_sse(
+                        chunk_id=self._wire_id(request, ""),
+                        created=self._stream_created(request),
+                        model=request.model,
+                        index=idx,
+                        finish_reason="server_interrupted",
+                        logprobs=self._end_frame_logprobs(held_logprobs, idx),
+                        choice_usage=self._k3_usage(
+                            prompt_tokens=prompt_tokens.get(idx, 0),
+                            completion_tokens=completion_tokens.get(idx, 0),
+                            reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
+                            cached_tokens=cached_tokens.get(idx, 0) or 0,
+                            cache_usage=cache_usage.get(idx),
+                            stub_tokens=self._k3_stub_tokens(request)
+                            if completion_tokens.get(idx, 0) > 0
+                            else 0,
+                        ),
+                    )
             else:
                 error = self.create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
@@ -3522,11 +4271,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(response, ChatCompletionResponse):
             response._response_headers = self._usage_headers(
                 ret[0]["meta_info"],
-                generation_stub_tokens=(
-                    self._KIMI_K3_GENERATION_STUB_TOKENS
-                    if request.input_ids is None
-                    else 0
-                ),
+                generation_stub_tokens=self._k3_stub_tokens(request),
             )
 
         return response
@@ -3539,6 +4284,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
         if self.chat_encoding_spec == "kimi_k3":
+            generation_stub_tokens = self._k3_stub_tokens(request)
             ret = [
                 {
                     **item,
@@ -3546,19 +4292,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         **item["meta_info"],
                         "prompt_tokens": self._reported_prompt_tokens(
                             item["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         ),
                         "cache_usage": self._reported_cache_usage(
                             item["meta_info"],
-                            generation_stub_tokens=(
-                                self._KIMI_K3_GENERATION_STUB_TOKENS
-                                if request.input_ids is None
-                                else 0
-                            ),
+                            generation_stub_tokens=generation_stub_tokens,
                         ),
                     },
                 }
@@ -3752,8 +4490,30 @@ class OpenAIServingChat(OpenAIServingBase):
             ret[i]["meta_info"].get("video_tokens", 0)
             for i in range(0, len(ret), request.n)
         )
+        started = {
+            index: self._k3_generation_started(
+                r["meta_info"].get("completion_tokens", 0),
+                r["meta_info"].get("finish_reason"),
+            )
+            for index, r in enumerate(ret)
+        }
+        usage_ret = ret
+        if self.chat_encoding_spec == "kimi_k3":
+            usage_ret = list(ret)
+            for first, choice in self._k3_prompt_choices(started, request.n).items():
+                usage_ret[first] = {
+                    **ret[first],
+                    "meta_info": {
+                        **ret[first]["meta_info"],
+                        **{
+                            key: ret[choice]["meta_info"][key]
+                            for key in ("prompt_tokens", "cached_tokens", "cache_usage")
+                            if key in ret[choice]["meta_info"]
+                        },
+                    },
+                }
         usage = UsageProcessor.calculate_response_usage(
-            ret,
+            usage_ret,
             n_choices=request.n,
             enable_cache_report=get_serving().enable_cache_report,
             image_tokens=image_tokens,
@@ -3763,15 +4523,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # The K3 usage rules cover every usage object, non-streaming responses included.
         usage = self._apply_k3_usage_details(
             usage,
-            n_choices=sum(
-                r["meta_info"].get("completion_tokens", 0) > 0 for r in ret
-            ),
+            stub_tokens=self._k3_stub_tokens(request) * sum(started.values()),
             reasoning_tokens=sum(
                 r["meta_info"].get("reasoning_tokens", 0) or 0 for r in ret
             ),
             cached_tokens=sum(
-                ret[i]["meta_info"].get("cached_tokens", 0) or 0
-                for i in range(0, len(ret), request.n)
+                usage_ret[i]["meta_info"].get("cached_tokens", 0) or 0
+                for i in range(0, len(usage_ret), request.n)
             ),
         )
 
@@ -3917,6 +4675,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens: int,
         cached_tokens: int,
         cache_usage: CacheUsage | dict[str, int] | None = None,
+        stub_tokens: int = 0,
     ) -> Dict[str, Any]:
         """A complete K3 usage object.
 
@@ -3939,6 +4698,7 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
             reasoning_tokens=reasoning_tokens,
             cached_tokens=cached_tokens,
+            stub_tokens=stub_tokens,
         ).model_dump()
 
     def _apply_k3_usage_details(
@@ -3947,20 +4707,21 @@ class OpenAIServingChat(OpenAIServingBase):
         *,
         reasoning_tokens: int,
         cached_tokens: int,
-        n_choices: int = 1,
+        stub_tokens: int,
     ) -> UsageInfo:
         """Account for K3's generation stub and fill mandatory token details.
+
+        stub_tokens is the stub moved to output: the template's stub for each
+        choice that started generating, the same amount the reported prompt
+        tokens leave out.
 
         A no-op under every other encoding, so their usage keeps its shape.
         """
         if self.chat_encoding_spec != "kimi_k3":
             return usage
-        # Each assistant choice reports the prompt's generation stub as output.
         # Keep engine completion counters unchanged for decoding and token IDs.
-        if usage.completion_tokens > 0:
-            stub_tokens = self._KIMI_K3_GENERATION_STUB_TOKENS * n_choices
-            usage.completion_tokens += stub_tokens
-            usage.total_tokens += stub_tokens
+        usage.completion_tokens += stub_tokens
+        usage.total_tokens += stub_tokens
         usage.completion_tokens_details = CompletionTokensDetails(
             reasoning_tokens=int(reasoning_tokens or 0)
         )
@@ -4169,10 +4930,106 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs = output_top_logprobs[
                 n_prev_token:total_output_logprobs
             ]
+        else:
+            # Incremental events carry only unsent entries; top rows are placed
+            # by their own segments onto the selected entries' positions.
+            output_top_logprobs = self._align_incremental_top_logprobs(
+                content["meta_info"], n_prev_token, len(output_token_logprobs)
+            )
         token_logprobs = self._build_token_logprobs_from_raw(
             output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
+
+    # Events one choice may hold back waiting for logprob entries. Entries that
+    # never arrive (positions without a selected logprob) must not stall the
+    # stream; past this many held events they go out as MISSING_LOGPROB.
+    _MAX_HELD_EVENTS = 32
+
+    @classmethod
+    def _hold_event_until_scored(
+        cls, content: dict, index: int, held_events: dict[int, tuple[dict, int]]
+    ) -> dict | None:
+        """The event to process now, or None to hold it.
+
+        An event whose ids are ahead of the engine's logprob entries
+        (output_token_logprobs_length < completion_tokens) is held and merged
+        into the next event of the choice, so its internal_content frames are
+        built once their scores are known. A finished event always goes out.
+        """
+        held = held_events.pop(index, None)
+        if held is not None:
+            content = cls._merge_stream_events(held[0], content)
+        count = (held[1] if held is not None else 0) + 1
+        meta = content["meta_info"]
+        lagging = (meta.get("output_token_logprobs_length") or 0) < (
+            meta.get("completion_tokens") or 0
+        )
+        if lagging and meta.get("finish_reason") is None:
+            if count < cls._MAX_HELD_EVENTS:
+                held_events[index] = (content, count)
+                return None
+            logger.warning(
+                "Logprob entries still behind token ids after %d events "
+                "(rid=%s choice=%d); sending those positions without scores",
+                count,
+                meta.get("id"),
+                index,
+            )
+        return content
+
+    @staticmethod
+    def _merge_stream_events(first: dict, second: dict) -> dict:
+        """One event covering ``first`` then ``second`` of the same choice.
+
+        Incremental events concatenate their deltas (text, output_ids, the
+        sliced logprob lists and their position segments), as the tokenizer
+        manager's backlog coalescing does; other fields come from ``second``.
+        Non-incremental events are cumulative, so ``second`` covers both.
+        """
+        if not get_serving().incremental_streaming_output:
+            return second
+        merged = dict(second)
+        merged["text"] = (first.get("text") or "") + (second.get("text") or "")
+        merged["output_ids"] = list(first.get("output_ids") or []) + list(
+            second.get("output_ids") or []
+        )
+        meta_first, meta = first["meta_info"], dict(second["meta_info"])
+        for key in (
+            "output_token_logprobs",
+            "output_top_logprobs",
+            "output_token_ids_logprobs",
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+        ):
+            for name in (key, key + "_segments"):
+                if name in meta_first or name in meta:
+                    meta[name] = list(meta_first.get(name) or []) + list(
+                        meta.get(name) or []
+                    )
+        if "output_ids_start" in meta_first:
+            meta["output_ids_start"] = meta_first["output_ids_start"]
+        merged["meta_info"] = meta
+        return merged
+
+    @staticmethod
+    def _align_incremental_top_logprobs(
+        meta_info: dict[str, Any], first_position: int, count: int
+    ) -> list[Any]:
+        """Top-logprob rows for the ``count`` selected entries an incremental
+        event carries from ``first_position`` (the request's selected entries
+        arrive in order). Each cumulative list has its own sent offset, so
+        rows are matched by output position; a row not delivered yet is None.
+        A row that arrives after its selected entry was sent is not resent.
+        """
+        rows = meta_info.get("output_top_logprobs") or []
+        if not rows:
+            return []
+        segments = meta_info.get("output_top_logprobs_segments")
+        if segments is None:
+            return list(rows[:count])
+        by_position = dict(place_event_values(rows, segments, first_position))
+        return [by_position.get(first_position + i) for i in range(count)]
 
     def _process_reasoning_stream(
         self,
@@ -4408,6 +5265,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.chat_encoding_spec == "kimi_k3" and _kimi_k3_partial_opens_response(
+            request
+        ):
+            return False
+
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(
                 request.chat_template_kwargs or {}
@@ -4500,11 +5362,26 @@ class OpenAIServingChat(OpenAIServingBase):
         internal_content: Optional[List[Dict[str, Any]]] = None,
         token_provenance: KimiTokenProvenance | None = None,
         replay_chars: int = 0,
+        logprobs: dict | None = None,
+        logprobs_object_required: bool = False,
+        standard_logprobs: KimiStandardLogprobs | None = None,
+        internal_requested: bool = False,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
         held back waiting for a marker that can no longer arrive.
+
+        ``logprobs`` (this step's choices[].logprobs) rides on the first frame
+        yielded, normal text or tool call; with no frame they stay with the
+        caller. With ``logprobs_object_required`` every later frame, including
+        a tool call's argument continuation, carries ``{"content": []}``.
+
+        K3 (``token_provenance`` or ``standard_logprobs`` set): each fragment's
+        frame carries the standard entries up to its last token (_k3_frame).
+        A slot-open frame and its argument continuation share one fragment;
+        the entries ride on the slot-open frame, the continuation carries
+        ``{"content": []}``. internal_content only with ``internal_requested``.
 
         K3 token provenance follows each parser fragment's original XTML source,
         including characters transformed into JSON syntax.
@@ -4565,18 +5442,45 @@ class OpenAIServingChat(OpenAIServingBase):
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
+        pending_logprobs = logprobs
+
+        def take_frame_logprobs() -> ChoiceLogprobs | None:
+            nonlocal pending_logprobs
+            frame_logprobs = self._frame_logprobs(
+                pending_logprobs, object_required=logprobs_object_required
+            )
+            pending_logprobs = None
+            if frame_logprobs is None:
+                return None
+            return ChoiceLogprobs.model_validate(frame_logprobs)
+
+        k3_frames = token_provenance is not None or standard_logprobs is not None
+
         # Yield normal text
         if normal_text:
+            if k3_frames:
+                text_internal, text_logprobs = self._k3_frame(
+                    token_provenance,
+                    standard_logprobs,
+                    internal_requested,
+                    normal_text,
+                    text=True,
+                    replay_chars=replay_chars,
+                )
+                text_logprobs = (
+                    ChoiceLogprobs.model_validate(text_logprobs)
+                    if text_logprobs is not None
+                    else None
+                )
+            else:
+                text_internal = internal_content
+                text_logprobs = take_frame_logprobs()
             choice_data = ChatCompletionResponseStreamChoice(
+                omit_null_logprobs=self.chat_encoding_spec == "kimi_k3",
                 index=index,
                 delta=DeltaMessage(content=normal_text),
-                internal_content=(
-                    token_provenance.take(
-                        normal_text, text=True, replay_chars=replay_chars
-                    )
-                    if token_provenance
-                    else internal_content
-                ),
+                logprobs=text_logprobs,
+                internal_content=text_internal,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -4608,10 +5512,29 @@ class OpenAIServingChat(OpenAIServingBase):
             has_tool_calls[index] = True
 
             call_internal = internal_content
-            if token_provenance:
+            call_logprobs = None
+            if k3_frames:
                 if call_item.source_text is None:
-                    raise ValueError("K3 tool delta has no original token source")
-                call_internal = token_provenance.take(call_item.source_text)
+                    if internal_requested or standard_logprobs is None:
+                        raise ValueError("K3 tool delta has no original token source")
+                    standard_logprobs.degrade("K3 tool delta has no token source")
+                call_internal, call_logprobs = self._k3_frame(
+                    token_provenance,
+                    standard_logprobs,
+                    internal_requested,
+                    call_item.source_text or "",
+                )
+            # The argument continuation repeats the slot-open frame's generated
+            # tokens, but not the prompt prefix that led it.
+            continuation_internal = call_internal
+            prefix_len = (
+                token_provenance.last_prefix_len if token_provenance is not None else 0
+            )
+            if k3_frames and call_internal and prefix_len:
+                continuation_internal = [
+                    {key: value[prefix_len:] for key, value in entry.items()}
+                    for entry in call_internal
+                ]
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -4654,11 +5577,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 )
 
-            for tool_call in tool_call_deltas:
+            for delta_index, tool_call in enumerate(tool_call_deltas):
+                if not k3_frames:
+                    frame_logprobs = take_frame_logprobs()
+                elif standard_logprobs is None:
+                    frame_logprobs = None
+                else:
+                    frame_logprobs = ChoiceLogprobs.model_validate(
+                        call_logprobs if delta_index == 0 else {"content": []}
+                    )
                 choice_data = ChatCompletionResponseStreamChoice(
+                    omit_null_logprobs=self.chat_encoding_spec == "kimi_k3",
                     index=index,
                     delta=DeltaMessage(tool_calls=[tool_call]),
-                    internal_content=call_internal,
+                    logprobs=frame_logprobs,
+                    internal_content=(
+                        call_internal if delta_index == 0 else continuation_internal
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
@@ -4691,6 +5626,7 @@ class OpenAIServingChat(OpenAIServingBase):
         index: int,
         created: int,
         internal_content: list[dict[str, Any]] | None = None,
+        logprobs: dict | None = None,
     ) -> str | None:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -4747,8 +5683,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             choice_data = ChatCompletionResponseStreamChoice(
+                omit_null_logprobs=self.chat_encoding_spec == "kimi_k3",
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
+                logprobs=(
+                    ChoiceLogprobs.model_validate(logprobs)
+                    if logprobs is not None
+                    else None
+                ),
                 internal_content=internal_content,
                 finish_reason=None,  # Don't send finish_reason with this chunk
             )

@@ -17,13 +17,17 @@ use tower_http::catch_panic::CatchPanicLayer;
 
 /// Infra endpoints whose *successful* polls are logged at DEBUG rather than
 /// INFO. They are polled constantly — Prometheus scrapes `/metrics`, the kubelet
-/// hits `/healthz` + `/readyz` every few seconds — so logging every hit at INFO
-/// would bury real API traffic. A FAILING probe is the opposite: a pod dropping
-/// out of readiness is an incident signal, so it keeps the normal INFO line (see
+/// hits `/healthz` + `/readyz` every few seconds, a rate-limiting gateway polls
+/// `/prefill_pressure` — so logging every hit at INFO would bury real API traffic.
+/// A FAILING probe is the opposite: a pod dropping out of readiness is an
+/// incident signal, so it keeps the normal INFO line (see
 /// `access_log_and_record`). They are counted in both edge counters either way;
 /// filter them by `route` in PromQL.
 fn is_infra_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
+    matches!(
+        path,
+        "/healthz" | "/readyz" | "/metrics" | "/prefill_pressure"
+    )
 }
 
 /// Collapse an HTTP method to a bounded allow-list for use as a metric label.
@@ -197,6 +201,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
+        .route(
+            "/prefill_pressure",
+            get(crate::server::routes::pressure::prefill_pressure),
+        )
         .route(
             "/v1/models",
             get(crate::server::routes::models::list_models),

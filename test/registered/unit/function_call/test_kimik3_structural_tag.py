@@ -34,6 +34,10 @@ from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_json_response_structural_tag,
     get_kimik3_structural_tag,
 )
+from sglang.srt.function_call.tool_schema_guard import (
+    ToolSchemaError,
+    check_tool_schema_terminates,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -125,6 +129,7 @@ def _grammar(
     thinking_mode=False,
     parallel_tool_calls=True,
     response_channel_open=False,
+    answer_prefilled=False,
 ):
     structural_tag = get_kimik3_structural_tag(
         tools,
@@ -132,6 +137,7 @@ def _grammar(
         thinking_mode=thinking_mode,
         parallel_tool_calls=parallel_tool_calls,
         response_channel_open=response_channel_open,
+        answer_prefilled=answer_prefilled,
     )
     return xgr.Grammar.from_structural_tag(structural_tag)
 
@@ -768,147 +774,34 @@ def test_strict_schema_handles_one_sided_negative_integer_minimum():
         )
 
 
-def test_strict_schema_relaxes_non_ascii_property_names():
-    """A declared non-ASCII property name is unsatisfiable in xgrammar, so the
-    argument falls back to the bare type instead of an impossible grammar."""
+def test_strict_schema_enforces_non_ascii_property_names():
+    """An emoji or CJK property name (kvv TestEnforcerCases) keeps its object
+    constraint; models emit such names as raw UTF-8."""
     key = "abc\U0001f60a"
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="submit",
-            strict=True,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "value": {
-                        "type": "object",
-                        "properties": {key: {"type": "string"}},
-                        "required": [key],
-                        "additionalProperties": False,
-                    }
-                },
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-        ),
-    )
-    grammar = _grammar([tool], tool_choice="required")
-
-    for spelling in (
-        json.dumps({key: ""}),
-        json.dumps({key: ""}, ensure_ascii=False),
-    ):
-        assert _accepts(
-            grammar,
-            _tools_section(_call("submit", 1, _argument("value", "object", spelling))),
-        ), spelling
-    # ASCII siblings keep their constraint: a wrong type is still refused.
-    assert not _accepts(
-        grammar,
-        _tools_section(_call("submit", 1, _argument("value", "number", "1"))),
-    )
+    value_schema = {
+        "type": "object",
+        "properties": {key: {"type": "string"}},
+        "required": [key],
+        "additionalProperties": False,
+    }
+    grammar = _grammar([_value_tool(value_schema)], tool_choice="required")
+    assert _accepts_value(grammar, json.dumps({key: "x"}, ensure_ascii=False))
+    assert not _accepts_value(grammar, "{}")
+    assert not _accepts_value(grammar, json.dumps({key: 1}, ensure_ascii=False))
 
 
-def test_unreferenced_definition_does_not_relax_other_arguments():
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="submit",
-            strict=True,
-            parameters={
-                "type": "object",
-                "properties": {"amount": {"$ref": "#/$defs/Money"}},
-                "required": ["amount"],
-                "additionalProperties": False,
-                "$defs": {
-                    "Money": {"type": "integer"},
-                    # Never referenced by any argument of this tool.
-                    "Loc": {
-                        "type": "object",
-                        "properties": {
-                            "\u0433\u043e\u0440\u043e\u0434\u0435": {"type": "string"}
-                        },
-                    },
-                },
-            },
-        ),
-    )
-    grammar = _grammar([tool], tool_choice="required")
-
-    assert _accepts(
-        grammar, _tools_section(_call("submit", 1, _argument("amount", "number", "5")))
-    )
-    # Still constrained: the relaxation did not leak across from `Loc`.
-    assert not _accepts(
-        grammar,
-        _tools_section(_call("submit", 1, _argument("amount", "string", "five"))),
+def test_strict_root_admits_undeclared_arguments_only_when_declared_open():
+    schema = {
+        "type": "object",
+        "properties": {"count": {"type": "number"}},
+        "required": ["count"],
+    }
+    call = _kvv_call(
+        _argument("count", "number", "1"), _argument("confidence", "number", "0.9")
     )
 
-
-def test_strict_schema_keeps_ascii_property_names_constrained():
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="submit",
-            strict=True,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "value": {
-                        "type": "object",
-                        "properties": {"only": {"type": "string"}},
-                        "required": ["only"],
-                        "additionalProperties": False,
-                    }
-                },
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-        ),
-    )
-    grammar = _grammar([tool], tool_choice="required")
-    assert _accepts(
-        grammar,
-        _tools_section(
-            _call("submit", 1, _argument("value", "object", '{"only": "x"}'))
-        ),
-    )
-    assert not _accepts(
-        grammar,
-        _tools_section(
-            _call("submit", 1, _argument("value", "object", '{"other": "x"}'))
-        ),
-    )
-
-
-def test_strict_schema_preserves_additional_properties_default():
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="annotate",
-            strict=True,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string"},
-                },
-                "required": ["label"],
-            },
-        ),
-    )
-    grammar = _grammar([tool], tool_choice="required")
-
-    assert _accepts(
-        grammar,
-        _tools_section(
-            _call(
-                "annotate",
-                1,
-                _argument("label", "string", "sample"),
-                _argument("confidence", "number", "0.9"),
-            )
-        ),
-    )
+    assert not _accepts(_kvv_grammar(schema), call)
+    assert _accepts(_kvv_grammar({**schema, "additionalProperties": True}), call)
 
 
 def test_dynamic_argument_key_compiles_without_xgrammar_unicode_warning(capfd):
@@ -1326,9 +1219,207 @@ def test_output_may_start_inside_the_prefilled_response():
     assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
 
 
+def test_tool_choice_none_lets_a_continued_answer_go_on_or_end():
+    """A partial answer already fills the open response channel, so its
+    continuation may start with whitespace or close at once; tools stay out."""
+    grammar = _grammar([_tool()], tool_choice="none", answer_prefilled=True)
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, " 3, 4" + RESPONSE_CLOSE + MESSAGE_CLOSE)
+    assert _accepts(grammar, RESPONSE_CLOSE + MESSAGE_CLOSE)
+    assert not _accepts(grammar, " 3" + RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, call + MESSAGE_CLOSE)
+
+
 def test_single_call_auto_admits_the_turn_close():
     grammar = _grammar([_tool()], parallel_tool_calls=False)
     assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+
+
+# Strict schemas below come from the Kimi Vendor Verifier's walle cases.
+_N_REQUIRED_SELF = {
+    "type": "object",
+    "properties": {"next": {"$ref": "#/$defs/N"}},
+    "required": ["next"],
+}
+
+
+def _kvv_grammar(parameters):
+    tool = Tool(
+        type="function",
+        function=Function(name="kvv", strict=True, parameters=parameters),
+    )
+    return _grammar([tool], tool_choice="required")
+
+
+def _kvv_call(*arguments):
+    return _tools_section(_call("kvv", 1, *arguments))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "$defs": {"N": _N_REQUIRED_SELF},
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/A"}},
+            "required": ["root"],
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {"b": {"$ref": "#/$defs/B"}},
+                    "required": ["b"],
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"a": {"$ref": "#/$defs/A"}},
+                    "required": ["a"],
+                },
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/L1"}},
+            "required": ["root"],
+            "$defs": {
+                "L1": {
+                    "type": "object",
+                    "properties": {"level2": {"$ref": "#/$defs/L2"}},
+                    "required": ["level2"],
+                },
+                "L2": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/L1"}},
+            },
+        },
+    ],
+)
+def test_strict_schema_without_finite_instance_is_rejected(schema):
+    """walle rejects these; XGrammar compiles them and a forced call can only run
+    to max_tokens."""
+    with pytest.raises(ToolSchemaError, match="parameters schema"):
+        check_tool_schema_terminates(schema)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "$defs": {
+                "N": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/N"}},
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/L1"}},
+            "required": ["root"],
+            "$defs": {
+                "L1": {
+                    "type": "object",
+                    "properties": {"level2": {"$ref": "#/$defs/L2"}},
+                    "required": ["level2"],
+                },
+                "L2": {"type": "array", "items": {"$ref": "#/$defs/L1"}},
+            },
+        },
+        # Walle strips keywords it does not support before checking refs.
+        {
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/N"}}},
+            "$defs": {"N": _N_REQUIRED_SELF},
+        },
+    ],
+)
+def test_strict_schema_with_finite_instance_is_accepted(schema):
+    check_tool_schema_terminates(schema)
+
+
+def test_required_names_without_a_schema_keep_the_call_constrained():
+    """Walle prunes required names that have no schema; they must not leave the
+    call unconstrained."""
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a", "b"],
+        }
+    )
+    assert _accepts(grammar, _kvv_call(_argument("a", "string", "x")))
+    assert not _accepts(grammar, _kvv_call())
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "minLength": 10, "maxLength": 2},
+        {"type": "integer", "minimum": 10, "maximum": 2},
+        {"type": "array", "minItems": 10, "maxItems": 2, "items": {"type": "string"}},
+    ],
+)
+def test_contradicting_bounds_compile_as_unconstrained(schema):
+    """Walle degrades min > max to {}, which XGrammar would refuse to compile."""
+    grammar = _kvv_grammar({"type": "object", "properties": {"a": schema}})
+    assert _accepts(grammar, _kvv_call(_argument("a", "string", "x")))
+
+
+def test_enum_without_a_value_of_its_type_keeps_the_type():
+    grammar = _kvv_grammar(
+        {"type": "object", "properties": {"v": {"type": ["null"], "enum": [False]}}}
+    )
+    assert _accepts(grammar, _kvv_call(_argument("v", "null", "null")))
+    assert not _accepts(grammar, _kvv_call(_argument("v", "boolean", "false")))
+
+
+def test_declared_keys_do_not_escape_through_additional_properties():
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "abc": {"type": "integer"}},
+            "additionalProperties": True,
+        }
+    )
+    assert not _accepts(grammar, _kvv_call(_argument("a", "number", "1")))
+    assert not _accepts(grammar, _kvv_call(_argument("abc", "string", "x")))
+    for undeclared in ("ab", "abcd", "b"):
+        assert _accepts(grammar, _kvv_call(_argument(undeclared, "number", "1")))
+
+
+def test_single_anyof_branch_keeps_the_stricter_parent_bound():
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {
+                "v": {"minLength": 20, "anyOf": [{"type": "string", "minLength": 10}]}
+            },
+        }
+    )
+    assert not _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 19)))
+    assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 20)))
+
+
+def test_single_anyof_branch_contradicting_the_parent_bound_leaves_the_type():
+    # walle degrades the merged branch (minLength 20 > maxLength 15) to {}.
+    grammar = _kvv_grammar(
+        {
+            "type": "object",
+            "properties": {
+                "v": {
+                    "minLength": 20,
+                    "anyOf": [{"type": "string", "minLength": 10, "maxLength": 15}],
+                }
+            },
+        }
+    )
+    for length in (1, 30):
+        assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * length)))
+    assert not _accepts(grammar, _kvv_call(_argument("v", "number", "1")))
 
 
 if __name__ == "__main__":

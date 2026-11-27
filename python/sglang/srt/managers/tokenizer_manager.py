@@ -296,6 +296,15 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_sampling_logprobs",
 )
 
+# Absolute generated position of each incremental event's entries of a key in
+# _INCREMENTAL_STREAMING_META_INFO_KEYS, under ``<key>_segments`` as
+# ``[start, count]`` pairs (one per event, concatenated on coalescing). Each
+# cumulative list can lag behind ``output_ids`` (an entry arrives in a later
+# batch), so every list keeps its own offset, separate from the output-id one.
+_STREAMING_SEGMENTS_SUFFIX = "_segments"
+# Absolute generated position of an incremental event's first ``output_ids`` entry.
+OUTPUT_IDS_START_KEY = "output_ids_start"
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -333,6 +342,12 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+    # Incremental streaming: entries of each cumulative output-side meta list
+    # already sent, per key. Lists may lag ``output_ids``, so an entry that
+    # arrives late is still sent once instead of being sliced away.
+    streaming_meta_sent: Dict[str, int] = dataclasses.field(default_factory=dict)
+    # Incremental streaming: characters of the output text already sent.
+    streaming_text_sent: int = 0
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -425,13 +440,31 @@ def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
     customized_info_keys: Optional[Iterable[str]] = None,
+    sent_offsets: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Align output-side metadata with the current incremental streaming chunk."""
+    """Align output-side metadata with the current incremental streaming chunk.
+
+    With ``sent_offsets`` (the request's per-key sent counts), the built-in
+    cumulative lists are sliced from what was already sent and the counts are
+    advanced, and each gets its absolute ``[start, count]`` segment under
+    ``<key>_segments``; customized keys keep slicing at ``last_output_offset``.
+    """
     streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
     if customized_info_keys is not None:
         streaming_meta_info_keys.update(customized_info_keys)
     for key in meta_info.keys() & streaming_meta_info_keys:
-        meta_info[key] = meta_info[key][last_output_offset:]
+        if sent_offsets is not None and key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+            full = meta_info[key]
+            start = sent_offsets.get(key, 0)
+            meta_info[key] = full[start:]
+            sent_offsets[key] = max(start, len(full))
+            meta_info[key + _STREAMING_SEGMENTS_SUFFIX] = [
+                [start, len(meta_info[key])]
+            ]
+        else:
+            meta_info[key] = meta_info[key][last_output_offset:]
+    if sent_offsets is not None:
+        meta_info[OUTPUT_IDS_START_KEY] = last_output_offset
 
 
 def _build_flat_top_logprobs_fields(
@@ -613,6 +646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = get_observability().enable_trace
         self.allow_auto_truncate = get_serving().allow_auto_truncate
+        self.clamp_max_new_tokens = get_serving().clamp_max_new_tokens
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
@@ -902,6 +936,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests_level=get_observability().log_requests_level,
             log_requests_format=get_observability().log_requests_format,
             log_requests_target=get_observability().log_requests_target,
+            log_requests_logprobs=get_observability().log_requests_logprobs,
         )
 
         # Dumping
@@ -1248,10 +1283,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and isinstance(finish_reason, dict)
             and finish_reason.get("type") in ("stop", "length")
         )
+        # A stop sequence excluded from the output still processed the prompt.
+        stopped_before_output = isinstance(finish_reason, dict) and bool(
+            finish_reason.get("stop_excluded")
+        )
         if (
             (plan is None and context is None and physical_ttl is None)
             or state.cache_task is not None
-            or (completion_tokens <= 0 and not physical_finished_without_output)
+            or (
+                completion_tokens <= 0
+                and not physical_finished_without_output
+                and not stopped_before_output
+            )
             or (
                 isinstance(finish_reason, dict)
                 and finish_reason.get("type") in ("abort", "error")
@@ -2095,15 +2138,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.allow_auto_truncate:
-                logger.warning(
+            if self.allow_auto_truncate or self.clamp_max_new_tokens:
+                # Under --clamp-max-new-tokens the clamp is the expected
+                # behavior, so keep it out of the warning log.
+                log = logger.warning if self.allow_auto_truncate else logger.debug
+                log(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
                     "Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                # Rebind instead of writing in place: batch items share one dict.
+                obj.sampling_params = {
+                    **obj.sampling_params,
+                    "max_new_tokens": max(0, _max_req_len - input_token_num),
+                }
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
@@ -2704,6 +2752,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             incremental_streaming_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
             if customized_info_keys is not None:
                 incremental_streaming_keys.update(customized_info_keys)
+            incremental_streaming_keys.update(
+                key + _STREAMING_SEGMENTS_SUFFIX
+                for key in _INCREMENTAL_STREAMING_META_INFO_KEYS
+            )
+            if OUTPUT_IDS_START_KEY in meta_info_list[0]:
+                meta_info[OUTPUT_IDS_START_KEY] = meta_info_list[0][
+                    OUTPUT_IDS_START_KEY
+                ]
             for key in incremental_streaming_keys:
                 if any(key in m for m in meta_info_list):
                     meta_info[key] = [
@@ -2830,17 +2886,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             if key in state.customized_info_reported_keys:
                                 meta_info.setdefault(key, list(values))
 
-            try:
-                await self._attach_cache_usage(state, out)
-            except CacheAccountingError as exc:
-                raise fastapi.HTTPException(
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    detail="Cache accounting is temporarily unavailable",
-                ) from exc
-
-            # Resolve deferred text for non-incremental streaming.
-            # _handle_batch_output sets "text": None on intermediate chunks
-            # to avoid O(n) string rebuild per step (O(n^2) total).
+            # Snapshot the text alongside this chunk's completion_tokens.
+            # The next batch can append text while cache accounting is pending.
             if (
                 is_stream
                 and not incremental_stream
@@ -2848,6 +2895,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and out["text"] is None
             ):
                 out["text"] = state.get_text()
+
+            try:
+                await self._attach_cache_usage(state, out)
+            except CacheAccountingError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Cache accounting is temporarily unavailable",
+                ) from exc
 
             # Flattened so the downstream finished/logging/metrics logic is shared.
             if out.get("beam_results"):
@@ -3294,6 +3349,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
+            log_requests_logprobs=obj.log_requests_logprobs,
         )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
@@ -3565,8 +3621,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.streaming_meta_sent,
                         )
                         state.last_output_offset = len(state.output_ids)
+                        state.streaming_text_sent += len(delta_text)
                         out_dict = {
                             "text": delta_text,
                             "output_ids": output_token_ids,
@@ -3611,6 +3669,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.streaming_meta_sent,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
@@ -4495,10 +4554,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
+        text = state.get_text()
         if is_stream and self.incremental_streaming_output:
-            output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+            # Earlier incremental events already carried their text/id deltas
+            # and logprob entries; the abort event carries only what is still
+            # unsent (normally nothing) plus its positions.
+            output_offset = state.last_output_offset
+            output_ids = output_ids[output_offset:]
+            text = text[state.streaming_text_sent :]
+            state.streaming_text_sent += len(text)
+            _slice_streaming_output_meta_info(
+                meta_info,
+                output_offset,
+                state.customized_info_accumulated.keys(),
+                state.streaming_meta_sent,
+            )
+            state.last_output_offset = len(state.output_ids)
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }

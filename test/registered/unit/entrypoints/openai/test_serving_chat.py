@@ -15,6 +15,7 @@ import copy
 import gc
 import itertools
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
@@ -54,7 +55,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -81,7 +85,10 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, get_disagg, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    get_request_conditional_token_ban,
     get_request_reasoning_in_grammar,
+    get_request_stop_token_sequences,
+    get_request_tool_calls_start,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -2129,6 +2136,50 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
                 self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
 
+    def test_convert_to_internal_request_internal_content_needs_selected_logprobs(
+        self,
+    ):
+        """include_internal_content turns on the selected logprob only; a
+        client's own logprobs request keeps its top-k and token text."""
+        self.tm.tokenizer = None
+        # (logprobs, top_logprobs, internal content) ->
+        # (return_logprob, top_logprobs_num, return_text_in_logprobs)
+        cases = (
+            (False, None, True, (True, 0, False)),
+            (False, 5, True, (True, 0, False)),
+            (True, 3, True, (True, 3, True)),
+            (False, None, False, (False, 0, True)),
+            (True, 3, False, (True, 3, True)),
+        )
+        for logprobs, top_logprobs, internal, expected in cases:
+            kwargs = {}
+            if top_logprobs is not None:
+                kwargs["top_logprobs"] = top_logprobs
+            if internal:
+                kwargs["stream_options"] = {"include_internal_content": True}
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                stream=True,
+                logprobs=logprobs,
+                **kwargs,
+            )
+            with self.subTest(
+                logprobs=logprobs, top_logprobs=top_logprobs, internal=internal
+            ):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                self.assertEqual(
+                    (
+                        adapted.return_logprob,
+                        adapted.top_logprobs_num,
+                        adapted.return_text_in_logprobs,
+                    ),
+                    expected,
+                )
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
@@ -3008,6 +3059,46 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_kimi_k3_strict_tool_schema_without_finite_instance_is_rejected(self):
+        """The Kimi Vendor Verifier expects a 400 naming the schema when a strict
+        tool's required $ref never terminates; other tools still pass."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        recursive = {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "required": ["node"],
+            "$defs": {
+                "N": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/N"}},
+                    "required": ["next"],
+                }
+            },
+        }
+        aliases = {f"d{i}": {"$ref": f"#/$defs/d{i + 1}"} for i in range(3000)}
+        aliases["d3000"] = {"type": "string"}
+        deep_alias_chain = {
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/d0"}},
+            "required": ["a"],
+            "$defs": aliases,
+        }
+
+        def validate(parameters, strict):
+            function = {"name": "f", "parameters": parameters, "strict": strict}
+            return self.chat._validate_request(
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tools=[{"type": "function", "function": function}],
+                )
+            )
+
+        self.assertIn("parameters schema", validate(parameters=recursive, strict=True))
+        self.assertIsNone(validate(parameters=recursive, strict=False))
+        # Deeper than the interpreter stack: served, not a 500.
+        self.assertIsNone(validate(parameters=deep_alias_chain, strict=True))
+
     def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -3531,7 +3622,9 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_json_response_format_constraints(self):
         """json_object stays prompt-guided; a strict json_schema is constrained
         inside the K3 response block, so its markers stay admissible, and stops
-        on the message close a model trapped in a JSON string would write."""
+        on the message close a model trapped in a JSON string would write. Only
+        the unconstrained output stops on a think close written without thinking;
+        in a JSON string it is data."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -3553,6 +3646,7 @@ class ServingChatTestCase(CustomTestCase):
                     messages=[{"role": "user", "content": "Return JSON"}],
                     response_format=response_format,
                     stop=["END"],
+                    thinking={"type": "disabled"},
                 )
                 adapted, _ = self.chat._convert_to_internal_request(
                     request, self.fastapi_request
@@ -3567,11 +3661,77 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(
                     MESSAGE_CLOSE in params["stop"], expected_tag is not None
                 )
+                self.assertEqual(THINK_CLOSE in params["stop"], expected_tag is None)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )
 
+    def test_kimi_k3_stops_reasoning_written_without_thinking(self):
+        """Only a prompt that opens the response channel stops on a think close,
+        and only a request without a tool-call parser stops on a tools open; both
+        stop on the special-token ids, and the client's own stops are kept. With
+        a tool-call parser, the client's stops end at the tools open instead and
+        the server's tools close stop does not."""
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        special = {"<|open|>": 900, "<|close|>": 901, "<|sep|>": 902}
+        names = {"think": 910, "tools": 911, "message": 912, "response": 913}
+
+        def encode(text, **kwargs):
+            match = re.fullmatch(r"(<\|\w+\|>)(\w+)(<\|sep\|>)", text)
+            if match is None:
+                return [special.get(text, names.get(text, 999))]
+            head, name, tail = match.groups()
+            return [special[head], names[name], special[tail]]
+
+        self.tm.tokenizer.encode.side_effect = encode
+        self.tm.tokenizer.convert_tokens_to_ids.side_effect = special.get
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        tool = {"type": "function", "function": {"name": "lookup"}}
+        think_close, tools_open = (901, 910, 902), (900, 911, 902)
+        cases = (
+            ({}, None, False, True),
+            ({"reasoning_effort": "none"}, None, True, True),
+            ({"thinking": {"type": "disabled"}}, None, True, True),
+            ({"chat_template_kwargs": {"thinking": False}}, None, True, True),
+            ({"thinking": {"type": "disabled"}, "tools": [tool]}, None, True, False),
+            ({"tools": [tool]}, None, False, False),
+            ({}, {"content": "1, 2,"}, True, True),
+            ({"input_ids": [11, 12]}, {"content": "1, 2,"}, True, True),
+            ({}, {"name": "Alice"}, True, True),
+            ({}, {"reasoning_content": "Count up."}, False, True),
+        )
+        for fields, partial, stops_think, stops_tools in cases:
+            with self.subTest(fields=fields, partial=partial):
+                messages = [{"role": "user", "content": "Hi"}]
+                if partial is not None:
+                    messages.append({"role": "assistant", "partial": True, **partial})
+                request = ChatCompletionRequest(
+                    model="x", messages=messages, stop=["END"], **fields
+                )
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIn("END", params["stop"])
+                self.assertNotIn(THINK_CLOSE, params["stop"])
+                self.assertNotIn(TOOLS_OPEN, params["stop"])
+                sequences = get_request_stop_token_sequences(params["custom_params"])
+                self.assertEqual(think_close in sequences, stops_think)
+                self.assertEqual(
+                    get_request_conditional_token_ban(params["custom_params"]),
+                    (910, (900, 901)) if stops_think else None,
+                )
+                self.assertEqual(tools_open in sequences, stops_tools)
+                self.assertEqual(
+                    get_request_tool_calls_start(params["custom_params"]),
+                    None if stops_tools else (list(tools_open), [TOOLS_CLOSE]),
+                )
+                if partial is None:
+                    kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                    self.assertEqual(stops_think, not kwargs.get("thinking", True))
 
     def test_slow_tool_schema_validation_is_reported(self):
         def tool(name):
@@ -7763,6 +7923,341 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         self.assertIsNone(self.chat._validate_request(request))
 
 
+class KimiK3PartialModeTestCase(unittest.TestCase):
+    """Moonshot partial mode: K3 continues the final assistant message."""
+
+    USER = {"role": "user", "content": "Count to ten."}
+    OPEN_MESSAGE = [
+        ("<|open|>", True),
+        ("message", False),
+        (" role", False),
+        ('="', False),
+        ("assistant", False),
+        ('"', False),
+        ("<|sep|>", True),
+    ]
+    OPEN_THINK = [("<|open|>", True), ("think", False), ("<|sep|>", True)]
+    CLOSE_THINK = [("<|close|>", True), ("think", False), ("<|sep|>", True)]
+    OPEN_RESPONSE = [("<|open|>", True), ("response", False), ("<|sep|>", True)]
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        # One id per (text, is_control) pair, so the prompt ids decode back to
+        # the exact segments the tokenizer was asked to encode.
+        self.segments = {}
+        self.tm.tokenizer.encode = Mock(side_effect=self._encode)
+        self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
+
+    def _encode(self, text, allow_special_tokens=True, **kwargs):
+        key = (text, allow_special_tokens)
+        return [self.segments.setdefault(key, 1000 + len(self.segments))]
+
+    def _render(self, messages, **kwargs):
+        self.segments.clear()
+        request = ChatCompletionRequest(model="x", messages=messages, **kwargs)
+        result = self.chat._process_messages(request, is_multimodal=False)
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        names = {token_id: key for key, token_id in self.segments.items()}
+        tail = [names[token_id] for token_id in result.prompt_ids[3:]]
+        return request, result, call, tail
+
+    def test_final_assistant_message_is_reopened_where_it_continues(self):
+        answer = [("1, 2,", False)]
+        off = {"chat_template_kwargs": {"thinking": False}}
+        for kwargs, last, expected in (
+            # An answer continues in the response channel, thinking or not.
+            ({}, {"content": "1, 2,"}, self.OPEN_RESPONSE + answer),
+            (off, {"content": "1, 2,"}, self.OPEN_RESPONSE + answer),
+            # Reasoning before an answer is closed; the answer continues.
+            (
+                {},
+                {"reasoning_content": "r", "content": "1, 2,"},
+                self.OPEN_THINK
+                + [("r", False)]
+                + self.CLOSE_THINK
+                + self.OPEN_RESPONSE
+                + answer,
+            ),
+            # Reasoning alone continues in the think channel.
+            ({}, {"reasoning_content": "r"}, self.OPEN_THINK + [("r", False)]),
+            # Thinking off drops the reasoning, as the encoder does.
+            (
+                off,
+                {"reasoning_content": "r", "content": "1, 2,"},
+                self.OPEN_RESPONSE + answer,
+            ),
+            (off, {"reasoning_content": "r"}, self.OPEN_RESPONSE),
+            # Text parts are encoded one by one, as in any assistant message.
+            (
+                {},
+                {
+                    "content": [
+                        {"type": "text", "text": "1, "},
+                        {"type": "text", "text": "2,"},
+                    ]
+                },
+                self.OPEN_RESPONSE + [("1, ", False), ("2,", False)],
+            ),
+            # Markers in client text stay text.
+            (
+                {},
+                {"content": "<|close|>message<|sep|>"},
+                self.OPEN_RESPONSE + [("<|close|>message<|sep|>", False)],
+            ),
+        ):
+            with self.subTest(kwargs=kwargs, last=last):
+                messages = [self.USER, {"role": "assistant", "partial": True, **last}]
+                _, _, call, tail = self._render(messages, **kwargs)
+                self.assertIs(call.kwargs["add_generation_prompt"], False)
+                self.assertEqual([m["role"] for m in call.args[0]], ["user"])
+                self.assertEqual(tail, self.OPEN_MESSAGE + expected)
+
+    def test_name_is_an_escaped_attribute_of_the_reopened_message(self):
+        messages = [
+            self.USER,
+            {"role": "assistant", "content": "", "name": 'A "&" B', "partial": True},
+        ]
+        _, _, _, tail = self._render(messages)
+        self.assertEqual(
+            tail,
+            self.OPEN_MESSAGE[:-1]
+            + [
+                (" name", False),
+                ('="', False),
+                ("A &quot;&amp;&quot; B", False),
+                ('"', False),
+                ("<|sep|>", True),
+            ]
+            + self.OPEN_RESPONSE,
+        )
+
+    def test_continue_final_message_continues_the_answer_too(self):
+        messages = [self.USER, {"role": "assistant", "content": "1, 2,"}]
+        _, _, call, tail = self._render(messages, continue_final_message=True)
+        self.assertIs(call.kwargs["add_generation_prompt"], False)
+        self.assertEqual(
+            tail, self.OPEN_MESSAGE + self.OPEN_RESPONSE + [("1, 2,", False)]
+        )
+
+    def test_flag_counts_only_on_the_final_assistant_message(self):
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for messages in (
+            [self.USER, partial, {"role": "user", "content": "go on"}],
+            [self.USER, dict(partial, partial=False)],
+        ):
+            with self.subTest(messages=messages):
+                request, result, call, tail = self._render(messages)
+                self.assertIs(call.kwargs["add_generation_prompt"], True)
+                self.assertEqual(len(call.args[0]), len(messages))
+                self.assertEqual(tail, [])
+                self.assertEqual(self.chat._k3_stub_tokens(request), 3)
+
+    def test_unusable_partial_messages_are_client_errors(self):
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "f", "arguments": "{}"},
+        }
+        image = {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
+        for last, error in (
+            (
+                {"content": ""},
+                "message at position 1 with role 'assistant' must not be empty",
+            ),
+            ({"content": None, "reasoning_content": ""}, "must not be empty"),
+            ({"content": "x", "tool_calls": [call]}, "must not have tool_calls"),
+            ({"content": [image]}, "must have only text content"),
+        ):
+            with self.subTest(last=last), self.assertRaisesRegex(ValueError, error):
+                self._render(
+                    [self.USER, {"role": "assistant", "partial": True, **last}]
+                )
+
+    def test_output_starts_in_the_channel_the_prompt_left_open(self):
+        off = {"chat_template_kwargs": {"thinking": False}}
+        for kwargs, last, reasoning in (
+            ({}, {"content": "1, 2,"}, False),
+            ({}, {"reasoning_content": "r", "content": "1, 2,"}, False),
+            ({}, {"reasoning_content": "r"}, True),
+            (off, {"reasoning_content": "r"}, False),
+        ):
+            with self.subTest(kwargs=kwargs, last=last):
+                messages = [self.USER, {"role": "assistant", "partial": True, **last}]
+                request, result, _, _ = self._render(messages, **kwargs)
+                self.assertIs(self.chat._get_reasoning_from_request(request), reasoning)
+                self.assertIs(result.require_reasoning, reasoning)
+
+    def test_marker_text_in_a_continued_answer_does_not_start_reasoning(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                self.USER,
+                {"role": "assistant", "content": "<|open|>think<|sep|>"},
+            ],
+            continue_final_message=True,
+        )
+        parser = ReasoningParser(
+            model_type="kimi_k3",
+            stream_reasoning=False,
+            force_reasoning=False,
+            request=request,
+        )
+        self.assertEqual(parser.parse_non_stream(" 3, 4"), ("", " 3, 4"))
+
+    def test_tool_grammar_continues_inside_the_open_response_channel(self):
+        """A continued answer leaves the response channel open: `required` must
+        close it before the call, and `none` lets the answer go on or end."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        call = (
+            TOOLS_OPEN
+            + '<|open|>call tool="get_weather" index="1"<|sep|>'
+            + '<|open|>argument key="city" type="string"<|sep|>Paris'
+            + ARGUMENT_CLOSE
+            + CALL_CLOSE
+            + TOOLS_CLOSE
+        )
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for tool_choice, messages, accepted, rejected in (
+            (
+                "required",
+                [self.USER, partial],
+                [RESPONSE_CLOSE + call],
+                [" 3" + RESPONSE_CLOSE + call, RESPONSE_CLOSE + MESSAGE_CLOSE],
+            ),
+            (
+                "none",
+                [self.USER, partial],
+                [
+                    " 3, 4" + RESPONSE_CLOSE + MESSAGE_CLOSE,
+                    RESPONSE_CLOSE + MESSAGE_CLOSE,
+                ],
+                [RESPONSE_CLOSE + call],
+            ),
+            # Without a partial answer the response may not end empty.
+            ("none", [self.USER], [], [RESPONSE_CLOSE + MESSAGE_CLOSE]),
+        ):
+            with self.subTest(tool_choice=tool_choice, partial=len(messages) > 1):
+                request = ChatCompletionRequest(
+                    model="x", messages=messages, tools=[tool], tool_choice=tool_choice
+                )
+                result = self.chat._process_messages(request, is_multimodal=False)
+                constraint_type, tag = result.tool_call_constraint
+                self.assertEqual(constraint_type, "structural_tag")
+                grammar = xgr.Grammar.from_structural_tag(tag)
+                for output in accepted:
+                    self.assertTrue(_is_grammar_accept_string(grammar, output), output)
+                for output in rejected:
+                    self.assertFalse(_is_grammar_accept_string(grammar, output), output)
+
+    def test_json_schema_grammar_with_a_continued_message(self):
+        """A strict schema requires an empty answer prefix. Continued reasoning
+        leaves the answer empty, so the response grammar still applies."""
+        self.tm.process_request_preprocessor = None
+        schema = {"type": "object", "properties": {"lat": {"type": "number"}}}
+        answer = {"content": '{"lat":'}
+        framed = get_kimik3_json_response_structural_tag(schema).model_dump(
+            by_alias=True
+        )
+        for last, strict, expected in (
+            (answer, {}, HTTPStatus.BAD_REQUEST),
+            (answer, {"strict": True}, HTTPStatus.BAD_REQUEST),
+            (answer, {"strict": False}, None),
+            ({"reasoning_content": "Look it up."}, {}, framed),
+        ):
+            with self.subTest(last=last, strict=strict):
+                partial = {"role": "assistant", "partial": True, **last}
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[self.USER, partial],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "point", "schema": schema, **strict},
+                    },
+                )
+                if expected == HTTPStatus.BAD_REQUEST:
+                    response = asyncio.run(
+                        self.chat.handle_request(request, self.fastapi_request)
+                    )
+                    self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                    message = json.loads(response.body)["error"]["message"]
+                    self.assertIn("remove the assistant answer prefix", message)
+                    self.assertIn(
+                        "set response_format.json_schema.strict to false", message
+                    )
+                    continue
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                params = adapted.sampling_params
+                self.assertIsNone(params.get("json_schema"))
+                tag = params.get("structural_tag")
+                self.assertEqual(json.loads(tag) if tag is not None else None, expected)
+                self.assertEqual(adapted.require_reasoning, "reasoning_content" in last)
+
+    def test_partial_usage_reports_the_reopened_channel_as_input(self):
+        """Moonshot counts the whole rendered prompt as input and only the
+        continuation as output, so the K3 stub moves neither way."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                self.USER,
+                {"role": "assistant", "content": "1, 2,", "partial": True},
+            ],
+        )
+        ret = [
+            {
+                "text": " 3, 4",
+                "meta_info": {
+                    "id": "chatcmpl-k3-partial",
+                    "prompt_tokens": 91,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+        response = self.chat._build_chat_response(request, ret, created=123)
+        self.assertEqual(response.usage.prompt_tokens, 91)
+        self.assertEqual(response.usage.completion_tokens, 5)
+        self.assertEqual(response.usage.total_tokens, 96)
+        self.assertEqual(self.chat._k3_stub_tokens(request), 0)
+
+
 class K3StreamSpecConformanceTestCase(unittest.TestCase):
     """Wire-level conformance for the Kimi K3 streaming chat contract.
 
@@ -7967,6 +8462,82 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         # And the reported prompt count still excludes K3's generation stub.
         self.assertEqual(usage["prompt_tokens"], 10 - self._STUB)
 
+    def test_partial_stream_starts_in_the_channel_the_prompt_left_open(self):
+        """A continued answer streams as content from its first frame; continued
+        reasoning streams as reasoning until the think close, then the answer."""
+        self.chat.reasoning_parser = "kimi_k3"
+        self.chat._reasoning_detector = ReasoningParser(model_type="kimi_k3").detector
+        user = {"role": "user", "content": "Count to ten."}
+        for last, pieces, reasoning, content in (
+            ({"content": "1, 2,"}, [" 3, 4", RESPONSE_CLOSE], "", " 3, 4"),
+            (
+                {"reasoning_content": "Count up."},
+                [
+                    " Start at 1.",
+                    THINK_CLOSE,
+                    "<|open|>response<|sep|>",
+                    "1, 2",
+                    RESPONSE_CLOSE,
+                ],
+                " Start at 1.",
+                "1, 2",
+            ),
+        ):
+            with self.subTest(last=last):
+                events = [
+                    self._event(
+                        text=piece,
+                        completion_tokens=i + 1,
+                        finish=(
+                            {"type": "stop", "matched": None}
+                            if i == len(pieces) - 1
+                            else None
+                        ),
+                    )
+                    for i, piece in enumerate(pieces)
+                ]
+                req = self._req(
+                    messages=[user, {"role": "assistant", "partial": True, **last}]
+                )
+                frames = self._frames(self._stream(events, req))
+                deltas = [c["delta"] for f in frames for c in f.get("choices", [])]
+                self.assertEqual(
+                    "".join(d.get("reasoning_content") or "" for d in deltas),
+                    reasoning,
+                )
+                self.assertEqual(
+                    "".join(d.get("content") or "" for d in deltas), content
+                )
+
+    def test_partial_message_usage_keeps_the_generation_stub_in_place(self):
+        """A continued message renders its channel opening as input, which
+        Moonshot reports as input; only other requests move the K3 stub."""
+        partial = {"role": "assistant", "content": "1, 2,", "partial": True}
+        for messages, expected in (
+            ([{"role": "user", "content": "Hi?"}], (10 - self._STUB, 2 + self._STUB)),
+            ([{"role": "user", "content": "Hi?"}, partial], (10, 2)),
+        ):
+            with self.subTest(messages=messages):
+                req = self._req(
+                    messages=messages, stream_options={"include_usage": True}
+                )
+                frames = self._frames(
+                    self._stream(
+                        [self._event(finish={"type": "stop", "matched": None})], req
+                    )
+                )
+                usage = [f for f in frames if f["choices"] == []][0]["usage"]
+                end = [
+                    f
+                    for f in frames
+                    if f["choices"] and f["choices"][0]["finish_reason"]
+                ][0]["choices"][0]["usage"]
+                for reported in (usage, end):
+                    self.assertEqual(
+                        (reported["prompt_tokens"], reported["completion_tokens"]),
+                        expected,
+                    )
+
     def test_physical_cache_header_is_independent_of_the_usage_prefix(self):
         """Disabling configurable usage headers keeps the physical cache count."""
         headers = {}
@@ -8115,16 +8686,27 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "grammar failed")
 
-    def test_server_abort_before_first_token_stays_server_interrupted(self):
-        response = self._abort_before_first_token(HTTPStatus.SERVICE_UNAVAILABLE)
-        self.assertIsInstance(response, StreamingResponse)
-
-        async def _drain():
-            return [chunk async for chunk in response.body_iterator]
-
-        frames = self._frames(get_or_create_event_loop().run_until_complete(_drain()))
-        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
-        self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
+    def test_server_abort_before_first_token_is_an_http_error(self):
+        """A 5xx abort before any byte is sent (e.g. a PD KV transfer that
+        timed out) is an HTTP error as well: a 200 whose only frame is the end
+        frame lacks the role frame and cannot be retried elsewhere. The client
+        gets the status phrase, not the engine's internal message, which goes
+        to the log instead."""
+        for status in (
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        ):
+            with self.subTest(status=status):
+                with (
+                    self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", "WARNING"
+                    ) as logs,
+                    self.assertRaises(HTTPException) as ctx,
+                ):
+                    self._abort_before_first_token(status)
+                self.assertEqual(ctx.exception.status_code, status.value)
+                self.assertEqual(ctx.exception.detail, status.phrase)
+                self.assertIn("grammar failed", "\n".join(logs.output))
 
     def test_other_encodings_still_emit_the_abort_error_frame(self):
         """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
@@ -8252,6 +8834,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
                     reasoning_tokens={0: 0},
                     completion_tokens={0: 2},
                     internal_token_ids=[101, 102],
+                    internal_token_logprobs=[-0.5, -1.25],
                 ):
                     out.append(chunk)
                 return out
@@ -8274,6 +8857,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             ids = internal[0]["token_ids"]
             self.assertTrue(ids, f"token_ids must be non-empty: {delta}")
             self.assertTrue(all(type(i) is int and i >= 0 for i in ids), ids)
+            self.assertEqual(internal[0]["logprobs"], [-0.5, -1.25])
         # normal text + the tool-call open chunk + its argument continuation
         self.assertGreaterEqual(increments, 3)
 
@@ -8377,8 +8961,15 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             if c["delta"].get("content") or c["delta"].get("reasoning_content")
         ]
         self.assertEqual(len(increments), 2)
-        self.assertEqual(increments[0]["internal_content"], [{"token_ids": [0]}])
-        self.assertEqual(increments[1]["internal_content"], [{"token_ids": [3]}])
+        # These events carry no output_token_logprobs.
+        self.assertEqual(
+            increments[0]["internal_content"],
+            [{"token_ids": [0], "logprobs": [-9999.0]}],
+        )
+        self.assertEqual(
+            increments[1]["internal_content"],
+            [{"token_ids": [3], "logprobs": [-9999.0]}],
+        )
 
     def test_reclassified_reasoning_keeps_original_token_ids(self):
         self.chat.reasoning_parser = "kimi_k3"
@@ -8411,7 +9002,10 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(increments[0]["delta"]["reasoning_content"], "answer")
         self.assertEqual(increments[1]["delta"]["content"], "answer")
         for choice in increments:
-            self.assertEqual(choice["internal_content"], [{"token_ids": [0]}])
+            self.assertEqual(
+                choice["internal_content"],
+                [{"token_ids": [0], "logprobs": [-9999.0]}],
+            )
 
     def test_truncated_tool_header_does_not_synthesize_arguments(self):
         self.chat.tool_call_parser = "kimi_k3"
@@ -8433,6 +9027,519 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             if f["choices"] and f["choices"][0]["finish_reason"]
         ][0]
         self.assertEqual(terminal["finish_reason"], "length")
+
+    def test_internal_content_logprobs_pair_with_their_token_ids(self):
+        """Every internal_content entry carries logprobs as long as its
+        token_ids: each the sampled token's selected logprob, or -9999.0 (never
+        0.0) where it is missing or was sampled for another token. Without
+        logprobs=true, choices[].logprobs stays null."""
+        pieces = ["Hello", " big", " world"]
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode()
+        )
+        first = self._event(
+            text="Hello",
+            completion_tokens=1,
+            output_token_logprobs=[(-0.25, 0, None)],
+            output_token_logprobs_length=1,
+        )
+        first["output_ids"] = [0]
+        second = self._event(
+            text=" big world",
+            completion_tokens=3,
+            finish={"type": "stop"},
+            output_token_logprobs=[(-0.5, 1, None), (-1.5, 99, None)],
+            output_token_logprobs_length=3,
+        )
+        second["output_ids"] = [1, 2]
+        req = self._req(stream_options={"include_internal_content": True})
+        frames = self._frames(self._stream([first, second], req))
+        increments = [
+            c for f in frames for c in f["choices"] if c["delta"].get("content")
+        ]
+        self.assertEqual(
+            [c["internal_content"] for c in increments],
+            [
+                [{"token_ids": [0], "logprobs": [-0.25]}],
+                [{"token_ids": [1, 2], "logprobs": [-0.5, -9999.0]}],
+            ],
+        )
+        for f in frames:
+            for c in f["choices"]:
+                self.assertNotIn("logprobs", c)
+
+    def test_internal_content_logprobs_from_cumulative_events(self):
+        """Non-incremental events carry the cumulative id and logprob lists --
+        one live reference each, repeated by backlog coalescing -- and each
+        frame still pairs its ids with their own positions' logprobs."""
+        enter_override(
+            self,
+            get_context().override_server_args(incremental_streaming_output=False),
+        )
+        pieces = ["Hello", " world"]
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode()
+        )
+        logprobs = [(-0.25, 0, None), (-0.75, 1, None)]
+        first = self._event(
+            text="Hello",
+            completion_tokens=1,
+            output_token_logprobs=logprobs[:1],
+            output_token_logprobs_length=1,
+        )
+        first["output_ids"] = [0]
+        second = self._event(
+            text="Hello world",
+            completion_tokens=2,
+            finish={"type": "stop"},
+            output_token_logprobs=logprobs + logprobs,
+            output_token_logprobs_length=2,
+        )
+        second["output_ids"] = [0, 1, 0, 1]
+        req = self._req(stream_options={"include_internal_content": True})
+        frames = self._frames(self._stream([first, second], req))
+        increments = [
+            c for f in frames for c in f["choices"] if c["delta"].get("content")
+        ]
+        self.assertEqual(
+            [(c["delta"]["content"], c["internal_content"]) for c in increments],
+            [
+                ("Hello", [{"token_ids": [0], "logprobs": [-0.25]}]),
+                (" world", [{"token_ids": [1], "logprobs": [-0.75]}]),
+            ],
+        )
+
+    def test_internal_token_ids_slice_a_growing_live_list_by_position(self):
+        """A non-incremental event hands over the live output_ids list, which
+        can already hold later tokens when this event's ids are sliced (it
+        grows while the role frame is yielded). Slicing by position keeps the
+        ids this event's own; slicing the tail would take the next token."""
+        enter_override(
+            self,
+            get_context().override_server_args(incremental_streaming_output=False),
+        )
+        pieces = ["Hello", " world"]
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode()
+        )
+        live_ids = [0, 1]
+        live_logprobs = [(-0.25, 0, None), (-0.75, 1, None)]
+        first = self._event(
+            text="Hello",
+            completion_tokens=1,
+            output_token_logprobs=live_logprobs,
+            output_token_logprobs_length=2,
+        )
+        first["output_ids"] = live_ids
+        second = self._event(
+            text="Hello world",
+            completion_tokens=2,
+            finish={"type": "stop"},
+            output_token_logprobs=live_logprobs,
+            output_token_logprobs_length=2,
+        )
+        second["output_ids"] = live_ids
+        req = self._req(stream_options={"include_internal_content": True})
+        frames = self._frames(self._stream([first, second], req))
+        increments = [
+            c for f in frames for c in f["choices"] if c["delta"].get("content")
+        ]
+        self.assertEqual(
+            [(c["delta"]["content"], c["internal_content"]) for c in increments],
+            [
+                ("Hello", [{"token_ids": [0], "logprobs": [-0.25]}]),
+                (" world", [{"token_ids": [1], "logprobs": [-0.75]}]),
+            ],
+        )
+        self.assertNotIn(
+            "server_interrupted",
+            [c["finish_reason"] for f in frames for c in f["choices"]],
+        )
+
+    # ------------- P1.17 choices[].logprobs -------------
+    def _logprob_event(self, text, token_ids, *, completion_tokens, top_k=0, **kw):
+        """An incremental event whose tokens' logprobs are deltas, as the
+        tokenizer manager slices them (with their positions); token text
+        "t<id>"."""
+        start = completion_tokens - len(token_ids)
+        event = self._event(
+            text=text,
+            completion_tokens=completion_tokens,
+            output_token_logprobs=[(-0.1 * (t + 1), t, f"t{t}") for t in token_ids],
+            output_top_logprobs=[
+                [(-0.5 - j, 1000 + j, f"alt{j}") for j in range(top_k)]
+                for _ in token_ids
+            ],
+            output_token_logprobs_length=completion_tokens,
+            output_ids_start=start,
+            output_token_logprobs_segments=[[start, len(token_ids)]],
+            output_top_logprobs_segments=[[start, len(token_ids)]],
+            **kw,
+        )
+        event["output_ids"] = list(token_ids)
+        return event
+
+    @staticmethod
+    def _is_end_frame(choice):
+        return choice.get("finish_reason") is not None
+
+    @staticmethod
+    def _carries_content(choice):
+        delta = choice["delta"]
+        return any(delta.get(k) for k in ("content", "reasoning_content", "tool_calls"))
+
+    def _assert_no_logprobs_only_frame(self, frames):
+        for f in frames:
+            for c in f["choices"]:
+                if c.get("logprobs") is not None:
+                    self.assertTrue(
+                        self._carries_content(c) or self._is_end_frame(c),
+                        f"logprobs on a frame without content: {c}",
+                    )
+
+    def test_logprobs_follow_the_openai_shape_on_content_and_end_frames(self):
+        """logprobs=true: the role-only first frame carries none; each content
+        frame carries content[] entries with token / logprob / bytes /
+        top_logprobs (top_logprobs=20 honored, each with token / logprob /
+        bytes); a token whose text produced no frame (a stripped stop token)
+        rides on the end frame -- never on a logprobs-only frame."""
+        req = self._req(logprobs=True, top_logprobs=20)
+        events = [
+            self._logprob_event("Hello", [0], completion_tokens=1, top_k=20),
+            self._logprob_event(" world", [1], completion_tokens=2, top_k=20),
+            self._logprob_event(
+                "", [2], completion_tokens=3, top_k=20, finish={"type": "stop"}
+            ),
+        ]
+        frames = self._frames(self._stream(events, req))
+        choices = [c for f in frames for c in f["choices"]]
+
+        first = choices[0]
+        self.assertEqual(first["delta"].get("role"), "assistant")
+        self.assertNotIn("logprobs", first)
+
+        content = [c for c in choices if c["delta"].get("content")]
+        self.assertEqual([c["delta"]["content"] for c in content], ["Hello", " world"])
+        for choice in content:
+            entries = choice["logprobs"]["content"]
+            self.assertEqual(len(entries), 1)
+            for entry in entries:
+                self.assertEqual(
+                    set(entry), {"token", "logprob", "bytes", "top_logprobs"}
+                )
+                self.assertEqual(entry["bytes"], list(entry["token"].encode()))
+                self.assertEqual(len(entry["top_logprobs"]), 20)
+                for top in entry["top_logprobs"]:
+                    self.assertEqual(set(top), {"token", "logprob", "bytes"})
+                    self.assertEqual(top["bytes"], list(top["token"].encode()))
+
+        end = [c for c in choices if self._is_end_frame(c)]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(
+            [e["token"] for e in end[0]["logprobs"]["content"]], ["t2"]
+        )
+        self._assert_no_logprobs_only_frame(frames)
+
+    def test_end_frame_carries_an_empty_logprobs_object_when_nothing_is_left(self):
+        req = self._req(logprobs=True)
+        events = [
+            self._logprob_event("Hello", [0], completion_tokens=1),
+            self._logprob_event(
+                " world", [1], completion_tokens=2, finish={"type": "stop"}
+            ),
+        ]
+        frames = self._frames(self._stream(events, req))
+        end = [c for f in frames for c in f["choices"] if self._is_end_frame(c)]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(end[0]["logprobs"], {"content": []})
+
+    def test_tool_stream_logprobs_ride_on_frames_with_content(self):
+        """Through the tool parser no frame carries logprobs alone: steps that
+        emit nothing hand theirs to the next frame (the tool-call slot opener
+        here) or the end frame, so every token's logprob arrives exactly once
+        and in order."""
+        self.chat.tool_call_parser = "kimi_k3"
+        req = self._req(
+            tools=[{"type": "function", "function": {"name": "python"}}],
+            logprobs=True,
+        )
+        pieces = [
+            TOOLS_OPEN,
+            '<|open|>call tool="python" index="1"<|sep|>',
+            '<|open|>argument key="code" type="string"<|sep|>',
+            "first",
+            "second",
+            "<|close|>argument<|sep|>",
+            "<|close|>call<|sep|>",
+            TOOLS_CLOSE,
+        ]
+        events = [
+            self._logprob_event(
+                piece,
+                [i],
+                completion_tokens=i + 1,
+                finish={"type": "stop"} if i == len(pieces) - 1 else None,
+            )
+            for i, piece in enumerate(pieces)
+        ]
+        frames = self._frames(self._stream(events, req))
+        choices = [c for f in frames for c in f["choices"]]
+        self._assert_no_logprobs_only_frame(frames)
+        delivered = [
+            entry["token"]
+            for c in choices
+            if c.get("logprobs") is not None
+            for entry in c["logprobs"]["content"]
+        ]
+        self.assertEqual(delivered, [f"t{i}" for i in range(len(pieces))])
+        tool_frames = [c for c in choices if c["delta"].get("tool_calls")]
+        self.assertTrue(tool_frames)
+        self.assertIsNotNone(tool_frames[0].get("logprobs"))
+        end = [c for c in choices if self._is_end_frame(c)]
+        self.assertEqual(end[0]["finish_reason"], "tool_calls")
+        self.assertIsNotNone(end[0].get("logprobs"))
+
+    def test_no_frame_carries_logprobs_unless_requested(self):
+        req = self._req()
+        events = [
+            self._logprob_event("Hello", [0], completion_tokens=1),
+            self._logprob_event("", [1], completion_tokens=2, finish={"type": "stop"}),
+        ]
+        frames = self._frames(self._stream(events, req))
+        for f in frames:
+            for c in f["choices"]:
+                self.assertNotIn("logprobs", c)
+
+    _TOOL_PIECES = [
+        TOOLS_OPEN,
+        '<|open|>call tool="python" index="1"<|sep|>',
+        '<|open|>argument key="code" type="string"<|sep|>',
+        "first",
+        "<|close|>argument<|sep|>",
+        "<|close|>call<|sep|>",
+        '<|open|>call tool="python" index="2"<|sep|>',
+        '<|open|>argument key="code" type="string"<|sep|>',
+        "second",
+        "<|close|>argument<|sep|>",
+        "<|close|>call<|sep|>",
+        TOOLS_CLOSE,
+    ]
+
+    def _step_events(self, pieces, steps, *, finish=None):
+        """One logprob event per step; ``steps`` lists each step's token ids
+        (ids index ``pieces``). The last step carries ``finish``. A stop token
+        stripped from the text still has real (non-empty) bytes."""
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode() or b"<eos>"
+        )
+        events = []
+        for n, ids in enumerate(steps):
+            events.append(
+                self._logprob_event(
+                    "".join(pieces[i] for i in ids),
+                    ids,
+                    completion_tokens=ids[-1] + 1 if ids else 0,
+                    finish=finish if n == len(steps) - 1 else None,
+                )
+            )
+        return events
+
+    def _assert_k3_logprobs_frames(self, frames, expected_tokens):
+        """K3 with logprobs: every content and end frame carries an object,
+        every other frame omits the key, mid frames keep finish_reason null,
+        and each token's entry arrives once and in order."""
+        delivered = []
+        for f in frames:
+            for c in f["choices"]:
+                if not self._is_end_frame(c):
+                    self.assertIn("finish_reason", c)
+                    self.assertIsNone(c["finish_reason"])
+                if self._carries_content(c) or self._is_end_frame(c):
+                    self.assertIsInstance(c["logprobs"]["content"], list, c)
+                    for entry in c["logprobs"]["content"]:
+                        self.assertEqual(
+                            set(entry), {"token", "logprob", "bytes", "top_logprobs"}
+                        )
+                        delivered.append(entry["token"])
+                else:
+                    self.assertNotIn("logprobs", c)
+        self.assertEqual(delivered, expected_tokens)
+
+    def test_reasoning_and_content_in_one_step_each_carry_a_logprobs_object(self):
+        """Each frame carries the entries up to its last token: the channel
+        markers between reasoning and content ride on the content frame, the
+        stripped stop token on the end frame."""
+        self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        pieces = ["thought", "<|close|>think<|sep|>", "<|open|>response<|sep|>"]
+        pieces += ["answer", ""]
+        req = self._req(logprobs=True)
+        events = self._step_events(pieces, [[0, 1, 2, 3], [4]], finish={"type": "stop"})
+        frames = self._frames(self._stream(events, req))
+        choices = [c for f in frames for c in f["choices"]]
+        reasoning = [c for c in choices if c["delta"].get("reasoning_content")]
+        content = [c for c in choices if c["delta"].get("content")]
+        self.assertTrue(reasoning and content)
+        self.assertEqual(
+            [e["token"] for e in reasoning[0]["logprobs"]["content"]], ["t0"]
+        )
+        self.assertEqual(
+            [e["token"] for e in content[0]["logprobs"]["content"]],
+            ["t1", "t2", "t3"],
+        )
+        end = [c for c in choices if self._is_end_frame(c)]
+        self.assertEqual([e["token"] for e in end[-1]["logprobs"]["content"]], ["t4"])
+        self._assert_k3_logprobs_frames(frames, [f"t{i}" for i in range(5)])
+
+    def test_every_tool_frame_carries_a_logprobs_object_under_each_switch(self):
+        """A tool slot and its arguments from one step, and two calls, through
+        the Pydantic tool frames: with logprobs every tool frame carries an
+        object (the argument continuation and the second call included) and
+        entries arrive once; without it no frame has the key, also when only
+        include_internal_content is on."""
+        self.chat.tool_call_parser = "kimi_k3"
+        pieces = self._TOOL_PIECES + [""]
+        steps = [[0, 1, 2, 3], [4, 5], [6, 7, 8, 9, 10], [11], [12]]
+        tools = [{"type": "function", "function": {"name": "python"}}]
+        switches = {
+            "logprobs": dict(logprobs=True),
+            "internal": dict(stream_options={"include_internal_content": True}),
+            "both": dict(
+                logprobs=True, stream_options={"include_internal_content": True}
+            ),
+        }
+        for name, kw in switches.items():
+            with self.subTest(switches=name):
+                req = self._req(tools=tools, **kw)
+                events = self._step_events(pieces, steps, finish={"type": "stop"})
+                frames = self._frames(self._stream(events, req))
+                choices = [c for f in frames for c in f["choices"]]
+                tool_frames = [c for c in choices if c["delta"].get("tool_calls")]
+                call_indexes = {
+                    t["index"] for c in tool_frames for t in c["delta"]["tool_calls"]
+                }
+                self.assertEqual(len(call_indexes), 2)
+                self.assertGreater(len(tool_frames), 2)
+                end = [c for c in choices if self._is_end_frame(c)]
+                self.assertEqual(end[-1]["finish_reason"], "tool_calls")
+                if "logprobs" in kw:
+                    self._assert_k3_logprobs_frames(
+                        frames, [f"t{i}" for i in range(len(pieces))]
+                    )
+                else:
+                    for c in choices:
+                        self.assertNotIn("logprobs", c)
+                if "stream_options" in kw:
+                    for c in tool_frames:
+                        self.assertTrue(c["internal_content"][0]["token_ids"])
+
+    def test_interrupted_end_frames_carry_a_logprobs_object(self):
+        req = self._req(logprobs=True)
+        with self.subTest(end="status-code abort"):
+            events = [
+                self._logprob_event("Hello", [0], completion_tokens=1),
+                self._event(
+                    text="",
+                    completion_tokens=1,
+                    output_token_logprobs_length=1,
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": "engine died",
+                    },
+                ),
+            ]
+            events[1]["output_ids"] = []
+            frames = self._frames(self._stream(events, req))
+            end = [c for f in frames for c in f["choices"] if self._is_end_frame(c)]
+            self.assertEqual(end[-1]["finish_reason"], "server_interrupted")
+            self.assertIsInstance(end[-1]["logprobs"]["content"], list)
+        with self.subTest(end="exception"):
+
+            async def _gen():
+                yield self._logprob_event("Hello", [0], completion_tokens=1)
+                raise RuntimeError("engine died")
+
+            self.tm.generate_request = Mock(return_value=_gen())
+
+            async def _run():
+                return [
+                    chunk
+                    async for chunk in self.chat._generate_chat_stream(
+                        Mock(), req, self.fastapi_request
+                    )
+                ]
+
+            frames = self._frames(get_or_create_event_loop().run_until_complete(_run()))
+            self.assertEqual(
+                frames[-1]["choices"][0]["finish_reason"], "server_interrupted"
+            )
+            self.assertIsInstance(frames[-1]["choices"][0]["logprobs"]["content"], list)
+
+    def test_incremental_short_logprob_list_never_shifts_onto_a_repeated_id(self):
+        """An incremental event with two equal ids and one entry: the entry
+        belongs to the first position. Right alignment put it on the second,
+        and the id check could not tell."""
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: b"x"
+        event = self._event(
+            text="xx",
+            completion_tokens=2,
+            finish={"type": "stop"},
+            output_token_logprobs=[(-0.3, 5, None)],
+            output_token_logprobs_length=1,
+        )
+        event["output_ids"] = [5, 5]
+        req = self._req(stream_options={"include_internal_content": True})
+        frames = self._frames(self._stream([event], req))
+        increments = [
+            c for f in frames for c in f["choices"] if c["delta"].get("content")
+        ]
+        self.assertEqual(
+            increments[0]["internal_content"],
+            [{"token_ids": [5, 5], "logprobs": [-0.3, -9999.0]}],
+        )
+
+    def test_incremental_coalesced_abort_reads_positions_and_sends_entries_once(self):
+        """A coalesced incremental abort event as the tokenizer manager builds
+        it: a delta for positions 2 and 3, then the abort, which carries only
+        what is still unsent (nothing here). Entries pair with ids by the
+        stated positions and the standard entries go out once."""
+        pieces = ["a", "b", "c", "d"]
+        full = [(-0.1 * (t + 1), t, f"t{t}") for t in range(4)]
+        first = self._logprob_event("ab", [0, 1], completion_tokens=2)
+        abort = self._event(
+            text="cd",
+            completion_tokens=4,
+            output_token_logprobs=full[2:],
+            output_top_logprobs=[[] for _ in full[2:]],
+            output_token_logprobs_length=4,
+            output_ids_start=2,
+            output_token_logprobs_segments=[[2, 2], [4, 0]],
+            output_top_logprobs_segments=[[2, 2], [4, 0]],
+            finish={"type": "abort"},
+        )
+        abort["output_ids"] = [2, 3]
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = lambda i: (
+            pieces[i].encode()
+        )
+        req = self._req(
+            logprobs=True, stream_options={"include_internal_content": True}
+        )
+        frames = self._frames(self._stream([first, abort], req))
+        increments = [
+            c for f in frames for c in f["choices"] if self._carries_content(c)
+        ]
+        self.assertEqual(
+            [[e["token"] for e in c["logprobs"]["content"]] for c in increments],
+            [["t0", "t1"], ["t2", "t3"]],
+        )
+        self.assertEqual(
+            [c["internal_content"] for c in increments],
+            [
+                [{"token_ids": [0, 1], "logprobs": [full[0][0], full[1][0]]}],
+                [{"token_ids": [2, 3], "logprobs": [full[2][0], full[3][0]]}],
+            ],
+        )
 
     def test_internal_content_absent_unless_requested(self):
         req = self._req(tools=[{"type": "function", "function": {"name": "w"}}])

@@ -29,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.cache_accounting.page_cache import CacheUsage  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -280,6 +281,39 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await pending)["output_ids"], [2])
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
+
+    async def test_cumulative_stream_snapshots_text_before_cache_wait(self):
+        self.tm.incremental_streaming_output = False
+        usage = CacheUsage(ttl_seconds=300, read_tokens=256)
+        accounting = asyncio.get_running_loop().create_future()
+        self.state.cache_task = accounting
+        stream = self.tm._wait_one_response(self.state.obj)
+
+        async def publish(text, token_ids, count, finish):
+            batch = _make_batch_str_output(self.state.obj.rid, finish)
+            batch.output_strs = [text]
+            batch.output_ids_flat = array("q", token_ids)
+            batch.output_ids_offsets = [0, len(token_ids)]
+            batch.completion_tokens = [count]
+            await self.tm._handle_batch_output(batch)
+
+        await publish("A", [1], 1, _NOT_FINISHED)
+        pending = asyncio.create_task(anext(stream))
+        # Let the consumer drain the first batch and wait for cache usage.
+        await asyncio.sleep(0)
+        self.assertFalse(self.state.out_list)
+        self.assertFalse(pending.done())
+        await publish("BC", [2, 3], 3, {"type": "length"})
+        accounting.set_result(usage)
+
+        first = await pending
+        final = await anext(stream)
+        for frame, text, count in ((first, "A", 1), (final, "ABC", 3)):
+            self.assertEqual(frame["text"], text)
+            self.assertEqual(frame["meta_info"]["completion_tokens"], count)
+            self.assertEqual(frame["meta_info"]["cache_usage"], usage.to_dict())
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
 
     async def test_cumulative_stream_backlog_preserves_customized_info(self):
         """Cumulative streaming returns only the last queued output.

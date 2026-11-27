@@ -421,6 +421,14 @@ pub fn lower_chat(
 ) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
     let original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
+    // The chat worker owns the continuation's output parser, grammar and usage.
+    // The router can still render and forward its prompt ids on the chat route.
+    #[cfg(feature = "render")]
+    if model.is_kimi_k3()
+        && crate::render::kimi_k3_continues_final_message(&original).unwrap_or(true)
+    {
+        return Err(Unsupported("kimi_k3_continuation"));
+    }
     let Value::Object(mut raw) = original.clone() else {
         return Err(Unsupported("unparsed_request"));
     };

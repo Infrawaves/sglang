@@ -421,6 +421,17 @@ class CustomizedInfoError(ValueError):
     pass
 
 
+# cached_tokens slot 7 says whether the prefill wrote the first output token's
+# logprob into its metadata row. WRITTEN is set only after
+# _validate_request_metadata checked the selected token ID and the top count.
+# A prefill that predates the slot leaves it 0 (UNKNOWN); its row cannot be
+# told from a previous owner's, so decode treats UNKNOWN like ABSENT.
+FIRST_TOKEN_LOGPROB_SLOT = 7
+FIRST_TOKEN_LOGPROB_UNKNOWN = 0
+FIRST_TOKEN_LOGPROB_WRITTEN = 1
+FIRST_TOKEN_LOGPROB_ABSENT = 2
+
+
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
 
@@ -711,6 +722,27 @@ class MetadataBuffers:
                     f"disaggregation metadata capacity {capacity}. "
                     "Lower top_logprobs_num or increase the metadata buffer."
                 )
+            selected_values = req.logprob.output_token_logprobs_val
+            selected_ids = req.logprob.output_token_logprobs_idx
+            if selected_values or selected_ids:
+                # set_buf marks these rows WRITTEN, and decode commits them
+                # without re-checking.
+                if not (selected_values and selected_ids):
+                    raise InvalidDisaggregationMetadata(
+                        "The first output token logprob needs both a value and "
+                        "a token ID."
+                    )
+                if selected_ids[0] != req.output_ids[0]:
+                    raise InvalidDisaggregationMetadata(
+                        f"The first output token logprob is for token "
+                        f"{selected_ids[0]}, but the prefill sampled token "
+                        f"{req.output_ids[0]}."
+                    )
+                if value_len != req.logprob.top_logprobs_num:
+                    raise InvalidDisaggregationMetadata(
+                        f"The first output token has {value_len} top_logprobs; "
+                        f"the request asked for {req.logprob.top_logprobs_num}."
+                    )
 
         if not req.return_sampling_mask:
             return None
@@ -751,9 +783,11 @@ class MetadataBuffers:
         self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # counts, slots 4-6 are reused for multimodal prompt token counts and
+        # slot 7 for the first-token logprob state (slots 8-15 remain spare).
+        # This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video
+        # 7=first-token logprob state (FIRST_TOKEN_LOGPROB_*).
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -765,6 +799,14 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # Written for every request: the row is reused, and without the state
+        # decode cannot tell this request's logprob from a previous owner's.
+        # Selected and top rows were validated together above.
+        self.cached_tokens[req.metadata_buffer_index][FIRST_TOKEN_LOGPROB_SLOT] = (
+            FIRST_TOKEN_LOGPROB_WRITTEN
+            if req.return_logprob and req.logprob.output_token_logprobs_val
+            else FIRST_TOKEN_LOGPROB_ABSENT
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

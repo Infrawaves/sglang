@@ -20,7 +20,7 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Annotated,
     Any,
@@ -292,9 +292,29 @@ class StreamOptions(BaseModel):
     # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
-    # K3 API extension: attach choices[].internal_content[].token_ids to
-    # every increment frame — the raw token ids behind that increment.
+    # K3 API extension: attach choices[].internal_content[] to every increment
+    # frame -- token_ids, the raw token ids behind that increment, and
+    # logprobs, each one's selected logprob (-9999.0 when unknown). A token
+    # backing two frames repeats in both (see KimiTokenProvenance).
     include_internal_content: Optional[bool] = False
+    # Internal opt-in on top of include_internal_content: each
+    # internal_content[] entry also carries token_positions, the 0-based
+    # generated position of each of its token_ids (same length). A token that
+    # backs two frames repeats with the same position, so consumers deduplicate
+    # by (choice index, token position). The prompt's generation prefix that
+    # leads a choice's first entry (see KimiTokenProvenance) takes the
+    # negative positions -len..-1 (-3, -2, -1 for K3); generated token 0 keeps
+    # position 0.
+    include_internal_token_positions: Optional[bool] = False
+
+    @model_validator(mode="after")
+    def _token_positions_need_internal_content(self) -> "StreamOptions":
+        if self.include_internal_token_positions and not self.include_internal_content:
+            raise ValueError(
+                "stream_options.include_internal_token_positions requires "
+                "stream_options.include_internal_content"
+            )
+        return self
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -860,6 +880,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+    # Moonshot partial mode: continue this final assistant message. Honored by
+    # the Kimi K3 encoding only; a flag on any other message is ignored.
+    partial: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -1062,6 +1085,11 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
+    # K3: the last prompt token ids the chat template rendered as the
+    # generation prefix (the opened think or response channel), captured
+    # before continue_final_message appends an assistant prefix. Empty for raw
+    # input_ids. Leads each choice's internal_content.
+    _kimi_k3_generation_prefix_ids: List[int] = PrivateAttr(default_factory=list)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1714,10 +1742,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     internal_content: Optional[List[Dict[str, Any]]] = None
+    # K3 forbids a null logprobs key: with this set, a frame without a logprobs
+    # object omits the key. Other encodings keep serializing null.
+    omit_null_logprobs: bool = Field(default=False, exclude=True)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.logprobs is None and self.omit_null_logprobs:
+            data.pop("logprobs", None)
         if self.internal_content is None:
             data.pop("internal_content", None)
         if self.delta.tool_calls is None:
@@ -2287,6 +2320,8 @@ class ResponsesRequest(PDRoutingFields):
                 "message.input_image.image_url",
                 "message.output_text.logprobs",
                 "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "web_search_call.results",
             ]
         ]
     ] = None
@@ -2842,6 +2877,8 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
+    # Server stops that still apply inside tool calls; client stops are not listed.
+    server_stop: List[str] = field(default_factory=list)
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False

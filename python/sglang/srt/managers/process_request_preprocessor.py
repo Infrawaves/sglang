@@ -198,7 +198,13 @@ def _safe_len(value: Any) -> Optional[int]:
         return None
 
 
-def _snapshot_request_state(request: Any):
+def _replayed_private_attrs(handler_cls: type) -> Tuple[str, ...]:
+    """Pydantic private attrs (kept in ``__pydantic_private__``, not
+    ``__dict__``) the handler's conversion sets for the parent to use."""
+    return tuple(getattr(handler_cls, "process_preprocessing_private_attrs", ()))
+
+
+def _snapshot_request_state(request: Any, private_attrs: Sequence[str] = ()):
     fields = getattr(request, "__dict__", None)
     if fields is None or not hasattr(request, "model_fields_set"):
         return None
@@ -209,12 +215,13 @@ def _snapshot_request_state(request: Any):
         else:
             tracked[name] = copy.deepcopy(value)
     extra = copy.deepcopy(getattr(request, "__pydantic_extra__", None) or {})
-    return tracked, set(request.model_fields_set), extra
+    private = {name: copy.deepcopy(getattr(request, name)) for name in private_attrs}
+    return tracked, set(request.model_fields_set), extra, private
 
 
 def _collect_request_changes(request: Any, snapshot) -> Dict[str, Any]:
     """Fields the conversion assigned or mutated, to replay on the parent's copy."""
-    tracked, fields_set, extra = snapshot
+    tracked, fields_set, extra, private = snapshot
     newly_set = set(request.model_fields_set) - fields_set
     changes: Dict[str, Any] = {}
     for name, value in request.__dict__.items():
@@ -227,6 +234,10 @@ def _collect_request_changes(request: Any, snapshot) -> Dict[str, Any]:
             changes[name] = value
     for name, value in (getattr(request, "__pydantic_extra__", None) or {}).items():
         if name not in extra or not _values_equal(extra[name], value):
+            changes[name] = value
+    for name, before in private.items():
+        value = getattr(request, name)
+        if not _values_equal(before, value):
             changes[name] = value
     return changes
 
@@ -378,7 +389,7 @@ def _child_warmup(handler_classes: Sequence[type]):
 def _child_convert(handler_cls: type, request: Any, raw_headers):
     handler = _CHILD_STATE.handler(handler_cls)
     raw_request = None if raw_headers is None else _HeadersOnlyRequest(raw_headers)
-    snapshot = _snapshot_request_state(request)
+    snapshot = _snapshot_request_state(request, _replayed_private_attrs(handler_cls))
     try:
         adapted, processed = handler._convert_to_internal_request(request, raw_request)
     except NeedsInProcessConversion as e:

@@ -283,6 +283,10 @@ class Serving(msgspec.Struct):
         bool,
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
     ] = False
+    clamp_max_new_tokens: A[
+        bool,
+        "When input + max_new_tokens exceeds the context length, clamp max_new_tokens to the remaining room instead of returning an error. Inputs that alone exceed the context length are still rejected. Not supported by the Rust server (SGLANG_RUST_SERVER).",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Streaming

@@ -20,8 +20,11 @@ use sgl_router::{
     },
     state::{
         kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
-        load_monitor::router_inflight_load::{
-            spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
+        load_monitor::{
+            cold_pressure::spawn_sampler as spawn_cold_pressure_sampler,
+            router_inflight_load::{
+                spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
+            },
         },
     },
     tokenizer::TokenizerRegistry,
@@ -143,6 +146,7 @@ async fn main() -> Result<()> {
     )?;
     app_context.chat_routing = chat_routing;
     let app_context = Arc::new(app_context);
+    let cold_pressure_handle = start_cold_pressure_sampler(&app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -167,6 +171,7 @@ async fn main() -> Result<()> {
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
     worker_manager_handle.abort();
+    cold_pressure_handle.abort();
     inflight_cleanup.shutdown().await;
     if let Some(cleanup) = reorg_cleanup {
         cleanup.shutdown().await;
@@ -431,6 +436,18 @@ fn build_app_context(
     app_context.kv_metrics = engine_state.metrics_source();
     app_context.kv_index = engine_state.snapshot_source();
     Ok(app_context)
+}
+
+fn start_cold_pressure_sampler(app_context: &Arc<AppContext>) -> JoinHandle<()> {
+    let config = app_context.config.server.cold_pressure;
+    let ctx = Arc::clone(app_context);
+    spawn_cold_pressure_sampler(
+        Arc::clone(&app_context.cold_pressure),
+        move || ctx.routable_prefill_workers(),
+        Arc::clone(&app_context.engine_reported_load),
+        config.per_prefill_cold_tokens,
+        Duration::from_secs(config.sample_interval_secs),
+    )
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped

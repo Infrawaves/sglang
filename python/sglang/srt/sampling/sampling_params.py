@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import msgspec
 
@@ -111,6 +111,187 @@ def set_request_reasoning_end_token_ids(
         raise ValueError("reasoning end token IDs must be non-empty integers")
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
+    sampling_params["custom_params"] = custom_params
+
+
+# Private transport, like the reasoning terminator above: a conditional token
+# ban ``[banned, prev, ...]``. Right after any of the ``prev`` tokens the sampler
+# masks the token ``banned``; everywhere else that token stays free.
+REQUEST_CONDITIONAL_TOKEN_BAN_KEY = "__sglang_conditional_token_ban"
+MAX_CONDITIONAL_TOKEN_BAN_PREVS = 4
+
+
+def get_request_conditional_token_ban(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[Tuple[int, Tuple[int, ...]]]:
+    """Return a validated ``(banned, prevs)`` rule, if the request has one."""
+    if not isinstance(custom_params, dict):
+        return None
+    if REQUEST_CONDITIONAL_TOKEN_BAN_KEY not in custom_params:
+        return None
+    rule = custom_params.get(REQUEST_CONDITIONAL_TOKEN_BAN_KEY)
+    invalid = (
+        not isinstance(rule, list)
+        or not 2 <= len(rule) <= 1 + MAX_CONDITIONAL_TOKEN_BAN_PREVS
+        or any(type(token_id) is not int or token_id < 0 for token_id in rule)
+        or (vocab_size is not None and any(token_id >= vocab_size for token_id in rule))
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "conditional token ban must be vocabulary-bounded token IDs "
+                f"[banned, prev, ...] with 1 to {MAX_CONDITIONAL_TOKEN_BAN_PREVS} "
+                "previous tokens"
+            )
+        return None
+    return rule[0], tuple(rule[1:])
+
+
+def set_request_conditional_token_ban(
+    sampling_params: Dict,
+    *,
+    banned: int,
+    after: Sequence[int],
+) -> None:
+    """Attach a renderer-selected conditional token ban to a request: mask
+    ``banned`` right after any of the ``after`` tokens."""
+    rule = [banned, *after]
+    if not 2 <= len(rule) <= 1 + MAX_CONDITIONAL_TOKEN_BAN_PREVS or any(
+        type(token_id) is not int or token_id < 0 for token_id in rule
+    ):
+        raise ValueError(
+            "conditional token ban must be a non-negative token ID and 1 to "
+            f"{MAX_CONDITIONAL_TOKEN_BAN_PREVS} non-negative previous token IDs"
+        )
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY] = rule
+    sampling_params["custom_params"] = custom_params
+
+
+def clear_request_conditional_token_ban(sampling_params: Dict) -> None:
+    """Remove the rule, so that a client cannot supply one of its own."""
+    custom_params = sampling_params.get("custom_params")
+    if (
+        isinstance(custom_params, dict)
+        and REQUEST_CONDITIONAL_TOKEN_BAN_KEY in custom_params
+    ):
+        custom_params = dict(custom_params)
+        del custom_params[REQUEST_CONDITIONAL_TOKEN_BAN_KEY]
+        sampling_params["custom_params"] = custom_params or None
+
+
+# Private transport, like the reasoning terminator above: token-id sequences
+# that end the request where they start, excluded from the output. Only special
+# tokens the model generates match them, never the same text spelled with
+# ordinary tokens, and checking them needs no decode. Sequences are flattened
+# with STOP_TOKEN_SEQUENCE_SEP between them to stay a JSON-safe list.
+REQUEST_STOP_TOKEN_SEQUENCES_KEY = "__sglang_stop_token_sequences"
+STOP_TOKEN_SEQUENCE_SEP = -1
+MAX_REQUEST_STOP_TOKEN_SEQUENCES_LEN = 64
+
+
+def append_request_stop_token_sequence(
+    sampling_params: Dict, token_ids: Sequence[int]
+) -> None:
+    """Attach a server-side stop token sequence to a request."""
+    if not token_ids or any(
+        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    ):
+        raise ValueError("stop token sequences must be non-empty integers")
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    flat = list(custom_params.get(REQUEST_STOP_TOKEN_SEQUENCES_KEY) or [])
+    if tuple(token_ids) in get_request_stop_token_sequences(custom_params):
+        return
+    if flat:
+        flat.append(STOP_TOKEN_SEQUENCE_SEP)
+    flat.extend(token_ids)
+    custom_params[REQUEST_STOP_TOKEN_SEQUENCES_KEY] = flat
+    sampling_params["custom_params"] = custom_params
+
+
+def get_request_stop_token_sequences(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> List[Tuple[int, ...]]:
+    """Return the request's server-side stop token sequences, if valid."""
+    if not isinstance(custom_params, dict):
+        return []
+    flat = custom_params.get(REQUEST_STOP_TOKEN_SEQUENCES_KEY)
+    if (
+        not isinstance(flat, list)
+        or len(flat) > MAX_REQUEST_STOP_TOKEN_SEQUENCES_LEN
+        or any(type(token_id) is not int for token_id in flat)
+    ):
+        return []
+    sequences, current = [], []
+    for token_id in flat:
+        if token_id == STOP_TOKEN_SEQUENCE_SEP:
+            if not current:
+                return []
+            sequences.append(tuple(current))
+            current = []
+        elif token_id < 0:
+            return []
+        else:
+            current.append(token_id)
+    if not current:
+        return []
+    sequences.append(tuple(current))
+    return sequences
+
+
+# Private transport, like the reasoning terminator above: client stop strings
+# and regexes do not match from the first tool-call opener on; the listed
+# server stop strings still match the whole output.
+REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY = "__sglang_tool_calls_start_token_ids"
+REQUEST_SERVER_STOP_STRS_KEY = "__sglang_server_stop_strs"
+MAX_REQUEST_TOOL_CALLS_START_TOKEN_IDS = 32
+
+
+def _valid_tool_calls_start(*, token_ids: object, server_stop_strs: object) -> bool:
+    return (
+        isinstance(token_ids, list)
+        and 0 < len(token_ids) <= MAX_REQUEST_TOOL_CALLS_START_TOKEN_IDS
+        and all(type(token_id) is int and token_id >= 0 for token_id in token_ids)
+        and isinstance(server_stop_strs, list)
+        and len(server_stop_strs) <= MAX_STOP_COUNT
+        and all(type(stop_str) is str for stop_str in server_stop_strs)
+    )
+
+
+def get_request_tool_calls_start(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> Optional[Tuple[List[int], List[str]]]:
+    if not isinstance(custom_params, dict):
+        return None
+    token_ids = custom_params.get(REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY)
+    server_stop_strs = custom_params.get(REQUEST_SERVER_STOP_STRS_KEY, [])
+    if not _valid_tool_calls_start(
+        token_ids=token_ids, server_stop_strs=server_stop_strs
+    ):
+        return None
+    return list(token_ids), list(server_stop_strs)
+
+
+def set_request_tool_calls_start(
+    sampling_params: Dict,
+    *,
+    token_ids: Sequence[int],
+    server_stop_strs: Sequence[str],
+) -> None:
+    token_ids, server_stop_strs = list(token_ids), list(server_stop_strs)
+    if not _valid_tool_calls_start(
+        token_ids=token_ids, server_stop_strs=server_stop_strs
+    ):
+        raise ValueError(
+            "tool-call opener token IDs must be a non-empty, bounded list of "
+            "non-negative integers, and server stop strings a bounded list of str"
+        )
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_TOOL_CALLS_START_TOKEN_IDS_KEY] = token_ids
+    custom_params[REQUEST_SERVER_STOP_STRS_KEY] = server_stop_strs
     sampling_params["custom_params"] = custom_params
 
 
@@ -312,6 +493,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 )
 
         get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
+        get_request_conditional_token_ban(
             self.custom_params,
             vocab_size=vocab_size,
             strict=True,

@@ -22,6 +22,8 @@ mod thinking;
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub(crate) use self::models::deepseek_v4_thinking;
+#[cfg(feature = "openai")]
+pub(crate) use self::models::kimi_k3_continues_final_message;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
     deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38,

@@ -2406,6 +2406,9 @@ class ReasoningParser:
             and isinstance(request, ChatCompletionRequest)
             and request.continue_final_message
             and request.messages[-1].role == "assistant"
+            # K3 serving renders the continued channel itself and sets
+            # force_reasoning to match; markers in the message are text there.
+            and model_type.lower() != "kimi_k3"
         ):
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content

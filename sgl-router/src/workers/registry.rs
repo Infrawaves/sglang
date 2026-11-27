@@ -174,6 +174,16 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Workers whose breaker admits traffic, excluding prefills awaiting a
+    /// bootstrap port. Read-only: unlike [`Self::healthy_workers_for`] it never
+    /// fails open, so an observer cannot reset breakers or mask a failed pool.
+    pub fn admitting_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
+        self.workers_for(model)
+            .into_iter()
+            .filter(|w| !w.awaiting_bootstrap_port() && w.breaker.would_allow())
+            .collect()
+    }
+
     /// Workers eligible for selection; excludes prefills still awaiting a bootstrap port.
     ///
     /// Fails open: when EVERY eligible worker's breaker is shut, it closes them
