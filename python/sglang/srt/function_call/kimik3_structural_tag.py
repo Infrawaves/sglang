@@ -32,10 +32,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
-from sglang.srt.function_call.tool_schema_guard import (
-    canonicalize_tool_schema,
-    merge_anyof_branch,
-)
+from sglang.srt.function_call.tool_schema_guard import merge_anyof_branch
 
 _JSON_TYPES = (
     "string",
@@ -559,9 +556,8 @@ def _tool_arguments_format(tool: Tool) -> Format:
         raise ValueError(
             f"Kimi K3 strict tool {tool.function.name!r} must define parameters"
         )
-    # What walle repairs would otherwise raise here (and leave the call
-    # unconstrained) or fail to compile in XGrammar.
-    parameters = canonicalize_tool_schema(parameters)
+    # The caller passes the canonical form from kimi_k3_tool_schema.py: what it
+    # repairs would otherwise raise here or fail to compile in XGrammar.
     schema_types = _schema_types(parameters, parameters)
     if "object" not in schema_types:
         raise ValueError(

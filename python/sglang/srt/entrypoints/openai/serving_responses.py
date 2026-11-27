@@ -106,6 +106,9 @@ from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimi_k3_tool_schema import (
+    KimiK3ToolSchemaInternalError,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
@@ -127,6 +130,10 @@ logger = logging.getLogger(__name__)
 
 
 class _MediaInputValidationError(ValueError):
+    pass
+
+
+class _ToolSchemaValidationError(ValueError):
     pass
 
 
@@ -470,8 +477,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 require_reasoning = processed_messages.require_reasoning
 
-        except _MediaInputValidationError as e:
+        except (_MediaInputValidationError, _ToolSchemaValidationError) as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            # Walle busy (503) is not the client's request at fault.
+            return self.create_error_response(
+                str(e.detail),
+                err_type=(
+                    "server_error" if e.status_code >= 500 else "invalid_request_error"
+                ),
+                status_code=e.status_code,
+            )
+        except KimiK3ToolSchemaInternalError as e:
+            logger.exception("Error resolving tool schemas")
+            return self.create_error_response(
+                f"Internal server error: {e}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
@@ -951,6 +974,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         media_error = self._validate_media_content(chat_request)
         if media_error:
             raise _MediaInputValidationError(media_error)
+        try:
+            schema_error = await self._resolve_kimi_k3_tool_schemas(chat_request)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # Kept out of the broad client-error handler below: not a 400.
+            raise KimiK3ToolSchemaInternalError(str(exc)) from exc
+        if schema_error:
+            raise _ToolSchemaValidationError(schema_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(

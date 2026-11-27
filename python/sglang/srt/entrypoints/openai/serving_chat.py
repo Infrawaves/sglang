@@ -120,11 +120,17 @@ from sglang.srt.entrypoints.openai.utils import (
     token_id_to_bytes,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimi_k3_tool_schema import (
+    KimiK3ToolSchemaInternalError,
+    check_walle_installed,
+    needs_canonical_parameters,
+    resolve_kimi_k3_tool_schemas,
+)
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -133,10 +139,6 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_OPEN,
     TOOLS_OPEN,
 )
-from sglang.srt.function_call.tool_schema_guard import (
-    ToolSchemaError,
-    check_tool_schema_terminates,
-)
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -144,6 +146,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
     without_schema_identifiers,
 )
+from sglang.srt.function_call.walle_pool import WalleBusyError, WalleCrashError
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.observability.req_time_stats import monotonic_time
@@ -506,23 +509,6 @@ def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | Non
     return None
 
 
-def _validate_kimi_k3_strict_tool_schemas(tools: list[Tool]) -> str | None:
-    # XGrammar compiles a schema with no finite instance and a forced call runs to
-    # max_tokens; walle, and the Kimi Vendor Verifier, expect a 400 instead.
-    strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
-    for tool in tools:
-        function = tool.function
-        if not isinstance(function.parameters, dict):
-            continue
-        if not (function.strict or strict_level >= ToolStrictLevel.PARAMETER):
-            continue
-        try:
-            check_tool_schema_terminates(function.parameters)
-        except ToolSchemaError as exc:
-            return f"tool {function.name!r}: {exc}"
-    return None
-
-
 _M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
 _M3_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -728,6 +714,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
         self._encoding_adapter = self._build_chat_encoding_adapter()
+        if self._resolves_kimi_k3_tool_schemas():
+            check_walle_installed()
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: ResponseParserProtocol | None = None
@@ -867,6 +855,11 @@ class OpenAIServingChat(OpenAIServingBase):
         tokenizer = self.tokenizer_manager.tokenizer
         return tokenizer is not None and detect_inline_system_support(
             tokenizer.chat_template
+        )
+
+    def _resolves_kimi_k3_tool_schemas(self) -> bool:
+        return (
+            self.chat_encoding_spec == "kimi_k3" or self.tool_call_parser == "kimi_k3"
         )
 
     def _resolve_chat_encoding_spec(self) -> str | None:
@@ -1930,11 +1923,6 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         if error_msg:
             return error_msg
-        if self.chat_encoding_spec == "kimi_k3":
-            # After the metaschema check, so a malformed schema keeps its error.
-            schema_error = _validate_kimi_k3_strict_tool_schemas(effective_tools)
-            if schema_error:
-                return schema_error
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1957,6 +1945,75 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    async def _validate_request_async(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        return await self._resolve_kimi_k3_tool_schemas(request)
+
+    async def _resolve_kimi_k3_tool_schemas(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        """Return a 400 message naming the rejected tool, or keep the canonical
+        schemas on the request for the tool grammar.
+
+        Must run before the request reaches _process_messages, and after the
+        metaschema check so a malformed schema keeps that error. Raises
+        HTTPException(503) on queue timeout or repeated worker crashes."""
+        if not self._resolves_kimi_k3_tool_schemas():
+            return None
+        try:
+            canonical, error = await resolve_kimi_k3_tool_schemas(
+                tools=self._effective_tools(request),
+            )
+        except WalleBusyError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Tool parameters schema validation is busy: {exc}",
+            ) from None
+        except WalleCrashError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        if error is None:
+            request._kimi_k3_canonical_parameters = canonical
+        return error
+
+    def _kimi_k3_constraint_tools(
+        self, *, request: ChatCompletionRequest, tools: list[Tool]
+    ) -> list[Tool]:
+        """``tools`` with strict parameters swapped for their canonical form, for
+        the K3 tool grammar only; the prompt renders the originals."""
+        # Another tool parser's grammar keeps the raw schema, whatever the encoding.
+        if self.tool_call_parser != "kimi_k3":
+            return tools
+        canonical = request._kimi_k3_canonical_parameters
+        if canonical is None or len(canonical) != len(tools):
+            canonical = [None] * len(tools)
+        missing = [
+            tool.function.name
+            for tool, parameters in zip(tools, canonical)
+            if parameters is None and needs_canonical_parameters(tool)
+        ]
+        if missing:
+            # Constraining the raw schema would serve what walle rejects.
+            raise KimiK3ToolSchemaInternalError(
+                f"Kimi K3 strict tools {missing} reached the tool grammar without "
+                "canonical parameters; the entry point must await "
+                "_resolve_kimi_k3_tool_schemas first."
+            )
+        return [
+            (
+                tool
+                if parameters is None
+                else tool.model_copy(
+                    update={
+                        "function": tool.function.model_copy(
+                            update={"parameters": parameters}
+                        )
+                    }
+                )
+            )
+            for tool, parameters in zip(tools, canonical)
+        ]
 
     @staticmethod
     def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
@@ -2831,8 +2888,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
         *,
         output_constrained: bool = False,
+        prompt_only: bool = False,
     ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template"""
+        """Render the prompt and, for generation, prepare the output constraints."""
         if self.is_minimax_m3:
             # Settle the request's own thinking and effort first; server defaults
             # only fill what it left unset.
@@ -2859,6 +2917,29 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_reasoning_skip_special_tokens(request)
 
+        effective_tools = self._effective_tools(request)
+        tool_calls_allowed = request.tool_choice != "none" and (
+            bool(effective_tools) or isinstance(request.tool_choice, AllowedToolChoice)
+        )
+        tools = None
+        if tool_calls_allowed:
+            request.skip_special_tokens = False
+            if isinstance(request.tool_choice, ToolChoice):
+                tools = [
+                    item.model_dump()
+                    for item in request.tools or []
+                    if item.function.name == request.tool_choice.function.name
+                ] or None
+            elif request.tools:
+                tools = [item.model_dump() for item in request.tools]
+                if self.tool_call_parser == "muse" and request._template_tools:
+                    tools = request._template_tools
+
+        if prompt_only:
+            return self._render_message_prompt(
+                request, tools=tools, is_multimodal=is_multimodal
+            )
+
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
@@ -2867,7 +2948,6 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
         template_tool_parser = None
 
-        effective_tools = self._effective_tools(request)
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
@@ -2890,30 +2970,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
 
-        # Apply chat template and its stop strings
-        tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
         kimi_k3_tool_grammar = (
             self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
         )
-        if (
-            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
-        ) and request.tool_choice != "none":
-            request.skip_special_tokens = False
-            if isinstance(request.tool_choice, ToolChoice):
-                tools = [
-                    item.model_dump()
-                    for item in request.tools or []
-                    if item.function.name == request.tool_choice.function.name
-                ] or None
-            elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
-                if self.tool_call_parser == "muse" and request._template_tools:
-                    tools = request._template_tools
+        if tool_calls_allowed:
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
-                    effective_tools,
+                    self._kimi_k3_constraint_tools(
+                        request=request, tools=effective_tools
+                    ),
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
@@ -2996,24 +3063,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if tag is not None:
                 tool_call_constraint = ("structural_tag", tag)
 
-        # When input_ids are provided, skip template tokenization entirely;
-        # only stop tokens and tool_call_constraint are needed.
-        if request.input_ids is not None:
-            if self.chat_encoding_spec == "kimi_k3":
-                self._validated_kimi_k3_partial_message(request)
-            result = MessageProcessingResult(
-                prompt="",
-                prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=request.stop or [],
-            )
-        elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
-        else:
-            result = self._apply_conversation_template(request, is_multimodal)
+        result = self._render_message_prompt(
+            request, tools=tools, is_multimodal=is_multimodal
+        )
 
         if tool_call_stop is not None:
             if isinstance(result.stop, str):
@@ -3064,6 +3116,31 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _render_message_prompt(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        tools: list[dict] | None,
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            if self.chat_encoding_spec == "kimi_k3":
+                self._validated_kimi_k3_partial_message(request)
+            return MessageProcessingResult(
+                prompt="",
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=request.stop or [],
+            )
+        if self.template_manager.chat_template_name is None:
+            return self._apply_jinja_template(request, tools, is_multimodal)
+        return self._apply_conversation_template(request, is_multimodal)
 
     def _apply_jinja_template(
         self,

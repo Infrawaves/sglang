@@ -743,6 +743,9 @@ class AnthropicServing:
                 error_type="invalid_request_error",
                 message=error_msg,
             )
+        schema_error = await self._kimi_k3_tool_schema_error(chat_request)
+        if schema_error is not None:
+            return schema_error
 
         try:
             # Convert to internal request
@@ -811,6 +814,9 @@ class AnthropicServing:
                 error_type="invalid_request_error",
                 message=error_msg,
             )
+        schema_error = await self._kimi_k3_tool_schema_error(chat_request)
+        if schema_error is not None:
+            return schema_error
 
         try:
             adapted_request, processed_request = (
@@ -1398,6 +1404,39 @@ class AnthropicServing:
             message=message,
         )
 
+    async def _kimi_k3_tool_schema_error(
+        self, chat_request: ChatCompletionRequest
+    ) -> Optional[JSONResponse]:
+        """Return 400 for a rejected schema or 503 for a queue timeout or repeated
+        worker crashes. A successful request carries the canonical schemas."""
+        try:
+            error_msg = await self.openai_serving_chat._resolve_kimi_k3_tool_schemas(
+                chat_request
+            )
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as e:
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=str(e.detail),
+            )
+        except Exception as e:
+            logger.exception("Error validating tool schemas: %s", e)
+            return self._error_response(
+                status_code=500,
+                error_type="api_error",
+                message="Internal server error",
+                exception_name=type(e).__name__,
+            )
+        if error_msg:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=error_msg,
+            )
+        return None
+
     def _error_response(
         self,
         status_code: int,
@@ -1466,7 +1505,7 @@ class AnthropicServing:
                 self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
             )
             processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
+                chat_request, is_multimodal, prompt_only=True
             )
 
             if isinstance(processed.prompt_ids, list):

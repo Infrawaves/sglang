@@ -931,6 +931,15 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    # Walle worker subprocesses per tokenizer worker process.
+    SGLANG_KIMI_K3_WALLE_WORKERS = EnvInt(2)
+    # A schema walle has not finished within this many seconds gets a 400 and
+    # its worker is replaced; the default awaits measurement on the target host.
+    SGLANG_KIMI_K3_WALLE_TIMEOUT_S = EnvFloat(1.0)
+    # Waiting this long for an idle walle worker answers 503.
+    SGLANG_KIMI_K3_WALLE_QUEUE_TIMEOUT_S = EnvFloat(2.0)
+    # Per-process cache of walle verdicts, in MB of schema text.
+    SGLANG_KIMI_K3_WALLE_CACHE_MB = EnvInt(64)
     SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR = EnvBool(True)
     # Kimi K3 with thinking off: mask `think` right after `<|open|>` and
     # `<|close|>`, so the model can neither open a think channel nor close one

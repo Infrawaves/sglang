@@ -65,6 +65,7 @@ from sglang.srt.sampling.sampling_params import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kimi_k3_tool_schema_utils import walle_installed
 from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -726,6 +727,8 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     ),
                     envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF),
                 ):
+                    if strict and not walle_installed():
+                        self.skipTest("walle is not installed")
                     request = self._request(
                         mode=mode,
                         stream=stream,
@@ -1141,6 +1144,7 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
         )
         self.assertIsInstance(result, ResponsesResponse)
 
+    @unittest.skipUnless(walle_installed(), "walle is not installed")
     def test_constraint_failure_uses_existing_fallback(self):
         for mode in ("auto", "required"):
             for stream in (False, True):
@@ -3582,10 +3586,13 @@ def test_inline_instruction_keeps_history_prefix(
     tokenizer_manager.tokenizer.chat_template = jinja_template
     template_manager = MockTemplateManager()
     template_manager.chat_template_name = chat_template_name
-    with patch.object(
-        OpenAIServingResponses,
-        "_resolve_chat_encoding_spec",
-        return_value=encoding_spec,
+    with (
+        patch.object(
+            OpenAIServingResponses,
+            "_resolve_chat_encoding_spec",
+            return_value=encoding_spec,
+        ),
+        patch("sglang.srt.entrypoints.openai.serving_chat.check_walle_installed"),
     ):
         serving = OpenAIServingResponses(tokenizer_manager, template_manager)
     history = [

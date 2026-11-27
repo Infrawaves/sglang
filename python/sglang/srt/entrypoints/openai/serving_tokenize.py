@@ -2,7 +2,7 @@ import logging
 from http import HTTPStatus
 from typing import List, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     DetokenizeRequest,
@@ -52,7 +52,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
+                token_ids = await self._tokenize_chat_request(request)
                 tokens = token_ids
                 count = len(token_ids)
             elif isinstance(request.prompt, str):
@@ -81,6 +81,10 @@ class OpenAIServingTokenize(OpenAIServingBase):
             )
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            return self.create_error_response(
+                str(e.detail), err_type=str(e.status_code), status_code=e.status_code
+            )
         except Exception as e:
             logger.error("Error during tokenization", exc_info=True)
             return self.create_error_response(
@@ -89,12 +93,16 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
+    async def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
         if self.chat_serving is None:
             raise ValueError("Chat template tokenization requires a template manager.")
 
         chat_request = request.to_chat_completion_request()
         validation_error = self.chat_serving._validate_request(chat_request)
+        if not validation_error:
+            validation_error = await self.chat_serving._resolve_kimi_k3_tool_schemas(
+                chat_request
+            )
         if validation_error:
             raise ValueError(validation_error)
         if chat_request._format_add_generation_prompt is not None:
