@@ -693,6 +693,141 @@ class TestMooncakeBundlePools(CustomTestCase):
                     logs.output,
                 )
 
+    def _dcp_node(self, dcp):
+        """Every node rank's MLA KV and DSA indexer host pools as shares of two
+        node buffers, as --enable-mla-hicache-dcp-node-aggregate lays them out."""
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            MLADCPNodeAggregateContext,
+            NodeShardedHostTensorAllocator,
+            _NodeShardedBuffer,
+        )
+
+        kvs = [self._mla_host("page_first", dcp, rank) for rank in range(dcp)]
+        idxs = [self._indexer_host(dcp, rank) for rank in range(dcp)]
+        kv_full = torch.cat([kv.kv_buffer for kv in kvs])
+        idx_full = torch.cat([idx.index_k_with_scale_buffer for idx in idxs])
+        kv_bytes, idx_bytes = kv_full.numel() // dcp, idx_full.numel() // dcp
+        for rank, (kv, idx) in enumerate(zip(kvs, idxs)):
+            kv.kv_buffer = kv_full[rank * kv_bytes : (rank + 1) * kv_bytes]
+            idx.index_k_with_scale_buffer = idx_full[
+                rank * idx_bytes : (rank + 1) * idx_bytes
+            ]
+            allocator = NodeShardedHostTensorAllocator.__new__(
+                NodeShardedHostTensorAllocator
+            )
+            allocator._buffers = [
+                _NodeShardedBuffer(full=kv_full, own=kv.kv_buffer, stride_bytes=kv_bytes),
+                _NodeShardedBuffer(
+                    full=idx_full,
+                    own=idx.index_k_with_scale_buffer,
+                    stride_bytes=idx_bytes,
+                ),
+            ]
+            kv.allocator = idx.allocator = allocator
+            kv.dcp_node_aggregate = MLADCPNodeAggregateContext(
+                node_rank=rank,
+                node_size=dcp,
+                node_index=0,
+                num_nodes=1,
+                backup_group=None,
+                prefetch_group=None,
+                allocator=allocator,
+            )
+        return kvs, idxs
+
+    def test_dcp_node_aggregate_moves_every_node_rank_in_one_object(self):
+        dcp = 2
+        logical = self.PHYS_PAGE * dcp
+        kv_page = self.LAYERS * self.KV_DIM * self.PHYS_PAGE
+        idx_page = self.LAYERS * self.INDEX_STRIDE
+        kvs, idxs = self._dcp_node(dcp)
+        objects = {}
+        stores = [
+            self._store(
+                kvs[rank],
+                {PoolName.INDEXER: idxs[rank]},
+                dcp=dcp,
+                rank=rank,
+                objects=objects,
+                bundle=True,
+            )
+            for rank in range(dcp)
+        ]
+        for store in stores:
+            self.assertEqual(store.bundled_pools, (PoolName.INDEXER,))
+        leader = stores[0]
+
+        def node_indices(firsts, num):
+            return [self._indices(logical, first, num) for first in firsts]
+
+        # The same op sits at different host pages on each rank.
+        pages, write_at = [f"h{i}" for i in range(1, 5)], [1, 5]
+        info = HiCacheStorageExtraInfo(
+            start_page=1, node_host_indices=node_indices(write_at, 4)
+        )
+        self.assertEqual(
+            leader.batch_set_v1(pages, node_indices(write_at, 4)[0], info),
+            [True] * 4,
+        )
+        # One object per page for the node, holding every rank's KV + indexer.
+        self.assertEqual(len(objects), 4, sorted(objects))
+        self.assertTrue(
+            all(k.endswith("_dcpnode0of1_cp0_kb_indexer") for k in objects),
+            sorted(objects),
+        )
+        self.assertTrue(
+            all(len(v) == dcp * (kv_page + idx_page) for v in objects.values())
+        )
+        written = [
+            (kv.kv_buffer.clone(), idx.index_k_with_scale_buffer.clone())
+            for kv, idx in zip(kvs, idxs)
+        ]
+        for kv, idx in zip(kvs, idxs):
+            kv.kv_buffer.zero_()
+            idx.index_k_with_scale_buffer.zero_()
+
+        keys, read_at = pages[1:], [10, 13]
+        for store in stores:
+            # Followers query the same node keys.
+            self.assertEqual(store.batch_exists(keys), len(keys))
+        extra = HiCacheStorageExtraInfo(
+            start_page=2, node_host_indices=node_indices(read_at, 3)
+        )
+        self.assertEqual(
+            leader.batch_get_v1(keys, node_indices(read_at, 3)[0], extra),
+            [True] * 3,
+        )
+        for rank in range(dcp):
+            self._assert_pages(
+                kvs[rank], written[rank][0], kv_page, write_at[rank] + 1, read_at[rank], 3
+            )
+            self._assert_pages(
+                idxs[rank],
+                written[rank][1],
+                idx_page,
+                write_at[rank] + 1,
+                read_at[rank],
+                3,
+            )
+        with self.assertRaisesRegex(ValueError, "every node rank"):
+            leader.batch_get_v1(
+                keys,
+                node_indices(read_at, 3)[0],
+                HiCacheStorageExtraInfo(start_page=2),
+            )
+
+    def test_dcp_node_aggregated_indexer_must_join_the_kv_object(self):
+        kvs, idxs = self._dcp_node(2)
+        with self.assertRaisesRegex(ValueError, "cannot join it"):
+            self._store(
+                kvs[0],
+                {PoolName.INDEXER: idxs[0]},
+                dcp=2,
+                rank=0,
+                objects={},
+                bundle=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

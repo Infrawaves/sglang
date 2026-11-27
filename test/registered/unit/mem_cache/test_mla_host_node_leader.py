@@ -1214,5 +1214,59 @@ class TestNodeLeaderStoragePolicies(CustomTestCase):
             self.assertFalse(controller.enable_storage)
 
 
+class TestDCPNodeAggregatedIndexerHostPool(CustomTestCase):
+    """The assembler gives a bundled DSA indexer the MLA KV's node allocator;
+    it is a full per-rank shard, never a per-node follower view."""
+
+    def _build(self, *, bundle):
+        from sglang.srt.mem_cache.device_pool_info import IndexKeyLayout
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+
+        allocator = object()
+        with (
+            mock.patch.object(hybrid_pool_assembler, "DSAIndexerPoolHost") as host_cls,
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_storage_bundle_pools=bundle),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            hybrid_pool_assembler._build_sidecar_host_pool(
+                config=SimpleNamespace(
+                    buffer_info=SimpleNamespace(
+                        key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+                    ),
+                    pool_name=PoolName.INDEXER,
+                    device_to_host_layer={0: 0},
+                ),
+                root=SimpleNamespace(
+                    layer_shard_enabled=False,
+                    layer_num=1,
+                    device="cpu",
+                    store_dtype=torch.uint8,
+                    start_layer=0,
+                    end_layer=1,
+                ),
+                root_host_pool=SimpleNamespace(
+                    page_num=4, page_size=2, layout="page_first", dcp_size=2, dcp_rank=0
+                ),
+                dcp_node_aggregate=SimpleNamespace(allocator=allocator),
+            )
+        return host_cls.call_args.kwargs, allocator
+
+    def test_bundled_indexer_uses_the_node_allocator(self):
+        kwargs, allocator = self._build(bundle=True)
+        self.assertIs(kwargs["host_allocator"], allocator)
+        self.assertFalse(kwargs["is_dummy"])
+        self.assertFalse(kwargs["host_buffer_read_only"])
+
+    def test_unbundled_indexer_keeps_its_own_buffers(self):
+        kwargs, _ = self._build(bundle=False)
+        self.assertIsNone(kwargs["host_allocator"])
+
+
 if __name__ == "__main__":
     unittest.main()

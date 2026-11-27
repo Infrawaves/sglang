@@ -68,8 +68,8 @@ def _object_nbytes(size: Any) -> int:
     return sum(size) if isinstance(size, Sequence) else size
 
 
-def _as_size_list(size: Any) -> list:
-    return list(size) if isinstance(size, Sequence) else [size]
+def _as_list(value: Any) -> list:
+    return list(value) if isinstance(value, Sequence) else [value]
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -819,6 +819,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.registered_pools = {}
             # KDANodeAggregateContext of the registered Mamba pool, if any.
             self.kda_node_aggregate = None
+            # MLADCPNodeAggregateContext of the registered MLA KV pool, if any.
+            self.mla_dcp_node_aggregate = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -950,8 +952,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             # Only the rank that owns the shared MLA host copy reads L3 into it.
             return
+        node = getattr(self.mem_pool_host, "dcp_node_aggregate", None)
+        self.mla_dcp_node_aggregate = node
+        if node is not None and not node.is_leader:
+            # The node leader moves this rank's shard inside the node objects.
+            return
         try:
-            for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
+            buffers = (
+                self._iter_host_pool_buffers(self.mem_pool_host)
+                if node is None
+                # Every node rank's shares, including a bundled DSA indexer's.
+                else node.allocator.full_buffers()
+            )
+            for buffer in buffers:
                 super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
@@ -982,6 +995,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if getattr(host_pool, "host_buffer_read_only", False):
             # Node-leader follower: no host mapping to register; the leader reads
             # and writes this pool's L3 objects (see _object_layout).
+            return
+        if self._is_dcp_node_aggregated(host_pool):
+            # The KV registration covered the node buffers (a bundled indexer).
             return
 
         node_aggregate = (
@@ -1072,6 +1088,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 reason="External L3 lookup requires rank-replicated/MLA pools",
             )
             return layout
+        if self.mla_dcp_node_aggregate is not None:
+            layout.update(
+                enabled=False,
+                reason="External L3 lookup does not support "
+                "--enable-mla-hicache-dcp-node-aggregate",
+            )
+            return layout
         if self.storage_page_group > 1:
             # Grouped KV/draft objects are keyed per segment (storage_page_group.py),
             # so no per-page key exists for an external lookup.
@@ -1157,12 +1180,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return layout
 
     def _mla_kv_object_suffix(self) -> str:
-        """Suffix of a page's MLA KV object: `_{mla_suffix}_k`, plus the names
-        of the pools bundled into it, so bundle layouts never share keys."""
+        """Suffix of a page's MLA KV object: `_{shard}_k`, plus the names of the
+        pools bundled into it, so bundle layouts never share keys. A DCP node
+        object names the node instead of this rank's DCP shard."""
+        node = self.mla_dcp_node_aggregate
+        shard = (
+            self.mla_suffix
+            if node is None
+            else f"dcpnode{node.node_index}of{node.num_nodes}_cp{self.attn_cp_rank}"
+        )
         if not self.bundled_pools:
-            return f"_{self.mla_suffix}_k"
+            return f"_{shard}_k"
         names = "_".join(name.value for name in self.bundled_pools)
-        return f"_{self.mla_suffix}_kb_{names}"
+        return f"_{shard}_kb_{names}"
 
     # KV-derived pools that MLA writers store per page under mla_suffix.
     _BUNDLE_CANDIDATES = (PoolName.INDEXER, PoolName.DRAFT, PoolName.DRAFT_INDEXER)
@@ -1182,6 +1212,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if host is None or not isinstance(host, MLATokenToKVPoolHost):
             return (), {"kv": "the KV host pool is not an MLA host pool"}
         kv_node_shared = self._is_node_shared_host_pool(host)
+        kv_dcp_node = self.mla_dcp_node_aggregate is not None
         if not kv_node_shared and host.kv_buffer is None:
             return (), {"kv": "the KV host pool has no buffer"}
         span = l3_page_span(host)
@@ -1204,6 +1235,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # Rank-independent, so every rank of the node decides alike.
                 skipped[name.value] = "its per-node sharing differs from the KV"
                 continue
+            if self._is_dcp_node_aggregated(pool) != kv_dcp_node:
+                # A DCP node object carries every node rank's share, so only a
+                # pool laid out in the same node buffers can ride in it.
+                skipped[name.value] = "its DCP node aggregation differs from the KV"
+                continue
             if name == PoolName.DRAFT and (
                 not isinstance(pool, MLATokenToKVPoolHost)
                 or pool.kv_buffer is None
@@ -1215,6 +1251,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 continue
             bundled.append(name)
         return tuple(bundled), skipped
+
+    def _is_dcp_node_aggregated(self, pool: Any) -> bool:
+        node = self.mla_dcp_node_aggregate
+        return node is not None and getattr(pool, "allocator", None) is node.allocator
 
     @staticmethod
     def _is_node_shared_host_pool(pool: Any) -> bool:
@@ -1238,6 +1278,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def on_host_pools_registered(self) -> None:
         self.bundled_pools, skipped = self._resolve_bundled_pools()
+        orphaned = [
+            name.value
+            for name, pool in self.registered_pools.items()
+            if self._is_dcp_node_aggregated(pool) and name not in self.bundled_pools
+        ]
+        if orphaned:
+            # Its buffers are node shares with no per-rank registration.
+            raise ValueError(
+                "--enable-mla-hicache-dcp-node-aggregate laid out "
+                f"{', '.join(orphaned)} for the KV object, but it cannot join it: "
+                + "; ".join(skipped.get(name, "not bundled") for name in orphaned)
+                + "."
+            )
         reasons = "; ".join(f"{name}: {why}" for name, why in skipped.items())
         if self.bundled_pools:
             logger.info(
@@ -2137,7 +2190,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """Scratch segments for ``count`` pages that precede a read's start."""
         per_page = base.objects_per_page
         comp_sizes = [
-            [int(s) for s in _as_size_list(base.buffer_sizes[c])]
+            [int(s) for s in _as_list(base.buffer_sizes[c])]
             for c in range(per_page)
         ]
         page_bytes = sum(sum(sizes) for sizes in comp_sizes)
@@ -2309,19 +2362,37 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return key_list, ptr_list, element_size_list
 
-    def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+    def _get_mla_buffer_meta(self, keys, indices, node_host_indices=None):
         suffix = self._mla_kv_object_suffix()
         key_list = [f"{key_}{suffix}" for key_ in keys]
+        if node_host_indices is None:
+            return key_list, *self._mla_page_buffer_meta(key_list, indices)
+        # A node object is every node rank's page, in node-rank order; each rank's
+        # page sits at its own host indices in that rank's node share.
+        allocator = self.mla_dcp_node_aggregate.allocator
+        page_ptrs = [[] for _ in key_list]
+        page_sizes = [[] for _ in key_list]
+        for node_rank, rank_indices in enumerate(node_host_indices):
+            ptrs, sizes = self._mla_page_buffer_meta(key_list, rank_indices)
+            for page, (ptr, size) in enumerate(zip(ptrs, sizes)):
+                page_ptrs[page].extend(
+                    allocator.peer_ptr(p, node_rank) for p in _as_list(ptr)
+                )
+                page_sizes[page].extend(_as_list(size))
+        return key_list, page_ptrs, page_sizes
+
+    def _mla_page_buffer_meta(self, key_list, indices):
+        """One object's buffers per key, in this rank's host view."""
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         if self.bundled_pools:
-            return key_list, *self._bundle_buffer_meta(
-                indices, len(keys), ptr_list, element_size_list
+            return self._bundle_buffer_meta(
+                indices, len(key_list), ptr_list, element_size_list
             )
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
         assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
+        return ptr_list, element_size_list
 
     def _bundle_buffer_meta(self, indices, num_pages, kv_ptrs, kv_sizes):
         """Per page: the KV segments, then each bundled pool's segments for
@@ -2341,7 +2412,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 page_sizes[page].extend(sizes[page * per_page : (page + 1) * per_page])
         return page_ptrs, page_sizes
 
-    def _batch_preprocess(self, keys, host_indices):
+    def _batch_preprocess(self, keys, host_indices, node_host_indices=None):
         assert len(keys) > 0
         page_size = (
             self.storage_config.logical_page_size
@@ -2350,7 +2421,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         assert len(keys) == len(host_indices) // page_size
         if self.is_mla_backend:
-            return self._get_mla_buffer_meta(keys, host_indices)
+            return self._get_mla_buffer_meta(keys, host_indices, node_host_indices)
         else:
             if self.should_split_heads:
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
@@ -2388,6 +2459,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    def _node_host_indices(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[List[torch.Tensor]]:
+        """Every node rank's host indices for a DCP node object's KV IO."""
+        if self.mla_dcp_node_aggregate is None:
+            return None
+        indices = None if extra_info is None else extra_info.node_host_indices
+        if indices is None or len(indices) != self.mla_dcp_node_aggregate.node_size:
+            # Moving only this rank's share would write or fill a partial node
+            # object under the node key.
+            raise ValueError(
+                "DCP node-aggregated KV IO needs every node rank's host indices."
+            )
+        return indices
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -2403,7 +2489,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            keys, host_indices, self._node_host_indices(extra_info)
+        )
 
         start_time = time.perf_counter()
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
@@ -2459,7 +2547,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys = self._tag_keys(keys)
 
             key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
-                keys, host_indices
+                keys, host_indices, self._node_host_indices(extra_info)
             )
             key_multiplier = len(key_strs) // len(keys)
             group_ids = (
