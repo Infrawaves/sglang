@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa import dsa_prefill_cuda_graph as graph_split
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import interleave
 from sglang.srt.layers.cp import padding as cp_padding
@@ -182,6 +183,33 @@ class TestPositionOwnerLayout(CustomTestCase):
             written.append(loc)
         self.assertEqual(sorted(torch.cat(written).tolist()), sorted(slots.tolist()))
 
+    def test_graph_indexer_stores_the_local_index_k_on_the_owner(self):
+        """The prefill-graph DSA indexer keeps the local (ungathered) index-K under
+        PCP+DCP; it must write that shard to the owner's slots, not demand a
+        gathered key."""
+        slots = torch.arange(sum(e for _, e in REQUESTS))
+        for rank in range(N):
+            batch, _ = _forward_batch(rank)
+            metadata = batch.attn_cp_metadata
+            metadata.local_out_cache_loc = slots.index_select(
+                0, metadata.local_sequence_rows
+            )
+            batch.out_cache_loc = slots
+            key = torch.randn(metadata.per_rank_actual_token[rank], 8)
+            with (
+                _topology(rank=rank),
+                patch.object(cp_utils, "is_cp_active", lambda fb: True),
+            ):
+                store_key, store_loc = graph_split._index_k_store_rows(
+                    forward_batch=batch,
+                    key=key,
+                    extend_num_tokens=slots.numel(),
+                    in_cp=True,
+                )
+            live = metadata.per_rank_logical_token[rank]
+            self.assertTrue(torch.equal(store_key, key[:live]))
+            self.assertTrue(torch.equal(store_loc, metadata.local_out_cache_loc))
+
 
 class TestGraphGatherIndex(CustomTestCase):
     """A breakable-graph replay widens every shard to the captured rows and keeps
@@ -318,6 +346,25 @@ class TestWithoutDcp(CustomTestCase):
                 metadata.per_rank_logical_token,
                 [base + (r < extra) for r in range(N)],
             )
+
+    def test_graph_indexer_stores_the_gathered_live_tokens(self):
+        total = sum(e for _, e in REQUESTS)
+        batch, _ = _forward_batch(0, dcp_size=1)
+        batch.out_cache_loc = torch.arange(total + N)
+        # A gathered key with bucket padding at its tail.
+        key = torch.randn(total + N, 8)
+        with (
+            _topology(rank=0, dcp_size=1),
+            patch.object(cp_utils, "is_cp_active", lambda fb: True),
+        ):
+            store_key, store_loc = graph_split._index_k_store_rows(
+                forward_batch=batch,
+                key=key,
+                extend_num_tokens=total,
+                in_cp=True,
+            )
+        self.assertTrue(torch.equal(store_key, key[:total]))
+        self.assertTrue(torch.equal(store_loc, batch.out_cache_loc[:total]))
 
 
 if __name__ == "__main__":
