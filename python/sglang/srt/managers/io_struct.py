@@ -1205,6 +1205,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal opt-in for one scheduler-finalized MM accounting input snapshot.
     # Identity and TTL remain in TokenizerManager, outside scheduler IPC.
     return_cache_input: bool = False
+    # Set when mm_inputs carry feature-less image items whose features the
+    # scheduler requests on demand (SGLANG_K3_IMAGE_DEMAND_PREPROCESS).
+    mm_demand_ticket: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2390,6 +2393,33 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
     error_msg: str
     error_code: int
+
+
+class MaterializeImagesReq(BaseReq, kw_only=True):
+    """Scheduler-to-tokenizer request to preprocess some images of a demand
+    request; see sglang.srt.multimodal.demand_preprocess."""
+
+    ticket: int
+    materialization_id: int
+    image_indices: List[int]
+
+
+class ImagesReadyReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler answer to one MaterializeImagesReq: either the
+    requested items with features, or an error for the whole round."""
+
+    ticket: int
+    materialization_id: int
+    image_indices: List[int]
+    mm_inputs: Optional[MultimodalProcessorOutput] = None
+    error_msg: Optional[str] = None
+    status_code: Optional[int] = None
+
+    def wrap_pickle_fields(self):
+        self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
+
+    def unwrap_pickle_fields(self):
+        self.mm_inputs = unwrap_object_fields_from_pickle(self.mm_inputs)
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

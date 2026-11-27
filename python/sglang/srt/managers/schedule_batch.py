@@ -625,6 +625,9 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Image readiness when the tokenizer sent feature-less image items
+        # (ImageDemandState, SGLANG_K3_IMAGE_DEMAND_PREPROCESS).
+        self.mm_demand = None
         # Pre-computed multimodal prompt token counts; populated on the prefill
         # node and transferred to decode via the metadata buffer in disagg (PD) mode.
         self.mm_image_tokens: int = 0

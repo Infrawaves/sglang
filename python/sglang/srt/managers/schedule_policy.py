@@ -629,6 +629,9 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    # This request's images past its prefix are not preprocessed yet (or
+    # failed); others may still be admitted. See demand_preprocess.
+    WAIT_FOR_MM = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1558,6 +1561,11 @@ class PrefillAdder:
                 if admission is AddReqResult.NO_TOKEN:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
+            # Checked on the selected prefix, before anything is reserved.
+            if req.mm_demand is not None and req.mm_demand.blocks(
+                admission.prefix_len
+            ):
+                return AddReqResult.WAIT_FOR_MM
             if not self._round_robin_can_admit(req):
                 return AddReqResult.NO_TOKEN
 
@@ -1690,6 +1698,17 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
+                    # The lost host prefix can expose images not requested yet.
+                    # Nothing was loaded, so waiting leaves no H2D behind.
+                    if req.mm_demand is not None and req.mm_demand.blocks(
+                        admission.prefix_len
+                    ):
+                        if self.kv_shard_scratch_spec is not None:
+                            (
+                                self.kv_shard_block_bound_pages,
+                                self.kv_shard_chunk_pages,
+                            ) = scratch_mark
+                        return AddReqResult.WAIT_FOR_MM
                 req.prefix_len += req.host_loaded_length
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.protect_prefix(req.prefix_len)

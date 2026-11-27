@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ImagesReadyReq,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -246,7 +247,10 @@ class SchedulerRequestReceiver:
             return
 
         for req in recv_reqs:
-            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+            if isinstance(
+                req,
+                (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, ImagesReadyReq),
+            ):
                 req.unwrap_pickle_fields()
             elif isinstance(
                 req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)

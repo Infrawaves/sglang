@@ -2689,6 +2689,15 @@ class Envs:
     # one line per request, matching the always-on video logs; turn it off to
     # silence it entirely.
     SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
+    # Demand image preprocessing for Kimi-K3 static images. The tokenizer
+    # sends only metadata (input_ids, offsets, grid, identity) and keeps the raw
+    # bytes; the scheduler asks it to preprocess an image only when the image
+    # is not fully covered by the request's device + host + L3 prefix hit.
+    # Images entirely inside a cached prefix are never decoded or encoded.
+    # Requires --mm-feature-transport cuda_vmm with features kept on device,
+    # TP-only scheduling (no DP attention, no PP) and the preprocess cache;
+    # any other request keeps the full tokenizer path.
+    SGLANG_K3_IMAGE_DEMAND_PREPROCESS = EnvBool(False)
     # MiB of idle preprocessing cache the Kimi-K3 tokenizer may keep on its GPU,
     # which it shares with TP rank 0; above this, all of it goes back to the driver.
     SGLANG_K3_PREPROCESS_RELEASE_THRESHOLD_MB = EnvInt(512)

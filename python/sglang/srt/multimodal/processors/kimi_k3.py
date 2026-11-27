@@ -17,6 +17,7 @@ import math
 import re
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from http import HTTPStatus
@@ -36,9 +37,11 @@ from sglang.srt.models.kimi_k3 import (
 )
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
+    parse_content_hash,
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.demand_preprocess import DemandImageSources
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -138,6 +141,26 @@ def _probe_encoded_image(data: bytes) -> Optional[_K3EncodedImage]:
     except Exception:
         return None
     return _K3EncodedImage(data, int(width), int(height), 4 if has_alpha else 3)
+
+
+def _retain_image_source(source: Any, payload: bytes) -> Optional[Any]:
+    """Replace a request image's URL/data with its downloaded bytes.
+
+    The envelope and every preprocess option stay, so the artifact key is the
+    request's; materialization then never fetches the URL a second time.
+    """
+    from sglang.srt.utils import ImageData
+
+    if isinstance(source, ImageData):
+        return replace(source, url=payload)
+    if isinstance(source, (str, bytes, bytearray)):
+        return payload
+    if isinstance(source, Mapping) and "format" not in source:
+        if "url" in source:
+            return {**source, "url": payload}
+        if "image" in source:
+            return {**source, "image": payload}
+    return None
 
 
 def _image_geometry(image) -> tuple[int, int, int]:
@@ -1675,8 +1698,26 @@ class KimiK3ImageProcessor(
             raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         # 2. build request-owned items from prompt-independent artifacts
+        items = self._build_image_items(artifacts, offsets)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=self._prepare_mm_items_for_transport(items),
+            im_token_id=self.mm_tokens.image_token_id,
+        )
+
+    def _build_image_items(
+        self,
+        artifacts: list[KimiK3ImagePreprocessArtifact],
+        offsets: list[tuple[int, int]],
+    ) -> list[MultimodalDataItem]:
+        """Turn artifacts into request items placed at ``offsets``.
+
+        A feature-less artifact (demand preprocessing) yields an item with the
+        same grid, identity and offsets but no feature; its feature is attached
+        later in the scheduler from an item built here from the real artifact.
+        """
         items = []
-        for artifact, offset in zip(artifacts, offsets):
+        for artifact, offset in zip(artifacts, offsets, strict=True):
             model_specific_data = {
                 "image_grid_thw": torch.tensor([artifact.grid_thw], dtype=torch.int64),
                 "cache_accounting_artifact_key": CacheArtifactIdentity(
@@ -1702,12 +1743,161 @@ class KimiK3ImageProcessor(
                     True
                 )
             items.append(item)
+        return items
 
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=self._prepare_mm_items_for_transport(items),
-            im_token_id=self.mm_tokens.image_token_id,
+    async def process_mm_metadata_async(
+        self, image_data, input_text, request_obj, *, ticket: int
+    ) -> Optional[tuple[MultimodalProcessorOutput, DemandImageSources]]:
+        """Compose the prompt from image headers only, for demand preprocessing.
+
+        Returns the request's items without features plus the retained sources
+        to materialize them later, or None when this request must take
+        ``process_mm_data_async``. Every rejection the full path would raise
+        (bad placeholder count, unreadable URL, content-hash mismatch) also
+        returns None, so the full path raises it with its usual message. An
+        image whose header parses but whose pixels are corrupt passes here and
+        fails at materialization with the full path's 400 error.
+        """
+        if request_obj.audio_data or request_obj.video_data:
+            return None
+        image_data = list(image_data or [])
+        if not image_data or any(self._is_preprocessed_input(i) for i in image_data):
+            return None
+        if not self.mm_preprocess_cache.enabled:
+            return None
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            # That mode identifies items by feature hash, which needs pixels.
+            return None
+        self.reject_caller_image_identity(image_data, request_obj)
+        placeholder_count = self.count_image_placeholders(
+            input_text, self.mm_tokens.image_token_id
         )
+        if placeholder_count is not None and placeholder_count != len(image_data):
+            return None
+        content_hashes = request_obj.mm_content_hashes or [None] * len(image_data)
+        if len(content_hashes) != len(image_data):
+            return None
+        try:
+            content_hashes = [parse_content_hash(value) for value in content_hashes]
+        except ValueError:
+            return None
+
+        loop = asyncio.get_running_loop()
+        try:
+            snapshots = await asyncio.gather(
+                *(
+                    loop.run_in_executor(
+                        self.io_executor,
+                        self.snapshot_media_source,
+                        source,
+                        Modality.IMAGE,
+                    )
+                    for source in image_data
+                )
+            )
+        except Exception:
+            return None
+
+        config = self._processor.preprocess_config
+        sources, digests, artifacts = [], [], []
+        for source, snapshot, caller_hash in zip(image_data, snapshots, content_hashes):
+            payload = snapshot.data
+            if not isinstance(payload, (bytes, bytearray)):
+                return None
+            if caller_hash is not None and caller_hash != snapshot.content_digest:
+                return None
+            payload = bytes(payload)
+            encoded = _probe_encoded_image(payload)
+            retained = _retain_image_source(source, payload)
+            if encoded is None or retained is None:
+                return None
+            artifact_key = self._artifact_key(snapshot.content_digest, source)
+            # The retained envelope must name the same artifact as the request.
+            if self._artifact_key(snapshot.content_digest, retained) != artifact_key:
+                return None
+            resize_config = navit_resize_config(
+                encoded.width,
+                encoded.height,
+                config.patch_size,
+                config.merge_kernel_size,
+                config.in_patch_limit,
+                config.patch_limit_on_one_side,
+                config.fixed_output_tokens,
+            )
+            artifacts.append(
+                KimiK3ImagePreprocessArtifact(
+                    content_digest=snapshot.content_digest,
+                    artifact_key=artifact_key,
+                    feature_hash=0,
+                    original_size=(encoded.width, encoded.height),
+                    resize_config=KimiK3ResizeConfig.from_dict(resize_config),
+                    grid_thw=_grid_thw_from_resize_config(
+                        resize_config, config.patch_size
+                    ),
+                    feature=None,
+                )
+            )
+            sources.append(retained)
+            digests.append(snapshot.content_digest)
+
+        output = self.compose_request(input_text, artifacts)
+        # The exact spans compose_request placed, so materialized items match.
+        offsets = [item.offsets[0] for item in output.mm_items]
+        return output, DemandImageSources(
+            ticket=ticket,
+            sources=sources,
+            content_digests=digests,
+            artifacts=artifacts,
+            offsets=offsets,
+        )
+
+    async def materialize_images_async(
+        self, demand: DemandImageSources, indices: list[int]
+    ) -> MultimodalProcessorOutput:
+        """Preprocess the requested images of a demand request.
+
+        Runs the same cached artifact path as ``process_mm_data_async`` and
+        returns items at the request's offsets, with features. A decode error
+        raises the full path's ``ValueError``; an artifact that disagrees with
+        the header-derived metadata raises RuntimeError.
+        """
+        _release_preprocess_cache(
+            threshold_bytes=self._preprocess_release_threshold_bytes
+        )
+        try:
+            artifacts = await self.prepare_media_artifacts(
+                [demand.sources[i] for i in indices],
+                content_hashes=[demand.content_digests[i] for i in indices],
+            )
+            for index, artifact in zip(indices, artifacts, strict=True):
+                expected = demand.artifacts[index]
+                if (
+                    artifact.artifact_key != expected.artifact_key
+                    or tuple(artifact.grid_thw) != tuple(expected.grid_thw)
+                    or tuple(artifact.original_size) != tuple(expected.original_size)
+                    or artifact.resize_config.num_tokens
+                    != expected.resize_config.num_tokens
+                ):
+                    raise RuntimeError(
+                        f"Kimi-K3 demand image {index} does not match its header "
+                        f"metadata: grid {artifact.grid_thw} != {expected.grid_thw}"
+                    )
+                if not artifact.has_feature:
+                    raise RuntimeError(
+                        f"Kimi-K3 demand image {index} has no feature after "
+                        "preprocessing"
+                    )
+            items = self._build_image_items(
+                artifacts, [demand.offsets[i] for i in indices]
+            )
+            return MultimodalProcessorOutput(
+                mm_items=self._prepare_mm_items_for_transport(items),
+                im_token_id=self.mm_tokens.image_token_id,
+            )
+        finally:
+            _release_preprocess_cache(
+                threshold_bytes=self._preprocess_release_threshold_bytes
+            )
 
     async def _stage_raw_images(self, image_data) -> Optional[list]:
         """Fetch each raw image once and read its header, without decoding.

@@ -546,6 +546,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.host_loaded_length = 0
         req.auxiliary_swa_host_hit_length = 0
         req.retracted_stain = False
+        req.mm_demand = None
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length

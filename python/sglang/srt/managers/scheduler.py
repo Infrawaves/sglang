@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+import weakref
 from array import array
 from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -169,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
+    ImagesReadyReq,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -178,6 +180,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MaterializeImagesReq,
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
@@ -350,6 +353,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.demand_preprocess import ImageDemandState
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -1401,6 +1405,11 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
+        # rid -> live request whose images are preprocessed on demand; entries
+        # vanish with the request, so no finish path has to clean them up.
+        self._image_demand_reqs: weakref.WeakValueDictionary[str, Req] = (
+            weakref.WeakValueDictionary()
+        )
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # Requests merged into a running batch, until they finish or a retract,
@@ -2151,6 +2160,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (ImagesReadyReq, self.handle_images_ready),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (ReleaseUocrDocReqInput, self.release_uocr_doc),
@@ -2546,6 +2556,8 @@ class Scheduler(
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
+                if isinstance(recv_req, ImagesReadyReq):
+                    self._materialize_images_ready(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -2691,6 +2703,156 @@ class Scheduler(
                 raise TypeError(
                     f"Unsupported tokenized request type: {type(tokenized_req).__name__}"
                 )
+
+    def _materialize_images_ready(self, recv_req: ImagesReadyReq) -> None:
+        """Copy an ImagesReadyReq's VMM features out on every TP rank.
+
+        Like _materialize_cuda_vmm_inputs, ranks agree on failure, so the reply
+        ends up identical everywhere: all features, or an error.
+        """
+        if recv_req.mm_inputs is None:
+            return
+        local_error = None
+        try:
+            recv_req.mm_inputs = MultimodalInputs.from_processor_output(
+                recv_req.mm_inputs
+            )
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+        rank_errors = self._gather_vmm_materialization_errors(local_error)
+        failed_ranks = [
+            rank for rank, error in enumerate(rank_errors) if error is not None
+        ]
+        if not failed_ranks:
+            return
+        details = "; ".join(
+            f"rank {rank}: {rank_errors[rank]}" for rank in failed_ranks
+        )
+        recv_req.error_msg = f"Multimodal feature reconstruction failed ({details})"
+        recv_req.status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        logger.error(recv_req.error_msg)
+        self._release_demand_items(recv_req.mm_inputs.mm_items)
+        recv_req.mm_inputs = None
+
+    @staticmethod
+    def _release_demand_items(items) -> None:
+        for item in items:
+            try:
+                item.release_transport_proxies()
+            except Exception:
+                logger.warning(
+                    "Failed to release a demand image feature transport",
+                    exc_info=True,
+                )
+            finally:
+                item.feature = None
+
+    def _register_image_demand(self, req: Req, ticket: int) -> None:
+        # One span per image item; prefix_len indexes the same origin_input_ids.
+        offsets = [
+            (item.offsets[0][0], item.offsets[-1][1])
+            for item in req.multimodal_inputs.mm_items
+        ]
+        req.mm_demand = ImageDemandState(ticket=ticket, offsets=offsets)
+        self._image_demand_reqs[req.rid] = req
+
+    def handle_images_ready(self, recv_req: ImagesReadyReq) -> None:
+        """Attach materialized image features, or record why they failed.
+
+        Runs on every TP rank from the same broadcast; each rank's request
+        state advances identically. A reply for a request that is gone, or
+        for a round it no longer waits for, only has its features released.
+        """
+        items = recv_req.mm_inputs.mm_items if recv_req.mm_inputs is not None else []
+        req = self._image_demand_reqs.get(recv_req.rid)
+        demand = req.mm_demand if req is not None else None
+        if (
+            demand is None
+            or req.finished()
+            or req.multimodal_inputs is None
+            or not demand.take_pending(
+                recv_req.ticket, recv_req.materialization_id, recv_req.image_indices
+            )
+        ):
+            self._release_demand_items(items)
+            return
+        indices = recv_req.image_indices
+        error_msg = recv_req.error_msg
+        status_code = recv_req.status_code or int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        if error_msg is None:
+            error_msg = self._attach_demand_features(req, indices, items)
+            status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        if error_msg is not None:
+            self._release_demand_items(items)
+            demand.mark_failed(indices, error_msg, status_code)
+            return
+        demand.mark_ready(indices)
+
+    @staticmethod
+    def _attach_demand_features(req: Req, indices, items) -> Optional[str]:
+        """Move each reply item's feature onto the request's item at its index."""
+        targets = req.multimodal_inputs.mm_items
+        if len(items) != len(indices):
+            return "Demand image reply does not match the requested images"
+        for index, item in zip(indices, items):
+            target = targets[index]
+            if (
+                target.hash != item.hash
+                or target.pad_value != item.pad_value
+                or [tuple(span) for span in target.offsets]
+                != [tuple(span) for span in item.offsets]
+                or item.feature is None
+            ):
+                return f"Demand image {index} does not match its metadata item"
+        for index, item in zip(indices, items):
+            target = targets[index]
+            target.feature = item.feature
+            # Carries the transport flags of the real item, e.g. deferred
+            # CUDA IPC reconstruction; the rest equals the metadata item's.
+            target.model_specific_data.update(item.model_specific_data)
+            item.feature = None
+        return None
+
+    def _await_demand_images(self, req: Req, failed: List[Req]) -> None:
+        """Ask for the images an admission attempt found missing."""
+        demand = req.mm_demand
+        prefix_len = demand.blocked_prefix_len
+        if demand.failed(prefix_len):
+            failed.append(req)
+            return
+        materialization = demand.begin_request(prefix_len)
+        if materialization is None:
+            return
+        materialization_id, indices = materialization
+        # Every rank opens the round; the socket exists on the leader only.
+        self.ipc_channels.send_to_tokenizer.send_output(
+            MaterializeImagesReq(
+                rid=req.rid,
+                ticket=demand.ticket,
+                materialization_id=materialization_id,
+                image_indices=indices,
+            ),
+            req,
+        )
+
+    def _abort_demand_image_failures(self, reqs: List[Req]) -> None:
+        """Abort waiting requests whose needed images failed to preprocess."""
+        failed_ids = {id(req) for req in reqs}
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        for req in self.waiting_queue.take(lambda req: id(req) in failed_ids):
+            demand = req.mm_demand
+            message = demand.error_msg or "Image preprocessing failed."
+            status_code = demand.status_code or int(HTTPStatus.INTERNAL_SERVER_ERROR)
+            if is_prefill:
+                # Same as _abort_waiting: the transfer queue releases it.
+                prepare_abort(req, message, status_code=status_code)
+                self.beam_coordinator.retire_group(req)
+                self.queue_aborted_prefill_transfer(req)
+                continue
+            reason = FINISH_ABORT(message, status_code)
+            self.request_retirer.abort(
+                req, reason=reason, finished_reason=reason.to_json()
+            )
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -3667,6 +3829,8 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             # the request now owns cleanup, including rejection after padding
             mm_cleanup.pop_all()
+            if recv_req.mm_demand_ticket is not None:
+                self._register_image_demand(req, recv_req.mm_demand_ticket)
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -4739,6 +4903,7 @@ class Scheduler(
             else set()
         )
         fresh_blocked = False
+        image_demand_failures: List[Req] = []
         candidates = self.waiting_queue
         if round_robin_enabled:
             candidates = sorted(
@@ -4861,6 +5026,13 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
+            if res == AddReqResult.WAIT_FOR_MM:
+                # Not admitted: its images are being preprocessed, or failed.
+                # Later candidates may still fit this batch.
+                self._revert_unadmitted_mamba(req)
+                self._await_demand_images(req, image_demand_failures)
+                continue
+
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
@@ -4886,6 +5058,8 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if image_demand_failures:
+            self._abort_demand_image_failures(image_demand_failures)
         self.running_reqs.leave(adder.preempt_list)
 
         self.policy.record_chunk_limit_outcome(

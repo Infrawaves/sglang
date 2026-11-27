@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import itertools
 import json
 import logging
 import os
@@ -116,7 +117,9 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
+    ImagesReadyReq,
     LoadLoRAAdapterReqInput,
+    MaterializeImagesReq,
     OpenSessionReqOutput,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
@@ -162,6 +165,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.demand_preprocess import DemandImageSources
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
@@ -306,6 +310,10 @@ _STREAMING_SEGMENTS_SUFFIX = "_segments"
 OUTPUT_IDS_START_KEY = "output_ids_start"
 
 
+class _MMDemandGone(Exception):
+    """The request of a MaterializeImagesReq finished or was aborted."""
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -336,6 +344,9 @@ class ReqState:
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
+    # Raw image bytes kept for SGLANG_K3_IMAGE_DEMAND_PREPROCESS; freed with
+    # this state.
+    mm_demand: Optional[DemandImageSources] = None
 
     # Prevent duplicate releases after completion or ownership transfer.
     lora_released: bool = False
@@ -908,6 +919,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks = set()
         # Keep pending LoRA release tasks alive.
         self._lora_release_tasks = set()
+        # Demand image preprocessing (SGLANG_K3_IMAGE_DEMAND_PREPROCESS)
+        self._mm_demand_supported: Optional[bool] = None
+        self._mm_demand_tickets = itertools.count(1)
+        self._mm_demand_tasks: Set[asyncio.Task] = set()
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -1111,6 +1126,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
                 (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (MaterializeImagesReq, self._handle_materialize_images_req),
             ]
         )
         self.init_communicators()
@@ -1973,6 +1989,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._normalize_mm_content_hashes(obj)
 
             mm_inputs = None
+            mm_demand = None
             mm_processor_input = (
                 input_ids
                 if self.mm_processor.prefer_tokenized_input and input_ids is not None
@@ -1997,6 +2014,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
+                    if self._mm_demand_eligible(obj):
+                        demand_result = (
+                            await self.mm_processor.process_mm_metadata_async(
+                                image_data=obj.image_data,
+                                input_text=mm_processor_input,
+                                request_obj=obj,
+                                ticket=next(self._mm_demand_tickets),
+                            )
+                        )
+                        if demand_result is not None:
+                            mm_inputs, mm_demand = demand_result
+                if mm_inputs is None:
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
@@ -2046,13 +2075,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
+            mm_demand = None
 
         self._validate_one_request(obj, input_ids)
         if isinstance(obj, GenerateReqInput):
             await self._prepare_cache_plan(obj, input_ids)
-        return self._create_tokenized_object(
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+        if mm_demand is not None:
+            self._register_mm_demand(tokenized_obj, mm_demand)
+        return tokenized_obj
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -2558,6 +2591,171 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
+
+    def _mm_demand_unsupported_reason(self) -> Optional[str]:
+        if not envs.SGLANG_K3_IMAGE_DEMAND_PREPROCESS.get():
+            return "disabled"
+        if not hasattr(self.mm_processor, "process_mm_metadata_async"):
+            return "the multimodal processor has no metadata path"
+        if (
+            get_mm().mm_feature_transport != "cuda_vmm"
+            or not self.mm_processor.keep_mm_features_on_device
+        ):
+            return "it requires --mm-feature-transport cuda_vmm"
+        parallel = get_parallel()
+        # Readiness is replicated by the TP request broadcast; DP attention and
+        # PP route requests and control messages through other channels.
+        if (
+            parallel.attn_dp_enabled
+            or parallel.num_dp_ranks != 1
+            or parallel.pp_size != 1
+        ):
+            return "it requires TP-only scheduling (no DP attention, dp 1, pp 1)"
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return "PD decode receives KV cache, not images"
+        if get_disagg().language_only:
+            return "EPD language-only receives embeddings from the encoder"
+        if get_memory().disable_radix_cache:
+            return "without the radix cache no image is ever covered by a prefix"
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            return "encoder SWA bounded replay needs every image feature"
+        if get_exec().dllm.dllm_algorithm is not None:
+            return "dLLM scheduling has its own admission path"
+        if envs.SGLANG_RUST_SERVER.get() or get_serving().tokenizer_worker_num > 1:
+            return "scheduler replies must reach this tokenizer worker"
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            return "SGLANG_MM_SKIP_COMPUTE_HASH identifies items by pixels"
+        return None
+
+    def _mm_demand_eligible(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        """Whether *obj* may take the demand image path.
+
+        See sglang.srt.multimodal.demand_preprocess. A request that is not
+        eligible, or for which the processor declines, takes the full path.
+        """
+        if self._mm_demand_supported is None:
+            reason = self._mm_demand_unsupported_reason()
+            if reason is not None and reason != "disabled":
+                logger.warning(
+                    "SGLANG_K3_IMAGE_DEMAND_PREPROCESS is ignored: %s.", reason
+                )
+            self._mm_demand_supported = reason is None
+        if not self._mm_demand_supported:
+            return False
+        if not isinstance(obj, GenerateReqInput) or not isinstance(obj.rid, str):
+            return False
+        if (
+            not obj.image_data
+            or has_valid_data(obj.video_data)
+            or has_valid_data(obj.audio_data)
+            or obj.input_embeds is not None
+        ):
+            return False
+        # Sessions reuse mm_inputs across turns, and cache accounting hashes the
+        # processor payloads before dispatch; both need features up front.
+        if (
+            obj.session_params is not None
+            or obj.session_id is not None
+            or obj.cache_ttl_seconds is not None
+        ):
+            return False
+        # Parallel sampling and beam search copy the tokenized request under new
+        # rids, which could not be mapped back to the retained sources.
+        sampling_params = obj.sampling_params or {}
+        if not isinstance(sampling_params, dict):
+            return False
+        if (
+            sampling_params.get("n", 1) != 1
+            or (sampling_params.get("beam_width") or 1) > 1
+        ):
+            return False
+        return obj.rid in self.rid_to_state
+
+    def _register_mm_demand(
+        self, tokenized_obj: TokenizedGenerateReqInput, demand: DemandImageSources
+    ) -> None:
+        # The ticket marks the items as feature-less even if the request is
+        # already gone: the scheduler then asks, gets an error and aborts it.
+        tokenized_obj.mm_demand_ticket = demand.ticket
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is None:
+            return
+        # The bytes live exactly as long as the request state, like obj.image_data.
+        state.mm_demand = demand
+
+    def _live_mm_demand(
+        self, recv_req: MaterializeImagesReq
+    ) -> Optional[DemandImageSources]:
+        state = self.rid_to_state.get(recv_req.rid)
+        if state is None or state.finished or state.abort_sent:
+            return None
+        demand = state.mm_demand
+        if demand is None or demand.ticket != recv_req.ticket:
+            return None
+        return demand
+
+    def _handle_materialize_images_req(self, recv_req: MaterializeImagesReq) -> None:
+        task = asyncio.create_task(self._materialize_images(recv_req))
+        self._mm_demand_tasks.add(task)
+        task.add_done_callback(self._mm_demand_tasks.discard)
+
+    async def _materialize_images(self, recv_req: MaterializeImagesReq) -> None:
+        """Answer one MaterializeImagesReq with features or an error, exactly once.
+
+        The scheduler keeps the request waiting until this reply arrives, so
+        every outcome, including a request gone meanwhile, replies.
+        """
+        reply = ImagesReadyReq(
+            rid=recv_req.rid,
+            ticket=recv_req.ticket,
+            materialization_id=recv_req.materialization_id,
+            image_indices=list(recv_req.image_indices),
+        )
+        prepared = []
+        try:
+            demand = self._live_mm_demand(recv_req)
+            if demand is None:
+                raise _MMDemandGone()
+            mm_inputs = await self.mm_processor.materialize_images_async(
+                demand, list(recv_req.image_indices)
+            )
+            # Same identity finalization as the full path in _tokenize_one_request.
+            self.mm_processor.finalize_cache_identities(mm_inputs)
+            if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+                await self.mm_processor.hash_executor.set_pad_values(
+                    mm_inputs.mm_items
+                )
+            prepared = await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
+                (mm_inputs,)
+            )
+            if self._live_mm_demand(recv_req) is None:
+                raise _MMDemandGone()
+            reply.mm_inputs = mm_inputs
+        except _MMDemandGone:
+            reply.error_msg = "Request finished before its images were preprocessed."
+            reply.status_code = int(HTTPStatus.BAD_REQUEST)
+        except ValueError as error:
+            # Includes the full path's "Could not decode image: ..." rejection.
+            reply.error_msg = str(error)
+            reply.status_code = int(HTTPStatus.BAD_REQUEST)
+        except Exception as error:
+            logger.exception("Demand image preprocessing failed rid=%s", recv_req.rid)
+            reply.error_msg = (
+                f"Image preprocessing failed: {type(error).__name__}: {error}"
+            )
+            reply.status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        if reply.mm_inputs is None:
+            self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared)
+            prepared = []
+
+        dispatched = False
+        try:
+            reply.wrap_pickle_fields()
+            self._dispatch_to_scheduler(reply)
+            dispatched = True
+        finally:
+            if not dispatched:
+                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared)
 
     async def _send_one_request(
         self,

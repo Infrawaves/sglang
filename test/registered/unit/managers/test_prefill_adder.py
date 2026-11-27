@@ -143,6 +143,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.mm_demand = None
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.auxiliary_swa_host_hit_length = 0
