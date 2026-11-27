@@ -54,6 +54,9 @@ class _FakeOpenAIServingChat:
     def apply_reasoning_enabled(self, chat_request, enabled):
         self.apply_reasoning_calls.append(enabled)
 
+    async def _resolve_kimi_k3_tool_schemas(self, chat_request):
+        return None
+
     def wrap_reasoning_history(self, text):
         return f"<think>\n{text}\n</think>"
 
@@ -70,6 +73,9 @@ class _FakeNonStreamingErrorOpenAI:
         self._exception = exception
 
     def _validate_request(self, chat_request):
+        return None
+
+    async def _resolve_kimi_k3_tool_schemas(self, chat_request):
         return None
 
     def _convert_to_internal_request(self, chat_request, raw_request):
@@ -1018,7 +1024,9 @@ class TestAnthropicServing(unittest.TestCase):
                     is_multimodal=False
                 )
 
-            def _process_messages(self, chat_request, is_multimodal):
+            def _process_messages(
+                self, chat_request, is_multimodal, *, prompt_only=False
+            ):
                 rendered.append(chat_request)
                 return SimpleNamespace(prompt_ids=[1])
 
@@ -1514,7 +1522,9 @@ class TestAnthropicServing(unittest.TestCase):
             def _convert_to_internal_request(self, chat_request, raw_request):
                 raise self.error
 
-            def _process_messages(self, chat_request, is_multimodal):
+            def _process_messages(
+                self, chat_request, is_multimodal, *, prompt_only=False
+            ):
                 raise self.error
 
         chat_request = ChatCompletionRequest(

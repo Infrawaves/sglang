@@ -95,7 +95,10 @@ class MockTemplateManager:
 
 
 def make_serving(
-    *, is_multimodal: bool = False, model_type: str = "llama"
+    *,
+    is_multimodal: bool = False,
+    model_type: str = "llama",
+    tool_call_parser: str | None = None,
 ) -> OpenAIServingResponses:
     """The serving layer reads its config from the bags, so the fixture
     publishes one. Idempotent: a caller that already published keeps its own,
@@ -104,6 +107,7 @@ def make_serving(
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
     manager = MockTokenizerManager(is_multimodal=is_multimodal)
     manager.model_config.hf_config.model_type = model_type
+    manager.server_args.tool_call_parser = tool_call_parser
     return OpenAIServingResponses(manager, MockTemplateManager())
 
 

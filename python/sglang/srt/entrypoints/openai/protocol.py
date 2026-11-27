@@ -1090,6 +1090,11 @@ class ChatCompletionRequest(PDRoutingFields):
     # before continue_final_message appends an assistant prefix. Empty for raw
     # input_ids. Leads each choice's internal_content.
     _kimi_k3_generation_prefix_ids: List[int] = PrivateAttr(default_factory=list)
+    # K3: canonical parameters per effective tool (None where not strict) for the
+    # tool grammar, set by the async schema step; None until that step has run.
+    _kimi_k3_canonical_parameters: Optional[List[Optional[Dict[str, Any]]]] = (
+        PrivateAttr(default=None)
+    )
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create

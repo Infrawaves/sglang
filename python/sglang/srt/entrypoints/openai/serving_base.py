@@ -114,6 +114,8 @@ class OpenAIServingBase(ABC):
         try:
             # Validate request
             error_msg = self._validate_request(request)
+            if not error_msg:
+                error_msg = await self._validate_request_async(request)
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -263,6 +265,13 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    async def _validate_request_async(
+        self, request: OpenAIServingRequest
+    ) -> Optional[str]:
+        """Validation that awaits, run once _validate_request passes; returns a
+        400 message, or raises HTTPException for another status."""
+        return None
 
     def create_error_response(
         self,

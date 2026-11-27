@@ -93,6 +93,10 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kimi_k3_tool_schema_utils import (
+    run_on_tool_schema_loop,
+    walle_installed,
+)
 
 register_cpu_ci(est_time=79, suite="base-a-test-cpu")
 
@@ -137,6 +141,12 @@ _WEATHER_TOOL = {
         },
     },
 }
+
+
+def _make_k3_test_chat(tokenizer_manager, template_manager):
+    """Exercise the serving logic independently of the Walle startup check."""
+    with patch("sglang.srt.entrypoints.openai.serving_chat.check_walle_installed"):
+        return OpenAIServingChat(tokenizer_manager, template_manager)
 
 
 def _spec_result(index):
@@ -3022,6 +3032,7 @@ class ServingChatTestCase(CustomTestCase):
                     tool_choice="required",
                     stop=request_stop,
                 )
+                request._kimi_k3_canonical_parameters = [tool["function"]["parameters"]]
                 original_stop = (
                     list(request.stop)
                     if isinstance(request.stop, list)
@@ -3059,6 +3070,7 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    @unittest.skipUnless(walle_installed(), "walle is not installed")
     def test_kimi_k3_strict_tool_schema_without_finite_instance_is_rejected(self):
         """The Kimi Vendor Verifier expects a 400 naming the schema when a strict
         tool's required $ref never terminates; other tools still pass."""
@@ -3086,12 +3098,13 @@ class ServingChatTestCase(CustomTestCase):
 
         def validate(parameters, strict):
             function = {"name": "f", "parameters": parameters, "strict": strict}
-            return self.chat._validate_request(
-                ChatCompletionRequest(
-                    model="x",
-                    messages=[{"role": "user", "content": "Hi?"}],
-                    tools=[{"type": "function", "function": function}],
-                )
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                tools=[{"type": "function", "function": function}],
+            )
+            return self.chat._validate_request(request) or run_on_tool_schema_loop(
+                self.chat._resolve_kimi_k3_tool_schemas(request)
             )
 
         self.assertIn("parameters schema", validate(parameters=recursive, strict=True))
@@ -4879,12 +4892,12 @@ class ServingChatTestCase(CustomTestCase):
 
         tm = _MockTokenizerManager()
         tm.model_config.hf_config.architectures = ["KimiK3ForConditionalGeneration"]
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        serving_chat = _make_k3_test_chat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
         tm.model_config.hf_config.architectures = ["LlamaForCausalLM"]
         tm.server_args.tool_call_parser = "kimi_k3"
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        serving_chat = _make_k3_test_chat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
     def test_custom_encoders_own_reasoning_history(self):
@@ -6926,7 +6939,7 @@ class TestAllowedToolsServing(CustomTestCase):
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         self.template_manager = _MockTemplateManager()
         self.template_manager.chat_template_name = None
-        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat = _make_k3_test_chat(self.tm, self.template_manager)
         self.raw_request = Request({"type": "http", "headers": []})
         self.internal_request = None
 
@@ -7081,7 +7094,7 @@ class TestAllowedToolsServing(CustomTestCase):
 
     def test_native_calls_work_with_streaming_reasoning_and_text_response_format(self):
         self.tm.server_args.reasoning_parser = "kimi_k3"
-        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat = _make_k3_test_chat(self.tm, self.template_manager)
         calls = (
             TOOLS_OPEN
             + '<|open|>call tool="B" index="1"<|sep|><|close|>call<|sep|>'
@@ -7193,6 +7206,7 @@ class TestAllowedToolsServing(CustomTestCase):
         )
         self.assertIsNone(self.internal_request)
 
+    @unittest.skipUnless(walle_installed(), "walle is not installed")
     def test_constraint_construction_failure_uses_existing_fallback(self):
         for mode in ("auto", "required"):
             for stream in (False, True):
@@ -7402,7 +7416,7 @@ class TestAllowedToolsServing(CustomTestCase):
                 ServerArgs(model_path="dummy", disaggregation_mode=mode),
                 role="tokenizer",
             )
-            self.chat = OpenAIServingChat(self.tm, self.template_manager)
+            self.chat = _make_k3_test_chat(self.tm, self.template_manager)
             for stream in (False, True):
                 with self.subTest(mode=mode, stream=stream):
                     response = self._complete(
@@ -7750,7 +7764,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         template_manager = _MockTemplateManager()
         template_manager.chat_template_name = None
         template_manager.jinja_template_content_format = "string"
-        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat = _make_k3_test_chat(self.tm, template_manager)
         self.chat.chat_encoding_spec = "kimi_k3"
         self.chat.tool_call_parser = "kimi_k3"
 
@@ -7960,7 +7974,7 @@ class KimiK3PartialModeTestCase(unittest.TestCase):
         template_manager = _MockTemplateManager()
         template_manager.chat_template_name = None
         template_manager.jinja_template_content_format = "string"
-        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat = _make_k3_test_chat(self.tm, template_manager)
         self.chat.chat_encoding_spec = "kimi_k3"
         self.chat.tool_call_parser = "kimi_k3"
         # One id per (text, is_control) pair, so the prompt ids decode back to
@@ -8174,6 +8188,7 @@ class KimiK3PartialModeTestCase(unittest.TestCase):
                 request = ChatCompletionRequest(
                     model="x", messages=messages, tools=[tool], tool_choice=tool_choice
                 )
+                request._kimi_k3_canonical_parameters = [tool["function"]["parameters"]]
                 result = self.chat._process_messages(request, is_multimodal=False)
                 constraint_type, tag = result.tool_call_constraint
                 self.assertEqual(constraint_type, "structural_tag")

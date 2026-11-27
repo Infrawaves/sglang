@@ -82,6 +82,14 @@ class GilHeavyServingChat(OpenAIServingChat):
         return super()._convert_to_internal_request(request, raw_request)
 
 
+class K3ToolServingChat(OpenAIServingChat):
+    """Use the K3 tool grammar with this fixture's tiny Llama tokenizer."""
+
+    def __init__(self, tokenizer_manager, template_manager):
+        super().__init__(tokenizer_manager, template_manager)
+        self.tool_call_parser = "kimi_k3"
+
+
 class FailingTokenizerManager(TokenizerManager):
     @classmethod
     def create_for_request_preprocessing(cls, server_args):
@@ -329,6 +337,7 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
             OpenAIServingChat,
             ClientReadingServingChat,
             GilHeavyServingChat,
+            K3ToolServingChat,
         )
         cls.tokenizer_manager.maybe_start_process_request_preprocessor(
             cls.template_manager, handler_classes=cls.handler_classes
@@ -401,6 +410,37 @@ class TestProcessRequestPreprocessorEndToEnd(CustomTestCase):
             self.assertEqual(ctx.exception.status_code, 400)
 
         asyncio.run(run())
+
+    def test_child_grammar_uses_canonical_tool_parameters(self):
+        """Walle drops const. The grammar built in a child must allow the repaired value."""
+        from xgrammar import Grammar
+        from xgrammar.testing import _is_grammar_accept_string
+
+        raw = {"type": "integer", "const": 7}
+        parameters = {"type": "object", "properties": {"n": raw}, "required": ["n"]}
+        request = _chat_request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "f", "strict": True, "parameters": parameters},
+                }
+            ],
+            tool_choice="required",
+        )
+        request._kimi_k3_canonical_parameters = [
+            {**parameters, "properties": {"n": {"type": "integer"}}}
+        ]
+        adapted, _ = asyncio.run(
+            self.preprocessor.convert(self._handler(K3ToolServingChat), request, None)
+        )
+        grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
+        begin = '<|open|>tools<|sep|><|open|>call tool="f" index="1"<|sep|>'
+        end = "<|close|>call<|sep|><|close|>tools<|sep|>"
+        argument = (
+            '<|open|>argument key="n" type="number"<|sep|>8<|close|>argument<|sep|>'
+        )
+        self.assertTrue(_is_grammar_accept_string(grammar, begin + argument + end))
+        self.assertFalse(_is_grammar_accept_string(grammar, begin + end))
 
     def test_non_header_access_falls_back_to_thread(self):
         handler = self._handler(ClientReadingServingChat)
@@ -523,6 +563,7 @@ class TestProcessRequestPreprocessorDisables(TestProcessRequestPreprocessorEndTo
     test_matches_in_process_conversion = None
     test_conversion_errors_keep_their_type = None
     test_non_header_access_falls_back_to_thread = None
+    test_child_grammar_uses_canonical_tool_parameters = None
     test_event_loop_stays_responsive = None
     test_broken_pool_restarts = None
 

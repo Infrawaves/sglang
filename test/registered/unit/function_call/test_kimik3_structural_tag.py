@@ -18,6 +18,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.kimi_k3_tool_schema import (
+    resolve_kimi_k3_tool_schemas,
+)
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
@@ -34,11 +37,11 @@ from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_json_response_structural_tag,
     get_kimik3_structural_tag,
 )
-from sglang.srt.function_call.tool_schema_guard import (
-    ToolSchemaError,
-    check_tool_schema_terminates,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kimi_k3_tool_schema_utils import (
+    run_on_tool_schema_loop,
+    walle_installed,
+)
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -1244,12 +1247,25 @@ _N_REQUIRED_SELF = {
 }
 
 
-def _kvv_grammar(parameters):
-    tool = Tool(
+def _kvv_tool(parameters):
+    return Tool(
         type="function",
         function=Function(name="kvv", strict=True, parameters=parameters),
     )
-    return _grammar([tool], tool_choice="required")
+
+
+def _resolve(parameters):
+    if not walle_installed():
+        pytest.skip("walle is not installed")
+    return run_on_tool_schema_loop(
+        resolve_kimi_k3_tool_schemas(tools=[_kvv_tool(parameters)])
+    )
+
+
+def _kvv_grammar(parameters):
+    canonical, rejection = _resolve(parameters)
+    assert rejection is None, rejection
+    return _grammar([_kvv_tool(canonical[0])], tool_choice="required")
 
 
 def _kvv_call(*arguments):
@@ -1299,8 +1315,8 @@ def _kvv_call(*arguments):
 def test_strict_schema_without_finite_instance_is_rejected(schema):
     """walle rejects these; XGrammar compiles them and a forced call can only run
     to max_tokens."""
-    with pytest.raises(ToolSchemaError, match="parameters schema"):
-        check_tool_schema_terminates(schema)
+    _, rejection = _resolve(schema)
+    assert "parameters schema" in rejection
 
 
 @pytest.mark.parametrize(
@@ -1338,7 +1354,8 @@ def test_strict_schema_without_finite_instance_is_rejected(schema):
     ],
 )
 def test_strict_schema_with_finite_instance_is_accepted(schema):
-    check_tool_schema_terminates(schema)
+    _, rejection = _resolve(schema)
+    assert rejection is None
 
 
 def test_required_names_without_a_schema_keep_the_call_constrained():
@@ -1404,7 +1421,7 @@ def test_single_anyof_branch_keeps_the_stricter_parent_bound():
     assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * 20)))
 
 
-def test_single_anyof_branch_contradicting_the_parent_bound_leaves_the_type():
+def test_walle_degrades_a_contradicting_single_anyof_branch_to_any_value():
     # walle degrades the merged branch (minLength 20 > maxLength 15) to {}.
     grammar = _kvv_grammar(
         {
@@ -1419,7 +1436,7 @@ def test_single_anyof_branch_contradicting_the_parent_bound_leaves_the_type():
     )
     for length in (1, 30):
         assert _accepts(grammar, _kvv_call(_argument("v", "string", "a" * length)))
-    assert not _accepts(grammar, _kvv_call(_argument("v", "number", "1")))
+    assert _accepts(grammar, _kvv_call(_argument("v", "number", "1")))
 
 
 if __name__ == "__main__":
