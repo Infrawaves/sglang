@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import aiohttp
 from aiohttp import web
+
 from sglang.srt.managers.prefill_pull_agent import (
     PrefillPullAgent,
     PrefillPullAgentConfig,
@@ -101,6 +102,24 @@ class TestPrefillPullProtocol(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 except aiohttp.ClientError:
                     pass
                 await asyncio.sleep(0.02)
+        # Presence is separate from capacity: register a ready agent session,
+        # then let each case decide when the agent may start claiming work.
+        async with self.http.post(
+            self.router_url + "/internal/pull/acquire",
+            headers={"Authorization": "Bearer pull-test-secret"},
+            json={
+                "worker_url": self.p_url,
+                "worker_epoch": "fixture-ready",
+                "dp_rank": 0,
+                "poll_id": "fixture-heartbeat",
+                "max_tokens": 0,
+                "max_requests": 1,
+                "max_offered": 1,
+                "wait_ms": 0,
+            },
+        ) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"status": "empty"})
 
     async def cleanup(self):
         self.allow_finish.set()
@@ -285,7 +304,7 @@ class TestPrefillPullProtocol(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         original_control = self.agent._control
 
         async def track_control(router, action, body, **kwargs):
-            if action == "acquire":
+            if action == "acquire" and body["max_tokens"] > 0:
                 polling.set()
             response = await original_control(router, action, body, **kwargs)
             if action == "reject":

@@ -788,13 +788,31 @@ def _state_slot_accounting(*, allocator, req_pool, tree_cache) -> dict:
     from types import SimpleNamespace
 
     state = allocator.state
+    # Before matching, a host hit may need a cache checkpoint slot in addition
+    # to the request's working/tracking state (`PrefillAdder._state_slots_for_req`).
+    host_checkpoint_slots = int(
+        tree_cache is not None
+        and (
+            tree_cache.cache_controller is not None
+            or getattr(tree_cache, "lmcache_connector", None) is not None
+        )
+    )
 
     def pending_state_slots(req) -> int:
-        return state.pending_request_slots(req_pool, req)
+        slots = state.pending_request_slots(req_pool, req)
+        # Intake precedes matching, so a zero mamba_host_hit_length does not yet
+        # rule out a restore. Keep the promise until the first chunk allocates
+        # KV; thereafter the allocator snapshot covers the restored checkpoint,
+        # even though the request keeps its host-hit metadata across chunks.
+        if req.kv.kv_allocated_len == 0:
+            slots += host_checkpoint_slots
+        return slots
 
     # A request that holds no state slot or tracking buffer yet, as acquire sees it.
     fresh = SimpleNamespace(
-        kv=SimpleNamespace(holds_mamba=False, mamba_ping_pong_track_buffer=None)
+        kv=SimpleNamespace(
+            holds_mamba=False, mamba_ping_pong_track_buffer=None, kv_allocated_len=0
+        )
     )
     return dict(
         fresh_state_slots=pending_state_slots(fresh),

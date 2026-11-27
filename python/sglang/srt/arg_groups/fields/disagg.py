@@ -58,7 +58,7 @@ class Disagg(msgspec.Struct):
     ] = "null"
     prefill_pull_router: A[
         Optional[str],
-        "Comma-separated router URLs from which this prefill worker acquires requests; enables request-pull admission. An http:// hostname is re-resolved every 10s and each address is claimed from, e.g. a Kubernetes headless Service.",
+        "Comma-separated router URLs from which this prefill worker acquires requests; enables request-pull admission. Each address must reach one router instance, not a load balancer or ClusterIP. An http:// hostname is re-resolved every 10s and each address is claimed from, e.g. a Kubernetes headless Service. HTTPS URLs must identify individual instances.",
     ] = None
     prefill_pull_worker_url: A[
         Optional[str],

@@ -94,9 +94,22 @@ pub async fn accept(
     _authorization: PullAuthorization,
     Json(input): Json<Action>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({"status":ctx.pull_queue.assignment(&input)?.map_or("expired", |a| ctx.pull_queue.accept(&a))}),
-    ))
+    let Some(assignment) = ctx.pull_queue.assignment(&input)? else {
+        return Ok(Json(json!({"status":"expired"})));
+    };
+    let worker = ctx.registry.all().into_iter().find(|worker| {
+        worker.url.trim_end_matches('/') == assignment.worker_url
+            && worker.mode() == WorkerMode::Prefill
+            && worker.dp_ranks() == 1
+            && assignment.offered_to(worker)
+    });
+    let status = worker
+        .and_then(|worker| {
+            ctx.registry
+                .with_registered_worker(&worker, || ctx.pull_queue.accept(&assignment, true))
+        })
+        .unwrap_or_else(|| ctx.pull_queue.accept(&assignment, false));
+    Ok(Json(json!({"status":status})))
 }
 pub async fn reject(
     State(ctx): State<Arc<AppContext>>,

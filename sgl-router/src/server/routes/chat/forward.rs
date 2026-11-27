@@ -400,7 +400,7 @@ async fn dispatch<T: Transport>(
         match prefill_task {
             Some((task, prefill)) => {
                 let wait = ctx.config.proxy.stream_after_prefill;
-                forward_pd(task, prefill, response, wait).await
+                forward_pd::<T>(task, prefill, response, wait).await
             }
             None => (response.await, None),
         }
@@ -627,6 +627,9 @@ impl Transport for Http {
         stream_abort: CancellationToken,
         decode_slot: Option<DecodeSlot>,
     ) -> Result<Response<Body>, ApiError> {
+        // Pull's request lease owns the deadline through the client body's
+        // lifetime, which can outlast the upstream pump's buffered response.
+        let expiration = self.0.as_ref().map_or(expiration, |a| a.expiration());
         forward_to_response_worker(
             ctx,
             worker,
@@ -939,14 +942,14 @@ struct Blame {
 }
 
 /// Returns decode's response as soon as decode answers, or with
-/// `stream_after_prefill` once prefill also completes, unless prefill fails
-/// first; then prefill's failure is returned along with the blamed prefill.
-async fn forward_pd<R>(
-    mut task: tokio::task::JoinHandle<PrefillFailure<R>>,
+/// `stream_after_prefill` once prefill also completes. A decode failure never
+/// waits for prefill. If prefill fails first, return it with the blamed prefill.
+async fn forward_pd<T: Transport>(
+    mut task: tokio::task::JoinHandle<PrefillFailure<T::Response>>,
     prefill: Arc<Worker>,
-    decode: impl Future<Output = Result<R, ApiError>>,
+    decode: impl Future<Output = Result<T::Response, ApiError>>,
     stream_after_prefill: bool,
-) -> (Result<R, ApiError>, Option<Blame>) {
+) -> (Result<T::Response, ApiError>, Option<Blame>) {
     // Set on decode's first poll, which is where `forward_to_response_worker`
     // begins and the request reaches the worker. Read from the same task, so
     // `Relaxed` needs no ordering beyond what the select already gives.
@@ -976,7 +979,11 @@ async fn forward_pd<R>(
             },
             // Dropping the handle leaves prefill running.
             response = &mut decode, if held.is_none() => {
-                if !stream_after_prefill {
+                // D cannot receive KV after failing. Waiting for P here can
+                // deadlock until bootstrap timeout, retaining its reservation.
+                if !stream_after_prefill
+                    || !response.as_ref().is_ok_and(|r| (200..300).contains(&T::status(r)))
+                {
                     return (response, None);
                 }
                 held = Some(response);
@@ -1189,6 +1196,7 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {
@@ -1200,12 +1208,13 @@ mod tests {
             let done = Arc::new(AtomicBool::new(false));
             let finished = Arc::clone(&done);
             let task = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 finished.store(true, Ordering::SeqCst);
                 None
             });
             let decode = async { Ok(Response::new(Body::empty())) };
-            let (response, blame) = forward_pd(task, Arc::clone(&prefill), decode, wait).await;
+            let (response, blame) =
+                forward_pd::<Http>(task, Arc::clone(&prefill), decode, wait).await;
             assert!(response.is_ok() && blame.is_none());
             assert_eq!(done.load(Ordering::SeqCst), wait);
         }

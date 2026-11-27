@@ -8,6 +8,7 @@ import asyncio
 import unittest
 
 from aiohttp import web
+
 from sglang.srt.managers.prefill_pull_agent import (
     PrefillPullAgent,
     PrefillPullAgentConfig,
@@ -35,6 +36,7 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.peek_gate = None
         self.acquire_status = None
         self.poll_ids = []
+        self.heartbeats = asyncio.Queue()
         self.execution_bodies = []
         self.outcomes = []
         self.state = "offered"
@@ -149,6 +151,9 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         self.router_auth.append(request.headers.get("Authorization"))
         action = request.match_info["action"]
         if action == "acquire":
+            if body["max_tokens"] == 0:
+                self.heartbeats.put_nowait(body)
+                return web.json_response({"status": "empty"})
             self.poll_ids.append(body["poll_id"])
             if body["max_tokens"] < self.offer_needs_tokens:
                 # Like the router: nothing fits, so the long poll waits.
@@ -579,6 +584,25 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         await asyncio.wait_for(self.outcome_finished.wait(), 5)
         self.assertEqual(self.executed, ["router-engine-rid"])
 
+    async def test_presence_does_not_depend_on_capacity_and_stops_on_drain(self):
+        """A saturated worker must stay eligible without reserving or claiming
+        work; stopping intake must also stop advertising its presence."""
+        self.peek_gate = asyncio.Event()
+        await self._start(heartbeat_interval=0.01)
+        for _ in range(2):
+            heartbeat = await asyncio.wait_for(self.heartbeats.get(), 1)
+            self.assertEqual(heartbeat["worker_epoch"], self.agent.worker_epoch)
+            self.assertEqual(heartbeat["worker_url"], self.agent.config.worker_url)
+            self.assertEqual(heartbeat["max_tokens"], 0)
+            self.assertEqual(heartbeat["wait_ms"], 0)
+        self.assertEqual(self.poll_ids, [])
+        self.assertEqual(self.reservations, {})
+        self.assertEqual(self.executed, [])
+        self.peek_gate.set()
+        await asyncio.wait_for(self.agent.drain(), 2)
+        self.assertTrue(all(task.done() for task in self.agent._heartbeats.values()))
+        self.assertEqual(self.executed, [])
+
     async def test_an_unreachable_unlisted_router_stops_being_claimed_from(self):
         """Claiming from a departed router lasts only while it answers."""
         import socket
@@ -726,6 +750,8 @@ class TestPrefillPullAgent(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             body = await request.json()
             action = request.match_info["action"]
             if action == "acquire":
+                if body["max_tokens"] == 0:
+                    return web.json_response({"status": "empty"})
                 if rejected:
                     await asyncio.sleep(30)
                 await release.wait()

@@ -13,8 +13,10 @@ use futures::StreamExt;
 use sgl_kv_indexer::PrefixOutcome;
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 /// How often an unclaimed request checks whether its worker fleet changed.
 const FLEET_RECHECK: Duration = Duration::from_secs(1);
@@ -36,6 +38,7 @@ const OFFER_BODY_HEADROOM: usize = 64 * 1024;
 fn worker_fleet(ctx: &AppContext, request: &PreparedRequest) -> u64 {
     ctx.pull_queue
         .fleet_generation(&request.model.0, FLEET_RECHECK, || {
+            let active_agents = ctx.pull_queue.active_workers();
             let mut fleet: Vec<_> = ctx
                 .registry
                 .workers_for(&request.model)
@@ -52,6 +55,7 @@ fn worker_fleet(ctx: &AppContext, request: &PreparedRequest) -> u64 {
                         w.version_group().map(str::to_owned),
                         w.dp_ranks(),
                         w.services(),
+                        active_agents.contains(w.url.trim_end_matches('/')),
                     )
                 })
                 .collect();
@@ -70,11 +74,12 @@ async fn eligible_prefills(
     headers: &HeaderMap,
 ) -> Result<HashSet<String>, ApiError> {
     let mut eligible = HashSet::new();
+    let active_agents = ctx.pull_queue.active_workers();
     for p in ctx
         .registry
         .workers_for_mode(&request.model, WorkerMode::Prefill)
     {
-        if p.dp_ranks() != 1 {
+        if p.dp_ranks() != 1 || !active_agents.contains(p.url.trim_end_matches('/')) {
             continue;
         }
         match reorg::prefill_is_eligible(ctx, resolver, request, headers, &p).await {
@@ -150,12 +155,30 @@ pub(super) async fn dispatch(
         serde_json::from_slice(&request.body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if request.path != "/generate"
         || request.fans_out
-        || ["image_data", "audio_data", "video_data", "input_embeds"]
-            .iter()
-            .any(|key| value.get(*key).is_some_and(|v| !v.is_null()))
+        || request.cache_namespace.lora_name.is_some()
+        || [
+            "image_data",
+            "audio_data",
+            "video_data",
+            "input_embeds",
+            "session_id",
+            "session_params",
+            "lora_path",
+            "positional_embed_overrides",
+        ]
+        .iter()
+        .any(|key| value.get(*key).is_some_and(|v| !v.is_null()))
+        || value.get("sampling_params").is_some_and(|params| {
+            !params.is_null()
+                && (!params.is_object()
+                    || params.get("n").is_some_and(|n| n.as_u64() != Some(1))
+                    || params
+                        .get("beam_width")
+                        .is_some_and(|width| !width.is_null() && width.as_u64() != Some(1)))
+        })
     {
         return Err(ApiError::BadRequest(
-            "pull supports one text /generate prompt (or chat converted to /generate), n=1".into(),
+            "pull supports one text /generate prompt, n=1, without sessions, adapters, positional overrides or beam search".into(),
         ));
     }
     let ids = value.get("input_ids").and_then(|v| v.as_array());
@@ -278,7 +301,7 @@ pub(super) async fn dispatch(
             };
             // Selection checks breaker readiness. Claim the probe after that
             // check so selecting a half-open P does not exclude itself.
-            if !assignment.admit_prefill(&workers.prefill.breaker) {
+            if !assignment.admit_prefill(&workers.prefill) {
                 assignment.reject();
                 ctx.pull_queue.requeue(&lease);
                 continue;
@@ -306,20 +329,58 @@ pub(super) async fn dispatch(
         .map_err(|_| ApiError::StaleRequestExpired {
             model: request.model.0.clone(),
         })??;
-    // The lease lives as long as the client's body. A successful D response
-    // read to its end marks it finished, so P is not cancelled for finishing
-    // first; a D error or a client disconnect still cancels P at once.
-    let succeeded = response.status().is_success();
-    Ok(response.map(|body| {
-        // Yields no frame; it only runs once the body is exhausted.
-        let end = futures::stream::once(async move {
-            if succeeded {
-                lease.finish();
+    // Non-2xx upstream bodies have already been collected. Stop P before
+    // returning the error, even if the client never consumes its response.
+    if !response.status().is_success() {
+        lease.expire();
+        return Ok(response);
+    }
+    // The deadline belongs to the client's response, not the upstream pump:
+    // a short D stream can be fully buffered while the client is still idle.
+    // A weak lease lets disconnect reclaim the request without waiting for the
+    // timer; expiry also removes pending state so draining never waits on it.
+    let lease = Arc::new(lease);
+    let weak_lease = Arc::downgrade(&lease);
+    let finished = CancellationToken::new();
+    let deadline_guard = finished.clone().drop_guard();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = finished.cancelled() => {}
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                if let Some(lease) = weak_lease.upgrade() {
+                    lease.expire();
+                }
             }
-            drop(lease);
-            None::<Result<bytes::Bytes, axum::Error>>
-        })
-        .filter_map(futures::future::ready);
-        Body::from_stream(body.into_data_stream().chain(end))
+        }
+    });
+    Ok(response.map(|body| {
+        let stream = futures::stream::try_unfold(
+            (body.into_data_stream(), lease, deadline_guard),
+            move |(mut body, lease, guard)| async move {
+                let expiration = lease.expiration();
+                let item = tokio::select! {
+                    biased;
+                    _ = expiration.cancelled() => {
+                        return Err(axum::Error::new(std::io::Error::other(
+                            "response exceeded stale_request_timeout",
+                        )));
+                    }
+                    item = body.next() => item,
+                };
+                match item {
+                    Some(Ok(bytes)) => Ok(Some((bytes, (body, lease, guard)))),
+                    Some(Err(error)) => {
+                        lease.expire();
+                        Err(error)
+                    }
+                    None => {
+                        lease.finish();
+                        Ok(None)
+                    }
+                }
+            },
+        );
+        Body::from_stream(stream)
     }))
 }

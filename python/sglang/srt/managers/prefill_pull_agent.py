@@ -46,6 +46,9 @@ class PrefillPullAgentConfig(msgspec.Struct, frozen=True):
     status_interval: float = 1.0
     control_timeout: float = 15.0
     router_refresh_interval: float = 10.0
+    # Advertise a live pull agent even when its scheduler has no capacity.
+    # Routers expire this presence after 45 s without an acquire/heartbeat.
+    heartbeat_interval: float = 10.0
     # Refreshes a router must be missing from DNS before its claims stop, so a
     # transient lookup gap does not drop outcome reporting.
     router_missing_refreshes: int = 3
@@ -114,6 +117,7 @@ class PrefillPullAgent:
         self._session: aiohttp.ClientSession | None = None
         # Router base URL -> its claim loops, listed or draining.
         self._routers: dict[str, list[asyncio.Task]] = {}
+        self._heartbeats: dict[str, asyncio.Task] = {}
         # Routers currently in DNS (or configured literally). A router that
         # left keeps its loops while it answers: it may still hold queued
         # requests that only a claim can drain.
@@ -161,6 +165,8 @@ class PrefillPullAgent:
         self._draining = True
         if self._refresher is not None:
             self._refresher.cancel()
+        for task in self._heartbeats.values():
+            task.cancel()
         # Wake loops waiting for room, so they see the flag and leave.
         self._capacity_freed.set()
         self._capacity_freed = asyncio.Event()
@@ -173,7 +179,7 @@ class PrefillPullAgent:
                 loops,
                 timeout=self.config.poll_wait_ms / 1000 + self.config.control_timeout,
             )
-        tasks = [*loops, self._refresher, self._peek_task]
+        tasks = [*loops, *self._heartbeats.values(), self._refresher, self._peek_task]
         tasks = [task for task in tasks if task is not None]
         for task in tasks:
             task.cancel()
@@ -252,6 +258,9 @@ class PrefillPullAgent:
                     asyncio.create_task(self._acquire_loop(router))
                     for _ in range(self.config.claim_concurrency)
                 ]
+                self._heartbeats[router] = asyncio.create_task(
+                    self._heartbeat_loop(router)
+                )
         for router in list(self._listed - current):
             self._missing[router] = self._missing.get(router, 0) + 1
             if self._missing[router] >= self.config.router_missing_refreshes:
@@ -271,11 +280,68 @@ class PrefillPullAgent:
 
     def _retire_router(self, router: str):
         loops = self._routers.pop(router, [])
+        heartbeat = self._heartbeats.pop(router, None)
+        if heartbeat is not None:
+            loops.append(heartbeat)
         current = asyncio.current_task()
         for task in loops:
             if task is not current:
                 task.cancel()
         logger.info("Prefill pull router %s is unreachable; stopped claiming", router)
+
+    async def _heartbeat_loop(self, router: str):
+        """A zero-budget acquire advertises presence without claiming work.
+
+        Capacity and presence are separate: full workers must remain eligible
+        for queued requests, while push-only or disconnected workers must not
+        attract cache affinity. This loop never contacts the scheduler.
+        """
+        unreachable_since = None
+        clock = asyncio.get_running_loop()
+        while not (self._draining or self._stopping):
+            if not self._can_claim():
+                await asyncio.sleep(self.config.retry_interval)
+                continue
+            delay = self.config.heartbeat_interval
+            try:
+                reply = await self._control(
+                    router,
+                    "acquire",
+                    {
+                        "worker_url": self.config.worker_url,
+                        "worker_epoch": self.worker_epoch,
+                        "dp_rank": 0,
+                        "poll_id": uuid.uuid4().hex,
+                        "max_tokens": 0,
+                        "max_requests": 1,
+                        "max_offered": self.config.claim_concurrency,
+                        "wait_ms": 0,
+                    },
+                )
+                if reply.get("status") != "empty":
+                    raise PullProtocolError("Pull heartbeat must not offer work")
+                unreachable_since = None
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                if unreachable_since is None:
+                    unreachable_since = clock.time()
+                if (
+                    router not in self._listed
+                    and clock.time() - unreachable_since
+                    >= self.config.router_unreachable_grace
+                ):
+                    self._retire_router(router)
+                    return
+                self._warn(router, "heartbeat", "heartbeat failed: %r", exc)
+                delay = self.config.retry_interval
+            except PullProtocolError as exc:
+                unreachable_since = None
+                self._warn(router, "heartbeat", "heartbeat refused: %s", exc)
+                delay = (
+                    self.config.rejected_retry_interval
+                    if isinstance(exc, PullHTTPError) and 400 <= exc.status < 500
+                    else self.config.retry_interval
+                )
+            await asyncio.sleep(delay)
 
     async def _refresh_loop(self):
         while not (self._draining or self._stopping):

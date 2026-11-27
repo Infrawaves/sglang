@@ -43,13 +43,28 @@ pub struct WorkerRegistry {
     /// an empty pool and both insert, leaving the registry in a mixed
     /// state — the exact corruption the check is meant to prevent.
     /// Reads (`workers_for`, `get`, `len`, …) stay lock-free against
-    /// the underlying DashMaps; only writes through `add_with_cb` /
-    /// `remove` take this lock so contention is bounded by registry
-    /// mutation rate (worker-discovery events), not request rate.
+    /// the underlying DashMaps. Pull commits briefly take this lock too so
+    /// their authorization cannot race a removal or replacement.
     write: Mutex<()>,
 }
 
 impl WorkerRegistry {
+    /// Run a short operation only while this exact worker remains registered.
+    /// Pull commit uses this to serialize its authorization with removal or
+    /// replacement; the callback must not mutate the registry.
+    pub fn with_registered_worker<T>(
+        &self,
+        worker: &Arc<Worker>,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _write = self.write.lock().unwrap();
+        let current = self.by_id.get(&worker.id)?;
+        if !Arc::ptr_eq(&current, worker) {
+            return None;
+        }
+        Some(operation())
+    }
+
     pub fn add(&self, spec: WorkerSpec) -> Result<(), AddWorkerError> {
         self.add_with_cb(spec, None, WireProtocol::default())
     }

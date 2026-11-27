@@ -6,15 +6,17 @@
 use crate::config::PullConfig;
 use crate::health::circuit_breaker::{CircuitBreaker, OwnedCircuitPermit};
 use crate::server::error::ApiError;
+use crate::workers::Worker;
 use axum::body::Body;
 use axum::http::{HeaderMap, Response, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
+use tokio_util::sync::CancellationToken;
 
 pub const MAX_OUTCOME_BYTES: usize = 4 * 1024 * 1024;
 /// Largest prefill body an offer carries; the agent caps offers at 16 MiB.
@@ -119,6 +121,7 @@ struct AssignmentState {
     phase: Phase,
     offer: Option<Offer>,
     prefill_permit: Option<OwnedCircuitPermit>,
+    prefill_worker: Option<Weak<Worker>>,
     outcome: Option<(u16, String)>,
     /// Set once the client's response ended while still committed. The
     /// background prefill task still needs its outcome before this deadline.
@@ -151,6 +154,7 @@ pub struct Assignment {
     /// The queued request (lease id) this assignment serves.
     request: String,
     hold: Arc<QuotaHold>,
+    expiration: CancellationToken,
     state: Mutex<AssignmentState>,
     changed: Notify,
     queue_changed: Arc<Notify>,
@@ -161,6 +165,10 @@ pub struct Assignment {
     retired: Arc<Mutex<VecDeque<(Instant, String)>>>,
 }
 impl Assignment {
+    pub fn expiration(&self) -> CancellationToken {
+        self.expiration.clone()
+    }
+
     fn notify_changed(&self) {
         self.changed.notify_waiters();
         // Leaving Offered makes another queued request claimable by this P.
@@ -232,12 +240,13 @@ impl Assignment {
     }
     /// Attach admission before publishing the offer. P may finish after D's
     /// response ends, so the assignment owns the permit until its terminal state.
-    pub fn admit_prefill(&self, breaker: &Arc<CircuitBreaker>) -> bool {
+    pub fn admit_prefill(&self, worker: &Arc<Worker>) -> bool {
         let mut state = self.state();
         if state.phase != Phase::Offered || state.prefill_permit.is_some() {
             return false;
         }
-        state.prefill_permit = breaker.acquire_owned();
+        state.prefill_permit = worker.breaker.acquire_owned();
+        state.prefill_worker = Some(Arc::downgrade(worker));
         state.prefill_permit.is_some()
     }
     pub fn cancel(&self) {
@@ -255,15 +264,34 @@ impl Assignment {
         self.state().compact_outcome();
     }
     /// Production commits through [`PullQueue::accept`], which also leaves the FIFO.
+    #[cfg(test)]
     fn accept(&self) -> &'static str {
+        self.accept_if(true)
+    }
+    fn accept_if(&self, worker_registered: bool) -> &'static str {
         let mut state = self.state();
         if state.phase == Phase::Offered && state.offer.is_some() {
-            // The durable-in-process transition precedes both D dispatch and the ACK.
-            self.transition(&mut state, Phase::Committed);
+            // Recheck registration only for the first commit. A repeated accept
+            // must preserve a committed assignment even after its P disappears.
+            let phase = if worker_registered {
+                Phase::Committed
+            } else {
+                Phase::Expired
+            };
+            self.transition(&mut state, phase);
             state.offer = None;
             self.notify_changed();
         }
         state.phase.name()
+    }
+    /// An offer belongs to the exact P instance selected before it was published.
+    /// Re-registering the URL must not authorize work on its replacement.
+    pub fn offered_to(&self, worker: &Arc<Worker>) -> bool {
+        self.state()
+            .prefill_worker
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|offered| Arc::ptr_eq(&offered, worker))
     }
     pub fn reject(&self) -> &'static str {
         let mut state = self.state();
@@ -447,6 +475,7 @@ struct Pending {
     eligible: HashSet<String>,
     tokens: usize,
     hold: Arc<QuotaHold>,
+    expiration: CancellationToken,
     claims: mpsc::UnboundedSender<Arc<Assignment>>,
     current: Option<Arc<Assignment>>,
     enqueued: Instant,
@@ -472,10 +501,13 @@ struct QueueState {
     /// Committed assignments whose client finished, by outcome deadline; the
     /// grace is constant, so pushing to the back keeps it sorted.
     orphans: VecDeque<(Instant, Arc<Assignment>)>,
-    /// Last acquire per worker. Discovered workers come and go with their URLs,
-    /// so per-worker state is dropped once a worker stops polling.
+    /// Last valid acquire or zero-budget heartbeat per worker. Separate from
+    /// capacity, so a saturated P can remain an eligible queue destination.
     last_poll: HashMap<String, Instant>,
 }
+/// Agents heartbeat every 10 s even while their scheduler has no capacity.
+/// Allow a missed heartbeat and the control timeout before dropping eligibility.
+const WORKER_LIVE_FOR: Duration = Duration::from_secs(45);
 /// An agent long-polls at least every 30 s, so ten idle minutes means it is gone.
 const WORKER_IDLE_FORGET: Duration = Duration::from_secs(600);
 
@@ -582,6 +614,23 @@ impl PullQueue {
         let generation = compute();
         cache.insert(model.to_owned(), (now, generation));
         generation
+    }
+
+    /// Registered engines alone do not imply that a pull agent can claim work.
+    /// Only agents that contacted this router recently belong to the pull fleet.
+    pub fn active_workers(&self) -> HashSet<String> {
+        self.active_workers_at(Instant::now())
+    }
+
+    fn active_workers_at(&self, now: Instant) -> HashSet<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .last_poll
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) < WORKER_LIVE_FOR)
+            .map(|(url, _)| url.clone())
+            .collect()
     }
 
     /// Drops tombstones past their TTL, then the oldest while there are `cap`.
@@ -729,6 +778,7 @@ impl PullQueue {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let (claims, receiver) = mpsc::unbounded_channel();
+        let expiration = CancellationToken::new();
         state.pending.insert(
             id.clone(),
             Pending {
@@ -740,6 +790,7 @@ impl PullQueue {
                     bytes,
                     held: AtomicBool::new(true),
                 }),
+                expiration: expiration.clone(),
                 claims,
                 current: None,
                 enqueued: Instant::now(),
@@ -756,7 +807,7 @@ impl PullQueue {
             RequestLease {
                 queue: self.clone(),
                 id,
-                finished: AtomicBool::new(false),
+                expiration,
             },
             receiver,
         ))
@@ -862,7 +913,7 @@ impl PullQueue {
         now: Instant,
     ) -> Result<Option<Arc<Assignment>>, ApiError> {
         Ok(self
-            .try_claim(input, &CircuitBreaker::disabled(), now)?
+            .try_claim(input, &CircuitBreaker::disabled(), now, true)?
             .ok())
     }
 
@@ -873,13 +924,13 @@ impl PullQueue {
         input: &Acquire,
         breaker: &CircuitBreaker,
         now: Instant,
+        record_contact: bool,
     ) -> Result<Result<Arc<Assignment>, Unclaimed>, ApiError> {
         let mut state = self.state.lock().unwrap();
         // Bound outcome tombstones independently of live requests.
         self.evict_tombstones(&mut state, now, self.limits.max_requests.saturating_mul(5));
         Self::expire_orphans(&mut state, now);
         state.forget_idle_workers(now);
-        state.last_poll.insert(input.worker_url.clone(), now);
         if let Some((current, retired)) = state.epochs.get_mut(&input.worker_url) {
             if current != &input.worker_epoch {
                 if retired.contains(&input.worker_epoch) || retired.len() >= 128 {
@@ -904,6 +955,25 @@ impl PullQueue {
                 input.worker_url.clone(),
                 (input.worker_epoch.clone(), HashSet::new()),
             );
+        }
+        // A stale epoch must neither revive a dead agent nor keep the new
+        // agent's fencing history from being collected.
+        // Only receiving another HTTP acquire proves contact. Rechecking a
+        // long poll on queue notifications or at its deadline does not prove
+        // its agent is still alive and must not extend the session lifetime.
+        if record_contact {
+            let was_active = state
+                .last_poll
+                .insert(input.worker_url.clone(), now)
+                .is_some_and(|at| now.saturating_duration_since(at) < WORKER_LIVE_FOR);
+            if !was_active {
+                self.changed.notify_waiters();
+            }
+        }
+        // A heartbeat shares authentication and epoch fencing with acquire but
+        // cannot return an existing offer, claim a request, or block for room.
+        if input.max_tokens == 0 {
+            return Ok(Err(Unclaimed::Nothing));
         }
         // A retried poll of a live assignment gets it back. Once terminal, a
         // retry may claim afresh: the agent reserves only after an offer, and
@@ -953,6 +1023,7 @@ impl PullQueue {
                 phase: Phase::Offered,
                 offer: None,
                 prefill_permit: None,
+                prefill_worker: None,
                 outcome: None,
                 orphaned_until: None,
             }),
@@ -961,6 +1032,7 @@ impl PullQueue {
             enqueued: p.enqueued,
             request: id.clone(),
             hold: p.hold.clone(),
+            expiration: p.expiration.clone(),
             counters: self.counters.clone(),
             retired: self.retired.clone(),
         });
@@ -982,7 +1054,12 @@ impl PullQueue {
         input: &Acquire,
         breaker: &CircuitBreaker,
     ) -> Result<Polled, ApiError> {
+        if input.max_tokens == 0 {
+            let _ = self.try_claim(input, breaker, Instant::now(), true)?;
+            return Ok(Polled::Empty);
+        }
         let deadline = Instant::now() + Duration::from_millis(input.wait_ms.min(30_000));
+        let mut record_contact = true;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -993,7 +1070,9 @@ impl PullQueue {
             // was "not yet" to the claim and "already over" to the wake-up, and
             // the poll slept to its deadline.
             let now = Instant::now();
-            match self.try_claim(input, breaker, now)? {
+            let claimed = self.try_claim(input, breaker, now, record_contact)?;
+            record_contact = false;
+            match claimed {
                 Ok(a) => return Ok(a.offer().await.map_or(Polled::Empty, Polled::Offer)),
                 Err(Unclaimed::BreakerUnavailable) => return Ok(Polled::Empty),
                 // Only fresher room can serve this worker now, and it learns
@@ -1011,11 +1090,13 @@ impl PullQueue {
             {
                 // Check once at the boundary: work becoming claimable at the
                 // deadline should not force an additional empty poll/backoff.
-                return Ok(match self.try_claim(input, breaker, Instant::now())? {
-                    Ok(a) => a.offer().await.map_or(Polled::Empty, Polled::Offer),
-                    Err(Unclaimed::Held) => Polled::Held,
-                    Err(Unclaimed::Nothing | Unclaimed::BreakerUnavailable) => Polled::Empty,
-                });
+                return Ok(
+                    match self.try_claim(input, breaker, Instant::now(), false)? {
+                        Ok(a) => a.offer().await.map_or(Polled::Empty, Polled::Offer),
+                        Err(Unclaimed::Held) => Polled::Held,
+                        Err(Unclaimed::Nothing | Unclaimed::BreakerUnavailable) => Polled::Empty,
+                    },
+                );
             }
         }
     }
@@ -1052,8 +1133,8 @@ impl PullQueue {
     /// Commits `a` and takes its request out of the FIFO: a committed request
     /// never returns to waiting, and leaving it there made every poll and
     /// scan grow with the requests in decode.
-    pub fn accept(&self, a: &Assignment) -> &'static str {
-        let status = a.accept();
+    pub fn accept(&self, a: &Assignment, worker_registered: bool) -> &'static str {
+        let status = a.accept_if(worker_registered);
         if status == "committed" {
             let mut state = self.state.lock().unwrap();
             if let Some(position) = state.fifo.iter().position(|id| id == &a.request) {
@@ -1085,27 +1166,38 @@ impl PullQueue {
 pub struct RequestLease {
     queue: Arc<PullQueue>,
     id: String,
-    finished: AtomicBool,
+    expiration: CancellationToken,
 }
 impl RequestLease {
     /// The client's response ended normally. P's outcome usually arrives
     /// after D's stream ends, so its assignment stays committed for that
     /// report instead of being cancelled (and P aborting work it finished).
     pub fn finish(&self) {
-        self.finished.store(true, Ordering::Relaxed);
+        self.release(true);
     }
-}
-impl Drop for RequestLease {
-    fn drop(&mut self) {
+
+    pub fn expiration(&self) -> CancellationToken {
+        self.expiration.clone()
+    }
+
+    /// End a request even when its client retains an unread response body.
+    pub fn expire(&self) {
+        self.release(false);
+    }
+
+    fn release(&self, finished: bool) {
         let mut state = self.queue.state.lock().unwrap();
         let Some(p) = state.pending.remove(&self.id) else {
             return;
         };
+        if !finished {
+            self.expiration.cancel();
+        }
         p.hold.release();
         let mut committed = false;
         if let Some(a) = p.current {
             let mut s = a.state();
-            if self.finished.load(Ordering::Relaxed) && s.phase == Phase::Committed {
+            if finished && s.phase == Phase::Committed {
                 // D succeeded, so P's outcome is due shortly; a 200 stream
                 // that carried an error, or a lost outcome, ends at the grace.
                 let until = Instant::now() + ORPHAN_OUTCOME_GRACE;
@@ -1129,6 +1221,11 @@ impl Drop for RequestLease {
         }
     }
 }
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
 
 /// How long P may take to report a committed prefill once its client's
 /// response ended. D finishing implies the KV arrived, so P is done or close;
@@ -1139,13 +1236,13 @@ pub fn validate_acquire(input: &Acquire) -> Result<(), ApiError> {
     if input.dp_rank != 0
         || input.max_requests != 1
         || !(1..=MAX_OFFERED_PER_WORKER).contains(&input.max_offered)
-        || input.max_tokens == 0
+        || (input.max_tokens == 0 && input.wait_ms != 0)
         || input.worker_epoch.is_empty()
         || input.worker_epoch.len() > 128
         || input.poll_id.is_empty()
         || input.poll_id.len() > 128
     {
-        return Err(ApiError::BadRequest("pull requires dp_rank=0, max_requests=1, max_offered in 1..=16, positive max_tokens and bounded epoch/poll IDs".into()));
+        return Err(ApiError::BadRequest("pull requires dp_rank=0, max_requests=1, max_offered in 1..=16, zero wait_ms for a zero-token heartbeat and bounded epoch/poll IDs".into()));
     }
     Ok(())
 }
@@ -1178,6 +1275,115 @@ mod tests {
             wait_ms: 0,
         }
     }
+
+    #[tokio::test]
+    async fn zero_budget_heartbeats_keep_saturated_agents_live_without_claiming() {
+        let queue = PullQueue::new(PullConfig::default());
+        let (_lease, mut claims) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        let mut heartbeat = acquire("p", "old", "heartbeat", 0);
+        assert!(validate_acquire(&heartbeat).is_ok());
+        let now = Instant::now();
+        assert!(queue.try_acquire_at(&heartbeat, now).unwrap().is_none());
+        assert!(claims.try_recv().is_err());
+        assert!(queue.active_workers_at(now).contains("p"));
+        assert!(!queue.active_workers_at(now).contains("push-only"));
+        assert!(queue.active_workers_at(now + WORKER_LIVE_FOR).is_empty());
+
+        // A saturated worker's independent heartbeat renews its membership
+        // even though no normal positive-budget acquire has ever succeeded.
+        heartbeat.worker_epoch = "new".into();
+        let renewed = now + Duration::from_secs(40);
+        assert!(queue.try_acquire_at(&heartbeat, renewed).unwrap().is_none());
+        assert!(queue
+            .active_workers_at(renewed + Duration::from_secs(40))
+            .contains("p"));
+        heartbeat.worker_epoch = "old".into();
+        assert!(queue
+            .try_acquire_at(&heartbeat, renewed + WORKER_LIVE_FOR)
+            .is_err());
+        assert!(queue
+            .active_workers_at(renewed + WORKER_LIVE_FOR)
+            .is_empty());
+
+        heartbeat.worker_epoch = "new".into();
+        heartbeat.wait_ms = 1;
+        assert!(validate_acquire(&heartbeat).is_err());
+        heartbeat.wait_ms = 0;
+        assert!(matches!(
+            queue
+                .acquire(&heartbeat, &CircuitBreaker::disabled())
+                .await
+                .unwrap(),
+            Polled::Empty
+        ));
+        assert!(claims.try_recv().is_err());
+    }
+
+    #[test]
+    fn registration_recheck_expires_only_uncommitted_work() {
+        let queue = PullQueue::new(PullConfig::default());
+        let (lease, _) = queue
+            .enqueue(HashSet::from(["p".into()]), HashMap::new(), 10, 10)
+            .unwrap();
+        let offer = |assignment: &Assignment| Offer {
+            status: "offer",
+            assignment_id: assignment.id.clone(),
+            request_id: "rid".into(),
+            path: "/generate",
+            body: serde_json::Value::Null,
+            headers: HashMap::new(),
+            input_tokens: 10,
+            expires_in_ms: 0,
+        };
+        let first = queue
+            .try_acquire(&acquire("p", "e", "first", 10))
+            .unwrap()
+            .unwrap();
+        first.state().offer = Some(offer(&first));
+        assert_eq!(queue.accept(&first, false), "expired");
+        queue.requeue(&lease);
+        let second = queue
+            .try_acquire(&acquire("p", "e", "second", 10))
+            .unwrap()
+            .unwrap();
+        second.state().offer = Some(offer(&second));
+        assert_eq!(queue.accept(&second, true), "committed");
+        assert_eq!(queue.accept(&second, false), "committed");
+        assert!(!queue.state.lock().unwrap().fifo.contains(&lease.id));
+    }
+
+    #[tokio::test]
+    async fn waiting_long_polls_do_not_renew_agent_presence_without_another_request() {
+        let queue = PullQueue::new(PullConfig::default());
+        let mut input = acquire("p", "e", "poll", 100);
+        input.wait_ms = 30_000;
+        let breaker = CircuitBreaker::disabled();
+        let pending = queue.acquire(&input, &breaker);
+        tokio::pin!(pending);
+        assert!(poll!(pending.as_mut()).is_pending());
+        let received = queue.state.lock().unwrap().last_poll["p"];
+
+        // A queue notification rechecks the outstanding poll, even if its
+        // agent has disappeared. That server-side work is not a heartbeat.
+        queue.changed.notify_waiters();
+        assert!(poll!(pending.as_mut()).is_pending());
+        assert_eq!(queue.state.lock().unwrap().last_poll["p"], received);
+        assert!(queue
+            .active_workers_at(received + WORKER_LIVE_FOR)
+            .is_empty());
+
+        // Retrying the HTTP acquire, including with the same poll ID, is real
+        // contact and should renew presence without creating a second offer.
+        let retry = queue.acquire(&input, &breaker);
+        tokio::pin!(retry);
+        assert!(poll!(retry.as_mut()).is_pending());
+        assert!(queue
+            .active_workers_at(received + WORKER_LIVE_FOR)
+            .contains("p"));
+    }
+
     #[test]
     fn queued_requests_respect_bytes_tokens_and_reclaim_on_cancellation() {
         let queue = PullQueue::new(PullConfig {
@@ -1704,7 +1910,7 @@ mod tests {
                 input_tokens: 10,
                 expires_in_ms: 0,
             });
-            assert_eq!(queue.accept(&a), "committed");
+            assert_eq!(queue.accept(&a, true), "committed");
             leases.push(lease);
         }
     }
@@ -1821,7 +2027,7 @@ mod tests {
             input_tokens: 10,
             expires_in_ms: 0,
         });
-        assert_eq!(queue.accept(&a), "committed");
+        assert_eq!(queue.accept(&a, true), "committed");
         assert!(queue.state.lock().unwrap().fifo.is_empty());
     }
 

@@ -4,6 +4,7 @@
 use crate::common::mock_worker::MockWorker;
 use axum::{body::Body, http::Request, Router};
 use clap::Parser;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sgl_router::{
     buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup},
@@ -34,6 +35,7 @@ use tower::ServiceExt;
 
 struct Fixture {
     app: Router,
+    pull_queue: Arc<sgl_router::state::work_pull::PullQueue>,
     prefill: MockWorker,
     decode: MockWorker,
     registry: Arc<WorkerRegistry>,
@@ -152,12 +154,23 @@ impl Fixture {
             )])
             .unwrap(),
         )]));
-        Self {
+        let fixture = Self {
+            pull_queue: ctx.pull_queue.clone(),
             app: build_router(Arc::new(ctx)),
             prefill,
             decode,
             registry,
-        }
+        };
+        fixture
+            .post(
+                "acquire",
+                json!({
+                    "worker_url": fixture.prefill.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                    "poll_id": "heartbeat", "max_tokens": 0, "max_requests": 1, "wait_ms": 0,
+                }),
+            )
+            .await;
+        fixture
     }
     fn generate(&self) -> tokio::task::JoinHandle<axum::response::Response> {
         let app = self.app.clone();
@@ -254,37 +267,57 @@ fn request(path: &str, value: Value) -> Request<Body> {
 
 #[tokio::test]
 async fn pull_decode_failure_still_cancels_its_committed_prefill() {
-    // A read-to-the-end D error kept P committed: nobody would take its KV,
-    // and P held its budget until the bootstrap timeout.
-    let decode = MockWorker::start_returning_error(
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "decode failed"}),
-    )
-    .await;
-    // Without stream_after_prefill, D's error reaches the client while P
-    // still waits for D to take its KV.
-    let f = Fixture::with_decode(
-        decode,
-        false,
-        1000,
-        10,
-        None,
-        None,
-        CircuitBreakerConfig::default(),
-    )
-    .await;
-    let client = f.generate();
-    let offer = f.acquire("poll-1").await;
-    f.post("accept", Fixture::action(&offer)).await;
-    let response = client.await.unwrap();
-    assert_eq!(response.status(), 500);
-    axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post("status", Fixture::action(&offer)).await["status"],
-        "cancelled"
-    );
+    // P may still be waiting for a D that has already failed. Waiting for
+    // P's outcome before forwarding D's error pins its reservation until timeout.
+    for wait_for_prefill in [false, true] {
+        for incomplete_body in [false, true] {
+            let decode = if incomplete_body {
+                MockWorker::start_returning_partial_body(axum::http::StatusCode::OK, b"{").await
+            } else {
+                MockWorker::start_returning_error(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "decode failed"}),
+                )
+                .await
+            };
+            let f = Fixture::with_decode(
+                decode,
+                wait_for_prefill,
+                1000,
+                10,
+                None,
+                None,
+                CircuitBreakerConfig::default(),
+            )
+            .await;
+            let client = f.generate();
+            let offer = f.acquire("poll-1").await;
+            f.post("accept", Fixture::action(&offer)).await;
+            let response = tokio::time::timeout(Duration::from_secs(1), client)
+                .await
+                .expect("D failure must not wait for P's outcome")
+                .unwrap();
+            assert_eq!(response.status(), if incomplete_body { 502 } else { 500 });
+            assert_eq!(
+                f.post("status", Fixture::action(&offer)).await["status"],
+                "cancelled",
+                "D failure must cancel P before the client reads the error body"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if !incomplete_body {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({"error":"decode failed"})
+                );
+            }
+            assert_eq!(
+                f.post("status", Fixture::action(&offer)).await["status"],
+                "cancelled"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -703,21 +736,54 @@ async fn pull_does_not_replay_committed_work_when_client_is_cancelled() {
 }
 
 #[tokio::test]
-async fn pull_rejects_batch_and_multisample_before_queueing() {
+async fn pull_rejects_unsupported_request_shapes_before_queueing() {
     let f = Fixture::new(1000, 10).await;
     for body in [
         json!({"input_ids":[[1],[2]]}),
         json!({"input_ids":[1],"sampling_params":{"n":2}}),
+        json!({"input_ids":[1],"sampling_params":{"n":0}}),
+        json!({"input_ids":[1],"sampling_params":{"n":"1"}}),
+        json!({"input_ids":[1],"sampling_params":{"beam_width":2}}),
+        json!({"input_ids":[1],"sampling_params":{"beam_width":0}}),
+        json!({"input_ids":[1],"sampling_params":{"beam_width":"1"}}),
+        json!({"input_ids":[1],"sampling_params":[]}),
+        json!({"input_ids":[1],"sampling_params":"default"}),
+        json!({"input_ids":[1],"session_id":"session"}),
+        json!({"input_ids":[1],"session_params":{"id":"session"}}),
+        json!({"input_ids":[1],"lora_path":"adapter"}),
+        json!({"input_ids":[1],"positional_embed_overrides":{}}),
     ] {
-        let response = f
-            .app
-            .clone()
-            .oneshot(request("/generate", body))
-            .await
-            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            f.app.clone().oneshot(request("/generate", body)),
+        )
+        .await
+        .expect("unsupported requests must be rejected before queueing")
+        .unwrap();
         assert_eq!(response.status(), 400);
     }
     assert_eq!(f.acquire("empty").await["status"], "empty");
+    assert!(f.decode.captured.lock().unwrap().last_body.is_none());
+
+    // Explicit null optional fields are still ordinary single text requests.
+    let app = f.app.clone();
+    let client = tokio::spawn(async move {
+        app.oneshot(request(
+            "/generate",
+            json!({
+                "input_ids":[1], "session_id":null, "session_params":null,
+                "lora_path":null, "positional_embed_overrides":null,
+                "sampling_params":{"n":1, "beam_width":null}, "stream":false,
+            }),
+        ))
+        .await
+        .unwrap()
+    });
+    let offer = f.acquire("null-optionals").await;
+    assert_eq!(offer["status"], "offer");
+    f.post("accept", Fixture::action(&offer)).await;
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
 }
 
 #[tokio::test]
@@ -797,6 +863,109 @@ async fn pull_client_deadline_includes_offer_waiting_time() {
         "cancelled"
     );
     assert!(f.decode.captured.lock().unwrap().last_body.is_none());
+}
+
+#[tokio::test]
+async fn pull_stream_deadline_includes_queue_time_and_cancels_without_body_reads() {
+    let decode =
+        MockWorker::start_slow_stream(vec!["data: token\n\n"; 1000], Duration::from_millis(10))
+            .await;
+    let f = Fixture::with_decode(
+        decode,
+        false,
+        10_000,
+        10,
+        None,
+        None,
+        CircuitBreakerConfig::default(),
+    )
+    .await;
+    let started = tokio::time::Instant::now();
+    let app = f.app.clone();
+    let client = tokio::spawn(async move {
+        app.oneshot(request(
+            "/generate",
+            json!({"input_ids":[1,2,3], "sampling_params":{"max_new_tokens":100}, "stream":true}),
+        ))
+        .await
+        .unwrap()
+    });
+    let offer = f.acquire("stream").await;
+    // The request budget is three seconds; spending one waiting for commit
+    // must not leave a fresh three seconds for the streaming response.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    f.post("accept", Fixture::action(&offer)).await;
+    let response = client.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: token\n\n");
+
+    // Leave the body unpolled. Cancellation must not depend on a slow client
+    // reading the terminal error or dropping its HTTP response.
+    tokio::time::sleep_until(started + Duration::from_millis(3300)).await;
+    assert_eq!(
+        f.post("status", Fixture::action(&offer)).await["status"],
+        "cancelled"
+    );
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while f.decode.abort_log.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("deadline must abort D before the client consumes the body");
+    assert_eq!(
+        *f.decode.abort_log.lock().unwrap(),
+        vec![json!({"rid":offer["request_id"], "abort_all":false})]
+    );
+    let error = body.collect().await.unwrap_err();
+    assert!(error.to_string().contains("stale_request_timeout"));
+}
+
+#[tokio::test]
+async fn pull_deadline_survives_upstream_eof_with_an_unread_client_body() {
+    let decode =
+        MockWorker::start_slow_stream(vec!["data: token\n\n"], Duration::from_millis(10)).await;
+    let f = Fixture::with_decode(
+        decode,
+        false,
+        10_000,
+        10,
+        None,
+        None,
+        CircuitBreakerConfig::default(),
+    )
+    .await;
+    let app = f.app.clone();
+    let client = tokio::spawn(async move {
+        app.oneshot(request(
+            "/generate",
+            json!({"input_ids":[1], "stream":true}),
+        ))
+        .await
+        .unwrap()
+    });
+    let offer = f.acquire("buffered").await;
+    f.post("accept", Fixture::action(&offer)).await;
+    let response = client.await.unwrap();
+    assert_eq!(response.status(), 200);
+    // D finishes into the router's buffer. Keep the client body alive and
+    // unread, with P still awaiting an outcome, while the router drains.
+    f.pull_queue.close();
+    tokio::time::timeout(Duration::from_secs(4), f.pull_queue.drained())
+        .await
+        .expect("an unread response must not retain a request beyond its deadline");
+    assert_eq!(
+        f.post("status", Fixture::action(&offer)).await["status"],
+        "cancelled"
+    );
+    let error = response.into_body().collect().await.unwrap_err();
+    assert!(error.to_string().contains("stale_request_timeout"));
+    assert!(
+        f.decode.abort_log.lock().unwrap().is_empty(),
+        "D already finished normally"
+    );
 }
 
 #[tokio::test]
@@ -946,6 +1115,117 @@ fn prefill_spec(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         bootstrap_port: Some(8997),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn pull_requires_a_live_agent_before_a_registered_prefill_is_eligible() {
+    let f = Fixture::new(1000, 10).await;
+    let replacement = MockWorker::start(vec![]).await;
+    f.registry.remove(&WorkerId("p".into()));
+    f.registry
+        .add(prefill_spec("p2", &replacement.url, WorkerMode::Prefill))
+        .unwrap();
+    // A healthy push-only worker must not turn an unroutable request into a
+    // queued request that can only wait for its deadline.
+    let response = tokio::time::timeout(Duration::from_millis(200), f.generate())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(f.decode.captured.lock().unwrap().last_body.is_none());
+
+    let heartbeat = f
+        .post(
+            "acquire",
+            json!({
+                "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                "poll_id": "heartbeat", "max_tokens": 0, "max_requests": 1, "wait_ms": 0
+            }),
+        )
+        .await;
+    assert_eq!(heartbeat["status"], "empty");
+    let client = f.generate();
+    let offer = f
+        .post(
+            "acquire",
+            json!({
+                "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                "poll_id": "with-room", "max_tokens": 100, "max_requests": 1, "wait_ms": 500
+            }),
+        )
+        .await;
+    assert_eq!(offer["status"], "offer");
+    assert_eq!(
+        f.post("accept", Fixture::action(&offer)).await["status"],
+        "committed"
+    );
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn pull_rechecks_the_exact_worker_registration_before_committing() {
+    for replace_same_url in [false, true] {
+        let f = Fixture::new(1000, 10).await;
+        let client = f.generate();
+        let old = f.acquire("old").await;
+        assert_eq!(old["status"], "offer");
+        if replace_same_url {
+            // Upsert preserves the breaker; checking only its identity would
+            // authorize an offer against a different registered worker object.
+            f.registry
+                .add(prefill_spec("p", &f.prefill.url, WorkerMode::Prefill))
+                .unwrap();
+        } else {
+            f.registry.remove(&WorkerId("p".into()));
+        }
+        assert_eq!(
+            f.post("accept", Fixture::action(&old)).await["status"],
+            "expired"
+        );
+        assert!(f.decode.captured.lock().unwrap().last_body.is_none());
+
+        let replacement = MockWorker::start(vec![]).await;
+        f.registry
+            .add(prefill_spec("p2", &replacement.url, WorkerMode::Prefill))
+            .unwrap();
+        let new = f
+            .post(
+                "acquire",
+                json!({
+                    "worker_url": replacement.url, "worker_epoch": "epoch-1", "dp_rank": 0,
+                    "poll_id": "replacement", "max_tokens": 100, "max_requests": 1,
+                    "wait_ms": 2000
+                }),
+            )
+            .await;
+        assert_eq!(new["status"], "offer");
+        assert_ne!(new["request_id"], old["request_id"]);
+        assert_eq!(
+            f.post("accept", Fixture::action(&new)).await["status"],
+            "committed"
+        );
+        f.outcome(&new, 200, "{}").await;
+        assert_eq!(client.await.unwrap().status(), 200);
+    }
+}
+
+#[tokio::test]
+async fn repeated_accept_does_not_cancel_committed_work_after_worker_removal() {
+    let f = Fixture::new(1000, 10).await;
+    let client = f.generate();
+    let offer = f.acquire("first").await;
+    assert_eq!(
+        f.post("accept", Fixture::action(&offer)).await["status"],
+        "committed"
+    );
+    f.registry.remove(&WorkerId("p".into()));
+    assert_eq!(
+        f.post("accept", Fixture::action(&offer)).await["status"],
+        "committed"
+    );
+    f.outcome(&offer, 200, "{}").await;
+    assert_eq!(client.await.unwrap().status(), 200);
 }
 
 #[tokio::test]

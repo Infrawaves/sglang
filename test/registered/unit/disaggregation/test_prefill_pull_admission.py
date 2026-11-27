@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from array import array
+from itertools import product
 from types import SimpleNamespace
 
 import torch.distributed as dist
@@ -27,15 +28,17 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
 )
 from sglang.srt.managers.scheduler_components.prefill_work_admission import (
+    PULL_WARMUP_HEADER,
     PrefillCapacity,
     PrefillPullBudgetClient,
     PrefillWorkAdmission,
     SchedulerPrefillWorkAdmission,
-    PULL_WARMUP_HEADER,
+    _state_slot_accounting,
     pending_prefill_tokens,
     prepare_prefill_pull_request,
     pull_warmup_headers,
 )
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -549,6 +552,88 @@ class TestPrefillPullAdmission(CustomTestCase):
         self.assertTrue(reserve("first").success)
         self.assertEqual(reserve("second").error, "no_capacity")
 
+    def test_hicache_state_grants_cover_restore_until_first_allocation(self):
+        """A host checkpoint needs a slot besides request working/tracking
+        state. Intake cannot drop that promise before matching, and continuing
+        chunks must not charge the restored checkpoint a second time."""
+        for host_cache, tracking_slots, state_cost in product(
+            (None, "hicache", "lmcache"), (0, 2), (0, 4)
+        ):
+            with self.subTest(
+                host_cache=host_cache,
+                tracking_slots=tracking_slots,
+                state_cost=state_cost,
+            ):
+                table = SimpleNamespace(
+                    enable_mamba_extra_buffer=tracking_slots > 0,
+                    mamba_initial_tracking_slots=tracking_slots,
+                )
+                allocator = SimpleNamespace(
+                    state=StateStorage.empty("mamba"),
+                    create_prefill_budget=lambda cache, cost=state_cost: (
+                        SimpleNamespace(state_slot_cost=cost)
+                    ),
+                )
+                ledger = PrefillWorkAdmission(
+                    max_tokens=64,
+                    max_requests=4,
+                    page_size=4,
+                    **_state_slot_accounting(
+                        allocator=allocator,
+                        req_pool=table,
+                        tree_cache=SimpleNamespace(
+                            cache_controller=(
+                                object() if host_cache == "hicache" else None
+                            ),
+                            lmcache_connector=(
+                                object() if host_cache == "lmcache" else None
+                            ),
+                        ),
+                    ),
+                )
+                # Load-back materializes both the cache checkpoint and the
+                # request's working state, plus initial tracking buffers.
+                slots = 1 + tracking_slots + int(host_cache is not None)
+
+                def control(
+                    action, available, reservation_id="r", *, ledger=ledger, **kwargs
+                ):
+                    return ledger.control(
+                        action=action,
+                        reservation_id=reservation_id,
+                        now=0,
+                        capacity=PrefillCapacity(256, 4, 4, state_slots=available),
+                        **kwargs,
+                    )
+
+                self.assertFalse(control("reserve", slots - 1)["success"])
+                granted = control("reserve", slots)
+                self.assertTrue(granted["success"])
+                # Shared pools must cover the checkpoint in token space too:
+                # 256 minus state, page/output slack, rounded down to page 4.
+                self.assertEqual(
+                    granted["data"]["max_tokens"], 248 - slots * state_cost
+                )
+                bound = {"assignment_id": "a", "request_id": "rid", "tokens": 8}
+                self.assertFalse(control("bind", slots - 1, **bound)["success"])
+                self.assertTrue(control("bind", slots, **bound)["success"])
+                self.assertFalse(control("reserve", 2 * slots - 1, "next")["success"])
+                self.assertIsNone(ledger.consume(reservation_id="r", **bound))
+                req = _request(seqlen=8)
+                req.kv.holds_mamba = False
+                req.kv.mamba_ping_pong_track_buffer = None
+                req.mamba_host_hit_length = 0  # Not matched yet at intake.
+                ledger.attach_request("r", req)
+                self.assertFalse(control("reserve", 2 * slots - 1, "next")["success"])
+
+                # The allocator snapshot now excludes the restored checkpoint
+                # and request slots. Host-hit metadata survives across chunks.
+                req.mamba_host_hit_length = int(host_cache is not None)
+                req.kv.holds_mamba = True
+                req.kv.mamba_ping_pong_track_buffer = object()
+                req.kv.kv_allocated_len = 4
+                self.assertTrue(control("reserve", slots, "next")["success"])
+
     def test_peek_uses_shared_clock_without_an_extra_collective(self):
         """Different host uptimes must not expire grants early or prevent an
         abandoned grant's slot from becoming claimable after its TTL."""
@@ -584,15 +669,18 @@ class TestPrefillPullAdmission(CustomTestCase):
                     clock.local += 0.25
 
                 reductions = []
-                with mock.patch.object(
-                    module.time, "monotonic", side_effect=lambda: clock.local
-                ), mock.patch(
-                    "torch.distributed.broadcast_object_list", side_effect=broadcast
-                ), mock.patch(
-                    "torch.distributed.all_reduce",
-                    side_effect=lambda tensor, **kwargs: reductions.append(tensor),
-                ), mock.patch.object(
-                    module, "_global_rank", return_value=0
+                with (
+                    mock.patch.object(
+                        module.time, "monotonic", side_effect=lambda: clock.local
+                    ),
+                    mock.patch(
+                        "torch.distributed.broadcast_object_list", side_effect=broadcast
+                    ),
+                    mock.patch(
+                        "torch.distributed.all_reduce",
+                        side_effect=lambda tensor, **kwargs: reductions.append(tensor),
+                    ),
+                    mock.patch.object(module, "_global_rank", return_value=0),
                 ):
                     reserve = adapter.handle_control(
                         PrefillPullBudgetReq(action="reserve", reservation_id="old"),
@@ -600,10 +688,15 @@ class TestPrefillPullAdmission(CustomTestCase):
                     )
                     self.assertTrue(reserve.success)
                     reductions.clear()
-                    with mock.patch(
-                        "torch.distributed.broadcast_object_list",
-                        side_effect=AssertionError("peek must not broadcast the clock"),
-                    ), self.assertLogs(module.logger, level="INFO") as logs:
+                    with (
+                        mock.patch(
+                            "torch.distributed.broadcast_object_list",
+                            side_effect=AssertionError(
+                                "peek must not broadcast the clock"
+                            ),
+                        ),
+                        self.assertLogs(module.logger, level="INFO") as logs,
+                    ):
                         for elapsed, available in (
                             (0, False),
                             (119, False),
