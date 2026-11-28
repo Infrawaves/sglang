@@ -14,7 +14,9 @@ RsNormAgGemm(qkv_proj). Once a forward fuses, the residual is this rank's
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 _DENSE_ARCHITECTURES = frozenset({"Qwen3ForCausalLM", "LlamaForCausalLM"})
 _MOE_ARCHITECTURES = frozenset({"Qwen3MoeForCausalLM"})
 # The world sizes of TP group.
-_SUPPORTED_TP_SIZES = (2, 4, 6, 8)
+_SUPPORTED_TP_SIZES = (2, 4, 8)
 # mega_ops kernel shape rules: comm n-tile is 256 columns, K-tile is 64, N-tile 128.
 _HIDDEN_ALIGN = 256
 _K_ALIGN = 64
@@ -99,7 +101,9 @@ class _Partial(msgspec.Struct, frozen=True):
 class _Service:
     """The two shared mega_ops kernels and the handoffs between call sites."""
 
-    def __init__(self, *, sparse: bool, hidden_size: int, col_n: int, eps: float):
+    def __init__(
+        self, *, sparse: bool, hidden_size: int, row_k: int, col_n: int, eps: float
+    ):
         import mega_ops
 
         group = get_parallel().tp_group
@@ -119,10 +123,75 @@ class _Service:
             self.row = mega_ops.GemmRSNormAG(n=hidden_size, **kwargs)
             self.col = mega_ops.RsNormAgGemm(hidden_size=hidden_size, n=col_n, **kwargs)
             torch.cuda.current_stream(group.device).synchronize()
+        self._load_chunk_tables(hidden_size=hidden_size, row_k=row_k, col_n=col_n)
         self.sparse = sparse
         self.pending_partial: Optional[_Partial] = None
         self.pending_row: Optional[_RowOutput] = None
         self.pending_col: Optional[_ColOutput] = None
+
+    def _load_chunk_tables(self, *, hidden_size: int, row_k: int, col_n: int) -> None:
+        """Install the tuned per-m RS chunk tables of this TP size, shape and GPU.
+
+        The tables are keyed by exact m_pad; any other m keeps the kernel's fixed grid.
+        """
+        import mega_ops
+        from mega_ops.tile_order import build_physical_tile_m_order
+
+        config_dir = envs.SGLANG_SM90_GEMM_NORM_CONFIG_DIR.get() or os.path.join(
+            os.path.dirname(mega_ops.__file__), "configs"
+        )
+        device_name = torch.cuda.get_device_name(self.group.device).replace(" ", "_")
+        world_size, rank = self.world_size, self.group.rank_in_group
+        suffix = f"device_name={device_name}.json"
+        for kernel, name, path in (
+            (self.row, "gemm_rs_norm_ag", f"world={world_size},H={hidden_size},K={row_k},{suffix}"),
+            (self.col, "rs_norm_ag_gemm", f"world={world_size},H={hidden_size},N={col_n},{suffix}"),
+        ):
+            path = os.path.join(config_dir, name, path)
+            if not os.path.exists(path):
+                logger.info("SM90 GEMM norm fusion: no chunk tables at %s", path)
+                continue
+            with open(path) as f:
+                spec = json.load(f)
+            match = spec["match"]
+            loaded = []
+            for m_text, entry in spec["configs"].items():
+                m = int(m_text)
+                if m > self.max_m or m % world_size:
+                    continue
+                if kernel is self.row:
+                    tile_n, cluster_m = match["tile_shape"][1], match["cluster_m"]
+                    chosen = kernel.config_for(m)
+                    if chosen is None or chosen[1:] != (tile_n, cluster_m):
+                        logger.warning(
+                            "SM90 GEMM norm fusion: skip %s m=%d, tuned for "
+                            "tile_n=%d cluster_m=%d but dispatches %s",
+                            name, m, tile_n, cluster_m, chosen,
+                        )
+                        continue
+                table = torch.tensor(entry["chunk_table"][str(rank)], dtype=torch.int32)
+                kernel.set_chunk_table(m, table.view(-1, 4))
+                loaded.append(m)
+            if kernel is self.col and loaded and match.get("physical_tile_m_order") == "common":
+                # These tables were tuned with the common M-tile order, not the default rotated one.
+                native_order = kernel._physical_tile_m_order_for
+                common = {}
+
+                def order_for(m, tile_m, _native=native_order, _ms=frozenset(loaded)):
+                    if m not in _ms:
+                        return _native(m, tile_m)
+                    if (m, tile_m) not in common:
+                        common[(m, tile_m)] = torch.tensor(
+                            build_physical_tile_m_order(m, tile_m, world_size),
+                            dtype=torch.int32,
+                            device=self.group.device,
+                        )
+                    return common[(m, tile_m)]
+
+                kernel._physical_tile_m_order_for = order_for
+            logger.info(
+                "SM90 GEMM norm fusion: %s chunk tables for m=%s from %s", name, loaded, path
+            )
 
     def active(self, forward_batch: ForwardBatch) -> Optional[int]:
         """m_pad when this forward fuses every boundary, else None.
@@ -318,8 +387,6 @@ class Sm90GemmNormFusion:
         return row.normed, row.residual
 
 
-# --- linear wrappers ----------------------------------------------------------
-
 
 def _install_col_forward(linear, service: _Service) -> None:
     """Return the fused GEMM output when the input is the normed tensor it consumed."""
@@ -405,9 +472,6 @@ def _install_row_forward(
     linear.forward = forward
 
 
-# --- install ------------------------------------------------------------------
-
-
 def install_sm90_gemm_norm_fusion(model) -> None:
     """Install on a Qwen3 / Qwen3-MoE / Llama ForCausalLM; a no-op otherwise.
 
@@ -427,9 +491,11 @@ def install_sm90_gemm_norm_fusion(model) -> None:
         logger.warning("SM90 GEMM norm fusion disabled; %s", reason)
         return
     col_linear = layers[0].self_attn.qkv_proj if sparse else layers[0].mlp.gate_up_proj
+    row_linear = layers[0].self_attn.o_proj if sparse else layers[0].mlp.down_proj
     service = _Service(
         sparse=sparse,
         hidden_size=model.config.hidden_size,
+        row_k=row_linear.weight.shape[1],
         col_n=col_linear.weight.shape[0],
         eps=layers[0].post_attention_layernorm.variance_epsilon,
     )

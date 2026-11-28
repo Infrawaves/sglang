@@ -793,6 +793,8 @@ class Envs:
     # adjacent GEMM with the SM90 mega_ops kernels (Qwen3, Qwen3-MoE, Llama
     # prefill). See srt/layers/layer_boundary/fusions/sm90_gemm_norm.py.
     SGLANG_ENABLE_SM90_GEMM_NORM_FUSION = EnvBool(False)
+    # Directory of the tuned RS chunk tables; empty = the configs/ folder inside mega_ops.
+    SGLANG_SM90_GEMM_NORM_CONFIG_DIR = EnvStr("")
 
     # ===================================================================
     # Tool calling and native web search

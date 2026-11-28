@@ -1,6 +1,8 @@
 """CPU contracts for the SM90 GEMM norm boundary fusion (no CUDA smoke test)."""
 
-from types import SimpleNamespace
+import json
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -298,3 +300,115 @@ def test_row_wrapper_refuses_a_sum_the_boundary_does_not_defer(monkeypatch):
     )
     with pytest.raises(RuntimeError):
         linear.forward(torch.zeros(4, 4), forward_batch=_batch(4))
+
+
+# --- chunk table loading --------------------------------------------------------------
+
+
+def _stub_mega_ops(monkeypatch):
+    def build_common_order(m, tile_m, world_size):
+        per_rank = (m // world_size) // tile_m
+        return tuple(
+            rank * per_rank + round_idx
+            for round_idx in range(per_rank)
+            for rank in range(world_size)
+        )
+
+    pkg = ModuleType("mega_ops")
+    pkg.__file__ = "/nonexistent/mega_ops/__init__.py"
+    tile_order = ModuleType("mega_ops.tile_order")
+    tile_order.build_physical_tile_m_order = build_common_order
+    monkeypatch.setitem(sys.modules, "mega_ops", pkg)
+    monkeypatch.setitem(sys.modules, "mega_ops.tile_order", tile_order)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "NVIDIA H200")
+
+
+def _chunk_service(*, world_size=4, rank=1, max_m=64, row_configs=None):
+    service = _service(world_size=world_size, rank=rank, max_m=max_m)
+    service.group.device = torch.device("cpu")
+    service.row = SimpleNamespace(
+        config_for=lambda m: (row_configs or {}).get(m, (128, 256, 2)),
+        set_chunk_table=Mock(),
+    )
+    service.col.set_chunk_table = Mock()
+    service.col._physical_tile_m_order_for = Mock(return_value=torch.tensor([99]))
+    return service
+
+
+def test_load_chunk_tables_filters_by_max_m_alignment_and_row_dispatch(
+    monkeypatch, tmp_path
+):
+    _stub_mega_ops(monkeypatch)
+    row_dir = tmp_path / "gemm_rs_norm_ag"
+    row_dir.mkdir()
+    spec = {
+        "match": {"tile_shape": [128, 256], "cluster_m": 2},
+        "configs": {
+            "16": {"chunk_table": {"1": [0, 1, 0, 4, 1, 1, 0, 4]}},
+            "18": {"chunk_table": {"1": [0, 1, 0, 4]}},
+            "32": {"chunk_table": {"1": [0, 1, 0, 4]}},
+            "128": {"chunk_table": {"1": [0, 1, 0, 4]}},
+        },
+    }
+    (row_dir / "world=4,H=5120,K=3200,device_name=NVIDIA_H200.json").write_text(
+        json.dumps(spec)
+    )
+    service = _chunk_service(
+        world_size=4, rank=1, max_m=64, row_configs={16: (128, 256, 2), 32: (128, 128, 2)}
+    )
+
+    with envs.SGLANG_SM90_GEMM_NORM_CONFIG_DIR.override(str(tmp_path)):
+        service._load_chunk_tables(hidden_size=5120, row_k=3200, col_n=6400)
+
+    service.row.set_chunk_table.assert_called_once()
+    loaded_m, loaded_table = service.row.set_chunk_table.call_args.args
+    assert loaded_m == 16
+    assert loaded_table.dtype == torch.int32
+    torch.testing.assert_close(
+        loaded_table, torch.tensor([[0, 1, 0, 4], [1, 1, 0, 4]], dtype=torch.int32)
+    )
+    service.col.set_chunk_table.assert_not_called()
+
+
+def test_load_chunk_tables_switches_col_to_common_order_only_for_loaded_ms(
+    monkeypatch, tmp_path
+):
+    _stub_mega_ops(monkeypatch)
+    col_dir = tmp_path / "rs_norm_ag_gemm"
+    col_dir.mkdir()
+    spec = {
+        "match": {"physical_tile_m_order": "common"},
+        "configs": {"512": {"chunk_table": {"0": [0, 4, 0, 1]}}},
+    }
+    (col_dir / "world=2,H=5120,N=6400,device_name=NVIDIA_H200.json").write_text(
+        json.dumps(spec)
+    )
+    service = _chunk_service(world_size=2, rank=0, max_m=512)
+    native_order = service.col._physical_tile_m_order_for
+
+    with envs.SGLANG_SM90_GEMM_NORM_CONFIG_DIR.override(str(tmp_path)):
+        service._load_chunk_tables(hidden_size=5120, row_k=3200, col_n=6400)
+
+    order_loaded = service.col._physical_tile_m_order_for(512, 128)
+    torch.testing.assert_close(
+        order_loaded, torch.tensor([0, 2, 1, 3], dtype=torch.int32)
+    )
+    assert service.col._physical_tile_m_order_for(512, 128) is order_loaded
+    native_order.assert_not_called()
+
+    order_unloaded = service.col._physical_tile_m_order_for(256, 128)
+    torch.testing.assert_close(order_unloaded, torch.tensor([99]))
+    native_order.assert_called_once_with(256, 128)
+
+
+def test_load_chunk_tables_missing_files_leave_kernels_unchanged(monkeypatch, tmp_path):
+    _stub_mega_ops(monkeypatch)
+    service = _chunk_service()
+    native_order = service.col._physical_tile_m_order_for
+
+    with envs.SGLANG_SM90_GEMM_NORM_CONFIG_DIR.override(str(tmp_path)):
+        service._load_chunk_tables(hidden_size=5120, row_k=3200, col_n=6400)
+
+    service.row.set_chunk_table.assert_not_called()
+    service.col.set_chunk_table.assert_not_called()
+    assert service.col._physical_tile_m_order_for is native_order
