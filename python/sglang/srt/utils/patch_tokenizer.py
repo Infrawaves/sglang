@@ -2,6 +2,7 @@ import inspect
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.tokenizer.kimi_tiktoken_encode import uninstall_kimi_tiktoken_encode
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def _needs_pad_padding_side_shim(tokenizer) -> bool:
 
 
 def unpatch_tokenizer(tokenizer):
+    tokenizer = uninstall_kimi_tiktoken_encode(tokenizer)
     tokenizer = _PadPaddingSideShim.unpatch(tokenizer)
     return _SpecialTokensCachePatcher.unpatch(tokenizer)
 
