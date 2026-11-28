@@ -208,10 +208,12 @@ def _truncate_kimi_k3_videos(messages: List[Dict[str, Any]]) -> None:
     Removing old parts before encoding keeps the rendered placeholders and
     the extracted ``video_data`` list aligned.
     """
+    # Only list content holds parts; iterating a str content walks its chars.
     video_count = sum(
         1
         for message in messages
-        for part in (message.get("content") or [])
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
         if isinstance(part, dict) and part.get("type") == "video_url"
     )
     to_drop = max(0, video_count - _KIMI_K3_MAX_VIDEO_INPUTS)

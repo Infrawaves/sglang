@@ -27,6 +27,7 @@ from transformers import (
 )
 
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.tokenizer.kimi_tiktoken_encode import install_kimi_tiktoken_encode
 from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
@@ -439,6 +440,7 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+    install_kimi_tiktoken_encode(tokenizer)
     return patch_tokenizer(tokenizer)
 
 

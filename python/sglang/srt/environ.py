@@ -2058,6 +2058,14 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Kimi TikTokenTokenizer: find its whitespace / non-whitespace run cuts
+    # with NumPy instead of a per-character loop (same slices, same ids).
+    SGLANG_KIMI_TOKENIZER_FAST_SCAN = EnvBool(True)
+    # Kimi TikTokenTokenizer: threads that encode the pieces of one long chat
+    # prompt concurrently; 1 disables it. The pool is per process, so a node
+    # runs up to threads x tokenizer_worker_num x request preprocessor
+    # processes encode threads.
+    SGLANG_KIMI_TOKENIZER_ENCODE_THREADS = EnvInt(1)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
