@@ -125,15 +125,24 @@ def test_metadata_composes_the_full_path_prompt_and_items(processor):
     payloads = [_png(28, 28, 0), _png(84, 56, 1)]
     prompt = [1, _IMAGE_TOKEN_ID, 2, 3, _IMAGE_TOKEN_ID, 4]
 
+    # Shorter than the expanded prompt: neither path truncates or rejects by it.
+    max_req_input_len = len(prompt)
     meta, demand = asyncio.run(
         processor.process_mm_metadata_async(
-            [_image_data(p) for p in payloads], prompt, _request(), ticket=7
+            [_image_data(p) for p in payloads],
+            prompt,
+            _request(),
+            ticket=7,
+            max_req_input_len=max_req_input_len,
         )
     )
     materialized = asyncio.run(processor.materialize_images_async(demand, [0, 1]))
     full = asyncio.run(
         processor.process_mm_data_async(
-            [_image_data(p) for p in payloads], prompt, _request()
+            [_image_data(p) for p in payloads],
+            prompt,
+            _request(),
+            max_req_input_len=max_req_input_len,
         )
     )
 

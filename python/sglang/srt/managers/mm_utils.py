@@ -22,6 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
+    ImagesReadyReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -1635,6 +1636,15 @@ def drop_mm_features_for_decode(mm_items) -> None:
         item.precomputed_embeddings = None
 
 
+# Messages whose mm_inputs may carry SHM-wrapped features; ImagesReadyReq is
+# the demand image reply (wrapped by TokenizerManager._materialize_images).
+_SHM_FEATURE_REQ_TYPES = (
+    TokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    ImagesReadyReq,
+)
+
+
 def _feature_has_shm(feat) -> bool:
     """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
     if isinstance(feat, ShmPointerMMData):
@@ -1650,9 +1660,9 @@ def has_shm_features(recv_reqs):
         if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif isinstance(
-            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-        ) and isinstance(req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+        elif isinstance(req, _SHM_FEATURE_REQ_TYPES) and isinstance(
+            req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
@@ -1680,7 +1690,7 @@ def discard_shm_features(obj) -> None:
         for sub_obj in obj.batch:
             discard_shm_features(sub_obj)
         return
-    if not isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+    if not isinstance(obj, _SHM_FEATURE_REQ_TYPES):
         return
     if not isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
         return
@@ -1718,9 +1728,9 @@ def unwrap_shm_features(obj):
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if isinstance(
-        obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-    ) and isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+    if isinstance(obj, _SHM_FEATURE_REQ_TYPES) and isinstance(
+        obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)
+    ):
         for item in obj.mm_inputs.mm_items:
             if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)

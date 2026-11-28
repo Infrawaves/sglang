@@ -2702,6 +2702,8 @@ class Envs:
     # bytes; the scheduler asks it to preprocess an image only when the image
     # is not fully covered by the request's device + host + L3 prefix hit.
     # Images entirely inside a cached prefix are never decoded or encoded.
+    # Only supports PD prefill: startup fails without PD disaggregation, and
+    # PD decode ignores it with a warning.
     # Requires --mm-feature-transport cuda_vmm with features kept on device,
     # TP-only scheduling (no DP attention, no PP) and the preprocess cache;
     # any other request keeps the full tokenizer path.

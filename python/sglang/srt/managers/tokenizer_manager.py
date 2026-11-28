@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import (
+    discard_shm_features,
     drop_mm_features_for_decode,
     wrap_shm_features,
 )
@@ -1014,6 +1015,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self._check_mm_demand_disaggregation_mode()
         self._drop_decode_mm_features = (
             self.disaggregation_mode == DisaggregationMode.DECODE
             and envs.SGLANG_DISAGG_DECODE_DROP_MM_FEATURES.get()
@@ -2021,6 +2023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 input_text=mm_processor_input,
                                 request_obj=obj,
                                 ticket=next(self._mm_demand_tickets),
+                                max_req_input_len=self.max_req_input_len,
                             )
                         )
                         if demand_result is not None:
@@ -2592,7 +2595,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _check_mm_demand_disaggregation_mode(self) -> None:
+        """Fail startup when demand image preprocessing runs without PD.
+
+        Without PD, a request rejected at admission (e.g. over-length) still
+        enters the waiting queue with its demand state and stays in
+        WAIT_FOR_MM forever. PD prefill retires rejected requests before they
+        are queued; PD decode only warns, since P and D may share one env.
+        """
+        if (
+            envs.SGLANG_K3_IMAGE_DEMAND_PREPROCESS.get()
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
+            raise ValueError(
+                "SGLANG_K3_IMAGE_DEMAND_PREPROCESS only supports PD prefill "
+                "(--disaggregation-mode prefill). Without PD disaggregation, an "
+                "image request rejected at admission (e.g. over-length) stays in "
+                "WAIT_FOR_MM forever. Unset it or run as PD prefill."
+            )
+
     def _mm_demand_unsupported_reason(self) -> Optional[str]:
+        # Non-PD mode never gets here: _check_mm_demand_disaggregation_mode
+        # fails startup. The reasons below only warn and keep the full path.
         if not envs.SGLANG_K3_IMAGE_DEMAND_PREPROCESS.get():
             return "disabled"
         if not hasattr(self.mm_processor, "process_mm_metadata_async"):
@@ -2698,6 +2722,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         task = asyncio.create_task(self._materialize_images(recv_req))
         self._mm_demand_tasks.add(task)
         task.add_done_callback(self._mm_demand_tasks.discard)
+        task.add_done_callback(
+            lambda done: self._on_materialize_images_done(recv_req, done)
+        )
+
+    def _on_materialize_images_done(
+        self, recv_req: MaterializeImagesReq, task: asyncio.Task
+    ) -> None:
+        """Reply with an error when _materialize_images raised, e.g. its send.
+
+        Otherwise the scheduler would keep the round REQUESTED and the request
+        waiting forever. A failed retry is only logged.
+        """
+        if task.cancelled() or task.exception() is None:
+            return
+        error = task.exception()
+        logger.error("Demand image reply failed rid=%s", recv_req.rid, exc_info=error)
+        reply = ImagesReadyReq(
+            rid=recv_req.rid,
+            ticket=recv_req.ticket,
+            materialization_id=recv_req.materialization_id,
+            image_indices=list(recv_req.image_indices),
+            error_msg=f"Image preprocessing failed: {type(error).__name__}: {error}",
+            status_code=int(HTTPStatus.INTERNAL_SERVER_ERROR),
+        )
+        try:
+            reply.wrap_pickle_fields()
+            self._dispatch_to_scheduler(reply)
+        except Exception:
+            logger.exception(
+                "Failed to send the demand image error reply rid=%s", recv_req.rid
+            )
 
     async def _materialize_images(self, recv_req: MaterializeImagesReq) -> None:
         """Answer one MaterializeImagesReq with features or an error, exactly once.
@@ -2731,6 +2786,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self._live_mm_demand(recv_req) is None:
                 raise _MMDemandGone()
             reply.mm_inputs = mm_inputs
+            # Same as _send_one_request: CPU features (e.g. a VMM pool fallback)
+            # travel through shared memory instead of the pickle.
+            wrap_shm_features(reply)
         except _MMDemandGone:
             reply.error_msg = "Request finished before its images were preprocessed."
             reply.status_code = int(HTTPStatus.BAD_REQUEST)
@@ -2744,6 +2802,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Image preprocessing failed: {type(error).__name__}: {error}"
             )
             reply.status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        if reply.error_msg is not None and reply.mm_inputs is not None:
+            # wrap_shm_features failed partway; drop what it already wrapped.
+            discard_shm_features(reply)
+            reply.mm_inputs = None
         if reply.mm_inputs is None:
             self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared)
             prepared = []

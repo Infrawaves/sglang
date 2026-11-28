@@ -22,12 +22,18 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     GenerateReqInput,
     ImagesReadyReq,
     MaterializeImagesReq,
     TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.mm_utils import (  # noqa: E402
+    ShmPointerMMData,
+    discard_shm_features,
+    has_shm_features,
 )
 from sglang.srt.managers.req_types import MultimodalProcessorOutput  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
@@ -56,9 +62,10 @@ class _Item:
 class _Req:
     """Weak-referenceable stand-in for the scheduler's Req."""
 
-    def __init__(self, rid, spans):
+    def __init__(self, rid, spans, input_len=40):
         self.rid = rid
         self.mm_demand = None
+        self.origin_input_ids = [0] * input_len
         self.multimodal_inputs = SimpleNamespace(
             mm_items=[_Item([span], hash_=index) for index, span in enumerate(spans)]
         )
@@ -224,6 +231,74 @@ def test_reply_that_disagrees_with_the_metadata_fails_and_is_released():
     assert req.mm_demand.failed(0)
 
 
+def test_images_cut_by_auto_truncate_are_never_requested():
+    scheduler = _scheduler()
+    # The prompt ends inside image 1; image 2 lies wholly past the end.
+    req = _Req("r", _SPANS, input_len=12)
+    scheduler._register_image_demand(req, 3)
+
+    assert req.mm_demand.offsets == [(3, 6), (10, 13)]
+    _wait(scheduler, req, 0)
+    message = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+    assert message.image_indices == [0, 1]
+
+
+def test_images_ready_reconstruction_passes_the_model_token_modalities():
+    scheduler = _scheduler()
+    scheduler.model_config = SimpleNamespace(requires_mm_token_modalities={"image"})
+    scheduler._gather_vmm_materialization_errors = Mock(return_value=[None])
+    recv_req = ImagesReadyReq(
+        rid="r",
+        ticket=3,
+        materialization_id=0,
+        image_indices=[0],
+        mm_inputs=MultimodalProcessorOutput(mm_items=[]),
+    )
+
+    with patch(
+        "sglang.srt.managers.scheduler.MultimodalInputs.from_processor_output"
+    ) as convert:
+        scheduler._materialize_images_ready(recv_req)
+
+    convert.assert_called_once()
+    assert convert.call_args.kwargs == {"requires_mm_token_modalities": {"image"}}
+    assert recv_req.mm_inputs is convert.return_value
+
+
+def test_failed_request_missing_from_the_waiting_queue_is_logged():
+    scheduler = _scheduler()
+    scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+    scheduler.waiting_queue = SimpleNamespace(take=Mock(return_value=[]))
+    req = _registered(scheduler)
+
+    with patch("sglang.srt.managers.scheduler.logger") as logger:
+        scheduler._abort_demand_image_failures([req])
+
+    logger.warning.assert_called_once()
+    assert "r" in logger.warning.call_args.args
+
+
+def test_images_ready_shm_features_are_found_and_discarded():
+    pointer = Mock(spec=ShmPointerMMData)
+    reply = ImagesReadyReq(
+        rid="r",
+        ticket=3,
+        materialization_id=0,
+        image_indices=[0],
+        mm_inputs=MultimodalProcessorOutput(
+            mm_items=[
+                SimpleNamespace(
+                    feature=pointer, precomputed_embeddings=None, model_specific_data={}
+                )
+            ]
+        ),
+    )
+
+    assert has_shm_features([reply])
+    discard_shm_features(reply)
+    pointer.close_and_unlink.assert_called_once_with()
+
+
 # --------------------------------------------------------------------------
 # Tokenizer side
 # --------------------------------------------------------------------------
@@ -268,8 +343,12 @@ def _materialize_req(ticket=3):
     )
 
 
-def _run(manager, recv_req):
-    with envs.SGLANG_MM_PRECOMPUTE_HASH.override(False):
+def _run(manager, recv_req, wrap_shm=None):
+    wrap_shm = wrap_shm or Mock(side_effect=lambda reply: reply)
+    with (
+        envs.SGLANG_MM_PRECOMPUTE_HASH.override(False),
+        patch("sglang.srt.managers.tokenizer_manager.wrap_shm_features", wrap_shm),
+    ):
         asyncio.run(manager._materialize_images(recv_req))
     manager._dispatch_to_scheduler.assert_called_once()
     reply = manager._dispatch_to_scheduler.call_args.args[0]
@@ -350,13 +429,74 @@ def test_tokenizer_maps_preprocessing_errors(error, status, message):
     )
 
 
+def test_tokenizer_wraps_reply_features_in_shm():
+    manager = _tokenizer(AsyncMock(return_value=MultimodalProcessorOutput(mm_items=[])))
+    manager.rid_to_state["r"] = _state(_demand())
+    wrap_shm = Mock(side_effect=lambda reply: reply)
+
+    reply = _run(manager, _materialize_req(), wrap_shm)
+
+    wrap_shm.assert_called_once_with(reply)
+    assert reply.error_msg is None
+
+
+def test_tokenizer_replies_500_when_shm_wrapping_fails():
+    manager = _tokenizer(AsyncMock(return_value=MultimodalProcessorOutput(mm_items=[])))
+    manager.rid_to_state["r"] = _state(_demand())
+
+    with patch("sglang.srt.managers.tokenizer_manager.discard_shm_features") as discard:
+        reply = _run(manager, _materialize_req(), Mock(side_effect=OSError("no shm")))
+
+    discard.assert_called_once_with(reply)
+    assert (reply.mm_inputs, reply.status_code) == (None, 500)
+    manager.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+        ["lease"]
+    )
+
+
+def test_tokenizer_sends_an_error_reply_when_the_reply_send_fails():
+    manager = _tokenizer(AsyncMock(return_value=MultimodalProcessorOutput(mm_items=[])))
+    manager._mm_demand_tasks = set()
+    manager.rid_to_state["r"] = _state(_demand())
+    manager._dispatch_to_scheduler.side_effect = [RuntimeError("socket closed"), None]
+
+    async def main():
+        manager._handle_materialize_images_req(_materialize_req())
+        (task,) = manager._mm_demand_tasks
+        await asyncio.wait([task])
+        await asyncio.sleep(0)  # let the done callbacks run
+
+    with (
+        envs.SGLANG_MM_PRECOMPUTE_HASH.override(False),
+        patch(
+            "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+            side_effect=lambda reply: reply,
+        ),
+    ):
+        asyncio.run(main())
+
+    assert manager._dispatch_to_scheduler.call_count == 2
+    retry = manager._dispatch_to_scheduler.call_args.args[0]
+    assert isinstance(retry, ImagesReadyReq)
+    assert (retry.rid, retry.ticket, retry.image_indices) == ("r", 3, [0])
+    assert (retry.mm_inputs, retry.status_code) == (None, 500)
+    assert "socket closed" in retry.error_msg
+    assert not manager._mm_demand_tasks
+
+
 def test_tokenizer_cancels_leases_when_dispatch_fails():
     manager = _tokenizer(AsyncMock(return_value=MultimodalProcessorOutput(mm_items=[])))
     manager.rid_to_state["r"] = _state(_demand())
     manager._dispatch_to_scheduler.side_effect = RuntimeError("socket closed")
 
     with pytest.raises(RuntimeError, match="socket closed"):
-        with envs.SGLANG_MM_PRECOMPUTE_HASH.override(False):
+        with (
+            envs.SGLANG_MM_PRECOMPUTE_HASH.override(False),
+            patch(
+                "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+                side_effect=lambda reply: reply,
+            ),
+        ):
             asyncio.run(manager._materialize_images(_materialize_req()))
 
     manager.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
@@ -416,3 +556,43 @@ def test_requests_that_need_features_up_front_are_not_eligible(overrides):
     )
 
     assert not manager._mm_demand_eligible(request)
+
+
+def test_switch_on_without_pd_fails_startup():
+    manager = object.__new__(TokenizerManager)
+    start_service = Mock()
+
+    with (
+        envs.SGLANG_K3_IMAGE_DEMAND_PREPROCESS.override(True),
+        patch(
+            "sglang.srt.managers.tokenizer_manager.get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_mode=DisaggregationMode.NULL.value
+            ),
+        ),
+        patch(
+            "sglang.srt.managers.tokenizer_manager.start_disagg_service",
+            start_service,
+        ),
+        pytest.raises(ValueError, match="only supports PD prefill.*WAIT_FOR_MM"),
+    ):
+        manager.init_disaggregation()
+
+    start_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mode, enabled",
+    [
+        (DisaggregationMode.PREFILL, True),
+        # P and D may share one env; decode warns later and keeps the full path.
+        (DisaggregationMode.DECODE, True),
+        (DisaggregationMode.NULL, False),
+    ],
+)
+def test_startup_check_accepts_pd_or_switch_off(mode, enabled):
+    manager = object.__new__(TokenizerManager)
+    manager.disaggregation_mode = mode
+
+    with envs.SGLANG_K3_IMAGE_DEMAND_PREPROCESS.override(enabled):
+        manager._check_mm_demand_disaggregation_mode()

@@ -1746,9 +1746,19 @@ class KimiK3ImageProcessor(
         return items
 
     async def process_mm_metadata_async(
-        self, image_data, input_text, request_obj, *, ticket: int
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        *,
+        ticket: int,
+        max_req_input_len: Optional[int] = None,
     ) -> Optional[tuple[MultimodalProcessorOutput, DemandImageSources]]:
         """Compose the prompt from image headers only, for demand preprocessing.
+
+        ``max_req_input_len`` is the argument ``process_mm_data_async`` gets.
+        Neither path truncates or rejects by it: the tokenizer and scheduler
+        length checks run on the composed prompt, which is identical.
 
         Returns the request's items without features plus the retained sources
         to materialize them later, or None when this request must take

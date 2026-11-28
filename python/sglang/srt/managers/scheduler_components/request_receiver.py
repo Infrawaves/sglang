@@ -285,7 +285,10 @@ class SchedulerRequestReceiver:
 
         tokenized_reqs = []
         for req in recv_reqs:
-            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+            if isinstance(
+                req,
+                (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, ImagesReadyReq),
+            ):
                 tokenized_reqs.append(req)
             elif isinstance(
                 req,
@@ -339,7 +342,13 @@ class SchedulerRequestReceiver:
         for index, req in enumerate(tokenized_reqs):
             if failed[index].item():
                 discard_shm_features(req)
-                req.mm_inputs = error
+                if isinstance(req, ImagesReadyReq):
+                    # The scheduler fails the round from these fields.
+                    req.mm_inputs = None
+                    req.error_msg = error.message
+                    req.status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+                else:
+                    req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

@@ -2715,7 +2715,8 @@ class Scheduler(
         local_error = None
         try:
             recv_req.mm_inputs = MultimodalInputs.from_processor_output(
-                recv_req.mm_inputs
+                recv_req.mm_inputs,
+                requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
             )
         except Exception as error:
             local_error = f"{type(error).__name__}: {error}"
@@ -2749,10 +2750,17 @@ class Scheduler(
 
     def _register_image_demand(self, req: Req, ticket: int) -> None:
         # One span per image item; prefix_len indexes the same origin_input_ids.
-        offsets = [
-            (item.offsets[0][0], item.offsets[-1][1])
-            for item in req.multimodal_inputs.mm_items
-        ]
+        # Auto-truncate in the tokenizer can cut trailing images off the
+        # prompt; no extend range reaches them, so they are never requested.
+        # Items follow prompt order, so the cut images are a suffix and the
+        # remaining indices still match mm_items.
+        input_len = len(req.origin_input_ids)
+        offsets = []
+        for item in req.multimodal_inputs.mm_items:
+            span = (item.offsets[0][0], item.offsets[-1][1])
+            if span[0] >= input_len:
+                break
+            offsets.append(span)
         req.mm_demand = ImageDemandState(ticket=ticket, offsets=offsets)
         self._image_demand_reqs[req.rid] = req
 
@@ -2839,7 +2847,17 @@ class Scheduler(
         """Abort waiting requests whose needed images failed to preprocess."""
         failed_ids = {id(req) for req in reqs}
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in self.waiting_queue.take(lambda req: id(req) in failed_ids):
+        taken = self.waiting_queue.take(lambda req: id(req) in failed_ids)
+        if len(taken) != len(failed_ids):
+            found = {id(req) for req in taken}
+            for req in reqs:
+                if id(req) not in found:
+                    logger.warning(
+                        "Demand image request rid=%s failed preprocessing but "
+                        "is not in the waiting queue; it is not aborted here.",
+                        req.rid,
+                    )
+        for req in taken:
             demand = req.mm_demand
             message = demand.error_msg or "Image preprocessing failed."
             status_code = demand.status_code or int(HTTPStatus.INTERNAL_SERVER_ERROR)
