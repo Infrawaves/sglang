@@ -99,6 +99,24 @@ class HiCacheStorageConfig:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
 
+    @property
+    def _key_cp_spans_dcp(self) -> bool:
+        # Prefill CP with DCP shards KV by DCP rank, which then names the CP rank;
+        # keys match a TP + DCP deployment holding the same shard bytes.
+        return (
+            self.dcp_size > 1
+            and self.tp_size == self.attn_cp_size == self.dcp_size
+            and self.attn_cp_rank == self.dcp_rank
+        )
+
+    @property
+    def key_attn_cp_rank(self) -> int:
+        return 0 if self._key_cp_spans_dcp else self.attn_cp_rank
+
+    @property
+    def key_attn_cp_size(self) -> int:
+        return 1 if self._key_cp_spans_dcp else self.attn_cp_size
+
 
 @dataclass
 class HiCacheStorageExtraInfo:
@@ -867,9 +885,10 @@ class HiCacheFile(HiCacheStorage):
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
-        if storage_config.attn_cp_size > 1:
+        if storage_config.key_attn_cp_size > 1:
             shard_suffix += (
-                f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+                f"_cp{storage_config.key_attn_cp_rank}"
+                f"_{storage_config.key_attn_cp_size}"
             )
         # MLA KV is replicated across TP ranks and shares one file per page;
         # TP-sharded state is keyed by tp_config_suffix instead.

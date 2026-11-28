@@ -167,6 +167,7 @@ if _use_aiter:
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import owned_kv_write, writes_owned_kv_only
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k, get_dcp_lens
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1072,7 +1073,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif self.alt_stream is not None and is_cp_active(forward_batch):
+        elif (
+            self.alt_stream is not None
+            and is_cp_active(forward_batch)
+            and not writes_owned_kv_only(forward_batch)
+        ):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1090,8 +1095,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query = self._maybe_rotate(query)
             key = self._maybe_rotate(key)
 
-        # allgather+rerrange
-        if is_cp_active(forward_batch):
+        # allgather+rerrange. Scoring reads index-K back from the cache; a rank
+        # that writes only its own index-K keeps the local key for that write.
+        if is_cp_active(forward_batch) and not writes_owned_kv_only(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
         return query, key, weights_raw
 
@@ -1711,9 +1717,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         if dsa_shards_index_k():
-            k_fp8, k_scale = self._dcp_gather_index_k(
-                layer_id, metadata, block_tables, indexer_seq_lens_cpu
-            )
+            whole_batch = metadata.get_dcp_whole_batch()
+            if whole_batch is None:
+                whole_batch = (
+                    block_tables,
+                    metadata.get_indexer_seq_len(),
+                    indexer_seq_lens_cpu,
+                )
+            k_fp8, k_scale = self._dcp_gather_index_k(layer_id, *whole_batch)
         else:
             k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
@@ -1924,31 +1935,43 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     @staticmethod
     def _dcp_gather_index_k(
         layer_id: int,
-        metadata: BaseIndexerMetadata,
         block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Prefill under DCP: every request's index-K from all ranks, in DCP1's
         # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
+        # The gather is collective: every rank passes the same request list.
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
         # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
-            get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
+            get_dcp_lens(seq_lens, dcp_size, dcp_rank),
             block_tables,
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
         )
-        rows = k_fp8.shape[0]
-        k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
-        s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        # A rank owns no rows when the KV is shorter than dcp_size; flatten the
+        # trailing dims, since view(0, -1) cannot infer the width.
+        k_bytes = k_fp8.view(torch.uint8).flatten(1)
+        s_bytes = k_scale.view(torch.uint8).flatten(1)
         gathered = dcp_gather_request_rows(
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )
         k_fp8, k_scale = gathered.split([k_bytes.shape[1], s_bytes.shape[1]], dim=-1)
-        return k_fp8.contiguous(), k_scale.contiguous()
+        # Dense copies, not contiguous(): a one-row split view already counts as
+        # contiguous yet keeps the 132-byte row stride, and DeepGEMM's TMA needs
+        # a 16-byte-aligned row stride (a one-token health check hits it).
+        return (
+            torch.empty(k_fp8.shape, dtype=k_fp8.dtype, device=k_fp8.device).copy_(
+                k_fp8
+            ),
+            torch.empty(
+                k_scale.shape, dtype=k_scale.dtype, device=k_scale.device
+            ).copy_(k_scale),
+        )
 
     def _indexer_tp_split(
         self, forward_batch: ForwardBatch, q_offset: int
@@ -2449,6 +2472,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 forward_batch=forward_batch,
             )
 
+            store_loc = None
+            store_key = key
+            if writes_owned_kv_only(forward_batch):
+                store_loc, store_key = owned_kv_write(forward_batch, key)
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -2458,8 +2485,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
                         layer_id=layer_id,
-                        key=key,
+                        key=store_key,
                         act_quant=act_quant,
+                        out_cache_loc=store_loc,
                     )
                 current_stream.wait_stream(self.alt_stream)
             elif not in_piecewise_or_breakable_cuda_graph:
@@ -2467,8 +2495,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key=key,
+                    key=store_key,
                     act_quant=act_quant,
+                    out_cache_loc=store_loc,
                 )
             else:
                 # Graph paths not handled by the full DSA indexer split op

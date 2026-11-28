@@ -218,6 +218,7 @@ from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
+    decode_attn_head_shards,
     get_device,
     get_exec,
     get_forward,
@@ -2258,10 +2259,12 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
+        # q_nope and q_rope are gathered from the DCP ranks, so decode sees a
+        # rank's decode heads times dcp_size. Prefill CP with DCP slices decode
+        # heads per CP rank, so that is num_heads rather than dcp_size x local.
         if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * self.dcp_size,
+                num_heads // decode_attn_head_shards() * self.dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -2337,6 +2340,10 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
+    def _decode_attn_tp_modules(self) -> list:
+        """The linears CP decode attention TP slices to this rank's heads."""
+        return [self.q_b_proj, self.o_proj]
+
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         if self.q_lora_rank is None:
@@ -2351,7 +2358,7 @@ class DeepseekV2AttentionMLA(
         ctx = get_cp_decode_attn_tp_ctx()
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
-            [self.q_b_proj, self.o_proj],
+            self._decode_attn_tp_modules(),
             tensor_attrs=tensor_attrs,
             radix_attn=self.attn_mqa,
             defer_all_reduce=self.defer_cp_decode_attn_tp,

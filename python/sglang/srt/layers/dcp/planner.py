@@ -27,7 +27,23 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
+
+
+def _check_prefill_cp_with_dcp_alignment(extend_prefix_lens_cpu, dcp_size: int):
+    # Prefill CP with DCP writes through the widened-slot owner filter, which
+    # equals the position rule only on dcp-aligned pages; the strided prefix
+    # slice below also needs every prefix to start a new dcp round.
+    page_size = get_schedule().page_size
+    assert page_size % dcp_size == 0, (
+        f"prefill CP with DCP needs page_size ({page_size}) divisible by "
+        f"dcp_size ({dcp_size})"
+    )
+    misaligned = [int(p) for p in extend_prefix_lens_cpu if int(p) % dcp_size]
+    assert not misaligned, (
+        f"prefill CP with DCP needs dcp_size-aligned prefix lengths, got "
+        f"{misaligned} at dcp_size={dcp_size}"
+    )
 
 
 def prepare_decode_context_parallel_metadata(
@@ -46,6 +62,8 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    if parallel.attn_cp_size > 1:
+        _check_prefill_cp_with_dcp_alignment(extend_prefix_lens_cpu, parallel.dcp_size)
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,

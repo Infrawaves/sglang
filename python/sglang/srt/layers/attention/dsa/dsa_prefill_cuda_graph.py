@@ -5,7 +5,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.layers.cp.interleave import is_interleave_extend
+from sglang.srt.layers.cp.interleave import (
+    is_interleave_extend,
+    owned_kv_write,
+    writes_owned_kv_only,
+)
 from sglang.srt.layers.cp.utils import cp_live_store_rows
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -174,19 +178,22 @@ def pcg_dsa_indexer_prefill_split(
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
-    # Under CP the key comes back gathered in global order, so it is sliced
-    # like the non-CP path. BCG replay hands over the bucket-sized static
-    # out_cache_loc and a gathered key whose padding sits at the tail; only
-    # the live rows are stored.
-    n_store = extend_num_tokens
-    if in_cp:
-        n_store = cp_live_store_rows(forward_batch, key.shape[0], "indexer K")
+    # Under CP without owned-KV writes the key comes back gathered in global
+    # order, so it is sliced like the non-CP path. BCG replay hands over the
+    # bucket-sized static out_cache_loc and a gathered key whose padding sits
+    # at the tail; only the live rows are stored.
+    store_key, store_loc = _index_k_store_rows(
+        forward_batch=forward_batch,
+        key=key,
+        extend_num_tokens=extend_num_tokens,
+        in_cp=in_cp,
+    )
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,
-        key=key[:n_store],
+        key=store_key,
         act_quant=act_quant,
-        out_cache_loc=forward_batch.out_cache_loc[:n_store],
+        out_cache_loc=store_loc,
     )
     if not return_indices:
         return
@@ -206,6 +213,25 @@ def pcg_dsa_indexer_prefill_split(
 
         _, logical_tokens = cp_interleave_indexer_rows(forward_batch)
         topk_result[logical_tokens:].fill_(-1)
+
+
+def _index_k_store_rows(
+    *,
+    forward_batch,
+    key: torch.Tensor,
+    extend_num_tokens: int,
+    in_cp: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The index-K rows and KV slots this rank writes."""
+    if in_cp and writes_owned_kv_only(forward_batch):
+        # PCP+DCP: _get_q_k_bf16 keeps the local key, and the rank writes only
+        # the positions it owns (the eager indexer path does the same).
+        store_loc, store_key = owned_kv_write(forward_batch, key)
+        return store_key, store_loc
+    n_store = extend_num_tokens
+    if in_cp:
+        n_store = cp_live_store_rows(forward_batch, key.shape[0], "indexer K")
+    return key[:n_store], forward_batch.out_cache_loc[:n_store]
 
 
 def _dsa_indexer_prefill_capture_stub(

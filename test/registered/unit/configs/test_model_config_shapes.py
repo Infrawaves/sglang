@@ -158,5 +158,27 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(_quant_config_to_dict(quant_config), {"quant_method": "test"})
 
 
+class TestNumKvHeadsUnderDcp(CustomTestCase):
+    """KV heads per GPU when DCP replicates KV across ``tp // dcp`` groups."""
+
+    @staticmethod
+    def _config(total_kv_heads):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.is_draft_model = False
+        model_config.get_total_num_kv_heads = lambda: total_kv_heads
+        return model_config
+
+    def test_dcp_wider_than_attention_tp_keeps_every_head(self):
+        # Prefill CP with DCP builds the KV pool at attention TP 1 under DCP8;
+        # the head count must not divide by a zero group count.
+        self.assertEqual(self._config(1).get_num_kv_heads(1, 8), 1)
+        self.assertEqual(self._config(8).get_num_kv_heads(2, 8), 8)
+
+    def test_dcp_inside_attention_tp_is_unchanged(self):
+        for tp, dcp, expected in ((8, 8, 8), (8, 4, 4), (8, 1, 1)):
+            with self.subTest(tp=tp, dcp=dcp):
+                self.assertEqual(self._config(8).get_num_kv_heads(tp, dcp), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

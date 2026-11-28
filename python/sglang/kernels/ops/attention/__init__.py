@@ -199,6 +199,7 @@ for _mod, _fn in [
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs"),
+    ("dsa.cp_split", "dsa_cp_owner_q_seqs"),
 ]:
     register_kernel(
         KernelSpec(

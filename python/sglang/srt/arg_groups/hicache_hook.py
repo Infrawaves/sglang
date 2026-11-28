@@ -217,8 +217,16 @@ def validate_kda_hicache_node_aggregate(server_args: Any):
         raise ValueError(f"{flag} requires --pp-size 1.")
     if cfg.enable_dp_attention:
         raise ValueError(f"{flag} does not support --enable-dp-attention.")
-    if cfg.attn_cp_size > 1:
-        raise ValueError(f"{flag} requires --attn-cp-size 1.")
+    # CP-TP group sharing (resolved later, in handle_context_parallelism) needs
+    # --attn-cp-size == --tp-size; it shards linear-attention heads over TP, so
+    # each rank's KDA state matches plain TP. Other CP layouts replicate it.
+    if cfg.attn_cp_size > 1 and not (
+        cfg.enable_prefill_cp and cfg.attn_cp_size == cfg.tp_size
+    ):
+        raise ValueError(
+            f"{flag} requires --attn-cp-size 1 or CP-TP group sharing "
+            "(--enable-prefill-cp with --attn-cp-size == --tp-size)."
+        )
     if cfg.disaggregation_mode == "decode":
         # Decode may write per-rank KDA keys in the prefill layout; the node
         # object keys would hide them from, or mix with, those readers.
@@ -335,6 +343,20 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
+    # Runs before handle_context_parallelism declares CP-TP group sharing, so
+    # only the configured CP flags tell the prefill-CP-with-DCP layout apart.
+    # Only these L3 backends key each DCP shard; the others share one object
+    # across the shards of a page.
+    if (
+        cfg.enable_prefill_cp
+        and cfg.attn_cp_size > 1
+        and cfg.hicache_storage_backend not in (None, "file", "mooncake")
+    ):
+        raise NotImplementedError(
+            "HiCache with --dcp-size > 1 and --enable-prefill-cp supports only "
+            "the file and mooncake L3 backends, got "
+            f"{cfg.hicache_storage_backend}."
+        )
     if (
         cfg.hicache_storage_backend is not None
         and cfg.hicache_host_memory_mode == "buffer_only"

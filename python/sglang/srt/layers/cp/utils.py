@@ -30,6 +30,8 @@ from sglang.srt.layers.cp.base import (
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     InterleaveCPStrategy,
+    cp_sequence_to_interleave_order,
+    writes_owned_kv_only,
 )
 from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import (
@@ -302,6 +304,14 @@ def prepare_cp_forward(forward_batch) -> None:
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
         forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        if writes_owned_kv_only(forward_batch):
+            metadata = forward_batch.attn_cp_metadata
+            # Position sharding computes the tokens this rank owns, so its KV
+            # writes take their own slots. Logits and the rest still read the
+            # full out_cache_loc.
+            metadata.local_out_cache_loc = forward_batch.out_cache_loc.index_select(
+                0, metadata.local_sequence_rows
+            )
 
 
 def cp_split_before_forward(
@@ -389,7 +399,13 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
-    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    metadata = forward_batch.attn_cp_metadata
+    physical_tokens = sum(metadata.per_rank_actual_token)
+    if writes_owned_kv_only(forward_batch):
+        # Rank-major rows of the position layout, as the boundary gather lays them.
+        return cp_sequence_to_interleave_order(
+            input_ids[: metadata.total_seq_lens], forward_batch, physical_tokens
+        )
     padded_input_ids = input_ids.new_zeros(physical_tokens)
     padded_input_ids[: input_ids.shape[0]] = input_ids
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()

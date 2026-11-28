@@ -618,7 +618,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 config_prefix_parts.append(
                     f"tp{storage_config.tp_size}_dcp{self.dcp_size}"
                     f"_page{storage_config.logical_page_size}"
-                    f"_pp{storage_config.pp_size}_cp{storage_config.attn_cp_size}"
+                    f"_pp{storage_config.pp_size}"
+                    f"_cp{storage_config.key_attn_cp_size}"
                 )
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
@@ -796,7 +797,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # Equivalent MLA replicas share one object per DCP/CP shard.
                 # Keep PP last for cross-stage queries in _batch_exist().
                 self.mla_suffix = (
-                    f"dcp{storage_config.dcp_rank}_cp{self.attn_cp_rank}"
+                    f"dcp{storage_config.dcp_rank}"
+                    f"_cp{storage_config.key_attn_cp_rank}"
                     + (f"_{self.pp_rank}" if self.enable_pp else "")
                 )
 

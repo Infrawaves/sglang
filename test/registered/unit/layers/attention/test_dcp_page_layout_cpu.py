@@ -795,5 +795,68 @@ class TestCuteDslDcpWrapperContracts(CustomTestCase):
                         )
 
 
+class TestPrefillCpWithDcpAlignment(CustomTestCase):
+    """Prefill CP with DCP stores KV through the widened-slot owner filter,
+    which matches the position rule only when pages and prefixes are
+    dcp_size-aligned; a misaligned batch must fail loudly, not store KV on
+    the wrong rank."""
+
+    @staticmethod
+    def _check(prefix_lens, *, dcp_size=8, page_size=64):
+        from sglang.srt.layers.dcp import planner
+
+        with patch.object(
+            planner, "get_schedule", return_value=SimpleNamespace(page_size=page_size)
+        ):
+            planner._check_prefill_cp_with_dcp_alignment(prefix_lens, dcp_size)
+
+    def test_aligned_prefixes_pass(self):
+        self._check([0, 64, 128])
+
+    def test_a_misaligned_prefix_is_refused(self):
+        with self.assertRaisesRegex(AssertionError, r"\[60\]"):
+            self._check([64, 60])
+
+    def test_a_page_size_off_the_dcp_grid_is_refused(self):
+        with self.assertRaisesRegex(AssertionError, "page_size"):
+            self._check([0], dcp_size=8, page_size=4)
+
+
+class TestDcpWholeBatchRows(CustomTestCase):
+    """Prefill CP leaves out the requests a rank has no query rows for, but the
+    DCP KV gather is collective: every rank must hand in its owned rows of the
+    whole batch, in batch order, or the gathered KV is mismatched across ranks.
+    Request 0 holds 4 tokens (1 cached, 3 new): its new tokens give query rows
+    to ranks 0-2 only, yet rank 3 owns position 3 and must still contribute it."""
+
+    DCP = 4
+
+    def test_every_rank_contributes_rows_of_every_request(self):
+        from sglang.srt.layers.attention.dsa_backend import _DcpFullBatch
+
+        lens = torch.tensor([4, 9])
+        # Widened slots: request 0 on page 1, request 1 on page 2 (16 per page).
+        page_table = torch.zeros((2, 9), dtype=torch.int64)
+        page_table[0, :4] = torch.arange(16, 20)
+        page_table[1, :9] = torch.arange(32, 41)
+        batch = _DcpFullBatch(page_table=page_table, seq_lens=lens, seq_lens_cpu=lens)
+        for rank in range(self.DCP):
+            with (
+                self.subTest(rank=rank),
+                get_context().override_server_args(dcp_size=self.DCP),
+                get_parallel().override(dcp_rank=rank, attn_dcp_rank=rank),
+            ):
+                expected = [
+                    slot // self.DCP
+                    for row, n in ((0, 4), (1, 9))
+                    for slot in page_table[row, :n].tolist()
+                    if slot % self.DCP == rank
+                ]
+                rows = batch.local_kv_rows(self.DCP).tolist()
+                self.assertEqual(rows, expected)
+                if rank == 3:
+                    self.assertIn(19 // self.DCP, rows)
+
+
 if __name__ == "__main__":
     unittest.main()

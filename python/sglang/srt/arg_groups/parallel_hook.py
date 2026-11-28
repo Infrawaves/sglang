@@ -170,6 +170,22 @@ def handle_context_parallelism(server_args: Any):
             "Aiter allreduce fusion is not supported with context parallelism"
         )
 
+        if cfg.enable_prefill_cp and cfg.dcp_size > 1:
+            # The DCP group must be the attention-CP group: one rank per token
+            # owner, with every attention head on each rank.
+            attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=view.attn_cp_size,
+                attn_dp_size=view.attn_dp_size,
+            )
+            if attn_tp_size != 1 or cfg.dcp_size != view.attn_cp_size:
+                raise ValueError(
+                    "--dcp-size > 1 with --enable-prefill-cp requires the "
+                    "resolved attention TP width to be 1 and --dcp-size to "
+                    f"equal --attn-cp-size, got attn_tp_size={attn_tp_size}, "
+                    f"attn_cp_size={view.attn_cp_size}, dcp_size={cfg.dcp_size}."
+                )
+
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert cfg.tp_size % cfg.moe_dp_size == 0, (
@@ -264,7 +280,7 @@ def handle_decode_context_parallelism(server_args: Any):
             f"dcp_size={cfg.dcp_size}."
         )
     if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
-        raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
+        _validate_prefill_cp_with_dcp(server_args, cfg)
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
@@ -288,6 +304,49 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+
+# Prefill CP with DCP runs one group that is TP, attention CP and DCP at once;
+# only these architectures implement it.
+_PREFILL_CP_WITH_DCP_ARCHS = frozenset({"KimiK31ForConditionalGeneration"})
+
+
+def _validate_prefill_cp_with_dcp(server_args: Any, cfg: Any) -> None:
+    # Runs before --cp-strategy and the model overrides resolve, so only the
+    # widths given on the command line are checked here;
+    # handle_context_parallelism checks the resolved attention widths.
+    arch = None
+    if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
+        arch = model_config_of(server_args).hf_config.architectures[0]
+    if arch not in _PREFILL_CP_WITH_DCP_ARCHS:
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp is only supported for "
+            f"{', '.join(sorted(_PREFILL_CP_WITH_DCP_ARCHS))}; got {arch!r}."
+        )
+    if not cfg.dcp_size == cfg.attn_cp_size == cfg.tp_size:
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp requires "
+            "--dcp-size == --attn-cp-size == --tp-size, got "
+            f"dcp_size={cfg.dcp_size}, attn_cp_size={cfg.attn_cp_size}, "
+            f"tp_size={cfg.tp_size}."
+        )
+    if cfg.cp_strategy not in (None, "interleave"):
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp supports only "
+            f"--cp-strategy interleave, got {cfg.cp_strategy!r}."
+        )
+    if cfg.dcp_kv_layout != "token":
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp requires "
+            f"--dcp-kv-layout token, got {cfg.dcp_kv_layout!r}."
+        )
+    # Not enabled implicitly: it also rejects online weight updates.
+    if not cfg.enable_cp_decode_attn_tp:
+        raise ValueError(
+            "--dcp-size > 1 with --enable-prefill-cp requires "
+            "--enable-cp-decode-attn-tp: decode slices the replicated attention "
+            "per CP rank before the DCP gather."
+        )
 
 
 def handle_data_parallelism(server_args: Any):

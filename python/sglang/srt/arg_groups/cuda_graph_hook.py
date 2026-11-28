@@ -141,6 +141,24 @@ def apply_cuda_graph_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        # An explicit backend skips the rules below. Prefill CP with DCP keeps
+        # its gathers and attention in breakable-graph breaks, so only that
+        # backend, on the one-group layout, has the per-batch metadata.
+        backend = cfg.cuda_graph_config.prefill.backend
+        if (
+            cfg.enable_prefill_cp
+            and cfg.dcp_size > 1
+            and backend != Backend.DISABLED
+            and not (
+                backend == Backend.BREAKABLE
+                and cfg.dcp_size == cfg.attn_cp_size == cfg.tp_size
+            )
+        ):
+            raise ValueError(
+                "--dcp-size > 1 with --enable-prefill-cp supports only "
+                "--cuda-graph-backend-prefill breakable (with --tp-size == "
+                "--attn-cp-size == --dcp-size) or disabled."
+            )
         return
 
     # PP prefill graph replay is opt-in. It is most useful for small

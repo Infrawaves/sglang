@@ -221,6 +221,14 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
+    # Prefill CP with DCP on one group (tp == attn_cp == dcp), on flashmla_kv.
+    prefill_cp_dcp = cfg.enable_prefill_cp and dcp == cfg.attn_cp_size == cfg.tp_size
+    # A PD prefill only writes the DFLASH draft KV from the CP-gathered target
+    # hidden states, in a draft scope that drops CP and keeps DCP (the layout a
+    # DCP prefill serves); it runs no draft or verify forward.
+    prefill_cp_dcp_dflash = (
+        cfg.speculative_algorithm == "DFLASH" and cfg.disaggregation_mode == "prefill"
+    )
     unsupported = {
         "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
         not in (None, "DSPARK", "DFLASH"),
@@ -237,13 +245,46 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             and cfg.disaggregation_transfer_backend != "mooncake"
         ),
         "HiSparse": cfg.enable_hisparse,
-        "prefill context parallel": cfg.enable_prefill_cp
-        or (cfg.attn_cp_size or 1) > 1,
+        "prefill context parallel other than --tp-size == --attn-cp-size == "
+        "--dcp-size": (cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1)
+        and not prefill_cp_dcp,
+        "speculative decoding with prefill context parallel other than DFLASH "
+        "on a PD prefill": prefill_cp_dcp
+        and cfg.speculative_algorithm is not None
+        and not prefill_cp_dcp_dflash,
+        # A prefill CP + DCP prefill ships pages to a decode of the same DCP;
+        # that decode serves TP + DCP, never prefill CP.
+        "PD decode with prefill context parallel": prefill_cp_dcp
+        and cfg.disaggregation_mode == "decode",
+        "a DSA backend other than flashmla_kv with prefill context parallel": (
+            prefill_cp_dcp
+            and any(
+                backend not in (None, "flashmla_kv")
+                for backend in (cfg.dsa_prefill_backend, cfg.dsa_decode_backend)
+            )
+        ),
+        # These fall back to the inline o_proj sum (can_defer_cp_decode_attn_tp),
+        # which reduces over attn_tp, a single rank under prefill CP with DCP.
+        "layernorm SP with prefill context parallel": prefill_cp_dcp
+        and cfg.enable_layernorm_sp,
+        "LoRA with prefill context parallel": prefill_cp_dcp
+        and bool(cfg.enable_lora or cfg.lora_paths),
+        "two-batch overlap with prefill context parallel": prefill_cp_dcp
+        and cfg.enable_two_batch_overlap,
+        "quantized communications with prefill context parallel": prefill_cp_dcp
+        and bool(cfg.enable_quant_communications),
+        # Every rank already holds all heads; the replica would gather N copies.
+        "--dcp-replicate-q-proj with prefill context parallel": prefill_cp_dcp
+        and cfg.dcp_replicate_q_proj is True,
     }
     rejected = [name for name, on in unsupported.items() if on]
     if rejected:
         raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
-    overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
+    overrides = (
+        {"dcp_replicate_q_proj": False}
+        if prefill_cp_dcp
+        else _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
+    )
     if cfg.speculative_algorithm == "DFLASH":
         overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
         # Target verify runs on the DSA decode impl, which merges the per-rank

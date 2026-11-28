@@ -2593,8 +2593,9 @@ def initialize_model_parallel(
         moe_dp_size: GPUs used for MoE data parallelism.
         attn_dcp_size: GPUs used for decode context parallelism, which splits
             the KV cache across GPUs within each tensor-parallel group during
-            decoding. Must be a divisor of `tp_size` and is currently only
-            supported on the AMD HIP platform.
+            decoding. Must be a divisor of `tp_size`. Supported on CUDA, HIP,
+            NPU and XPU. With prefill CP the DCP group is the attention-CP
+            group.
         shared_experts_tp_size: optional shared-expert TP width. May span
             interleave prefill CP within one attention replica; the validated
             width divides attention TP x CP and never crosses DP or PP.
@@ -2778,6 +2779,14 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
+        )
+
+    # Prefill CP with DCP keeps its own DCP communicator, but the KV owner rule
+    # needs it to span exactly the ranks of the attention-CP group.
+    if _DCP is not None and attn_cp_size > 1:
+        assert sorted(_DCP.ranks) == sorted(_ATTN_CP.ranks), (
+            f"DCP group {_DCP.ranks} differs from attention-CP group "
+            f"{_ATTN_CP.ranks}"
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
